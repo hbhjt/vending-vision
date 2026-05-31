@@ -1,0 +1,11 @@
+﻿index,time,personPresent,heightCm,shoulderWidthCm,ageRange,gender,bodyType,upperColor,confidence,raw_age,raw_gender,raw_height_cm,raw_shoulder_width_cm,raw_body_type,raw_upper_color,raw_presence,frame_path,error
+1,2026-05-29T16:42:30,,,,,,,,,,,,,,,,,"camera unavailable, index=1, backend=dshow"
+2,2026-05-29T16:42:32,,,,,,,,,,,,,,,,,"camera unavailable, index=1, backend=dshow"
+3,2026-05-29T16:42:35,,,,,,,,,,,,,,,,,"camera unavailable, index=1, backend=dshow"
+4,2026-05-29T16:42:37,,,,,,,,,,,,,,,,,"camera unavailable, index=1, backend=dshow"
+5,2026-05-29T16:42:39,,,,,,,,,,,,,,,,,"camera unavailable, index=1, backend=dshow"
+6,2026-05-29T16:42:42,,,,,,,,,,,,,,,,,"camera unavailable, index=1, backend=dshow"
+7,2026-05-29T16:42:44,,,,,,,,,,,,,,,,,"camera unavailable, index=1, backend=dshow"
+8,2026-05-29T16:42:47,,,,,,,,,,,,,,,,,"camera unavailable, index=1, backend=dshow"
+9,2026-05-29T16:42:49,,,,,,,,,,,,,,,,,"camera unavailable, index=1, backend=dshow"
+10,2026-05-29T16:42:51,,,,,,,,,,,,,,,,,"camera unavailable, index=1, backend=dshow"

@@ -1,0 +1,11 @@
+﻿index,time,personPresent,heightCm,shoulderWidthCm,ageRange,gender,bodyType,upperColor,confidence,raw_age,raw_gender,raw_height_cm,raw_shoulder_width_cm,raw_body_type,raw_upper_color,raw_presence,frame_path,error
+1,2026-05-29T16:32:09,True,,,adult,male,unknown,light,0.59,18,male,,,unknown,light,True,test_reports\frames_20260529_163204\frame_001.jpg,
+2,2026-05-29T16:32:15,True,,42.9,adult,male,unknown,light,0.69,18,male,,42.9,unknown,light,True,test_reports\frames_20260529_163204\frame_002.jpg,
+3,2026-05-29T16:32:22,True,,33.5,adult,male,unknown,light,0.69,18,male,,33.5,unknown,light,True,test_reports\frames_20260529_163204\frame_003.jpg,
+4,2026-05-29T16:32:28,True,,,adult,female,unknown,light,0.59,18,female,,,unknown,light,True,test_reports\frames_20260529_163204\frame_004.jpg,
+5,2026-05-29T16:32:35,True,,44.2,adult,male,unknown,light,0.69,18,male,,44.2,unknown,light,True,test_reports\frames_20260529_163204\frame_005.jpg,
+6,2026-05-29T16:32:41,True,,45.9,adult,male,unknown,light,0.69,18,male,,45.9,unknown,light,True,test_reports\frames_20260529_163204\frame_006.jpg,
+7,2026-05-29T16:32:48,True,,,adult,male,unknown,unknown,0.54,18,male,,,unknown,unknown,True,test_reports\frames_20260529_163204\frame_007.jpg,
+8,2026-05-29T16:32:54,True,,,adult,male,unknown,unknown,0.54,18,male,,,unknown,unknown,True,test_reports\frames_20260529_163204\frame_008.jpg,
+9,2026-05-29T16:33:01,True,,44.0,adult,male,unknown,light,0.69,18,male,,44.0,unknown,light,True,test_reports\frames_20260529_163204\frame_009.jpg,
+10,2026-05-29T16:33:07,True,,,adult,female,unknown,light,0.59,18,female,,,unknown,light,True,test_reports\frames_20260529_163204\frame_010.jpg,

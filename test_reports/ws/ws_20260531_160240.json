@@ -1,0 +1,168 @@
+{
+  "createdAt": "2026-05-31T08:02:53.355941Z",
+  "url": "ws://127.0.0.1:7892/ws",
+  "waitSeconds": 30,
+  "status": "profile_result",
+  "error": "",
+  "messages": [
+    {
+      "direction": "send",
+      "at": "2026-05-31T08:02:40.393730Z",
+      "message": {
+        "protocol": "vem.vision.v1",
+        "type": "vision.hello",
+        "messageId": "hello-001",
+        "timestamp": "2026-05-31T08:02:40.393730Z",
+        "payload": {
+          "clientRole": "machine",
+          "machineCode": "M001",
+          "protocolVersion": 1,
+          "capabilities": [
+            "profile_push"
+          ]
+        }
+      }
+    },
+    {
+      "direction": "recv",
+      "at": "2026-05-31T08:02:40.394729Z",
+      "message": {
+        "protocol": "vem.vision.v1",
+        "type": "vision.ready",
+        "messageId": "ready-001",
+        "timestamp": "2026-05-31T08:02:40.393730Z",
+        "payload": {
+          "serverName": "vem-vision-python",
+          "serverVersion": "0.2.0",
+          "cameraReady": true,
+          "modelReady": true,
+          "capabilities": [
+            "profile_push"
+          ]
+        }
+      }
+    },
+    {
+      "direction": "send",
+      "at": "2026-05-31T08:02:40.394729Z",
+      "message": {
+        "protocol": "vem.vision.v1",
+        "type": "vision.ping",
+        "messageId": "ping-001",
+        "timestamp": "2026-05-31T08:02:40.394729Z",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "recv",
+      "at": "2026-05-31T08:02:40.396727Z",
+      "message": {
+        "protocol": "vem.vision.v1",
+        "type": "vision.pong",
+        "messageId": "pong-001",
+        "timestamp": "2026-05-31T08:02:40.396727Z",
+        "payload": {}
+      }
+    },
+    {
+      "direction": "recv",
+      "at": "2026-05-31T08:02:53.354039Z",
+      "message": {
+        "protocol": "vem.vision.v1",
+        "type": "vision.profile_result",
+        "messageId": "result-vision-event-58fca102-34d5-4bea-971c-9e1bc1dce5d9",
+        "timestamp": "2026-05-31T08:02:53.352934Z",
+        "payload": {
+          "eventId": "vision-event-58fca102-34d5-4bea-971c-9e1bc1dce5d9",
+          "detectedAt": "2026-05-31T08:02:53.352934Z",
+          "profile": {
+            "personPresent": true,
+            "heightCm": null,
+            "shoulderWidthCm": null,
+            "ageRange": "adult",
+            "gender": "male",
+            "bodyType": "unknown",
+            "upperColor": "unknown",
+            "confidence": 0.54
+          },
+          "quality": {
+            "overall": "fair",
+            "warnings": [
+              "height is unavailable",
+              "body type is unknown"
+            ],
+            "sampleCount": 5,
+            "validFrameCount": 5,
+            "minValidFrames": 2,
+            "samples": [
+              {
+                "index": 1,
+                "personPresent": true,
+                "confidence": 0.54,
+                "brightness": 208.53,
+                "sharpness": 95.4,
+                "inferenceWidth": 416,
+                "inferenceHeight": 234,
+                "valid": true
+              },
+              {
+                "index": 2,
+                "personPresent": true,
+                "confidence": 0.54,
+                "brightness": 195.35,
+                "sharpness": 110.18,
+                "inferenceWidth": 416,
+                "inferenceHeight": 234,
+                "valid": true
+              },
+              {
+                "index": 3,
+                "personPresent": true,
+                "confidence": 0.54,
+                "brightness": 202.84,
+                "sharpness": 108.16,
+                "inferenceWidth": 416,
+                "inferenceHeight": 234,
+                "valid": true
+              },
+              {
+                "index": 4,
+                "personPresent": true,
+                "confidence": 0.54,
+                "brightness": 197.12,
+                "sharpness": 106.34,
+                "inferenceWidth": 416,
+                "inferenceHeight": 234,
+                "valid": true
+              },
+              {
+                "index": 5,
+                "personPresent": true,
+                "confidence": 0.54,
+                "brightness": 218.73,
+                "sharpness": 55.88,
+                "inferenceWidth": 416,
+                "inferenceHeight": 234,
+                "valid": true
+              }
+            ],
+            "proximity": {
+              "present": true,
+              "close": true,
+              "closeNow": true,
+              "closeStreak": 2,
+              "requiredCloseStreak": 2,
+              "faceCount": 1,
+              "largestFaceRatio": 0.18004,
+              "presentFaceRatio": 0.003,
+              "closeFaceRatio": 0.015,
+              "monitorWidth": 416,
+              "monitorHeight": 234,
+              "method": "face_area_ratio"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

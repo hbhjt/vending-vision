@@ -1,0 +1,11 @@
+﻿index,time,personPresent,heightCm,shoulderWidthCm,ageRange,gender,bodyType,upperColor,confidence,raw_age,raw_gender,raw_height_cm,raw_shoulder_width_cm,raw_body_type,raw_upper_color,raw_presence,frame_path,error
+1,2026-05-29T16:20:29,False,,,unknown,unknown,unknown,unknown,0.3,,unknown,,,unknown,unknown,False,test_reports\frames_20260529_162025\frame_001.jpg,
+2,2026-05-29T16:20:36,True,,,adult,female,unknown,unknown,0.54,28,female,,,unknown,unknown,True,test_reports\frames_20260529_162025\frame_002.jpg,
+3,2026-05-29T16:20:43,False,,,unknown,unknown,unknown,unknown,0.3,,unknown,,,unknown,unknown,False,test_reports\frames_20260529_162025\frame_003.jpg,
+4,2026-05-29T16:20:49,True,,,adult,female,unknown,yellow,0.59,28,female,,,unknown,yellow,True,test_reports\frames_20260529_162025\frame_004.jpg,
+5,2026-05-29T16:20:55,True,,,adult,female,unknown,yellow,0.59,28,female,,,unknown,yellow,True,test_reports\frames_20260529_162025\frame_005.jpg,
+6,2026-05-29T16:21:02,True,,,child,female,unknown,yellow,0.59,1,female,,,unknown,yellow,True,test_reports\frames_20260529_162025\frame_006.jpg,
+7,2026-05-29T16:21:09,False,,,unknown,unknown,unknown,unknown,0.3,,unknown,,,unknown,unknown,False,test_reports\frames_20260529_162025\frame_007.jpg,
+8,2026-05-29T16:21:15,False,,,unknown,unknown,unknown,unknown,0.3,,unknown,,,unknown,unknown,False,test_reports\frames_20260529_162025\frame_008.jpg,
+9,2026-05-29T16:21:22,False,,,unknown,unknown,unknown,unknown,0.3,,unknown,,,unknown,unknown,False,test_reports\frames_20260529_162025\frame_009.jpg,
+10,2026-05-29T16:21:28,False,,,unknown,unknown,unknown,unknown,0.3,,unknown,,,unknown,unknown,False,test_reports\frames_20260529_162025\frame_010.jpg,

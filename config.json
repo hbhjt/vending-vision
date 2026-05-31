@@ -1,0 +1,44 @@
+{
+  "camera_index": 1,
+  "camera_backend": "dshow",
+  "camera_width": 1280,
+  "camera_height": 720,
+  "camera_fps": 30,
+  "camera_fourcc": "MJPG",
+  "camera_warmup_frames": 5,
+
+  "height_scale": 100,
+  "height_offset": 80,
+
+  "body_type_thin_threshold": 0.2,
+  "body_type_fat_threshold": 0.3,
+
+  "save_debug_images": true,
+  "debug_output_dir": "debug_outputs",
+  "max_debug_images": 200,
+
+  "default_timeout_ms": 8000,
+
+  "profile_push_enabled": true,
+  "profile_push_interval_ms": 1000,
+  "profile_push_cooldown_ms": 8000,
+  "profile_sample_count": 5,
+  "profile_sample_interval_ms": 300,
+  "profile_min_confidence": 0.45,
+  "profile_min_valid_frames": 2,
+  "profile_detection_width": 416,
+  "profile_detection_height": 234,
+  "proximity_enabled": true,
+  "proximity_monitor_width": 416,
+  "proximity_monitor_height": 234,
+  "proximity_present_face_ratio": 0.003,
+  "proximity_close_face_ratio": 0.015,
+  "proximity_close_consecutive_frames": 2,
+  "primary_face_max_head_distance_ratio": 0.18,
+  "mock_push_interval_ms": 1000,
+
+  "mock_scenario": "off",
+
+  "host": "127.0.0.1",
+  "port": 7892
+}

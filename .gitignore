@@ -1,0 +1,54 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+conda-meta/
+
+# Logs
+logs/
+*.log
+
+# Debug outputs
+debug_outputs/
+output_*.jpg
+output_*.png
+output_*.jpeg
+
+# Field datasets
+datasets/
+
+# Generated reports
+reports/
+
+# Test temporary files
+*.tmp
+*.bak
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model files
+models/**/*.onnx
+models/**/*.caffemodel
+models/**/*.pb
+models/**/*.tflite
+models/**/*.pth
+models/**/*.pt
+
+# Keep model folders
+!models/
+!models/**/
+!models/**/*.txt
+!models/**/*.prototxt
+!models/**/*.md

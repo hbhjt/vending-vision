@@ -1,0 +1,11 @@
+﻿index,time,personPresent,heightCm,shoulderWidthCm,ageRange,gender,bodyType,upperColor,confidence,raw_age,raw_gender,raw_height_cm,raw_shoulder_width_cm,raw_body_type,raw_upper_color,raw_presence,error
+1,2026-05-25T21:21:06,True,158.5,35.1,adult,male,regular,light,0.94,18,male,158.5,35.1,medium,light,True,
+2,2026-05-25T21:21:10,True,160.9,35.9,adult,male,regular,light,0.94,18,male,160.9,35.9,medium,light,True,
+3,2026-05-25T21:21:13,True,163.4,36.0,adult,male,regular,light,0.94,28,male,163.4,36.0,medium,light,True,
+4,2026-05-25T21:21:16,True,159.1,37.6,adult,female,regular,light,0.94,18,female,159.1,37.6,medium,light,True,
+5,2026-05-25T21:21:20,True,157.8,36.0,adult,male,regular,light,0.94,18,male,157.8,36.0,medium,light,True,
+6,2026-05-25T21:21:23,True,160.4,34.5,adult,male,regular,light,0.94,18,male,160.4,34.5,medium,light,True,
+7,2026-05-25T21:21:26,True,160.8,34.5,adult,male,regular,light,0.94,18,male,160.8,34.5,medium,light,True,
+8,2026-05-25T21:21:29,True,160.9,35.2,adult,male,regular,light,0.94,18,male,160.9,35.2,medium,light,True,
+9,2026-05-25T21:21:32,True,161.4,35.1,adult,male,regular,light,0.94,18,male,161.4,35.1,medium,light,True,
+10,2026-05-25T21:21:35,True,160.6,35.3,adult,male,regular,light,0.94,18,male,160.6,35.3,medium,light,True,
