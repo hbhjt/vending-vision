@@ -1,8 +1,8 @@
-opencv-python
-numpy
-pydantic
-mediapipe
-fastapi
-uvicorn
-python-multipart
-websockets
+opencv-python==4.13.0.92
+numpy==2.2.6
+pydantic==2.13.4
+mediapipe==0.10.14
+fastapi==0.136.3
+uvicorn==0.48.0
+python-multipart==0.0.29
+websockets==16.0

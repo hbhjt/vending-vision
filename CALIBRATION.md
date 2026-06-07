@@ -1,47 +1,38 @@
-# 现场标定说明
+# 摄像头和画像标定步骤
 
-本文档用于指导真实售货机场景下的摄像头安装、靠近检测阈值、多帧画像推送和结果标定。
+本文档用于固定售货机摄像头后做一次现场标定。日常排查见 [FIELD_TUNING.md](FIELD_TUNING.md)。
 
-当前现场条件：
+## 标定目标
 
-```text
-摄像头高度：约 1.8m
-用户距离：约 20cm
-摄像头俯拍角度：约 45度
-摄像头：工业 USB 摄像头，已验证 1280x720 / 30fps / MJPG
-```
+- 无人时不误推送。
+- 用户靠近售货机时能及时推送。
+- 远处路过不触发画像。
+- 身体、颜色、人脸字段尽量减少 `unknown`。
+- CPU 和磁盘占用可接受。
 
-这个视角和桌面正面测试差异很大。20cm 距离非常近，45度俯拍会让头肩被放大、腿部被压缩，手臂操作屏幕时也容易遮挡身体。因此不要用正面测试数据直接调售货机场景参数。
+## 1. 固定现场条件
 
-## 当前识别流程
-
-正式流程为：
+先固定这些条件，再开始调参：
 
 ```text
-摄像头常驻采集
-↓
-低分辨率靠近检测
-↓
-连续多帧判断用户靠近
-↓
-启动完整多帧画像采样
-↓
-过滤低质量/低置信帧
-↓
-聚合最可信结果
-↓
-主动推送 vision.profile_result
+摄像头型号
+摄像头 index
+安装高度
+俯仰角度
+用户典型站位
+现场光线
+售货机屏幕反光情况
 ```
 
-无人或未靠近时，视觉服务保持静默，不向后端推送 `no_person`。
+摄像头位置改变后，原来的阈值需要重新验证。
 
-## 摄像头配置
+## 2. 确认摄像头
 
-当前推荐配置：
+售货机摄像头通常配置为：
 
 ```json
 {
-  "camera_index": 1,
+  "camera_index": 0,
   "camera_backend": "dshow",
   "camera_width": 1280,
   "camera_height": 720,
@@ -50,158 +41,131 @@
 }
 ```
 
-检查摄像头：
+探测：
 
-```bash
+```bat
 python test_camera.py --probe --max-index 8
-python test_camera.py --index 1 --backend dshow --width 1280 --height 720 --fps 30 --fourcc MJPG --output debug_outputs/camera_test.jpg
 ```
 
-启动服务后检查：
+拍照：
+
+```bat
+python test_camera.py --index 0 --backend dshow --width 1280 --height 720 --fps 30 --fourcc MJPG --output debug_outputs/camera_test.jpg
+```
+
+启动服务后查看：
 
 ```text
 http://127.0.0.1:7892/camera/status
-http://127.0.0.1:7892/health
 ```
 
-## 靠近检测标定
+重点确认 `stream.opened=true`、实际分辨率符合预期。
 
-当前靠近检测先使用低分辨率人脸框面积占比：
+## 3. 标定靠近阈值
 
-```json
-{
-  "proximity_enabled": true,
-  "proximity_monitor_width": 416,
-  "proximity_monitor_height": 234,
-  "proximity_present_face_ratio": 0.003,
-  "proximity_close_face_ratio": 0.015,
-  "proximity_close_consecutive_frames": 2
-}
-```
+先跑：
 
-现场调试：
-
-```bash
+```bat
 python test_proximity.py --runs 20 --interval 0.5
 ```
 
-重点看输出字段：
+分别记录三种情况：
 
-```text
-largestFaceRatio
-present
-closeNow
-close
-closeStreak
-```
-
-调参规则：
-
-| 现象 | 调整 |
+| 场景 | 期望 |
 | --- | --- |
-| 用户已经靠近但 `close=false` | 降低 `proximity_close_face_ratio` |
-| 用户还很远就 `close=true` | 提高 `proximity_close_face_ratio` |
-| 靠近状态忽真忽假 | 提高 `proximity_close_consecutive_frames` |
-| 人脸检测不到 | 检查光照、角度、遮挡，或后续改成人体检测模型 |
+| 无人 | `present=false` |
+| 远处路过 | `present` 可为 true，但 `close=false` |
+| 正常靠近操作 | `closeNow=true` 或 `close=true` |
 
-建议今晚采集时记录不同站位下的 `largestFaceRatio`，后续用数据确定阈值，而不是凭感觉调。
+主要看这些字段：
 
-## 多帧画像配置
+```text
+personReady
+largestPersonRatio
+personCloseNow
+largestFaceRatio
+faceCloseNow
+closeStreak
+close
+```
 
-当前画像推送配置：
+调参原则：
+
+- 靠近也不触发：降低 `proximity_close_person_ratio` 或 `proximity_close_face_ratio`。
+- 远处也触发：提高 `proximity_close_person_ratio` 或 `proximity_close_face_ratio`。
+- 偶发误触发：提高 `proximity_close_consecutive_frames`。
+- 人体模型不可用：检查 `models/person_detection/person_yolov8n.onnx`。
+
+## 4. 验证 WebSocket 推送
+
+普通模式启动：
+
+```bat
+scripts\start_server.bat
+```
+
+测试：
+
+```bat
+python test_ws_client.py --wait-seconds 60
+```
+
+用户靠近后应收到 `vision.profile_result`。无人时长时间没有画像推送是正常情况。
+
+如果有人靠近但没有推送，启动过程追踪：
+
+```bat
+scripts\start_trace_server.bat
+python test_ws_client.py --wait-seconds 60
+```
+
+查看最新目录：
+
+```text
+debug_outputs/process_traces/
+```
+
+重点看 `manifest.json`：
+
+| `statusReason` | 含义 |
+| --- | --- |
+| `person_present_but_not_close` | 有人但未达到靠近阈值 |
+| `not_enough_valid_frames` | 采样结果有效帧不足 |
+| `confidence_below_threshold` | 聚合结果置信度低 |
+
+## 5. 标定画像字段
+
+建议找 3 到 5 个已知身高的人，在相同站位下测试。
+
+| 字段 | 调整方向 |
+| --- | --- |
+| `heightCm` 整体偏高/偏低 | 调 `height_offset` |
+| 高矮变化趋势不对 | 调 `height_scale` |
+| `bodyType` 经常偏 slim/strong | 调体型阈值 |
+| `upperColor` 不准 | 改善光线和上半身入画 |
+| `ageRange` / `gender` 不稳 | 作为弱参考，优先保证人脸清晰 |
+
+注意：单目 RGB 摄像头无法保证精确身高，身高和体型建议作为粗略分层。
+
+## 6. 保存最终配置
+
+每次调整只改一组参数，并记录：
+
+```text
+修改参数
+无人误触发次数
+靠近成功推送次数
+平均推送延迟
+字段 unknown 情况
+CPU 占用
+是否开启 trace
+```
+
+正式上线前确认：
 
 ```json
 {
-  "profile_sample_count": 5,
-  "profile_sample_interval_ms": 300,
-  "profile_min_confidence": 0.45,
-  "profile_min_valid_frames": 2,
-  "profile_detection_width": 416,
-  "profile_detection_height": 234,
-  "profile_push_cooldown_ms": 8000
+  "mock_scenario": "off",
+  "process_trace_enabled": false
 }
 ```
-
-含义：
-
-- 每次靠近后采 5 张候选帧。
-- 每张候选帧间隔 300ms。
-- 单帧置信度低于 0.45 不进入统计。
-- 至少 2 张有效帧才推送结果。
-- 推理前缩放到 416x234，降低 N150 工控机负载。
-- 推送后冷却 8 秒，避免同一个用户频繁刷新推荐。
-
-## 单用户主目标标定
-
-当前系统默认只识别一个主用户。多人同时出现在画面中时：
-
-```text
-优先选择与姿态头部关键点最近的人脸
-匹配不到时，选择面积较大且靠近画面中心的人脸
-```
-
-展示材料中：
-
-```text
-红色 primary 框：系统选择的主用户
-绿色 face 框：其他检测到的人脸
-```
-
-相关配置：
-
-```json
-{
-  "primary_face_max_head_distance_ratio": 0.18
-}
-```
-
-如果脸和姿态经常错配，应优先检查：
-
-```text
-画面里是否多人重叠
-主用户是否站在固定识别区域
-摄像头角度是否导致头部关键点偏移
-primary_face_max_head_distance_ratio 是否过大
-```
-
-## 现场标定步骤
-
-1. 固定摄像头高度、角度和位置。
-2. 在地面或机器前贴站位标识。
-3. 用 `test_camera.py` 拍样图，确认画面范围。
-4. 用 `test_proximity.py` 采远/近两组靠近检测数据。
-5. 调整 `proximity_close_face_ratio`。
-6. 启动服务，运行 `test_ws_client.py --wait-seconds 30`。
-7. 让用户靠近，确认是否收到 `vision.profile_result`。
-8. 用 `collect_person_dataset.py` 采集多人、多姿态数据。
-9. 用 `test_real_camera_batch.py --runs 10 --interval 2 --save-frames` 做稳定性测试。
-10. 根据 CSV 和图片调整身高、体型、颜色和置信度规则。
-
-## 身高和体型注意事项
-
-在 1.8m 高、20cm 距离、45度俯拍条件下，不建议把 `heightCm` 当作精确身高。更现实的业务目标是：
-
-```text
-是否有人
-是否靠近
-大致身高区间
-大致体型
-上衣颜色
-整体置信度
-```
-
-如果后续要稳定估计身高，建议融合距离传感器、深度摄像头或更严格的站位约束。
-
-## 交付物
-
-完成现场标定后保留：
-
-```text
-config.json
-datasets/field_capture/
-test_reports/
-debug_outputs/ 中的典型样图
-logs/vision.log
-```
-
-不同安装角度可能需要不同配置，不建议跨机器直接复用。

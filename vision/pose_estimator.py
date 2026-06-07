@@ -1,6 +1,8 @@
 import cv2
 import mediapipe as mp
 
+from vision.config import settings
+
 
 class PoseEstimator:
     def __init__(self):
@@ -10,7 +12,7 @@ class PoseEstimator:
         self.pose = self.mp_pose.Pose(
             static_image_mode=True,
             model_complexity=1,
-            enable_segmentation=False,
+            enable_segmentation=settings.POSE_ENABLE_SEGMENTATION,
             min_detection_confidence=0.5
         )
 

@@ -7,7 +7,11 @@
 ```text
 models/
 ├── README.md
+├── person_detection/
+│   ├── README.md
+│   └── person_yolov8n.onnx
 ├── face_detection/
+│   ├── README.md
 │   └── face_detection_yunet_2023mar.onnx
 └── age_gender/
     ├── age_deploy.prototxt
@@ -15,6 +19,28 @@ models/
     ├── gender_deploy.prototxt
     └── gender_net.caffemodel
 ```
+
+GitHub 仓库默认不上传 `.onnx`、`.caffemodel` 等模型权重，只保留目录说明和轻量配置文件。部署到售货机时，需要把模型权重文件放回上述路径。
+
+## 人体检测模型
+
+推荐放置轻量人体检测 ONNX：
+
+```text
+models/person_detection/person_yolov8n.onnx
+```
+
+默认按 COCO 类别解析，`person` 类别 ID 为 `0`。当前解析器兼容常见 YOLOv5/YOLOv8 ONNX 输出形状；如果后续换成其他模型，需要在 `vision/person_detector.py` 里适配输出格式。
+
+多数现成 YOLOv8 ONNX 是固定 640x640 输入，当前默认配置也按 640x640。若自行导出 416x416 动态模型，可以同步调整 `person_detector_input_width` 和 `person_detector_input_height`。
+
+人体检测就绪时，proximity 优先使用人体框面积占比：
+
+```text
+largestPersonRatio >= proximity_close_person_ratio
+```
+
+人体检测比人脸面积更适合侧脸、低头操作、轻微遮挡和俯拍场景。
 
 ## 人脸检测模型
 
@@ -26,13 +52,19 @@ models/face_detection/face_detection_yunet_2023mar.onnx
 
 如果 YuNet 不可用，会回退到 OpenCV Haar。Haar 可继续运行，但弱光、侧脸、遮挡和小人脸稳定性更差。
 
-当前靠近检测也是先基于低分辨率人脸框面积占比实现：
+人脸检测作为靠近判断的补充，也用于年龄/性别和主脸裁剪。当前人脸靠近判断基于低分辨率人脸框面积占比：
 
 ```text
 largestFaceRatio >= proximity_close_face_ratio
 ```
 
-后续如果人脸在俯拍场景不稳定，可以替换为轻量人体检测模型。
+当人体检测模型缺失或未就绪时，会回退到 MediaPipe Pose 的姿态框辅助判断：
+
+```text
+bodyBoxRatio >= proximity_close_body_ratio
+```
+
+人体检测或人脸已经明确达到 close 时，会跳过姿态回退，避免低功耗工控机每次 proximity 都额外跑姿态推理。
 
 ## 年龄和性别模型
 
@@ -53,7 +85,9 @@ models/age_gender/gender_net.caffemodel
 
 ```text
 低分辨率输入
-轻量人脸/人体检测
+轻量人体检测
+轻量人脸检测作为补充
+姿态辅助只做回退
 低频推理
 多帧统计
 OpenVINO / ONNX Runtime 优化
@@ -88,7 +122,7 @@ ageGenderMode
 
 ## 后续规划
 
-- 增加轻量人体检测模型，用于替代当前人脸面积靠近判断。
+- 基于现场数据选择更稳定的轻量人体检测模型和阈值。
 - 增加 OpenVINO 推理路径。
 - 记录每个模型的版本、来源、输入尺寸和输出含义。
 - 建立现场数据回归测试集，避免模型替换后行为退化。

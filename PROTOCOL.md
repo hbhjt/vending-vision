@@ -1,53 +1,41 @@
-# 机器视觉模块通信协议
+# 通信协议说明
 
-版本：`vem.vision.v1`
+协议版本：`vem.vision.v1`
 
 默认地址：`ws://127.0.0.1:7892/ws`
 
-修改日期：2026-05-29
-
-本协议采用“视觉端主动推送”模式。售货机应用连接本地视觉服务后，只负责握手、心跳和接收画像；视觉应用自行管理摄像头、人体检测、采集、推理和多帧统计。当识别到可用画像时，主动推送 `vision.profile_result`。没有有效人员时保持静默。
+当前模式：视觉端主动推送。
 
 ## 职责边界
 
-售货机应用负责：
+售货机原生层/后端：
 
-- 连接本地视觉 WebSocket 服务。
-- 发送握手和心跳。
-- 接收视觉画像推送。
-- 将画像转换为推荐请求并刷新推荐商品。
-- 视觉未连接、未收到画像或推荐失败时展示默认商品列表。
-- 部署时启动、维护和关闭视觉进程。
+- 建立 WebSocket 连接。
+- 发送 `vision.hello`。
+- 定期发送 `vision.ping`，接收 `vision.pong`。
+- 等待视觉端主动推送 `vision.profile_result`。
+- 长时间没有画像时展示默认商品。
 
-机器视觉应用负责：
+视觉模块：
 
-- 自行检测是否有人进入识别范围。
-- 自行管理摄像头、模型加载、采集和推理。
-- 有可用识别数据时主动推送 `vision.profile_result`。
-- 未检测到有效人员时保持静默，不推送消息。
-- 设备异常或协议异常时推送 `vision.error`。
-- 只监听本地回环地址。
+- 自己管理长期摄像头连接、靠近检测、采样、推理和聚合。
+- 摄像头读帧失败时自动重连；重连仍失败时推送 `vision.error`。
+- 没有有效用户时保持静默。
+- 有可用画像时主动推送 `vision.profile_result`。
+- 摄像头、模型或协议异常时推送 `vision.error`。
 
-## 传输约定
+新协议不再要求原生层发送 `vision.start_profile` 或 `vision.cancel`。
 
-| 项目 | 约定 |
-| --- | --- |
-| Transport | WebSocket，UTF-8 JSON 文本帧 |
-| 默认监听 | `127.0.0.1:7892/ws` |
-| 单帧大小 | 建议不超过 64 KiB |
-| 二进制数据 | 禁止传图片或视频帧 |
-| 心跳 | 双方可使用 `vision.ping` / `vision.pong` |
-| 推送模型 | 视觉端检测到可用画像后主动推送 |
-| 安全 | 只绑定 `127.0.0.1` 或 `::1` |
+## 统一消息结构
 
-## 统一消息信封
+所有消息都是 UTF-8 JSON 文本：
 
 ```json
 {
   "protocol": "vem.vision.v1",
-  "type": "vision.profile_result",
-  "messageId": "018fb994-c70e-7ec2-b4c3-90e6a7f2c8f1",
-  "timestamp": "2026-05-29T12:00:00.000Z",
+  "type": "vision.hello",
+  "messageId": "hello-001",
+  "timestamp": "2026-06-01T12:00:00.000Z",
   "payload": {}
 }
 ```
@@ -56,22 +44,22 @@
 | --- | --- | --- | --- |
 | `protocol` | string | 是 | 固定为 `vem.vision.v1` |
 | `type` | string | 是 | 消息类型 |
-| `messageId` | string | 是 | 发送方生成，用于日志追踪 |
-| `timestamp` | ISO datetime | 是 | 发送时间 |
-| `payload` | object | 是 | 消息载荷 |
+| `messageId` | string | 是 | 消息 ID，用于日志追踪 |
+| `timestamp` | string | 是 | ISO 时间 |
+| `payload` | object | 是 | 消息内容 |
 
-## 售货机应用到视觉端
+## 原生层到视觉模块
 
-### `vision.hello`
+### vision.hello
 
-连接建立后，售货机应用先发送握手消息。握手只声明身份和能力，不触发识别。
+连接建立后发送一次。
 
 ```json
 {
   "protocol": "vem.vision.v1",
   "type": "vision.hello",
   "messageId": "hello-001",
-  "timestamp": "2026-05-29T12:00:00.000Z",
+  "timestamp": "2026-06-01T12:00:00.000Z",
   "payload": {
     "clientRole": "machine",
     "machineCode": "M001",
@@ -81,32 +69,32 @@
 }
 ```
 
-### `vision.ping`
+### vision.ping
+
+用于心跳。
 
 ```json
 {
   "protocol": "vem.vision.v1",
   "type": "vision.ping",
   "messageId": "ping-001",
-  "timestamp": "2026-05-29T12:00:03.000Z",
+  "timestamp": "2026-06-01T12:00:03.000Z",
   "payload": {}
 }
 ```
 
-新版协议不再包含 `vision.start_profile` 和 `vision.cancel`。识别生命周期由视觉应用自行管理。
+## 视觉模块到原生层
 
-## 视觉端到售货机应用
+### vision.ready
 
-### `vision.ready`
-
-视觉端收到 `vision.hello` 后返回。售货机应用收到后保持连接，等待后续画像推送。
+收到 `vision.hello` 后返回。
 
 ```json
 {
   "protocol": "vem.vision.v1",
   "type": "vision.ready",
   "messageId": "ready-001",
-  "timestamp": "2026-05-29T12:00:00.100Z",
+  "timestamp": "2026-06-01T12:00:00.100Z",
   "payload": {
     "serverName": "vem-vision-python",
     "serverVersion": "0.2.0",
@@ -117,19 +105,56 @@
 }
 ```
 
-### `vision.profile_result`
+### vision.pong
 
-视觉端识别到可用画像时主动推送。每次推送代表一次识别事件。
+收到 `vision.ping` 后返回。
+
+```json
+{
+  "protocol": "vem.vision.v1",
+  "type": "vision.pong",
+  "messageId": "pong-001",
+  "timestamp": "2026-06-01T12:00:03.100Z",
+  "payload": {}
+}
+```
+
+### vision.presence_status
+
+展示面板声明 `capabilities` 包含 `presence_status` 时，视觉模块会额外推送该辅助状态。该消息用于 Dashboard 实时显示“当前无人”“接近中”“画像暂不可用”，原生层/后端推荐算法可以忽略。
+
+```json
+{
+  "protocol": "vem.vision.v1",
+  "type": "vision.presence_status",
+  "messageId": "status-vision-event-xxx",
+  "timestamp": "2026-06-01T12:00:03.500Z",
+  "payload": {
+    "eventId": "vision-event-xxx",
+    "detectedAt": "2026-06-01T12:00:03.500Z",
+    "state": "empty",
+    "reason": "no_person",
+    "personPresent": false,
+    "closeNow": false,
+    "close": false,
+    "proximity": {}
+  }
+}
+```
+
+### vision.profile_result
+
+检测到用户靠近并得到可用画像后主动推送。
 
 ```json
 {
   "protocol": "vem.vision.v1",
   "type": "vision.profile_result",
-  "messageId": "result-001",
-  "timestamp": "2026-05-29T12:00:04.000Z",
+  "messageId": "result-vision-event-xxx",
+  "timestamp": "2026-06-01T12:00:04.000Z",
   "payload": {
-    "eventId": "vision-event-20260529-0001",
-    "detectedAt": "2026-05-29T12:00:03.900Z",
+    "eventId": "vision-event-xxx",
+    "detectedAt": "2026-06-01T12:00:03.900Z",
     "profile": {
       "personPresent": true,
       "heightCm": 172,
@@ -141,23 +166,77 @@
       "confidence": 0.86
     },
     "quality": {
-      "overall": "good",
-      "warnings": []
+      "overall": "fair",
+      "warnings": [],
+      "sampleCount": 3,
+      "validFrameCount": 2,
+      "minValidFrames": 1,
+      "targetSampleCount": 5,
+      "faceVoteFrameCount": 2,
+      "faceVoteQualifiedFrameCount": 3,
+      "samplingMode": "approach_buffer_immediate_close",
+      "proximity": {
+        "present": true,
+        "close": true,
+        "closeNow": true,
+        "closeTrigger": "close_now",
+        "personReady": true,
+        "personPresent": true,
+        "largestPersonRatio": 0.21,
+        "facePresent": true,
+        "bodyPresent": false,
+        "largestFaceRatio": 0.018,
+        "bodyBoxRatio": 0.0,
+        "method": "person_detector+face_area_ratio"
+      }
     }
   }
 }
 ```
 
-### `vision.error`
+画像字段：
 
-设备不可用、模型未就绪或协议错误时推送标准错误。未检测到有效人员不是异常，视觉应用保持静默。
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `personPresent` | boolean | 是否检测到有效用户 |
+| `heightCm` | number/null | 粗略身高 |
+| `shoulderWidthCm` | number/null | 粗略肩宽 |
+| `ageRange` | string | `child`、`teen`、`adult`、`senior`、`unknown` |
+| `gender` | string | `male`、`female`、`unknown` |
+| `bodyType` | string | `slim`、`regular`、`strong`、`unknown` |
+| `upperColor` | string | 上衣颜色类别 |
+| `confidence` | number | 0 到 1 的整体置信度 |
+
+`quality.proximity` 是调试辅助字段，说明本次触发主流程时的靠近判断状态。原生层推荐算法可以忽略它，只消费 `profile`。常见字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `present` | boolean | 是否检测到有人 |
+| `close` | boolean | 是否满足连续靠近条件 |
+| `personReady` | boolean | 轻量人体检测模型是否可用 |
+| `personPresent` | boolean | 人体框面积是否达到有人阈值 |
+| `personCloseNow` | boolean | 当前帧人体框面积是否达到靠近阈值 |
+| `largestPersonRatio` | number | 最大人体框面积占监控图比例 |
+| `largestPersonScore` | number/null | 最大人体框检测分数 |
+| `facePresent` | boolean | 人脸面积是否达到有人阈值 |
+| `faceCloseNow` | boolean | 当前帧人脸面积是否达到靠近阈值 |
+| `bodyPresent` | boolean | 人体姿态框是否达到有人阈值 |
+| `bodyCloseNow` | boolean | 当前帧人体姿态框是否达到靠近阈值 |
+| `bodySkipped` | boolean | 是否因人体检测/人脸已明确靠近而跳过姿态回退 |
+| `largestFaceRatio` | number | 最大人脸框面积占监控图比例 |
+| `bodyBoxRatio` | number | 可见人体姿态点外接框面积占监控图比例 |
+| `method` | string | 当前靠近检测方法 |
+
+### vision.error
+
+发生异常时推送。未检测到人不是异常，不会推送错误。
 
 ```json
 {
   "protocol": "vem.vision.v1",
   "type": "vision.error",
   "messageId": "error-001",
-  "timestamp": "2026-05-29T12:00:04.000Z",
+  "timestamp": "2026-06-01T12:00:04.000Z",
   "payload": {
     "code": "camera_unavailable",
     "message": "camera unavailable",
@@ -171,37 +250,55 @@
 | code | retryable | 说明 |
 | --- | --- | --- |
 | `invalid_message` | false | JSON 格式或字段不符合协议 |
-| `unsupported_version` | false | 协议版本不兼容 |
+| `unsupported_version` | false | 协议版本不匹配 |
 | `camera_unavailable` | true | 摄像头不可用 |
-| `model_not_ready` | true | 模型未加载完成 |
-| `internal_error` | true | 视觉端内部异常 |
-
-### `vision.pong`
-
-视觉端收到 `vision.ping` 后返回。
+| `model_not_ready` | true | 模型未就绪 |
+| `internal_error` | true | 视觉模块内部异常 |
 
 ## 正常时序
 
 ```mermaid
 sequenceDiagram
-    participant Machine as 售货机应用
-    participant Vision as 机器视觉应用
+    participant Machine as 原生层/后端
+    participant Vision as 视觉模块
     Machine->>Vision: WebSocket connect
     Machine->>Vision: vision.hello
     Vision-->>Machine: vision.ready
-    loop 视觉应用自行检测来人
+    Machine->>Vision: vision.ping
+    Vision-->>Machine: vision.pong
+    loop 视觉端自行检测
+        Vision->>Vision: 长期摄像头读帧
+        Vision->>Vision: 轻量人体检测/人脸/姿态回退检测有人和靠近
+        Vision->>Vision: 多帧采样和聚合
         Vision-->>Machine: vision.profile_result
-        Machine->>Machine: 根据画像请求推荐并展示
     end
 ```
 
-## 当前实现说明
+## HTTP 运维接口
 
-当前 Python 实现会在握手后启动后台推送循环：
+WebSocket 是业务协议；下面接口用于本机联调、健康检查和现场运维。
 
-- 每轮采集 `profile_sample_count` 张候选帧。
-- 每张候选帧执行一次画像推理。
-- 过滤掉无人或置信度低于 `profile_min_confidence` 的帧。
-- 至少保留 `profile_min_valid_frames` 张有效帧才会推送。
-- 数值字段取中位数，类别字段取众数。
-- 推送后等待 `profile_push_cooldown_ms`，避免同一个人频繁触发推荐。
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/health` | 返回服务、模型和实时摄像头状态 |
+| `GET` | `/camera/status` | 返回摄像头实际参数、长期连接状态、读帧计数和重连次数 |
+| `POST` | `/camera/reopen` | 手动释放并重新打开摄像头连接 |
+| `GET` | `/proximity/check` | 单次靠近检测，返回人脸和人体辅助判断字段 |
+
+`/camera/status` 中的 `stream.reconnectCount` 可用于判断长期运行期间摄像头是否发生过重连；`stream.lastError` 可用于定位最近一次摄像头异常。
+
+## 过程追踪字段
+
+普通模式下不保存过程图，也不要求后端处理 trace 字段。
+
+开启过程追踪模式后，`quality` 可能包含：
+
+```json
+{
+  "trace": {
+    "eventDir": "debug_outputs\\process_traces\\20260601_203000_vision-event-xxx"
+  }
+}
+```
+
+该字段仅用于本机展示和排查，原生层可以忽略。

@@ -1,0 +1,1404 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vending Vision 标签展示</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --panel-soft: #f9fafb;
+      --text: #111827;
+      --muted: #6b7280;
+      --line: #d9dee7;
+      --strong-line: #bcc5d3;
+      --blue: #2563eb;
+      --green: #059669;
+      --yellow: #d97706;
+      --red: #dc2626;
+      --violet: #7c3aed;
+      --shadow: 0 18px 42px rgba(15, 23, 42, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family:
+        "Microsoft YaHei",
+        "PingFang SC",
+        "Segoe UI",
+        Arial,
+        sans-serif;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) auto;
+      gap: 20px;
+      align-items: center;
+      padding: 18px 24px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      gap: 14px;
+    }
+
+    .brand-mark {
+      width: 42px;
+      height: 42px;
+      border: 1px solid var(--strong-line);
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      background: #0f172a;
+      color: #ffffff;
+      flex: 0 0 auto;
+    }
+
+    .brand-title {
+      min-width: 0;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.2;
+      font-weight: 800;
+    }
+
+    .subtitle {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(280px, 420px) repeat(4, auto);
+      gap: 8px;
+      align-items: center;
+    }
+
+    .url-input {
+      height: 38px;
+      min-width: 0;
+      border: 1px solid var(--strong-line);
+      border-radius: 6px;
+      padding: 0 12px;
+      background: #ffffff;
+      color: var(--text);
+      outline: none;
+    }
+
+    .url-input:focus {
+      border-color: var(--blue);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
+    }
+
+    .icon-button {
+      width: 38px;
+      height: 38px;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--strong-line);
+      border-radius: 6px;
+      background: #ffffff;
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    .icon-button:hover {
+      border-color: var(--blue);
+      color: var(--blue);
+      background: #f8fbff;
+    }
+
+    .icon-button.primary {
+      background: var(--blue);
+      border-color: var(--blue);
+      color: #ffffff;
+    }
+
+    .icon-button.primary:hover {
+      background: #1d4ed8;
+      color: #ffffff;
+    }
+
+    .icon-button:disabled {
+      cursor: not-allowed;
+      opacity: 0.45;
+    }
+
+    .content {
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(340px, 0.75fr);
+      gap: 18px;
+      padding: 18px 24px 24px;
+      align-items: start;
+    }
+
+    .left,
+    .right {
+      display: grid;
+      gap: 18px;
+      min-width: 0;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      min-width: 0;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 800;
+    }
+
+    .panel-body {
+      padding: 16px;
+    }
+
+    .status-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .status-cell {
+      min-height: 74px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+      display: grid;
+      align-content: center;
+      gap: 5px;
+      min-width: 0;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .value {
+      font-size: 18px;
+      font-weight: 800;
+      line-height: 1.2;
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: var(--muted);
+      box-shadow: 0 0 0 4px rgba(107, 114, 128, 0.12);
+    }
+
+    .dot.connected {
+      background: var(--green);
+      box-shadow: 0 0 0 4px rgba(5, 150, 105, 0.14);
+    }
+
+    .dot.connecting {
+      background: var(--yellow);
+      box-shadow: 0 0 0 4px rgba(217, 119, 6, 0.14);
+    }
+
+    .dot.error {
+      background: var(--red);
+      box-shadow: 0 0 0 4px rgba(220, 38, 38, 0.14);
+    }
+
+    .profile-stage {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .person-visual {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: linear-gradient(180deg, #ffffff 0%, #f6f8fb 100%);
+      padding: 18px;
+      display: grid;
+      place-items: center;
+      min-height: 314px;
+    }
+
+    .figure {
+      width: 172px;
+      height: 260px;
+      position: relative;
+    }
+
+    .head {
+      position: absolute;
+      left: 50%;
+      top: 3px;
+      transform: translateX(-50%);
+      width: 62px;
+      height: 62px;
+      border-radius: 50%;
+      background: #dbe4ee;
+      border: 2px solid #8fa1b8;
+    }
+
+    .torso {
+      position: absolute;
+      left: 50%;
+      top: 75px;
+      transform: translateX(-50%);
+      width: 112px;
+      height: 124px;
+      border-radius: 8px 8px 18px 18px;
+      background: #334155;
+      border: 2px solid rgba(15, 23, 42, 0.2);
+    }
+
+    .arm {
+      position: absolute;
+      top: 83px;
+      width: 24px;
+      height: 122px;
+      border-radius: 14px;
+      background: #cbd5e1;
+      border: 2px solid #94a3b8;
+    }
+
+    .arm.left {
+      left: 12px;
+      transform: rotate(7deg);
+    }
+
+    .arm.right {
+      right: 12px;
+      transform: rotate(-7deg);
+    }
+
+    .leg {
+      position: absolute;
+      top: 196px;
+      width: 35px;
+      height: 62px;
+      border-radius: 12px 12px 8px 8px;
+      background: #475569;
+      border: 2px solid rgba(15, 23, 42, 0.18);
+    }
+
+    .leg.left {
+      left: 49px;
+    }
+
+    .leg.right {
+      right: 49px;
+    }
+
+    .confidence-card {
+      width: 116px;
+      height: 116px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: conic-gradient(var(--green) 0deg, var(--line) 0deg);
+      margin-top: -48px;
+      border: 1px solid var(--line);
+    }
+
+    .confidence-inner {
+      width: 86px;
+      height: 86px;
+      border-radius: 50%;
+      background: #ffffff;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      font-weight: 800;
+      font-size: 20px;
+      line-height: 1.1;
+    }
+
+    .confidence-inner span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      margin-top: 4px;
+    }
+
+    .profile-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 13px 14px;
+      min-height: 82px;
+      display: grid;
+      align-content: center;
+      gap: 6px;
+      background: #ffffff;
+      min-width: 0;
+    }
+
+    .metric.wide {
+      grid-column: 1 / -1;
+    }
+
+    .metric-value {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      font-size: 21px;
+      font-weight: 850;
+      line-height: 1.15;
+      overflow-wrap: anywhere;
+    }
+
+    .swatch {
+      width: 22px;
+      height: 22px;
+      border-radius: 5px;
+      border: 1px solid var(--strong-line);
+      background: #9ca3af;
+      flex: 0 0 auto;
+    }
+
+    .tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 28px;
+      padding: 5px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--panel-soft);
+      color: #374151;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .tag.good {
+      color: var(--green);
+      border-color: rgba(5, 150, 105, 0.35);
+      background: rgba(5, 150, 105, 0.08);
+    }
+
+    .tag.warn {
+      color: var(--yellow);
+      border-color: rgba(217, 119, 6, 0.35);
+      background: rgba(217, 119, 6, 0.08);
+    }
+
+    .tag.bad {
+      color: var(--red);
+      border-color: rgba(220, 38, 38, 0.35);
+      background: rgba(220, 38, 38, 0.08);
+    }
+
+    .quality-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .event-list {
+      display: grid;
+      gap: 8px;
+      max-height: 306px;
+      overflow: auto;
+    }
+
+    .event {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      min-width: 0;
+    }
+
+    .event-type {
+      min-width: 0;
+      font-size: 13px;
+      font-weight: 800;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .event-time {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .event-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--blue);
+    }
+
+    .event-dot.profile {
+      background: var(--green);
+    }
+
+    .event-dot.error {
+      background: var(--red);
+    }
+
+    .raw {
+      margin: 0;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #111827;
+      color: #e5e7eb;
+      min-height: 220px;
+      max-height: 360px;
+      overflow: auto;
+      font-family: Consolas, "SFMono-Regular", monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .empty {
+      display: grid;
+      place-items: center;
+      min-height: 180px;
+      color: var(--muted);
+      border: 1px dashed var(--strong-line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+      text-align: center;
+      padding: 18px;
+    }
+
+    svg {
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+      stroke-width: 2;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    @media (max-width: 1120px) {
+      .topbar,
+      .content {
+        grid-template-columns: 1fr;
+      }
+
+      .toolbar {
+        grid-template-columns: minmax(0, 1fr) repeat(4, auto);
+      }
+    }
+
+    @media (max-width: 760px) {
+      .topbar,
+      .content {
+        padding-left: 14px;
+        padding-right: 14px;
+      }
+
+      .toolbar {
+        grid-template-columns: minmax(0, 1fr) repeat(2, auto);
+      }
+
+      .toolbar .icon-button:nth-of-type(3),
+      .toolbar .icon-button:nth-of-type(4) {
+        display: none;
+      }
+
+      .status-strip,
+      .profile-stage,
+      .profile-grid,
+      .quality-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .person-visual {
+        min-height: 260px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M4 6h16" />
+            <path d="M7 6v13" />
+            <path d="M17 6v13" />
+            <path d="M7 19h10" />
+            <path d="M9 10h6" />
+            <path d="M9 14h6" />
+          </svg>
+        </div>
+        <div class="brand-title">
+          <h1>Vending Vision 标签展示</h1>
+          <div class="subtitle" id="subtitle">等待画像标签</div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <input id="wsUrl" class="url-input" aria-label="WebSocket 地址" />
+        <button class="icon-button primary" id="connectBtn" title="连接">
+          <svg viewBox="0 0 24 24">
+            <path d="M10 7V4" />
+            <path d="M14 7V4" />
+            <path d="M7 11h10" />
+            <path d="M8 7h8v5a4 4 0 0 1-8 0Z" />
+            <path d="M12 16v4" />
+          </svg>
+        </button>
+        <button class="icon-button" id="disconnectBtn" title="断开">
+          <svg viewBox="0 0 24 24">
+            <path d="M12 2v10" />
+            <path d="M18.4 6.6a9 9 0 1 1-12.8 0" />
+          </svg>
+        </button>
+        <button class="icon-button" id="demoBtn" title="演示数据">
+          <svg viewBox="0 0 24 24">
+            <path d="M4 5h16v14H4Z" />
+            <path d="M8 9h8" />
+            <path d="M8 13h5" />
+          </svg>
+        </button>
+        <button class="icon-button" id="clearBtn" title="清空">
+          <svg viewBox="0 0 24 24">
+            <path d="M3 6h18" />
+            <path d="M8 6V4h8v2" />
+            <path d="M6 6l1 14h10l1-14" />
+            <path d="M10 11v5" />
+            <path d="M14 11v5" />
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="content">
+      <section class="left">
+        <div class="panel">
+          <div class="panel-header">
+            <h2 class="panel-title">实时状态</h2>
+            <div class="status-pill">
+              <span class="dot" id="statusDot"></span>
+              <span id="statusText">未连接</span>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="status-strip">
+              <div class="status-cell">
+                <div class="label">协议</div>
+                <div class="value" id="protocolValue">vem.vision.v1</div>
+              </div>
+              <div class="status-cell">
+                <div class="label">最后更新</div>
+                <div class="value" id="lastUpdate">--</div>
+              </div>
+              <div class="status-cell">
+                <div class="label">事件 ID</div>
+                <div class="value" id="eventId">--</div>
+              </div>
+              <div class="status-cell">
+                <div class="label">近距离触发</div>
+                <div class="value" id="closeTrigger">--</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h2 class="panel-title">画像标签</h2>
+            <span class="tag" id="profileState">等待推送</span>
+          </div>
+          <div class="panel-body">
+            <div class="profile-stage">
+              <div class="person-visual">
+                <div>
+                  <div class="figure" aria-hidden="true">
+                    <div class="head"></div>
+                    <div class="arm left"></div>
+                    <div class="arm right"></div>
+                    <div class="torso" id="torso"></div>
+                    <div class="leg left"></div>
+                    <div class="leg right"></div>
+                  </div>
+                  <div class="confidence-card" id="confidenceRing">
+                    <div class="confidence-inner">
+                      <div id="confidenceValue">--</div>
+                      <span>置信度</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <div class="profile-grid">
+                  <div class="metric">
+                    <div class="label">是否有人</div>
+                    <div class="metric-value" id="personPresent">--</div>
+                  </div>
+                  <div class="metric">
+                    <div class="label">年龄段</div>
+                    <div class="metric-value" id="ageRange">--</div>
+                  </div>
+                  <div class="metric">
+                    <div class="label">性别</div>
+                    <div class="metric-value" id="gender">--</div>
+                  </div>
+                  <div class="metric">
+                    <div class="label">体型</div>
+                    <div class="metric-value" id="bodyType">--</div>
+                  </div>
+                  <div class="metric">
+                    <div class="label">身高</div>
+                    <div class="metric-value" id="heightCm">--</div>
+                  </div>
+                  <div class="metric">
+                    <div class="label">肩宽</div>
+                    <div class="metric-value" id="shoulderWidthCm">--</div>
+                  </div>
+                  <div class="metric wide">
+                    <div class="label">上衣颜色</div>
+                    <div class="metric-value">
+                      <span class="swatch" id="colorSwatch"></span>
+                      <span id="upperColor">--</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="tag-row" id="profileTags"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h2 class="panel-title">质量与靠近状态</h2>
+            <span class="tag" id="qualityOverall">--</span>
+          </div>
+          <div class="panel-body">
+            <div class="quality-grid">
+              <div class="metric">
+                <div class="label">采样帧</div>
+                <div class="metric-value" id="sampleCount">--</div>
+              </div>
+              <div class="metric">
+                <div class="label">有效帧</div>
+                <div class="metric-value" id="validFrameCount">--</div>
+              </div>
+              <div class="metric">
+                <div class="label">采样模式</div>
+                <div class="metric-value" id="samplingMode">--</div>
+              </div>
+              <div class="metric">
+                <div class="label">有人</div>
+                <div class="metric-value" id="proximityPresent">--</div>
+              </div>
+              <div class="metric">
+                <div class="label">当前近距离</div>
+                <div class="metric-value" id="closeNow">--</div>
+              </div>
+              <div class="metric">
+                <div class="label">人体框比例</div>
+                <div class="metric-value" id="personRatio">--</div>
+              </div>
+            </div>
+            <div class="tag-row" id="warningTags"></div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="right">
+        <div class="panel">
+          <div class="panel-header">
+            <h2 class="panel-title">消息流</h2>
+            <span class="tag" id="messageCount">0 条</span>
+          </div>
+          <div class="panel-body">
+            <div class="event-list" id="eventList">
+              <div class="empty">等待 WebSocket 消息</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h2 class="panel-title">原始消息</h2>
+            <span class="tag" id="rawType">--</span>
+          </div>
+          <div class="panel-body">
+            <pre class="raw" id="rawJson">{}</pre>
+          </div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script>
+    const PROTOCOL = "vem.vision.v1";
+
+    const els = {
+      wsUrl: document.getElementById("wsUrl"),
+      connectBtn: document.getElementById("connectBtn"),
+      disconnectBtn: document.getElementById("disconnectBtn"),
+      demoBtn: document.getElementById("demoBtn"),
+      clearBtn: document.getElementById("clearBtn"),
+      subtitle: document.getElementById("subtitle"),
+      statusDot: document.getElementById("statusDot"),
+      statusText: document.getElementById("statusText"),
+      protocolValue: document.getElementById("protocolValue"),
+      lastUpdate: document.getElementById("lastUpdate"),
+      eventId: document.getElementById("eventId"),
+      closeTrigger: document.getElementById("closeTrigger"),
+      profileState: document.getElementById("profileState"),
+      torso: document.getElementById("torso"),
+      confidenceRing: document.getElementById("confidenceRing"),
+      confidenceValue: document.getElementById("confidenceValue"),
+      personPresent: document.getElementById("personPresent"),
+      ageRange: document.getElementById("ageRange"),
+      gender: document.getElementById("gender"),
+      bodyType: document.getElementById("bodyType"),
+      heightCm: document.getElementById("heightCm"),
+      shoulderWidthCm: document.getElementById("shoulderWidthCm"),
+      colorSwatch: document.getElementById("colorSwatch"),
+      upperColor: document.getElementById("upperColor"),
+      profileTags: document.getElementById("profileTags"),
+      qualityOverall: document.getElementById("qualityOverall"),
+      sampleCount: document.getElementById("sampleCount"),
+      validFrameCount: document.getElementById("validFrameCount"),
+      samplingMode: document.getElementById("samplingMode"),
+      proximityPresent: document.getElementById("proximityPresent"),
+      closeNow: document.getElementById("closeNow"),
+      personRatio: document.getElementById("personRatio"),
+      warningTags: document.getElementById("warningTags"),
+      eventList: document.getElementById("eventList"),
+      messageCount: document.getElementById("messageCount"),
+      rawJson: document.getElementById("rawJson"),
+      rawType: document.getElementById("rawType"),
+    };
+
+    const state = {
+      ws: null,
+      pingTimer: null,
+      reconnectTimer: null,
+      intentionallyClosed: false,
+      messages: [],
+      latestProfileAt: null,
+    };
+
+    function defaultWsUrl() {
+      if (location.protocol === "http:" || location.protocol === "https:") {
+        const scheme = location.protocol === "https:" ? "wss" : "ws";
+        return `${scheme}://${location.host}/ws`;
+      }
+
+      return "ws://127.0.0.1:7892/ws";
+    }
+
+    function nowIso() {
+      return new Date().toISOString();
+    }
+
+    function shortTime(value = new Date()) {
+      const date = value instanceof Date ? value : new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return "--";
+      }
+
+      return date.toLocaleTimeString("zh-CN", { hour12: false });
+    }
+
+    function envelope(type, messageId, payload = {}) {
+      return {
+        protocol: PROTOCOL,
+        type,
+        messageId,
+        timestamp: nowIso(),
+        payload,
+      };
+    }
+
+    function send(type, payload = {}) {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      state.ws.send(JSON.stringify(envelope(type, `${type}-${Date.now()}`, payload)));
+    }
+
+    function setStatus(status, text) {
+      els.statusDot.className = "dot";
+
+      if (status === "connected") {
+        els.statusDot.classList.add("connected");
+      } else if (status === "connecting") {
+        els.statusDot.classList.add("connecting");
+      } else if (status === "error") {
+        els.statusDot.classList.add("error");
+      }
+
+      els.statusText.textContent = text;
+      els.connectBtn.disabled = status === "connected" || status === "connecting";
+      els.disconnectBtn.disabled = status !== "connected" && status !== "connecting";
+    }
+
+    function connect() {
+      const url = els.wsUrl.value.trim();
+      if (!url) {
+        setStatus("error", "缺少地址");
+        return;
+      }
+
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+        return;
+      }
+
+      clearTimeout(state.reconnectTimer);
+      state.intentionallyClosed = false;
+      setStatus("connecting", "连接中");
+
+      try {
+        state.ws = new WebSocket(url);
+      } catch (error) {
+        setStatus("error", "地址错误");
+        renderRaw({ error: String(error) }, "local.error");
+        return;
+      }
+
+      state.ws.addEventListener("open", () => {
+        setStatus("connected", "已连接");
+        send("vision.hello", {
+          clientRole: "dashboard",
+          machineCode: "dashboard-demo",
+          protocolVersion: 1,
+          capabilities: ["profile_push", "presence_status"],
+        });
+        clearInterval(state.pingTimer);
+        state.pingTimer = setInterval(() => send("vision.ping"), 3000);
+      });
+
+      state.ws.addEventListener("message", (event) => {
+        let message;
+        try {
+          message = JSON.parse(event.data);
+        } catch (error) {
+          message = {
+            protocol: PROTOCOL,
+            type: "local.invalid_json",
+            messageId: `invalid-${Date.now()}`,
+            timestamp: nowIso(),
+            payload: { raw: event.data, error: String(error) },
+          };
+        }
+
+        handleMessage(message);
+      });
+
+      state.ws.addEventListener("close", () => {
+        clearInterval(state.pingTimer);
+        state.pingTimer = null;
+        state.ws = null;
+
+        if (state.intentionallyClosed) {
+          setStatus("idle", "已断开");
+          return;
+        }
+
+        setStatus("connecting", "重连中");
+        state.reconnectTimer = setTimeout(connect, 1800);
+      });
+
+      state.ws.addEventListener("error", () => {
+        setStatus("error", "连接异常");
+      });
+    }
+
+    function disconnect() {
+      state.intentionallyClosed = true;
+      clearTimeout(state.reconnectTimer);
+      clearInterval(state.pingTimer);
+      state.pingTimer = null;
+
+      if (state.ws) {
+        state.ws.close();
+      }
+
+      state.ws = null;
+      setStatus("idle", "已断开");
+    }
+
+    function handleMessage(message) {
+      addEvent(message);
+      renderRaw(message, message.type);
+
+      if (message.protocol) {
+        els.protocolValue.textContent = message.protocol;
+      }
+
+      if (message.type === "vision.ready") {
+        const payload = message.payload || {};
+        els.subtitle.textContent = `服务 ${payload.serverVersion || "--"} | 摄像头 ${payload.cameraReady ? "就绪" : "未就绪"} | 模型 ${payload.modelReady ? "就绪" : "未就绪"}`;
+        return;
+      }
+
+      if (message.type === "vision.profile_result") {
+        renderProfile(message.payload || {});
+        return;
+      }
+
+      if (message.type === "vision.presence_status") {
+        renderPresenceStatus(message.payload || {});
+        return;
+      }
+
+      if (message.type === "vision.error") {
+        const payload = message.payload || {};
+        els.subtitle.textContent = `${payload.code || "error"}: ${payload.message || "未知错误"}`;
+        els.profileState.textContent = "错误";
+        els.profileState.className = "tag bad";
+      }
+    }
+
+    function renderProfile(payload) {
+      const profile = payload.profile || {};
+      const quality = payload.quality || {};
+      const proximity = quality.proximity || {};
+      const confidence = typeof profile.confidence === "number" ? profile.confidence : null;
+
+      state.latestProfileAt = new Date();
+      els.lastUpdate.textContent = shortTime(state.latestProfileAt);
+      els.eventId.textContent = payload.eventId || "--";
+      els.closeTrigger.textContent = proximity.closeTrigger || "--";
+      els.subtitle.textContent = `收到画像 ${shortTime(state.latestProfileAt)}`;
+
+      els.profileState.textContent = profile.personPresent ? "画像已更新" : "无人";
+      els.profileState.className = `tag ${profile.personPresent ? "good" : "warn"}`;
+      els.personPresent.textContent = profile.personPresent ? "是" : "否";
+      els.ageRange.textContent = labelAge(profile.ageRange);
+      els.gender.textContent = labelGender(profile.gender);
+      els.bodyType.textContent = labelBodyType(profile.bodyType);
+      els.heightCm.textContent = formatNumber(profile.heightCm, " cm");
+      els.shoulderWidthCm.textContent = formatNumber(profile.shoulderWidthCm, " cm");
+      els.upperColor.textContent = labelColor(profile.upperColor);
+      setColor(profile.upperColor);
+      setConfidence(confidence);
+
+      els.qualityOverall.textContent = labelQuality(quality.overall);
+      els.qualityOverall.className = `tag ${qualityClass(quality.overall)}`;
+      els.sampleCount.textContent = formatCount(quality.sampleCount, quality.targetSampleCount);
+      els.validFrameCount.textContent = formatCount(quality.validFrameCount, quality.minValidFrames);
+      els.samplingMode.textContent = labelSamplingMode(quality.samplingMode);
+      els.proximityPresent.textContent = proximity.present ? "是" : "否";
+      els.closeNow.textContent = proximity.closeNow ? "是" : "否";
+      els.personRatio.textContent = formatRatio(proximity.largestPersonRatio);
+
+      renderProfileTags(profile, quality, proximity);
+      renderWarnings(quality.warnings || []);
+    }
+
+    function renderPresenceStatus(payload) {
+      const proximity = payload.proximity || {};
+      const stateText = labelPresenceState(payload.state);
+      const isEmpty = payload.state === "empty";
+      const isApproach = payload.state === "approach";
+      const isUnusable = payload.state === "unusable";
+
+      els.lastUpdate.textContent = shortTime(payload.detectedAt || new Date());
+      els.eventId.textContent = payload.eventId || "--";
+      els.closeTrigger.textContent = payload.closeTrigger || proximity.closeTrigger || "--";
+      els.subtitle.textContent = stateText;
+      els.profileState.textContent = stateText;
+      els.profileState.className = `tag ${isEmpty ? "warn" : isUnusable ? "bad" : "good"}`;
+
+      els.personPresent.textContent = payload.personPresent ? "是" : "否";
+      els.proximityPresent.textContent = payload.personPresent ? "是" : "否";
+      els.closeNow.textContent = payload.closeNow ? "是" : "否";
+      els.personRatio.textContent = formatRatio(proximity.largestPersonRatio);
+      els.samplingMode.textContent = isApproach ? "接近采样" : "--";
+      els.sampleCount.textContent = payload.sample ? "1" : "--";
+      els.validFrameCount.textContent = payload.sample && payload.sample.valid ? "1" : "--";
+      els.qualityOverall.textContent = isUnusable ? "画像不可用" : "--";
+      els.qualityOverall.className = `tag ${isUnusable ? "bad" : ""}`;
+
+      if (isEmpty) {
+        clearProfileFields();
+        els.profileTags.innerHTML = tagHtml("当前无人", "warn");
+        els.warningTags.innerHTML = tagHtml("等待用户进入识别范围", "");
+        return;
+      }
+
+      if (isApproach) {
+        els.profileTags.innerHTML = [
+          tagHtml("检测到用户", "good"),
+          tagHtml("接近采样中", "good"),
+          tagHtml("尚未到达近距离阈值", "warn"),
+        ].join("");
+        els.warningTags.innerHTML = tagHtml("到达近距离后会立即推送画像", "");
+        return;
+      }
+
+      if (isUnusable) {
+        els.profileTags.innerHTML = tagHtml("已靠近但画像暂不可用", "bad");
+        els.warningTags.innerHTML = tagHtml(labelStatusReason(payload.reason), "warn");
+      }
+    }
+
+    function clearProfileFields() {
+      els.personPresent.textContent = "否";
+      els.ageRange.textContent = "--";
+      els.gender.textContent = "--";
+      els.bodyType.textContent = "--";
+      els.heightCm.textContent = "--";
+      els.shoulderWidthCm.textContent = "--";
+      els.upperColor.textContent = "--";
+      setColor("unknown");
+      setConfidence(null);
+    }
+
+    function setConfidence(confidence) {
+      if (confidence === null) {
+        els.confidenceValue.textContent = "--";
+        els.confidenceRing.style.background = "conic-gradient(var(--line) 0deg, var(--line) 0deg)";
+        return;
+      }
+
+      const pct = Math.round(confidence * 100);
+      const degrees = Math.max(0, Math.min(360, confidence * 360));
+      const color = confidence >= 0.75 ? "var(--green)" : confidence >= 0.45 ? "var(--yellow)" : "var(--red)";
+      els.confidenceValue.textContent = `${pct}%`;
+      els.confidenceRing.style.background = `conic-gradient(${color} ${degrees}deg, var(--line) ${degrees}deg)`;
+    }
+
+    function setColor(value) {
+      const map = {
+        black: "#111827",
+        dark: "#334155",
+        white: "#f8fafc",
+        light: "#dbeafe",
+        red: "#dc2626",
+        blue: "#2563eb",
+        green: "#059669",
+        yellow: "#facc15",
+        unknown: "#9ca3af",
+      };
+      const color = map[value] || map.unknown;
+      els.colorSwatch.style.background = color;
+      els.torso.style.background = color;
+      els.torso.style.borderColor = value === "white" ? "#94a3b8" : "rgba(15, 23, 42, 0.2)";
+    }
+
+    function renderProfileTags(profile, quality, proximity) {
+      const tags = [
+        { text: `年龄 ${labelAge(profile.ageRange)}`, level: profile.ageRange === "unknown" ? "warn" : "good" },
+        { text: `体型 ${labelBodyType(profile.bodyType)}`, level: profile.bodyType === "unknown" ? "warn" : "good" },
+        { text: `颜色 ${labelColor(profile.upperColor)}`, level: profile.upperColor === "unknown" ? "warn" : "good" },
+        { text: `缓存 ${quality.bodyBufferFrameCount ?? 0}`, level: "good" },
+        { text: `人脸投票 ${quality.faceVoteQualifiedFrameCount ?? 0}/${quality.faceVoteFrameCount ?? 0}`, level: (quality.faceVoteQualifiedFrameCount ?? 0) >= 3 ? "good" : "warn" },
+        { text: `近距 ${proximity.closeNow ? "已到达" : "未到达"}`, level: proximity.closeNow ? "good" : "warn" },
+      ];
+
+      els.profileTags.innerHTML = tags.map((tag) => tagHtml(tag.text, tag.level)).join("");
+    }
+
+    function renderWarnings(warnings) {
+      if (!warnings.length) {
+        els.warningTags.innerHTML = tagHtml("无质量警告", "good");
+        return;
+      }
+
+      els.warningTags.innerHTML = warnings.map((item) => tagHtml(item, "warn")).join("");
+    }
+
+    function tagHtml(text, level = "") {
+      return `<span class="tag ${level}">${escapeHtml(String(text))}</span>`;
+    }
+
+    function addEvent(message) {
+      state.messages.unshift({
+        type: message.type || "unknown",
+        timestamp: message.timestamp || nowIso(),
+        message,
+      });
+      state.messages = state.messages.slice(0, 12);
+      els.messageCount.textContent = `${state.messages.length} 条`;
+
+      els.eventList.innerHTML = state.messages
+        .map((item) => {
+          const level = item.type.includes("error") ? "error" : item.type === "vision.profile_result" ? "profile" : "";
+          return `
+            <div class="event">
+              <span class="event-dot ${level}"></span>
+              <span class="event-type">${escapeHtml(item.type)}</span>
+              <span class="event-time">${shortTime(item.timestamp)}</span>
+            </div>
+          `;
+        })
+        .join("");
+    }
+
+    function renderRaw(message, type) {
+      els.rawType.textContent = type || "--";
+      els.rawJson.textContent = JSON.stringify(message, null, 2);
+    }
+
+    function clearDashboard() {
+      state.messages = [];
+      els.eventList.innerHTML = '<div class="empty">等待 WebSocket 消息</div>';
+      els.messageCount.textContent = "0 条";
+      els.rawType.textContent = "--";
+      els.rawJson.textContent = "{}";
+      els.lastUpdate.textContent = "--";
+      els.eventId.textContent = "--";
+      els.closeTrigger.textContent = "--";
+    }
+
+    function loadDemo() {
+      const message = {
+        protocol: PROTOCOL,
+        type: "vision.profile_result",
+        messageId: `demo-${Date.now()}`,
+        timestamp: nowIso(),
+        payload: {
+          eventId: "vision-event-demo",
+          detectedAt: nowIso(),
+          profile: {
+            personPresent: true,
+            heightCm: 172,
+            shoulderWidthCm: 43,
+            ageRange: "adult",
+            gender: "unknown",
+            bodyType: "regular",
+            upperColor: "dark",
+            confidence: 0.86,
+          },
+          quality: {
+            overall: "fair",
+            warnings: [],
+            sampleCount: 3,
+            validFrameCount: 2,
+            minValidFrames: 1,
+            targetSampleCount: 5,
+            bodyBufferFrameCount: 2,
+            closeSampleFrameCount: 1,
+            samplingMode: "approach_buffer_immediate_close",
+            proximity: {
+              present: true,
+              close: false,
+              closeNow: true,
+              closeTrigger: "close_now",
+              personPresent: true,
+              largestPersonRatio: 0.21,
+              facePresent: true,
+              largestFaceRatio: 0.018,
+            },
+          },
+        },
+      };
+
+      handleMessage(message);
+    }
+
+    function labelAge(value) {
+      return {
+        child: "儿童",
+        teen: "青少年",
+        adult: "成人",
+        senior: "老年",
+        unknown: "未知",
+      }[value] || "未知";
+    }
+
+    function labelGender(value) {
+      return {
+        male: "男",
+        female: "女",
+        unknown: "未知",
+      }[value] || "未知";
+    }
+
+    function labelBodyType(value) {
+      return {
+        slim: "偏瘦",
+        regular: "常规",
+        strong: "健壮",
+        unknown: "未知",
+      }[value] || "未知";
+    }
+
+    function labelColor(value) {
+      return {
+        black: "黑色",
+        dark: "深色",
+        white: "白色",
+        light: "浅色",
+        red: "红色",
+        blue: "蓝色",
+        green: "绿色",
+        yellow: "黄色",
+        unknown: "未知",
+      }[value] || value || "未知";
+    }
+
+    function labelQuality(value) {
+      return {
+        good: "质量好",
+        fair: "质量一般",
+        poor: "质量低",
+      }[value] || "--";
+    }
+
+    function qualityClass(value) {
+      if (value === "good") return "good";
+      if (value === "poor") return "bad";
+      if (value === "fair") return "warn";
+      return "";
+    }
+
+    function labelSamplingMode(value) {
+      return {
+        approach_buffer_immediate_close: "接近缓存",
+      }[value] || value || "--";
+    }
+
+    function labelPresenceState(value) {
+      return {
+        empty: "当前无人",
+        waiting: "等待用户",
+        approach: "接近中",
+        close: "已到近距离",
+        unusable: "画像暂不可用",
+      }[value] || "识别中";
+    }
+
+    function labelStatusReason(value) {
+      return {
+        no_person: "未检测到用户",
+        person_present_but_not_close: "用户尚未到达近距离阈值",
+        not_enough_valid_frames: "有效画像帧不足",
+        confidence_below_threshold: "画像置信度低于阈值",
+        mock_no_person: "模拟无人",
+        mock_timeout: "模拟超时",
+      }[value] || value || "等待有效画像";
+    }
+
+    function formatNumber(value, unit) {
+      if (typeof value !== "number" || Number.isNaN(value)) {
+        return "--";
+      }
+
+      return `${Number.isInteger(value) ? value : value.toFixed(1)}${unit}`;
+    }
+
+    function formatRatio(value) {
+      if (typeof value !== "number" || Number.isNaN(value)) {
+        return "--";
+      }
+
+      return `${(value * 100).toFixed(1)}%`;
+    }
+
+    function formatCount(value, target) {
+      if (typeof value !== "number") {
+        return "--";
+      }
+
+      return typeof target === "number" ? `${value}/${target}` : String(value);
+    }
+
+    function escapeHtml(value) {
+      return value
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    els.wsUrl.value = defaultWsUrl();
+    els.connectBtn.addEventListener("click", connect);
+    els.disconnectBtn.addEventListener("click", disconnect);
+    els.demoBtn.addEventListener("click", loadDemo);
+    els.clearBtn.addEventListener("click", clearDashboard);
+    els.disconnectBtn.disabled = true;
+    setColor("unknown");
+    setConfidence(null);
+    setTimeout(connect, 250);
+  </script>
+</body>
+</html>

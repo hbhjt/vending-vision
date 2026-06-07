@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.pytest_cache/
 
 # Virtual environments
 .venv/
@@ -9,6 +10,10 @@ venv/
 env/
 ENV/
 conda-meta/
+
+# Local environment
+.env
+.env.*
 
 # Logs
 logs/
@@ -19,16 +24,21 @@ debug_outputs/
 output_*.jpg
 output_*.png
 output_*.jpeg
+*.avi
+*.mp4
 
 # Field datasets
 datasets/
+demo_inputs/
 
 # Generated reports
 reports/
+test_reports/
 
 # Test temporary files
 *.tmp
 *.bak
+*.csv
 
 # IDE
 .vscode/

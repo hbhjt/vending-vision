@@ -1,86 +1,99 @@
-# 展示材料和周报生成说明
+# 展示材料和周报说明
 
-本项目提供 `generate_weekly_report.py`，用于把现场照片处理成可展示的中间结果，并生成一份周报 Markdown。
+项目提供两类展示材料：
 
-## 生成内容
+1. 实时过程追踪：跟随 WebSocket 实时流程产生，适合演示“用户靠近后系统如何处理”。
+2. 离线周报：对一批已有图片做分析，生成 Markdown 周报和 CSV，适合每周汇报。
 
-输入一批图片后，会输出：
+## 实时过程追踪
 
-```text
-reports/weekly_xxx/
-├── WEEKLY_REPORT.md
-├── weekly_results.csv
-├── manifest.json
-├── original/
-├── face_boxes/
-├── face_crops/
-└── pose/
+启动：
+
+```bat
+scripts\start_trace_server.bat
 ```
 
-说明：
+测试：
 
-| 目录/文件 | 用途 |
-| --- | --- |
-| `original/` | 原始图片副本 |
-| `face_boxes/` | 画出人脸框后的图片 |
-| `face_crops/` | 裁剪出的人脸图片 |
-| `pose/` | MediaPipe 姿态骨架图 |
-| `weekly_results.csv` | 每张图片的识别结果和质量指标 |
-| `WEEKLY_REPORT.md` | 可发给负责人/甲方的周报 |
-
-在人脸框图片中：
-
-```text
-红色 primary：系统选择的主用户
-绿色 face：其他检测到的人脸
+```bat
+python test_ws_client.py --wait-seconds 60
 ```
 
-当前项目默认单用户场景。多人入镜时，报告会展示多张脸，但最终画像只对应主用户。
+输出：
 
-## 使用命令
+```text
+debug_outputs/process_traces/
+```
 
-处理现场采集数据：
+每个事件包含：
 
-```bash
+- 摄像头发现人时的图片。
+- 靠近检测人体框、人脸框，以及姿态回退判断字段。
+- 多帧采样原图。
+- 输入识别流程前的缩放图。
+- 人脸框和主脸裁剪。
+- 姿态骨架图。
+- 每帧画像结果和最终 payload。
+
+详细说明见 [PROCESS_TRACE.md](PROCESS_TRACE.md)。
+
+## 离线周报
+
+脚本：
+
+```bat
 python generate_weekly_report.py --input datasets/field_capture --limit 40
 ```
 
 指定输出目录：
 
-```bash
+```bat
 python generate_weekly_report.py --input datasets/field_capture --output reports/week_01 --limit 40
 ```
 
-处理单个目录：
+输出结构：
 
-```bash
-python generate_weekly_report.py --input datasets/field_capture/20260529_203000_p001 --output reports/p001_demo
+```text
+reports/week_01/
+  WEEKLY_REPORT.md
+  weekly_results.csv
+  manifest.json
+  original/
+  face_boxes/
+  face_crops/
+  pose/
 ```
 
-## 建议给甲方展示的内容
+| 文件/目录 | 用途 |
+| --- | --- |
+| `WEEKLY_REPORT.md` | 可直接给负责人看的周报草稿 |
+| `weekly_results.csv` | 每张图片的结构化识别结果 |
+| `manifest.json` | 本次生成任务摘要 |
+| `original/` | 原始图片副本 |
+| `face_boxes/` | 人脸框结果图 |
+| `face_crops/` | 人脸裁剪图 |
+| `pose/` | 姿态骨架图 |
+
+## 展示建议
 
 建议展示顺序：
 
 1. 原始摄像头画面。
-2. 人脸框检测结果。
-3. 人脸裁剪结果。
-4. 姿态骨架结果。
-5. 单张图片画像输出。
-6. 多张图片统计后的稳定性说明。
-7. 当前限制和下周计划。
+2. 检测到人脸/靠近的画面。
+3. `proximity` 字段：展示人体检测、人脸和姿态回退分别是否触发。
+4. 被选中的采样帧。
+5. 主用户人脸框和裁剪图。
+6. 姿态骨架图。
+7. 单帧画像结果。
+8. 多帧聚合后的最终画像。
+9. 摄像头长期运行状态和当前限制。
 
-## 周报口径建议
+需要谨慎说明：
 
-建议强调：
+- 年龄和性别在弱光、侧脸、遮挡条件下不稳定，目前应作为弱参考。
+- 单目 RGB 摄像头无法保证精确身高，当前身高更适合做粗略分层。
+- 现场 1.8m 高度、20cm 距离、45 度倾斜安装会改变画面比例，需要现场重新调参。
+- 轻量人体检测可以缓解侧脸和轻微遮挡；如果模型缺失会自动回退到姿态辅助，但多人、严重遮挡、强反光仍需要现场验证。
+- 长期运行时建议定期查看 `/camera/status` 的 `stream.reconnectCount` 和 `stream.lastError`，确认摄像头连接稳定。
 
-- 当前已经完成工业摄像头接入。
-- 已切换为视觉端主动推送协议。
-- 已增加靠近检测、多帧采样和结果聚合。
-- 当前可生成中间处理结果，便于验证算法过程。
-- 45度俯拍和20cm近距离会影响身高、体型和性别年龄稳定性。
 
-建议谨慎表达：
-
-- 年龄和性别只作为弱参考。
-- 精确身高不是当前阶段的强承诺。
-- 后续会基于现场数据继续调靠近阈值和画像规则。

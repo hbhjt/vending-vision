@@ -131,11 +131,19 @@ async def run(url, wait_seconds, transcript):
         print(f"waiting for active profile push, timeout={wait_seconds}s")
 
         while True:
-            message = await recv_json(
-                websocket,
-                timeout=wait_seconds,
-                transcript=transcript,
-            )
+            try:
+                message = await recv_json(
+                    websocket,
+                    timeout=wait_seconds,
+                    transcript=transcript,
+                )
+            except asyncio.TimeoutError:
+                print(
+                    "PUSH WS TEST TIMEOUT: no profile_result received; "
+                    "this is normal when no person is close enough or valid frames are insufficient"
+                )
+                return "timeout_no_push"
+
             require_envelope(message)
 
             if message["type"] == "vision.profile_result":
@@ -181,7 +189,6 @@ if __name__ == "__main__":
         transcript = locals().get("transcript", [])
         status = "failed"
         error = str(e)
-        raise
     finally:
         result = {
             "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

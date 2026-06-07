@@ -1,6 +1,10 @@
 import cv2
+import threading
+import time
+from datetime import datetime
 
 from vision.config import settings
+from vision.logger import logger
 
 
 def get_camera_backend(backend_name: str | None = None):
@@ -78,6 +82,154 @@ def read_warmup_frame(cap, warmup_frames: int):
     return image
 
 
+def _time_iso(value):
+    if value is None:
+        return None
+
+    return datetime.fromtimestamp(value).isoformat(timespec="seconds")
+
+
+def _uses_default_camera(
+    camera_index: int | None = None,
+    backend_name: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    fps: int | None = None,
+    fourcc: str | None = None,
+):
+    return all(
+        value is None
+        for value in [camera_index, backend_name, width, height, fps, fourcc]
+    )
+
+
+class CameraStream:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.cap = None
+        self.opened_at = None
+        self.last_frame_at = None
+        self.frame_count = 0
+        self.reconnect_count = 0
+        self.last_error = None
+
+    def _release_locked(self):
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception as e:
+                logger.warning(f"Failed to release camera: {e}")
+
+        self.cap = None
+        self.opened_at = None
+
+    def release(self):
+        with self.lock:
+            self._release_locked()
+
+    def reset(self):
+        with self.lock:
+            self._release_locked()
+            self.last_error = None
+
+    def _ensure_open_locked(self):
+        if self.cap is not None and self.cap.isOpened():
+            return
+
+        self._release_locked()
+        self.cap = open_camera()
+        self.opened_at = time.time()
+        self.reconnect_count += 1
+        logger.info(
+            "Camera stream opened "
+            f"index={settings.CAMERA_INDEX}, backend={settings.CAMERA_BACKEND}"
+        )
+
+    def read(self, warmup_frames: int | None = None):
+        if warmup_frames is None:
+            warmup_frames = settings.CAMERA_WARMUP_FRAMES
+
+        attempts = max(1, int(settings.CAMERA_READ_RETRY_COUNT) + 1)
+        last_error = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                with self.lock:
+                    self._ensure_open_locked()
+                    image = read_warmup_frame(self.cap, warmup_frames)
+                    self.frame_count += 1
+                    self.last_frame_at = time.time()
+                    self.last_error = None
+                    return image
+
+            except Exception as e:
+                last_error = e
+                with self.lock:
+                    self.last_error = str(e)
+                    self._release_locked()
+
+                logger.warning(
+                    f"Camera read failed attempt={attempt}/{attempts}: {e}"
+                )
+
+                if attempt < attempts:
+                    time.sleep(settings.CAMERA_RECONNECT_DELAY_MS / 1000.0)
+
+        raise RuntimeError(f"camera read failed after reconnect: {last_error}")
+
+    def status(self):
+        with self.lock:
+            self._ensure_open_locked()
+            image = read_warmup_frame(self.cap, settings.CAMERA_WARMUP_FRAMES)
+            capture = describe_capture(self.cap)
+            h, w = image.shape[:2]
+
+            return {
+                "ok": True,
+                "index": settings.CAMERA_INDEX,
+                "backend": settings.CAMERA_BACKEND,
+                "mode": "persistent",
+                "requested": {
+                    "width": settings.CAMERA_WIDTH,
+                    "height": settings.CAMERA_HEIGHT,
+                    "fps": settings.CAMERA_FPS,
+                    "fourcc": settings.CAMERA_FOURCC,
+                },
+                "actual": capture,
+                "frame": {
+                    "width": w,
+                    "height": h,
+                    "channels": image.shape[2] if len(image.shape) == 3 else 1,
+                },
+                "stream": {
+                    "keepOpen": settings.CAMERA_KEEP_OPEN,
+                    "opened": self.cap is not None and self.cap.isOpened(),
+                    "openedAt": _time_iso(self.opened_at),
+                    "lastFrameAt": _time_iso(self.last_frame_at),
+                    "frameCount": self.frame_count,
+                    "reconnectCount": self.reconnect_count,
+                    "lastError": self.last_error,
+                    "readRetryCount": settings.CAMERA_READ_RETRY_COUNT,
+                    "reconnectDelayMs": settings.CAMERA_RECONNECT_DELAY_MS,
+                },
+            }
+
+
+_camera_stream = CameraStream()
+
+
+def get_camera_stream():
+    return _camera_stream
+
+
+def release_camera_stream():
+    _camera_stream.release()
+
+
+def reset_camera_stream():
+    _camera_stream.reset()
+
+
 def capture_image(
     camera_index: int | None = None,
     warmup_frames: int | None = None,
@@ -89,6 +241,16 @@ def capture_image(
 ):
     if warmup_frames is None:
         warmup_frames = settings.CAMERA_WARMUP_FRAMES
+
+    if settings.CAMERA_KEEP_OPEN and _uses_default_camera(
+        camera_index=camera_index,
+        backend_name=backend_name,
+        width=width,
+        height=height,
+        fps=fps,
+        fourcc=fourcc,
+    ):
+        return get_camera_stream().read(warmup_frames=warmup_frames)
 
     cap = open_camera(
         camera_index=camera_index,
@@ -106,6 +268,9 @@ def capture_image(
 
 
 def get_configured_camera_status():
+    if settings.CAMERA_KEEP_OPEN:
+        return get_camera_stream().status()
+
     cap = open_camera()
 
     try:
@@ -117,6 +282,7 @@ def get_configured_camera_status():
             "ok": True,
             "index": settings.CAMERA_INDEX,
             "backend": settings.CAMERA_BACKEND,
+            "mode": "single_capture",
             "requested": {
                 "width": settings.CAMERA_WIDTH,
                 "height": settings.CAMERA_HEIGHT,

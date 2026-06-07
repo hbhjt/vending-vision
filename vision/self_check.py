@@ -1,6 +1,7 @@
 from vision.config import settings
 from vision.pose_estimator import PoseEstimator
 from vision.face_detector import FaceDetector
+from vision.person_detector import PersonDetector
 from vision.logger import logger
 from vision.age_gender_estimator import AgeGenderEstimator
 from vision.camera import get_configured_camera_status
@@ -73,6 +74,39 @@ def check_face_detector():
             "message": str(e)
         }
 
+
+def check_person_detector():
+    """
+    检查轻量人体检测模型状态。
+
+    人体检测是 proximity 的增强项；模型不存在时允许回退到姿态辅助。
+    """
+    try:
+        detector = PersonDetector()
+        status = detector.status()
+
+        return {
+            "ok": True,
+            "modelReady": status["ready"],
+            "mode": status["backend"],
+            "message": (
+                "person detector ready"
+                if status["ready"]
+                else "person detector not ready, fallback to pose proximity"
+            ),
+            "detail": status,
+        }
+
+    except Exception as e:
+        logger.exception("Person detector check failed")
+        return {
+            "ok": True,
+            "modelReady": False,
+            "mode": "error",
+            "message": f"person detector check failed, fallback to pose: {e}",
+        }
+
+
 def check_age_gender_model():
     """
     检查年龄性别模型状态。
@@ -110,6 +144,7 @@ def run_self_check():
         "camera": check_camera(),
         "pose": check_pose_model(),
         "face": check_face_detector(),
+        "person": check_person_detector(),
         "ageGender": check_age_gender_model()
     }
 

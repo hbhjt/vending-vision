@@ -55,6 +55,13 @@ class VisionPipeline:
 
         # 4. 身高、肩宽、体型、上衣颜色
         can_measure_body = self.body_estimator.has_full_body_for_measurement(pose_results)
+        can_measure_upper_body = self.body_estimator.has_upper_body_for_body_type(
+            pose_results
+        )
+
+        height_cm = None
+        shoulder_width_cm = None
+        body_type = "unknown"
 
         if can_measure_body:
             height_cm = self.body_estimator.estimate_height_cm(pose_results)
@@ -71,17 +78,21 @@ class VisionPipeline:
             if shoulder_width_cm is not None and not (32 <= shoulder_width_cm <= 55):
                 shoulder_width_cm = None
 
-            if height_cm is None or shoulder_width_cm is None:
-                body_type = "unknown"
+        if body_type == "unknown" and can_measure_upper_body:
+            body_type = self.body_estimator.estimate_upper_body_type(pose_results)
 
-        else:
-            height_cm = None
-            shoulder_width_cm = None
-            body_type = "unknown"
+        if height_cm is None:
+            height_cm = self.body_estimator.estimate_height_cm_from_mask(pose_results)
+
+            if height_cm is not None and not (140 <= height_cm <= 200):
+                height_cm = None
+
+        if body_type == "unknown":
+            body_type = self.body_estimator.estimate_body_type_from_mask(pose_results)
 
         upper_color = self.upper_color_estimator.estimate(image, pose_results)
 
-        # 5. 年龄性别识别，目前仍然是 mock
+        # 5. 年龄性别识别，模型缺失或人脸不可用时返回 unknown
         age, gender = self.age_gender_estimator.predict(face_image)
 
         profile = VisionProfile(

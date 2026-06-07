@@ -1,5 +1,7 @@
 import math
 import mediapipe as mp
+import numpy as np
+
 from vision.config import settings
 
 class BodyEstimator:
@@ -97,6 +99,162 @@ class BodyEstimator:
         else:
             return "fat"
 
+    def has_upper_body_for_body_type(self, results) -> bool:
+        """
+        判断是否适合用上半身估算体型。
+
+        只要求左右肩和左右髋可见，不再要求膝盖或脚踝。
+        """
+        if not results.pose_landmarks:
+            return False
+
+        landmarks = results.pose_landmarks.landmark
+        required_points = [
+            self.mp_pose.PoseLandmark.LEFT_SHOULDER,
+            self.mp_pose.PoseLandmark.RIGHT_SHOULDER,
+            self.mp_pose.PoseLandmark.LEFT_HIP,
+            self.mp_pose.PoseLandmark.RIGHT_HIP,
+        ]
+
+        return all(landmarks[point].visibility >= 0.45 for point in required_points)
+
+    def estimate_upper_body_type(self, results):
+        """
+        根据上半身比例粗略估算体型。
+
+        使用肩宽 / 躯干高度。该结果适合售货机上半身画面，
+        但仍会受站姿、衣服宽松程度和摄像头角度影响。
+        """
+        if not self.has_upper_body_for_body_type(results):
+            return "unknown"
+
+        landmarks = results.pose_landmarks.landmark
+        left_shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
+        right_shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        left_hip = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP]
+        right_hip = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP]
+
+        shoulder_width = math.sqrt(
+            (left_shoulder.x - right_shoulder.x) ** 2
+            + (left_shoulder.y - right_shoulder.y) ** 2
+        )
+        shoulder_y = (left_shoulder.y + right_shoulder.y) / 2.0
+        hip_y = (left_hip.y + right_hip.y) / 2.0
+        torso_height = hip_y - shoulder_y
+
+        if torso_height <= 0:
+            return "unknown"
+
+        ratio = shoulder_width / torso_height
+
+        if ratio < settings.UPPER_BODY_TYPE_THIN_THRESHOLD:
+            return "thin"
+        elif ratio < settings.UPPER_BODY_TYPE_FAT_THRESHOLD:
+            return "medium"
+        else:
+            return "fat"
+
+    def _segmentation_bbox(self, results):
+        if not settings.BODY_MASK_ENABLED:
+            return None
+
+        mask = getattr(results, "segmentation_mask", None)
+
+        if mask is None:
+            return None
+
+        person_mask = mask >= settings.BODY_MASK_THRESHOLD
+        area_ratio = float(person_mask.mean())
+
+        if area_ratio < settings.BODY_MASK_MIN_AREA_RATIO:
+            return None
+
+        ys, xs = np.where(person_mask)
+
+        if len(xs) == 0 or len(ys) == 0:
+            return None
+
+        height, width = person_mask.shape[:2]
+        x_min = int(xs.min())
+        x_max = int(xs.max())
+        y_min = int(ys.min())
+        y_max = int(ys.max())
+
+        box_width = max(x_max - x_min + 1, 1)
+        box_height = max(y_max - y_min + 1, 1)
+
+        return {
+            "mask": person_mask,
+            "width": width,
+            "height": height,
+            "xMin": x_min,
+            "xMax": x_max,
+            "yMin": y_min,
+            "yMax": y_max,
+            "boxWidth": box_width,
+            "boxHeight": box_height,
+            "areaRatio": area_ratio,
+            "heightRatio": box_height / float(height),
+            "widthRatio": box_width / float(width),
+        }
+
+    def estimate_height_cm_from_mask(self, results):
+        """
+        用人体分割 mask 的可见人体高度做粗略身高 fallback。
+        """
+        bbox = self._segmentation_bbox(results)
+
+        if bbox is None:
+            return None
+
+        height_cm = (
+            bbox["heightRatio"] * settings.HEIGHT_SCALE
+            + settings.HEIGHT_OFFSET
+        )
+
+        if height_cm < 130:
+            height_cm = 130.0
+
+        if height_cm > 210:
+            height_cm = 210.0
+
+        return round(height_cm, 1)
+
+    def estimate_body_type_from_mask(self, results):
+        """
+        用人体分割 mask 的上半身轮廓粗略估算体型。
+        """
+        bbox = self._segmentation_bbox(results)
+
+        if bbox is None:
+            return "unknown"
+
+        person_mask = bbox["mask"]
+        y_min = bbox["yMin"]
+        y_max = bbox["yMax"]
+        body_height = bbox["boxHeight"]
+
+        band_top = int(y_min + body_height * 0.22)
+        band_bottom = int(y_min + body_height * 0.58)
+        band_top = max(y_min, min(band_top, y_max))
+        band_bottom = max(band_top + 1, min(band_bottom, y_max + 1))
+        band = person_mask[band_top:band_bottom, :]
+
+        ys, xs = np.where(band)
+
+        if len(xs) == 0:
+            return "unknown"
+
+        upper_width = int(xs.max() - xs.min() + 1)
+        ratio = upper_width / float(body_height)
+
+        if ratio < settings.BODY_MASK_TYPE_THIN_THRESHOLD:
+            return "thin"
+        elif ratio < settings.BODY_MASK_TYPE_FAT_THRESHOLD:
+            return "medium"
+        else:
+            return "fat"
+
     def estimate_shoulder_width_cm(self, results, height_cm=None):
         """
         简化版肩宽估算。
@@ -157,7 +315,7 @@ class BodyEstimator:
 
     def has_full_body_for_measurement(self, results) -> bool:
         """
-        判断是否适合估算身高、肩宽、体型。
+        判断是否适合估算身高、肩宽。
 
         需要至少检测到：
         - 左右肩
