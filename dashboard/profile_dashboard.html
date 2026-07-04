@@ -459,6 +459,148 @@
       background: rgba(220, 38, 38, 0.08);
     }
 
+    .software-summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .software-card {
+      min-height: 68px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-soft);
+      padding: 11px 12px;
+      display: grid;
+      align-content: center;
+      gap: 5px;
+      min-width: 0;
+    }
+
+    .software-card .value {
+      font-size: 15px;
+    }
+
+    .recommendations {
+      display: grid;
+      gap: 8px;
+      min-height: 148px;
+    }
+
+    .recommendation {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 11px 12px;
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .recommendation-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-weight: 850;
+      font-size: 14px;
+      min-width: 0;
+    }
+
+    .recommendation-title span:first-child {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .recommendation-score {
+      color: var(--green);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .recommendation-meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+
+    .action-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .action-button {
+      min-height: 38px;
+      border: 1px solid var(--strong-line);
+      border-radius: 6px;
+      background: #ffffff;
+      color: var(--text);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font-weight: 800;
+      padding: 0 12px;
+    }
+
+    .action-button.primary {
+      background: var(--blue);
+      border-color: var(--blue);
+      color: #ffffff;
+    }
+
+    .action-button.danger {
+      color: var(--red);
+      border-color: rgba(220, 38, 38, 0.35);
+    }
+
+    .action-button:disabled {
+      cursor: not-allowed;
+      opacity: 0.45;
+    }
+
+    .tryon-preview {
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111827;
+      min-height: 220px;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      color: #e5e7eb;
+    }
+
+    .tryon-preview img {
+      width: 100%;
+      height: 100%;
+      min-height: 220px;
+      object-fit: contain;
+      display: block;
+      background: #111827;
+    }
+
+    .tryon-placeholder {
+      padding: 18px;
+      color: #cbd5e1;
+      text-align: center;
+      font-size: 13px;
+    }
+
+    .preview-url {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
     .quality-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -583,6 +725,8 @@
       .status-strip,
       .profile-stage,
       .profile-grid,
+      .software-summary,
+      .action-row,
       .quality-grid {
         grid-template-columns: 1fr;
       }
@@ -778,6 +922,14 @@
                 <div class="label">人体框比例</div>
                 <div class="metric-value" id="personRatio">--</div>
               </div>
+              <div class="metric">
+                <div class="label">亮度等级</div>
+                <div class="metric-value" id="ambientLightLevel">--</div>
+              </div>
+              <div class="metric">
+                <div class="label">亮度样本</div>
+                <div class="metric-value" id="ambientLightSample">--</div>
+              </div>
             </div>
             <div class="tag-row" id="warningTags"></div>
           </div>
@@ -785,6 +937,57 @@
       </section>
 
       <aside class="right">
+        <div class="panel">
+          <div class="panel-header">
+            <h2 class="panel-title">模拟软件层</h2>
+            <span class="tag" id="softwareSessionTag">等待画像</span>
+          </div>
+          <div class="panel-body">
+            <div class="software-summary">
+              <div class="software-card">
+                <div class="label">推荐状态</div>
+                <div class="value" id="recommendationState">待机</div>
+              </div>
+              <div class="software-card">
+                <div class="label">事件/会话</div>
+                <div class="value" id="softwareSessionId">--</div>
+              </div>
+              <div class="software-card">
+                <div class="label">推送时间</div>
+                <div class="value" id="recommendationTime">--</div>
+              </div>
+            </div>
+
+            <div class="recommendations" id="recommendations">
+              <div class="empty">等待画像字段推送</div>
+            </div>
+
+            <div class="tag-row" id="softwareTags"></div>
+
+            <div class="action-row">
+              <button class="action-button primary" id="tryOnStartBtn" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M8 4l4 2 4-2 4 4-3 3v9H7v-9L4 8Z" />
+                  <path d="M10 6a2 2 0 0 0 4 0" />
+                </svg>
+                <span>试衣</span>
+              </button>
+              <button class="action-button danger" id="tryOnStopBtn" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+                <span>退出试衣</span>
+              </button>
+            </div>
+
+            <div class="tryon-preview" id="tryOnPreview">
+              <div class="tryon-placeholder">试衣预览未启动</div>
+            </div>
+            <div class="preview-url" id="tryOnPreviewUrl">previewUrl: --</div>
+          </div>
+        </div>
+
         <div class="panel">
           <div class="panel-header">
             <h2 class="panel-title">消息流</h2>
@@ -846,7 +1049,19 @@
       proximityPresent: document.getElementById("proximityPresent"),
       closeNow: document.getElementById("closeNow"),
       personRatio: document.getElementById("personRatio"),
+      ambientLightLevel: document.getElementById("ambientLightLevel"),
+      ambientLightSample: document.getElementById("ambientLightSample"),
       warningTags: document.getElementById("warningTags"),
+      softwareSessionTag: document.getElementById("softwareSessionTag"),
+      recommendationState: document.getElementById("recommendationState"),
+      softwareSessionId: document.getElementById("softwareSessionId"),
+      recommendationTime: document.getElementById("recommendationTime"),
+      recommendations: document.getElementById("recommendations"),
+      softwareTags: document.getElementById("softwareTags"),
+      tryOnStartBtn: document.getElementById("tryOnStartBtn"),
+      tryOnStopBtn: document.getElementById("tryOnStopBtn"),
+      tryOnPreview: document.getElementById("tryOnPreview"),
+      tryOnPreviewUrl: document.getElementById("tryOnPreviewUrl"),
       eventList: document.getElementById("eventList"),
       messageCount: document.getElementById("messageCount"),
       rawJson: document.getElementById("rawJson"),
@@ -860,6 +1075,10 @@
       intentionallyClosed: false,
       messages: [],
       latestProfileAt: null,
+      latestProfilePayload: null,
+      activeTryOnSessionId: null,
+      pendingTryOnSessionId: null,
+      selectedRecommendation: null,
     };
 
     function defaultWsUrl() {
@@ -896,10 +1115,12 @@
 
     function send(type, payload = {}) {
       if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-        return;
+        return null;
       }
 
-      state.ws.send(JSON.stringify(envelope(type, `${type}-${Date.now()}`, payload)));
+      const message = envelope(type, `${type}-${Date.now()}`, payload);
+      state.ws.send(JSON.stringify(message));
+      return message;
     }
 
     function setStatus(status, text) {
@@ -916,6 +1137,40 @@
       els.statusText.textContent = text;
       els.connectBtn.disabled = status === "connected" || status === "connecting";
       els.disconnectBtn.disabled = status !== "connected" && status !== "connecting";
+      updateTryOnControls();
+    }
+
+    function isWsConnected() {
+      return Boolean(state.ws && state.ws.readyState === WebSocket.OPEN);
+    }
+
+    function updateTryOnControls() {
+      const hasProfile = Boolean(
+        state.latestProfilePayload
+        && state.latestProfilePayload.profile
+        && state.latestProfilePayload.profile.personPresent
+      );
+      const waiting = Boolean(state.pendingTryOnSessionId);
+      const active = Boolean(state.activeTryOnSessionId);
+      els.tryOnStartBtn.disabled = !isWsConnected() || !hasProfile || waiting || active;
+      els.tryOnStopBtn.disabled = !isWsConnected() || (!waiting && !active);
+    }
+
+    function setTryOnPreview(url) {
+      if (!url) {
+        els.tryOnPreview.innerHTML = '<div class="tryon-placeholder">试衣预览未启动</div>';
+        els.tryOnPreviewUrl.textContent = "previewUrl: --";
+        return;
+      }
+
+      els.tryOnPreview.innerHTML = `<img src="${escapeAttr(url)}" alt="试衣预览" />`;
+      els.tryOnPreviewUrl.textContent = `previewUrl: ${url}`;
+    }
+
+    function setSoftwareState(text, level = "") {
+      els.softwareSessionTag.textContent = text;
+      els.softwareSessionTag.className = `tag ${level}`;
+      els.recommendationState.textContent = text;
     }
 
     function connect() {
@@ -947,7 +1202,13 @@
           clientRole: "dashboard",
           machineCode: "dashboard-demo",
           protocolVersion: 1,
-          capabilities: ["profile_push", "presence_status"],
+          capabilities: [
+            "profile_push",
+            "presence_status",
+            "person_departed",
+            "ambient_light",
+            "try_on_session",
+          ],
         });
         clearInterval(state.pingTimer);
         state.pingTimer = setInterval(() => send("vision.ping"), 3000);
@@ -1019,11 +1280,29 @@
 
       if (message.type === "vision.profile_result") {
         renderProfile(message.payload || {});
+        renderSoftwareProfile(message.payload || {});
         return;
       }
 
       if (message.type === "vision.presence_status") {
         renderPresenceStatus(message.payload || {});
+        renderSoftwarePresence(message.payload || {});
+        return;
+      }
+
+      if (message.type === "vision.person_departed") {
+        renderPersonDeparted(message.payload || {});
+        renderSoftwareDeparted(message.payload || {});
+        return;
+      }
+
+      if (message.type === "vision.try_on.started") {
+        renderTryOnStarted(message.payload || {});
+        return;
+      }
+
+      if (message.type === "vision.try_on.stopped") {
+        renderTryOnStopped(message.payload || {});
         return;
       }
 
@@ -1032,6 +1311,12 @@
         els.subtitle.textContent = `${payload.code || "error"}: ${payload.message || "未知错误"}`;
         els.profileState.textContent = "错误";
         els.profileState.className = "tag bad";
+        if (payload.code === "try_on_unavailable") {
+          state.pendingTryOnSessionId = null;
+          setSoftwareState("试衣不可用", "bad");
+          els.softwareTags.innerHTML = tagHtml(payload.message || "试衣摄像头暂不可用", "bad");
+          updateTryOnControls();
+        }
       }
     }
 
@@ -1067,6 +1352,9 @@
       els.proximityPresent.textContent = proximity.present ? "是" : "否";
       els.closeNow.textContent = proximity.closeNow ? "是" : "否";
       els.personRatio.textContent = formatRatio(proximity.largestPersonRatio);
+      if ("ambientLight" in payload) {
+        renderAmbientLight(payload.ambientLight);
+      }
 
       renderProfileTags(profile, quality, proximity);
       renderWarnings(quality.warnings || []);
@@ -1090,6 +1378,7 @@
       els.proximityPresent.textContent = payload.personPresent ? "是" : "否";
       els.closeNow.textContent = payload.closeNow ? "是" : "否";
       els.personRatio.textContent = formatRatio(proximity.largestPersonRatio);
+      renderAmbientLight(payload.ambientLight);
       els.samplingMode.textContent = isApproach ? "接近采样" : "--";
       els.sampleCount.textContent = payload.sample ? "1" : "--";
       els.validFrameCount.textContent = payload.sample && payload.sample.valid ? "1" : "--";
@@ -1119,6 +1408,265 @@
       }
     }
 
+    function renderPersonDeparted(payload) {
+      els.lastUpdate.textContent = shortTime(payload.detectedAt || new Date());
+      els.eventId.textContent = payload.eventId || "--";
+      els.closeTrigger.textContent = payload.reason || "--";
+      els.subtitle.textContent = "用户已离开";
+      els.profileState.textContent = "已离开";
+      els.profileState.className = "tag warn";
+      els.personPresent.textContent = "否";
+      els.proximityPresent.textContent = "否";
+      els.closeNow.textContent = "否";
+      els.personRatio.textContent = "--";
+      els.samplingMode.textContent = "--";
+      els.sampleCount.textContent = "--";
+      els.validFrameCount.textContent = "--";
+      els.qualityOverall.textContent = "--";
+      els.qualityOverall.className = "tag";
+      clearProfileFields();
+      renderAmbientLight(payload.ambientLight);
+      els.profileTags.innerHTML = tagHtml("上一位用户已离开", "warn");
+      els.warningTags.innerHTML = tagHtml(
+        `离开原因 ${labelDepartureReason(payload.reason)}`,
+        ""
+      );
+    }
+
+    function renderSoftwareProfile(payload) {
+      const profile = payload.profile || {};
+      const quality = payload.quality || {};
+      const pushedAt = payload.detectedAt || nowIso();
+
+      state.latestProfilePayload = payload;
+      state.selectedRecommendation = buildRecommendations(profile, quality)[0] || null;
+
+      setSoftwareState("已收到画像", profile.personPresent ? "good" : "warn");
+      els.softwareSessionId.textContent = payload.eventId || "--";
+      els.recommendationTime.textContent = shortTime(pushedAt);
+      els.recommendations.innerHTML = renderRecommendationList(
+        buildRecommendations(profile, quality)
+      );
+      els.softwareTags.innerHTML = [
+        tagHtml(`年龄 ${labelAge(profile.ageRange)}`, profile.ageRange === "unknown" ? "warn" : "good"),
+        tagHtml(`体型 ${labelBodyType(profile.bodyType)}`, profile.bodyType === "unknown" ? "warn" : "good"),
+        tagHtml(`颜色 ${labelColor(profile.upperColor)}`, profile.upperColor === "unknown" ? "warn" : "good"),
+        tagHtml(`置信度 ${formatPercent(profile.confidence)}`, qualityClass(quality.overall)),
+      ].join("");
+      updateTryOnControls();
+    }
+
+    function renderSoftwarePresence(payload) {
+      const stateText = labelPresenceState(payload.state);
+      const occupancy = payload.occupancy || {};
+      const isMultiple = occupancy.state === "multiple";
+      const isTryOnActive = payload.reason === "front_camera_reserved_by_tryon";
+      const isFrontCameraWaiting = payload.reason === "front_camera_busy"
+        || payload.reason === "front_camera_owner_changed";
+
+      els.softwareSessionId.textContent = payload.eventId || "--";
+
+      if (payload.state === "empty") {
+        state.latestProfilePayload = null;
+        state.selectedRecommendation = null;
+        setSoftwareState("等待顾客", "warn");
+        els.recommendationTime.textContent = "--";
+        els.recommendations.innerHTML = '<div class="empty">等待画像字段推送</div>';
+        els.softwareTags.innerHTML = tagHtml("顶部摄像头空场", "warn");
+        updateTryOnControls();
+        return;
+      }
+
+      if (isMultiple) {
+        setSoftwareState("多人不推荐", "warn");
+        els.softwareTags.innerHTML = tagHtml("多人状态只显示状态，不使用人物字段", "warn");
+        updateTryOnControls();
+        return;
+      }
+
+      if (isTryOnActive) {
+        setSoftwareState("试衣中", "good");
+        els.softwareTags.innerHTML = tagHtml("中部摄像头由试衣预览占用", "good");
+        updateTryOnControls();
+        return;
+      }
+
+      if (isFrontCameraWaiting || payload.state === "waiting") {
+        setSoftwareState("等待摄像头", "warn");
+        els.softwareTags.innerHTML = tagHtml("中部摄像头暂不可用", "warn");
+        updateTryOnControls();
+        return;
+      }
+
+      if (payload.state === "unusable") {
+        setSoftwareState("画像不可用", "bad");
+        els.softwareTags.innerHTML = tagHtml(labelStatusReason(payload.reason), "bad");
+        updateTryOnControls();
+        return;
+      }
+
+      setSoftwareState(stateText, payload.personPresent ? "good" : "warn");
+      els.softwareTags.innerHTML = tagHtml(
+        payload.personPresent ? "等待画像字段" : "等待顾客进入",
+        payload.personPresent ? "good" : "warn"
+      );
+      updateTryOnControls();
+    }
+
+    function renderSoftwareDeparted(payload) {
+      state.latestProfilePayload = null;
+      state.selectedRecommendation = null;
+      state.pendingTryOnSessionId = null;
+      setSoftwareState("会话结束", "warn");
+      els.softwareSessionId.textContent = payload.eventId || "--";
+      els.recommendationTime.textContent = "--";
+      els.recommendations.innerHTML = '<div class="empty">等待下一位顾客</div>';
+      els.softwareTags.innerHTML = tagHtml(`离开原因 ${labelDepartureReason(payload.reason)}`, "warn");
+      updateTryOnControls();
+    }
+
+    function renderTryOnStarted(payload) {
+      state.pendingTryOnSessionId = null;
+      state.activeTryOnSessionId = payload.sessionId || null;
+      setSoftwareState("试衣中", "good");
+      setTryOnPreview(payload.previewUrl);
+      els.softwareSessionId.textContent = payload.sessionId || "--";
+      els.softwareTags.innerHTML = [
+        tagHtml(`试衣会话 ${payload.sessionId || "--"}`, "good"),
+        tagHtml(payload.streamType || "mjpeg", "good"),
+      ].join("");
+      updateTryOnControls();
+    }
+
+    function renderTryOnStopped(payload) {
+      state.pendingTryOnSessionId = null;
+      state.activeTryOnSessionId = null;
+      setTryOnPreview(null);
+      const hasProfileContext = Boolean(state.latestProfilePayload);
+      setSoftwareState(
+        hasProfileContext ? "继续当前推荐" : "等待重新画像",
+        hasProfileContext ? "good" : "warn"
+      );
+      els.softwareSessionId.textContent = payload.sessionId || els.softwareSessionId.textContent;
+      els.softwareTags.innerHTML = [
+        tagHtml(`试衣会话 ${payload.sessionId || "--"}`, "good"),
+        tagHtml(`退出原因 ${payload.reason || "client_stop"}`, hasProfileContext ? "good" : "warn"),
+      ].join("");
+      updateTryOnControls();
+    }
+
+    function buildRecommendations(profile, quality) {
+      if (!profile.personPresent) {
+        return [];
+      }
+
+      const colorText = labelColor(profile.upperColor);
+      const bodyText = labelBodyType(profile.bodyType);
+      const ageText = labelAge(profile.ageRange);
+      const confidence = typeof profile.confidence === "number" ? profile.confidence : 0.5;
+      const baseScore = Math.round(Math.max(0.55, Math.min(0.95, confidence + 0.06)) * 100);
+      const fitKeyword = profile.bodyType === "slim"
+        ? "修身"
+        : profile.bodyType === "strong"
+          ? "宽松"
+          : "标准";
+
+      return [
+        {
+          title: `${fitKeyword}国风上衣`,
+          score: baseScore,
+          catalogKey: "product:tang-poetry-top",
+          variantId: `fit:${profile.bodyType || "regular"}`,
+          reason: `${ageText} / ${bodyText} / 当前上衣${colorText}`,
+        },
+        {
+          title: "轻量外搭推荐",
+          score: Math.max(baseScore - 6, 60),
+          catalogKey: "product:light-jacket",
+          variantId: `color:${profile.upperColor || "unknown"}`,
+          reason: `按上衣颜色和肩宽 ${formatNumber(profile.shoulderWidthCm, " cm")} 匹配`,
+        },
+        {
+          title: "通用热销款",
+          score: Math.max(baseScore - 11, 55),
+          catalogKey: "product:popular-default",
+          variantId: quality.profileUsable === false ? "fallback" : "ranked",
+          reason: "推荐兜底款，适合画像字段不完整时展示",
+        },
+      ];
+    }
+
+    function renderRecommendationList(items) {
+      if (!items.length) {
+        return '<div class="empty">暂无可用推荐</div>';
+      }
+
+      return items.map((item, index) => `
+        <div class="recommendation">
+          <div class="recommendation-title">
+            <span>${escapeHtml(index === 0 ? `主推：${item.title}` : item.title)}</span>
+            <span class="recommendation-score">${item.score}%</span>
+          </div>
+          <div class="recommendation-meta">
+            ${escapeHtml(item.reason)}<br />
+            ${escapeHtml(item.catalogKey)} · ${escapeHtml(item.variantId)}
+          </div>
+        </div>
+      `).join("");
+    }
+
+    function startTryOn() {
+      if (!state.latestProfilePayload || !state.selectedRecommendation) {
+        setSoftwareState("缺少画像", "warn");
+        return;
+      }
+
+      const sessionId = `try-on-${Date.now()}`;
+      const payload = {
+        sessionId,
+        catalogKey: state.selectedRecommendation.catalogKey,
+        variantId: state.selectedRecommendation.variantId,
+      };
+      const sent = send("vision.try_on.start", payload);
+
+      if (!sent) {
+        setSoftwareState("未连接", "bad");
+        els.softwareTags.innerHTML = tagHtml("WebSocket 未连接，无法发送试衣协议", "bad");
+        updateTryOnControls();
+        return;
+      }
+
+      state.pendingTryOnSessionId = sessionId;
+      setSoftwareState("等待试衣流", "warn");
+      els.softwareTags.innerHTML = tagHtml(`已发送 vision.try_on.start: ${sessionId}`, "good");
+      renderRaw(sent, "vision.try_on.start");
+      updateTryOnControls();
+    }
+
+    function stopTryOn() {
+      const sessionId = state.activeTryOnSessionId || state.pendingTryOnSessionId;
+      if (!sessionId) {
+        return;
+      }
+
+      const sent = send("vision.try_on.stop", {
+        sessionId,
+        reason: "dashboard_exit",
+      });
+
+      if (!sent) {
+        setSoftwareState("未连接", "bad");
+        els.softwareTags.innerHTML = tagHtml("WebSocket 未连接，无法发送退出试衣", "bad");
+        updateTryOnControls();
+        return;
+      }
+
+      setSoftwareState("正在退出试衣", "warn");
+      els.softwareTags.innerHTML = tagHtml(`已发送 vision.try_on.stop: ${sessionId}`, "good");
+      renderRaw(sent, "vision.try_on.stop");
+      updateTryOnControls();
+    }
+
     function clearProfileFields() {
       els.personPresent.textContent = "否";
       els.ageRange.textContent = "--";
@@ -1129,6 +1677,19 @@
       els.upperColor.textContent = "--";
       setColor("unknown");
       setConfidence(null);
+    }
+
+    function renderAmbientLight(ambientLight) {
+      if (!ambientLight) {
+        els.ambientLightLevel.textContent = "--";
+        els.ambientLightSample.textContent = "--";
+        return;
+      }
+
+      const sample = ambientLight.sample || {};
+      const lumaMean = typeof sample.lumaMean === "number" ? sample.lumaMean.toFixed(1) : "--";
+      els.ambientLightLevel.textContent = labelAmbientLight(ambientLight.level);
+      els.ambientLightSample.textContent = lumaMean;
     }
 
     function setConfidence(confidence) {
@@ -1168,8 +1729,7 @@
         { text: `年龄 ${labelAge(profile.ageRange)}`, level: profile.ageRange === "unknown" ? "warn" : "good" },
         { text: `体型 ${labelBodyType(profile.bodyType)}`, level: profile.bodyType === "unknown" ? "warn" : "good" },
         { text: `颜色 ${labelColor(profile.upperColor)}`, level: profile.upperColor === "unknown" ? "warn" : "good" },
-        { text: `缓存 ${quality.bodyBufferFrameCount ?? 0}`, level: "good" },
-        { text: `人脸投票 ${quality.faceVoteQualifiedFrameCount ?? 0}/${quality.faceVoteFrameCount ?? 0}`, level: (quality.faceVoteQualifiedFrameCount ?? 0) >= 3 ? "good" : "warn" },
+        { text: `样本 ${quality.validFrameCount ?? 0}/${quality.sampleCount ?? 0}`, level: (quality.validFrameCount ?? 0) > 0 ? "good" : "warn" },
         { text: `近距 ${proximity.closeNow ? "已到达" : "未到达"}`, level: proximity.closeNow ? "good" : "warn" },
       ];
 
@@ -1226,6 +1786,18 @@
       els.lastUpdate.textContent = "--";
       els.eventId.textContent = "--";
       els.closeTrigger.textContent = "--";
+      state.latestProfilePayload = null;
+      state.selectedRecommendation = null;
+      state.pendingTryOnSessionId = null;
+      state.activeTryOnSessionId = null;
+      setSoftwareState("等待画像", "");
+      els.softwareSessionId.textContent = "--";
+      els.recommendationTime.textContent = "--";
+      els.recommendations.innerHTML = '<div class="empty">等待画像字段推送</div>';
+      els.softwareTags.innerHTML = "";
+      setTryOnPreview(null);
+      updateTryOnControls();
+      renderAmbientLight(null);
     }
 
     function loadDemo() {
@@ -1254,8 +1826,6 @@
             validFrameCount: 2,
             minValidFrames: 1,
             targetSampleCount: 5,
-            bodyBufferFrameCount: 2,
-            closeSampleFrameCount: 1,
             samplingMode: "approach_buffer_immediate_close",
             proximity: {
               present: true,
@@ -1266,6 +1836,15 @@
               largestPersonRatio: 0.21,
               facePresent: true,
               largestFaceRatio: 0.018,
+            },
+          },
+          ambientLight: {
+            level: "dim",
+            measuredAt: nowIso(),
+            source: "camera",
+            confidence: 0.82,
+            sample: {
+              lumaMean: 74.5,
             },
           },
         },
@@ -1323,6 +1902,14 @@
       }[value] || "--";
     }
 
+    function labelAmbientLight(value) {
+      return {
+        bright: "明亮",
+        dim: "昏暗",
+        dark: "很暗",
+      }[value] || "--";
+    }
+
     function qualityClass(value) {
       if (value === "good") return "good";
       if (value === "poor") return "bad";
@@ -1333,6 +1920,7 @@
     function labelSamplingMode(value) {
       return {
         approach_buffer_immediate_close: "接近缓存",
+        top_presence_front_profile: "顶部触发 + 中部画像",
       }[value] || value || "--";
     }
 
@@ -1342,14 +1930,29 @@
         waiting: "等待用户",
         approach: "接近中",
         close: "已到近距离",
+        occupied: "当前会话已推荐",
         unusable: "画像暂不可用",
       }[value] || "识别中";
+    }
+
+    function labelDepartureReason(value) {
+      return {
+        no_person: "无人",
+        left_frame: "离开画面",
+        tracking_lost: "跟踪丢失",
+        absence_timeout: "空场超时",
+        manual: "手动结束",
+        unknown: "未知",
+      }[value] || value || "未知";
     }
 
     function labelStatusReason(value) {
       return {
         no_person: "未检测到用户",
         person_present_but_not_close: "用户尚未到达近距离阈值",
+        multiple_people_detected: "检测到多人",
+        front_camera_busy: "中部摄像头忙",
+        front_camera_reserved_by_tryon: "中部摄像头正在试衣",
         not_enough_valid_frames: "有效画像帧不足",
         confidence_below_threshold: "画像置信度低于阈值",
         mock_no_person: "模拟无人",
@@ -1381,6 +1984,14 @@
       return typeof target === "number" ? `${value}/${target}` : String(value);
     }
 
+    function formatPercent(value) {
+      if (typeof value !== "number" || Number.isNaN(value)) {
+        return "--";
+      }
+
+      return `${Math.round(value * 100)}%`;
+    }
+
     function escapeHtml(value) {
       return value
         .replaceAll("&", "&amp;")
@@ -1390,14 +2001,22 @@
         .replaceAll("'", "&#039;");
     }
 
+    function escapeAttr(value) {
+      return escapeHtml(String(value));
+    }
+
     els.wsUrl.value = defaultWsUrl();
     els.connectBtn.addEventListener("click", connect);
     els.disconnectBtn.addEventListener("click", disconnect);
     els.demoBtn.addEventListener("click", loadDemo);
     els.clearBtn.addEventListener("click", clearDashboard);
+    els.tryOnStartBtn.addEventListener("click", startTryOn);
+    els.tryOnStopBtn.addEventListener("click", stopTryOn);
     els.disconnectBtn.disabled = true;
     setColor("unknown");
     setConfidence(null);
+    setTryOnPreview(null);
+    updateTryOnControls();
     setTimeout(connect, 250);
   </script>
 </body>

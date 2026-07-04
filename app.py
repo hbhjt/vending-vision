@@ -3,28 +3,34 @@ import json
 from json import JSONDecodeError
 from pathlib import Path
 
-import cv2
-import numpy as np
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from vision.camera import (
-    capture_image,
-    get_configured_camera_status,
-    probe_cameras,
-    release_camera_stream,
-    reset_camera_stream,
+from vision.camera_manager import (
+    get_all_camera_statuses,
+    get_camera_config,
+    get_camera_status,
+    release_all_cameras,
+    reset_camera,
 )
+from vision.camera_owner import get_front_camera_owner
 from vision.config import settings
-from vision.debug_saver import save_debug_images
 from vision.logger import logger
-from vision.pipeline import infer_image
 from vision.profile_push import collect_profile_update
-from vision.profile_mapper import vision_profile_to_protocol
-from vision.protocol import APP_VERSION, PROTOCOL, envelope, error_envelope, now_iso
-from vision.proximity import check_proximity_once
-from vision.schema import VisionProfile
+from vision.protocol import APP_VERSION, PROTOCOL, envelope, error_envelope
 from vision.self_check import run_self_check
+from vision.session_state import (
+    get_vision_session_status,
+    mark_vision_session_tryon_started,
+    mark_vision_session_tryon_stopped,
+)
+from vision.try_on_session import (
+    get_try_on_status,
+    iter_try_on_mjpeg,
+    is_try_on_session_active,
+    start_try_on_session,
+    stop_try_on_session,
+)
 
 
 app = FastAPI(
@@ -34,9 +40,7 @@ app = FastAPI(
 )
 
 
-busy = False
 startup_check = None
-active_session_id: str | None = None
 DASHBOARD_FILE = Path(__file__).parent / "dashboard" / "profile_dashboard.html"
 
 
@@ -55,8 +59,8 @@ def on_startup():
 
 @app.on_event("shutdown")
 def on_shutdown():
-    release_camera_stream()
-    logger.info("Camera stream released")
+    release_all_cameras()
+    logger.info("Camera streams released")
 
 
 def get_startup_check():
@@ -74,17 +78,15 @@ def get_runtime_status():
 
     if settings.MOCK_SCENARIO == "off":
         try:
-            camera_status = get_configured_camera_status()
+            camera_statuses = get_all_camera_statuses()
+            camera_ok = all(
+                status.get("ok")
+                for status in camera_statuses.values()
+            )
             checks["camera"] = {
-                "ok": True,
-                "message": (
-                    f"camera opened, index={settings.CAMERA_INDEX}, "
-                    f"backend={settings.CAMERA_BACKEND}, "
-                    f"mode={camera_status.get('mode')}, "
-                    f"frame={camera_status['frame']['width']}x"
-                    f"{camera_status['frame']['height']}"
-                ),
-                "detail": camera_status,
+                "ok": camera_ok,
+                "message": "top/front cameras checked",
+                "detail": camera_statuses,
             }
         except Exception as e:
             checks["camera"] = {
@@ -106,108 +108,6 @@ def get_runtime_status():
     }
 
 
-def run_capture_and_infer(session_id: str | None = None):
-    scenario = settings.MOCK_SCENARIO
-
-    if scenario != "off":
-        logger.info(f"Using mock scenario: {scenario}")
-
-    if scenario == "success":
-        return VisionProfile(
-            age=22,
-            gender="unknown",
-            height_cm=172.0,
-            shoulder_width_cm=43.0,
-            body_type="medium",
-            upper_color="dark",
-            presence=True,
-        ), {}
-
-    if scenario == "no_person":
-        return VisionProfile(
-            age=None,
-            gender="unknown",
-            height_cm=None,
-            shoulder_width_cm=None,
-            body_type="unknown",
-            upper_color="unknown",
-            presence=False,
-        ), {}
-
-    if scenario == "camera_unavailable":
-        raise RuntimeError("camera unavailable")
-
-    if scenario == "timeout":
-        import time
-
-        time.sleep(60)
-        return VisionProfile(
-            age=None,
-            gender="unknown",
-            height_cm=None,
-            shoulder_width_cm=None,
-            body_type="unknown",
-            upper_color="unknown",
-            presence=False,
-        ), {}
-
-    image = capture_image()
-    debug_info = save_debug_images(image, session_id=session_id)
-    profile = infer_image(image)
-
-    return profile, debug_info
-
-
-def normalize_timeout_ms(value) -> int:
-    if value is None:
-        return settings.DEFAULT_TIMEOUT_MS
-
-    try:
-        timeout_ms = int(value)
-    except (TypeError, ValueError):
-        return settings.DEFAULT_TIMEOUT_MS
-
-    return max(1000, min(timeout_ms, 30000))
-
-
-def build_quality(profile: VisionProfile, debug_info: dict | None = None):
-    warnings = []
-
-    if settings.MOCK_SCENARIO != "off":
-        warnings.append(f"mock scenario enabled: {settings.MOCK_SCENARIO}")
-
-    if profile.height_cm is None:
-        warnings.append("height is unavailable or filtered")
-
-    if profile.body_type == "unknown":
-        warnings.append("body type is unavailable")
-
-    if profile.gender == "unknown":
-        warnings.append("gender is unknown")
-
-    if profile.age is None:
-        warnings.append("age range is unknown")
-
-    confidence = vision_profile_to_protocol(profile)["confidence"]
-
-    if confidence >= 0.75:
-        overall = "good"
-    elif confidence >= 0.45:
-        overall = "fair"
-    else:
-        overall = "poor"
-
-    quality = {
-        "overall": overall,
-        "warnings": warnings,
-    }
-
-    if debug_info:
-        quality["debug"] = debug_info
-
-    return quality
-
-
 def validate_envelope(message):
     if not isinstance(message, dict):
         return "message must be a JSON object"
@@ -218,8 +118,68 @@ def validate_envelope(message):
     if missing:
         return f"missing required field(s): {', '.join(missing)}"
 
+    for field in ["protocol", "type", "messageId", "timestamp"]:
+        if not isinstance(message.get(field), str):
+            return f"{field} must be a string"
+
+        if not message.get(field).strip():
+            return f"{field} must not be empty"
+
     if not isinstance(message.get("payload"), dict):
         return "payload must be an object"
+
+    return None
+
+
+def validate_message_payload(message_type: str, payload: dict):
+    if message_type == "vision.hello":
+        protocol_version = payload.get("protocolVersion")
+        capabilities = payload.get("capabilities")
+        client_role = payload.get("clientRole")
+        machine_code = payload.get("machineCode")
+
+        if (
+            not isinstance(protocol_version, int)
+            or isinstance(protocol_version, bool)
+            or protocol_version != 1
+        ):
+            return "payload.protocolVersion must be 1"
+
+        if not isinstance(capabilities, list):
+            return "payload.capabilities must be an array"
+
+        if not all(isinstance(item, str) and item.strip() for item in capabilities):
+            return "payload.capabilities must contain non-empty strings"
+
+        if client_role is not None and not isinstance(client_role, str):
+            return "payload.clientRole must be a string"
+
+        if machine_code is not None and not isinstance(machine_code, str):
+            return "payload.machineCode must be a string"
+
+    if message_type == "vision.try_on.start":
+        session_id = payload.get("sessionId")
+        catalog_key = payload.get("catalogKey")
+        variant_id = payload.get("variantId")
+
+        if not isinstance(session_id, str) or not session_id.strip():
+            return "payload.sessionId must be a non-empty string"
+
+        if catalog_key is not None and not isinstance(catalog_key, str):
+            return "payload.catalogKey must be a string"
+
+        if variant_id is not None and not isinstance(variant_id, str):
+            return "payload.variantId must be a string"
+
+    if message_type == "vision.try_on.stop":
+        session_id = payload.get("sessionId")
+        reason = payload.get("reason")
+
+        if not isinstance(session_id, str) or not session_id.strip():
+            return "payload.sessionId must be a non-empty string"
+
+        if reason is not None and not isinstance(reason, str):
+            return "payload.reason must be a string"
 
     return None
 
@@ -230,11 +190,10 @@ def root():
         "message": "Vending Vision Module is running",
         "api": {
             "dashboard": "/dashboard",
-            "infer": "/infer",
-            "capture_infer": "/capture_infer",
-            "camera_status": "/camera/status",
-            "camera_reopen": "/camera/reopen",
-            "camera_probe": "/camera/probe",
+            "camera_roles_status": "/camera/roles/status",
+            "front_camera_owner": "/camera/front/owner",
+            "try_on_preview": "/try-on/{sessionId}.mjpeg",
+            "session_status": "/session/status",
             "ws": "/ws",
             "health": "/health",
             "version": "/version",
@@ -271,7 +230,6 @@ def health():
         "protocol": PROTOCOL,
         "version": APP_VERSION,
         "mockScenario": settings.MOCK_SCENARIO,
-        "busy": busy,
         "cameraReady": status["cameraReady"],
         "modelReady": status["modelReady"],
         "ageGenderReady": status["ageGenderReady"],
@@ -290,16 +248,6 @@ def version():
         "port": settings.PORT,
         "mock_scenario": settings.MOCK_SCENARIO,
         "default_timeout_ms": settings.DEFAULT_TIMEOUT_MS,
-        "debug": {
-            "save_debug_images": settings.SAVE_DEBUG_IMAGES,
-            "debug_output_dir": settings.DEBUG_OUTPUT_DIR,
-            "max_debug_images": settings.MAX_DEBUG_IMAGES,
-        },
-        "process_trace": {
-            "enabled": settings.PROCESS_TRACE_ENABLED,
-            "output_dir": settings.PROCESS_TRACE_OUTPUT_DIR,
-            "max_events": settings.PROCESS_TRACE_MAX_EVENTS,
-        },
         "profile_push": {
             "enabled": settings.PROFILE_PUSH_ENABLED,
             "push_interval_ms": settings.PROFILE_PUSH_INTERVAL_MS,
@@ -377,6 +325,20 @@ def version():
                 settings.BODY_MASK_TYPE_FAT_THRESHOLD
             ),
         },
+        "cameras": {
+            "top": settings.TOP_CAMERA_CONFIG,
+            "front": settings.FRONT_CAMERA_CONFIG,
+            "front_owner": get_front_camera_owner(),
+            "try_on": get_try_on_status(),
+            "vision_session": get_vision_session_status(),
+            "profile": {
+                "max_wait_ms": settings.FRONT_CAMERA_PROFILE_MAX_WAIT_MS,
+                "sample_count": settings.FRONT_CAMERA_PROFILE_SAMPLE_COUNT,
+                "sample_interval_ms": (
+                    settings.FRONT_CAMERA_PROFILE_SAMPLE_INTERVAL_MS
+                ),
+            },
+        },
         "model_paths": {
             "face_detector_model": settings.FACE_DETECTOR_MODEL,
             "person_detector_model": settings.PERSON_DETECTOR_MODEL,
@@ -392,89 +354,65 @@ def version():
             "face_detection": "yunet_or_haar",
             "person_detection": "opencv_dnn_onnx_optional",
             "age_gender_estimation": "opencv_dnn_or_mock",
-            "fastapi_infer_api": True,
-            "camera_capture_api": True,
             "websocket_protocol": True,
             "timeout_control": True,
             "logging": True,
             "mock_scenario": True,
-            "debug_images": True,
-            "debug_cleanup": True,
         },
     }
 
+@app.get("/camera/roles/status")
+def camera_roles_status():
+    return get_all_camera_statuses()
 
-@app.get("/camera/status")
-def camera_status():
+
+@app.get("/camera/{role}/status")
+def camera_role_status(role: str):
     try:
-        return get_configured_camera_status()
+        return get_camera_status(role)
+    except ValueError as e:
+        return JSONResponse(status_code=404, content={"ok": False, "error": str(e)})
     except Exception as e:
-        logger.exception("HTTP /camera/status failed")
+        logger.exception(f"HTTP /camera/{role}/status failed")
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
-@app.post("/camera/reopen")
-def camera_reopen():
+@app.post("/camera/{role}/reopen")
+def camera_role_reopen(role: str):
     try:
-        reset_camera_stream()
-        return get_configured_camera_status()
+        get_camera_config(role)
+        reset_camera(role)
+        return get_camera_status(role)
+    except ValueError as e:
+        return JSONResponse(status_code=404, content={"ok": False, "error": str(e)})
     except Exception as e:
-        logger.exception("HTTP /camera/reopen failed")
+        logger.exception(f"HTTP /camera/{role}/reopen failed")
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
-@app.get("/camera/probe")
-def camera_probe(max_index: int = 8, backend: str | None = None):
-    try:
-        return {
-            "backend": backend or settings.CAMERA_BACKEND,
-            "maxIndex": max_index,
-            "cameras": probe_cameras(max_index=max_index, backend_name=backend),
-        }
-    except Exception as e:
-        logger.exception("HTTP /camera/probe failed")
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+@app.get("/camera/front/owner")
+def front_camera_owner():
+    return get_front_camera_owner()
 
 
-@app.get("/proximity/check")
-def proximity_check():
-    try:
-        return check_proximity_once()
-    except Exception as e:
-        logger.exception("HTTP /proximity/check failed")
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+@app.get("/session/status")
+def session_status():
+    return get_vision_session_status()
 
 
-@app.post("/infer", response_model=VisionProfile)
-async def infer(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
+@app.get("/try-on/{session_id}.mjpeg")
+def try_on_mjpeg(session_id: str):
+    if not is_try_on_session_active(session_id):
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "error": "try-on session is not active"},
+        )
 
-        np_arr = np.frombuffer(contents, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-        if image is None:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "failed to read image, please upload jpg/png"},
-            )
-
-        return infer_image(image)
-
-    except Exception as e:
-        logger.exception("HTTP /infer failed")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.get("/capture_infer", response_model=VisionProfile)
-def capture_infer():
-    try:
-        profile, _ = run_capture_and_infer()
-        return profile
-
-    except Exception as e:
-        logger.exception("HTTP /capture_infer failed")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+    media_type = "multipart/x-mixed-replace; boundary=frame"
+    return StreamingResponse(
+        iter_try_on_mjpeg(session_id),
+        media_type=media_type,
+    )
 
 
 async def send_error(
@@ -502,12 +440,16 @@ async def profile_push_loop(
     websocket: WebSocket,
     send_lock: asyncio.Lock,
     presence_status_enabled: bool = False,
+    ambient_light_enabled: bool = False,
+    person_departed_enabled: bool = False,
 ):
     while True:
         try:
             update = await asyncio.to_thread(
                 collect_profile_update,
                 presence_status_enabled,
+                ambient_light_enabled,
+                person_departed_enabled,
             )
 
             if update is None:
@@ -516,11 +458,10 @@ async def profile_push_loop(
 
             event_payload = update["payload"]
             message_type = update["message_type"]
-            message_prefix = (
-                "result"
-                if message_type == "vision.profile_result"
-                else "status"
-            )
+            message_prefix = {
+                "vision.profile_result": "result",
+                "vision.person_departed": "departure",
+            }.get(message_type, "status")
 
             async with send_lock:
                 await websocket.send_json(
@@ -625,11 +566,33 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.warning(f"Unsupported protocol: {protocol}")
                 continue
 
+            payload_error = validate_message_payload(message_type, payload)
+
+            if payload_error:
+                async with send_lock:
+                    await send_error(
+                        websocket,
+                        code="invalid_message",
+                        message=payload_error,
+                        retryable=False,
+                        message_id=message_id,
+                    )
+                continue
+
             if message_type == "vision.hello":
                 status = get_runtime_status()
                 client_capabilities = set(payload.get("capabilities") or [])
                 presence_status_enabled = "presence_status" in client_capabilities
+                ambient_light_enabled = "ambient_light" in client_capabilities
+                person_departed_enabled = "person_departed" in client_capabilities
 
+                server_capabilities = [
+                    "profile_push",
+                    "presence_status",
+                    "person_departed",
+                    "ambient_light",
+                    "try_on_session",
+                ]
                 async with send_lock:
                     await websocket.send_json(
                         envelope(
@@ -640,7 +603,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "serverVersion": APP_VERSION,
                                 "cameraReady": status["cameraReady"],
                                 "modelReady": status["modelReady"],
-                                "capabilities": ["profile_push", "presence_status"],
+                                "capabilities": server_capabilities,
                             },
                         )
                     )
@@ -662,6 +625,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             websocket,
                             send_lock,
                             presence_status_enabled=presence_status_enabled,
+                            ambient_light_enabled=ambient_light_enabled,
+                            person_departed_enabled=person_departed_enabled,
                         )
                     )
 
@@ -674,6 +639,94 @@ async def websocket_endpoint(websocket: WebSocket):
                             message_type="vision.pong",
                             message_id="pong-001",
                             payload={},
+                        )
+                    )
+                continue
+
+            if message_type == "vision.try_on.start":
+                try:
+                    session = start_try_on_session(
+                        payload.get("sessionId"),
+                        catalog_key=payload.get("catalogKey"),
+                        variant_id=payload.get("variantId"),
+                    )
+                except ValueError as e:
+                    async with send_lock:
+                        await send_error(
+                            websocket,
+                            code="invalid_message",
+                            message=str(e),
+                            retryable=False,
+                            message_id=message_id,
+                        )
+                    continue
+                except Exception as e:
+                    logger.exception("Try-on start failed")
+                    async with send_lock:
+                        await websocket.send_json(
+                            error_envelope(
+                                code="try_on_unavailable",
+                                message=str(e),
+                                retryable=True,
+                                message_id=message_id,
+                            )
+                        )
+                    continue
+
+                mark_vision_session_tryon_started(session)
+                async with send_lock:
+                    await websocket.send_json(
+                        envelope(
+                            message_type="vision.try_on.started",
+                            message_id=f"try-on-started-{session['sessionId']}",
+                            payload={
+                                "sessionId": session["sessionId"],
+                                "previewUrl": session["previewUrl"],
+                                "streamType": session["streamType"],
+                            },
+                        )
+                    )
+                continue
+
+            if message_type == "vision.try_on.stop":
+                try:
+                    stopped = stop_try_on_session(
+                        payload.get("sessionId"),
+                        reason=payload.get("reason"),
+                    )
+                except ValueError as e:
+                    async with send_lock:
+                        await send_error(
+                            websocket,
+                            code="invalid_message",
+                            message=str(e),
+                            retryable=False,
+                            message_id=message_id,
+                        )
+                    continue
+                except Exception as e:
+                    logger.exception("Try-on stop failed")
+                    async with send_lock:
+                        await websocket.send_json(
+                            error_envelope(
+                                code="try_on_unavailable",
+                                message=str(e),
+                                retryable=True,
+                                message_id=message_id,
+                            )
+                        )
+                    continue
+
+                mark_vision_session_tryon_stopped(stopped)
+                async with send_lock:
+                    await websocket.send_json(
+                        envelope(
+                            message_type="vision.try_on.stopped",
+                            message_id=f"try-on-stopped-{stopped['sessionId']}",
+                            payload={
+                                "sessionId": stopped["sessionId"],
+                                "reason": stopped["reason"],
+                            },
                         )
                     )
                 continue

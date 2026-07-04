@@ -1,6 +1,6 @@
 import cv2
 
-from vision.camera import capture_image
+from vision.camera_manager import read_camera
 from vision.config import settings
 from vision.face_detector import FaceDetector
 from vision.person_detector import PersonDetector
@@ -240,8 +240,8 @@ class ProximityMonitor:
             "centerY": round(center_y, 5),
         }
 
-    def check_once(self, return_image: bool = False):
-        image = capture_image(warmup_frames=1)
+    def check_once(self, return_image: bool = False, camera_role: str = "top"):
+        image = read_camera(camera_role, warmup_frames=1)
         result = self.check_image(image)
 
         if return_image:
@@ -262,9 +262,12 @@ def get_proximity_monitor():
     return _monitor
 
 
-def check_proximity_once():
-    return get_proximity_monitor().check_once()
+def check_proximity_once(camera_role: str = "top"):
+    return get_proximity_monitor().check_once(camera_role=camera_role)
 
 
-def check_proximity_once_with_image():
-    return get_proximity_monitor().check_once(return_image=True)
+def check_proximity_once_with_image(camera_role: str = "top"):
+    return get_proximity_monitor().check_once(
+        return_image=True,
+        camera_role=camera_role,
+    )

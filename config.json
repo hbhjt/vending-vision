@@ -9,6 +9,32 @@
   "camera_keep_open": true,
   "camera_read_retry_count": 2,
   "camera_reconnect_delay_ms": 300,
+  "cameras": {
+    "top": {
+      "index": 0,
+      "backend": "dshow",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "fourcc": "MJPG",
+      "role": "presence",
+      "keep_open": true
+    },
+    "front": {
+      "index": 1,
+      "backend": "dshow",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "fourcc": "MJPG",
+      "role": "profile_tryon",
+      "keep_open": true
+    }
+  },
+  "front_camera_profile_max_wait_ms": 3000,
+  "front_camera_profile_sample_count": 6,
+  "front_camera_profile_sample_interval_ms": 250,
+  "front_camera_owner_timeout_ms": 120000,
 
   "height_scale": 100,
   "height_offset": 80,
@@ -23,13 +49,6 @@
   "body_mask_min_area_ratio": 0.03,
   "body_mask_type_thin_threshold": 0.32,
   "body_mask_type_fat_threshold": 0.46,
-
-  "save_debug_images": true,
-  "debug_output_dir": "debug_outputs",
-  "max_debug_images": 200,
-  "process_trace_enabled": false,
-  "process_trace_output_dir": "debug_outputs/process_traces",
-  "process_trace_max_events": 50,
 
   "default_timeout_ms": 8000,
 
