@@ -35,6 +35,20 @@ class AgeGenderEstimator:
 
         self._load_models()
 
+    def _read_caffe_net(self, proto_path, weights_path):
+        if hasattr(cv2.dnn, "readNetFromCaffe"):
+            return cv2.dnn.readNetFromCaffe(proto_path, weights_path)
+
+        if hasattr(cv2.dnn, "readNet"):
+            try:
+                return cv2.dnn.readNet(weights_path, proto_path, "Caffe")
+            except Exception:
+                return cv2.dnn.readNet(weights_path, proto_path)
+
+        raise RuntimeError(
+            "current OpenCV DNN build does not support Caffe model loading"
+        )
+
     def _load_models(self):
         required_files = [
             settings.AGE_MODEL_PROTO,
@@ -53,12 +67,12 @@ class AgeGenderEstimator:
             return
 
         try:
-            self.age_net = cv2.dnn.readNetFromCaffe(
+            self.age_net = self._read_caffe_net(
                 settings.AGE_MODEL_PROTO,
                 settings.AGE_MODEL_WEIGHTS
             )
 
-            self.gender_net = cv2.dnn.readNetFromCaffe(
+            self.gender_net = self._read_caffe_net(
                 settings.GENDER_MODEL_PROTO,
                 settings.GENDER_MODEL_WEIGHTS
             )
@@ -67,7 +81,7 @@ class AgeGenderEstimator:
             logger.info("Age/Gender models loaded successfully")
 
         except Exception as e:
-            logger.exception(f"Failed to load Age/Gender models: {e}")
+            logger.warning(f"Age/Gender models unavailable, fallback to mock: {e}")
             self.model_ready = False
 
     def _age_bucket_to_number(self, age_bucket: str):

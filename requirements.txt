@@ -1,4 +1,5 @@
-opencv-python==4.13.0.92
+# OpenCV 5 removed the Caffe importer used by age/gender .caffemodel files.
+opencv-python==4.10.0.84
 numpy==2.2.6
 pydantic==2.13.4
 mediapipe==0.10.14

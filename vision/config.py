@@ -42,6 +42,40 @@ def get_config_value(key, env_key, default):
     return _json_config.get(key, default)
 
 
+def get_json_config_value(key, env_key, default):
+    if env_key in os.environ:
+        try:
+            return json.loads(os.getenv(env_key) or "")
+        except Exception:
+            return default
+
+    value = _json_config.get(key, default)
+    return value if isinstance(value, type(default)) else default
+
+
+def build_camera_config(cameras, role, fallback):
+    config = dict(fallback)
+    role_config = cameras.get(role, {}) if isinstance(cameras, dict) else {}
+
+    if isinstance(role_config, dict):
+        for key, value in role_config.items():
+            if value is not None:
+                config[key] = value
+
+    config.setdefault("role", role)
+    return config
+
+
+def bool_config_value(value, default=False):
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return default
+
+    return str(value).lower() == "true"
+
+
 class Settings:
     APP_NAME = "Vending Vision Module"
     APP_VERSION = "0.2.0"
@@ -234,6 +268,16 @@ class Settings:
         "VISION_PRIMARY_FACE_MAX_HEAD_DISTANCE_RATIO",
         0.18
     )
+    AMBIENT_LIGHT_DARK_LUMA = get_config_value(
+        "ambient_light_dark_luma",
+        "VISION_AMBIENT_LIGHT_DARK_LUMA",
+        50.0
+    )
+    AMBIENT_LIGHT_DIM_LUMA = get_config_value(
+        "ambient_light_dim_luma",
+        "VISION_AMBIENT_LIGHT_DIM_LUMA",
+        110.0
+    )
 
     CAMERA_INDEX = get_config_value("camera_index", "VISION_CAMERA_INDEX", 0)
     CAMERA_BACKEND = get_config_value("camera_backend", "VISION_CAMERA_BACKEND", "dshow")
@@ -260,6 +304,58 @@ class Settings:
         "camera_reconnect_delay_ms",
         "VISION_CAMERA_RECONNECT_DELAY_MS",
         300
+    )
+    CAMERAS = get_json_config_value("cameras", "VISION_CAMERAS", {})
+    LEGACY_CAMERA_CONFIG = {
+        "index": CAMERA_INDEX,
+        "backend": CAMERA_BACKEND,
+        "width": CAMERA_WIDTH,
+        "height": CAMERA_HEIGHT,
+        "fps": CAMERA_FPS,
+        "fourcc": CAMERA_FOURCC,
+        "keep_open": CAMERA_KEEP_OPEN,
+    }
+    TOP_CAMERA_CONFIG = build_camera_config(CAMERAS, "top", LEGACY_CAMERA_CONFIG)
+    FRONT_CAMERA_CONFIG = build_camera_config(CAMERAS, "front", LEGACY_CAMERA_CONFIG)
+    TOP_CAMERA_INDEX = int(TOP_CAMERA_CONFIG.get("index", CAMERA_INDEX))
+    TOP_CAMERA_BACKEND = TOP_CAMERA_CONFIG.get("backend", CAMERA_BACKEND)
+    TOP_CAMERA_WIDTH = int(TOP_CAMERA_CONFIG.get("width", CAMERA_WIDTH) or 0)
+    TOP_CAMERA_HEIGHT = int(TOP_CAMERA_CONFIG.get("height", CAMERA_HEIGHT) or 0)
+    TOP_CAMERA_FPS = int(TOP_CAMERA_CONFIG.get("fps", CAMERA_FPS) or 0)
+    TOP_CAMERA_FOURCC = TOP_CAMERA_CONFIG.get("fourcc", CAMERA_FOURCC)
+    TOP_CAMERA_KEEP_OPEN = bool_config_value(
+        TOP_CAMERA_CONFIG.get("keep_open"),
+        CAMERA_KEEP_OPEN
+    )
+    FRONT_CAMERA_INDEX = int(FRONT_CAMERA_CONFIG.get("index", CAMERA_INDEX))
+    FRONT_CAMERA_BACKEND = FRONT_CAMERA_CONFIG.get("backend", CAMERA_BACKEND)
+    FRONT_CAMERA_WIDTH = int(FRONT_CAMERA_CONFIG.get("width", CAMERA_WIDTH) or 0)
+    FRONT_CAMERA_HEIGHT = int(FRONT_CAMERA_CONFIG.get("height", CAMERA_HEIGHT) or 0)
+    FRONT_CAMERA_FPS = int(FRONT_CAMERA_CONFIG.get("fps", CAMERA_FPS) or 0)
+    FRONT_CAMERA_FOURCC = FRONT_CAMERA_CONFIG.get("fourcc", CAMERA_FOURCC)
+    FRONT_CAMERA_KEEP_OPEN = bool_config_value(
+        FRONT_CAMERA_CONFIG.get("keep_open"),
+        False
+    )
+    FRONT_CAMERA_PROFILE_MAX_WAIT_MS = get_config_value(
+        "front_camera_profile_max_wait_ms",
+        "VISION_FRONT_CAMERA_PROFILE_MAX_WAIT_MS",
+        3000
+    )
+    FRONT_CAMERA_PROFILE_SAMPLE_COUNT = get_config_value(
+        "front_camera_profile_sample_count",
+        "VISION_FRONT_CAMERA_PROFILE_SAMPLE_COUNT",
+        6
+    )
+    FRONT_CAMERA_PROFILE_SAMPLE_INTERVAL_MS = get_config_value(
+        "front_camera_profile_sample_interval_ms",
+        "VISION_FRONT_CAMERA_PROFILE_SAMPLE_INTERVAL_MS",
+        250
+    )
+    FRONT_CAMERA_OWNER_TIMEOUT_MS = get_config_value(
+        "front_camera_owner_timeout_ms",
+        "VISION_FRONT_CAMERA_OWNER_TIMEOUT_MS",
+        120000
     )
 
     HEIGHT_SCALE = get_config_value("height_scale", "VISION_HEIGHT_SCALE", 100.0)
@@ -377,37 +473,6 @@ class Settings:
 
     LOG_DIR = os.getenv("VISION_LOG_DIR", "logs")
     LOG_FILE = os.getenv("VISION_LOG_FILE", "logs/vision.log")
-
-    DEBUG_OUTPUT_DIR = get_config_value(
-        "debug_output_dir",
-        "VISION_DEBUG_OUTPUT_DIR",
-        "debug_outputs"
-    )
-    SAVE_DEBUG_IMAGES = get_config_value(
-        "save_debug_images",
-        "VISION_SAVE_DEBUG_IMAGES",
-        True
-    )
-    MAX_DEBUG_IMAGES = get_config_value(
-        "max_debug_images",
-        "VISION_MAX_DEBUG_IMAGES",
-        200
-    )
-    PROCESS_TRACE_ENABLED = get_config_value(
-        "process_trace_enabled",
-        "VISION_PROCESS_TRACE_ENABLED",
-        False
-    )
-    PROCESS_TRACE_OUTPUT_DIR = get_config_value(
-        "process_trace_output_dir",
-        "VISION_PROCESS_TRACE_OUTPUT_DIR",
-        "debug_outputs/process_traces"
-    )
-    PROCESS_TRACE_MAX_EVENTS = get_config_value(
-        "process_trace_max_events",
-        "VISION_PROCESS_TRACE_MAX_EVENTS",
-        50
-    )
 
 
 settings = Settings()

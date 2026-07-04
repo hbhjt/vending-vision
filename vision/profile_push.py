@@ -6,10 +6,15 @@ from uuid import uuid4
 
 import cv2
 
-from vision.camera import capture_image
+from vision.camera_manager import read_camera
+from vision.camera_owner import (
+    acquire_front_camera,
+    front_camera_io_lock,
+    get_front_camera_owner,
+    release_front_camera,
+)
 from vision.config import settings
 from vision.pipeline import infer_image
-from vision.process_trace import ProcessTrace
 from vision.profile_mapper import (
     age_to_age_range,
     body_type_to_protocol,
@@ -19,6 +24,16 @@ from vision.profile_mapper import (
 from vision.proximity import check_proximity_once_with_image
 from vision.protocol import now_iso
 from vision.schema import VisionProfile
+from vision.session_state import (
+    mark_vision_session_departed,
+    mark_vision_session_presence,
+    mark_vision_session_profile_pushed,
+    mark_vision_session_profiling,
+    mark_vision_session_tryon_departed,
+    mark_vision_session_unusable,
+    mark_vision_session_waiting_front_camera,
+)
+from vision.try_on_session import get_try_on_status, mark_active_try_on_departed
 
 
 class TemporaryProfileTrack:
@@ -33,6 +48,7 @@ class TemporaryProfileTrack:
         self.body_samples = deque(
             maxlen=max(settings.PROFILE_BODY_BUFFER_MAX_FRAMES, 1)
         )
+        self.announced_presence_states = set()
 
     def update(self, signature, state, match_score=1.0):
         self.signature = signature
@@ -59,6 +75,13 @@ class TemporaryProfileTrack:
     def append_body_sample(self, sample):
         self.body_samples.append(sample)
 
+    def announce_presence_once(self, state):
+        if state in self.announced_presence_states:
+            return False
+
+        self.announced_presence_states.add(state)
+        return True
+
     def public_state(self):
         return {
             "trackId": self.track_id,
@@ -72,6 +95,8 @@ class TemporaryProfileTrack:
 
 
 _active_track = None
+_mock_pending_profile_payload = None
+_mock_pending_departure_payload = None
 
 
 class ProfileOccupancyGate:
@@ -141,6 +166,110 @@ class ProfileOccupancyGate:
 _occupancy_gate = ProfileOccupancyGate()
 
 
+class PersonDepartureTracker:
+    def __init__(self):
+        self.active = False
+        self.absent_count = 0
+        self.last_seen_at = None
+        self.last_seen_monotonic = None
+        self.departed_announced = False
+
+    def mark_present(self):
+        self.active = True
+        self.absent_count = 0
+        self.last_seen_at = now_iso()
+        self.last_seen_monotonic = time.time()
+        self.departed_announced = False
+
+    def mark_absent(self, reason="no_person", ambient_light=None):
+        if not self.active or self.departed_announced:
+            return None
+
+        self.absent_count += 1
+
+        if self.absent_count < settings.PROFILE_OCCUPANCY_RESET_ABSENT_FRAMES:
+            return None
+
+        detected_monotonic = time.time()
+        absence_duration_ms = None
+
+        if self.last_seen_monotonic is not None:
+            absence_duration_ms = int(
+                max(detected_monotonic - self.last_seen_monotonic, 0.0) * 1000
+            )
+
+        self.active = False
+        self.departed_announced = True
+
+        payload = {
+            "eventId": f"vision-departure-{uuid4()}",
+            "detectedAt": now_iso(),
+            "lastSeenAt": self.last_seen_at,
+            "reason": reason,
+        }
+
+        if absence_duration_ms is not None:
+            payload["absenceDurationMs"] = absence_duration_ms
+
+        if ambient_light is not None:
+            payload["ambientLight"] = ambient_light
+
+        return payload
+
+
+_departure_tracker = PersonDepartureTracker()
+
+
+class FrontCameraBusy(RuntimeError):
+    def __init__(self, owner_status=None, reason="front_camera_busy"):
+        super().__init__(reason)
+        self.owner_status = owner_status or {}
+        self.reason = reason
+
+
+def active_try_on_status():
+    status = get_try_on_status()
+    return status if status.get("activeSessionId") else None
+
+
+def wait_for_front_camera_owner(event_id):
+    deadline = time.time() + max(settings.FRONT_CAMERA_PROFILE_MAX_WAIT_MS, 0) / 1000.0
+    result = None
+
+    while True:
+        result = acquire_front_camera("vision", reason=f"profile:{event_id}")
+        if result.get("ok"):
+            return result
+
+        if result.get("error") != "front_camera_busy" or time.time() >= deadline:
+            return result
+
+        time.sleep(min(settings.FRONT_CAMERA_PROFILE_SAMPLE_INTERVAL_MS, 100) / 1000.0)
+
+
+def build_front_camera_waiting_update(
+    event_id,
+    reason,
+    proximity=None,
+    tracking=None,
+    occupancy=None,
+    ambient_light=None,
+    owner_status=None,
+):
+    return profile_update(
+        "vision.presence_status",
+        build_presence_status(
+            event_id=event_id,
+            state="waiting",
+            reason=reason,
+            proximity=proximity,
+            tracking=tracking,
+            occupancy=occupancy,
+            ambient_light=ambient_light,
+        ),
+    )
+
+
 def image_quality(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     brightness = float(gray.mean())
@@ -149,6 +278,31 @@ def image_quality(image):
     return {
         "brightness": round(brightness, 2),
         "sharpness": round(sharpness, 2),
+    }
+
+
+def estimate_ambient_light(image):
+    if image is None:
+        return None
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    luma_mean = float(gray.mean())
+
+    if luma_mean < settings.AMBIENT_LIGHT_DARK_LUMA:
+        level = "dark"
+    elif luma_mean < settings.AMBIENT_LIGHT_DIM_LUMA:
+        level = "dim"
+    else:
+        level = "bright"
+
+    return {
+        "level": level,
+        "measuredAt": now_iso(),
+        "source": "camera",
+        "confidence": 0.82,
+        "sample": {
+            "lumaMean": round(luma_mean, 2),
+        },
     }
 
 
@@ -286,6 +440,44 @@ def reset_active_track():
 
 def get_occupancy_gate():
     return _occupancy_gate
+
+
+def protocol_occupancy_snapshot(proximity=None, state_hint: str | None = None):
+    proximity = proximity or {}
+
+    if state_hint in {"none", "single", "multiple", "unknown"}:
+        state = state_hint
+    elif max(
+        int(proximity.get("personCount") or 0),
+        int(proximity.get("faceCount") or 0),
+    ) > 1:
+        state = "multiple"
+    elif proximity.get("present"):
+        state = "single"
+    else:
+        state = "none"
+
+    confidence = 0.5
+    if state == "single":
+        confidence = 0.82
+    elif state == "multiple":
+        confidence = 0.78
+    elif state == "none":
+        confidence = 0.8
+
+    return {
+        "state": state,
+        "confidence": round(confidence, 2),
+    }
+
+
+def normalize_protocol_occupancy(occupancy=None, proximity=None):
+    if isinstance(occupancy, dict):
+        state = occupancy.get("state")
+        if state in {"none", "single", "multiple", "unknown"}:
+            return occupancy
+
+    return protocol_occupancy_snapshot(proximity)
 
 
 def sample_weight(sample, purpose="general"):
@@ -522,8 +714,6 @@ def build_quality(
     samples,
     valid_count,
     proximity=None,
-    tracking=None,
-    occupancy=None,
     min_valid_frames=None,
     sampling_mode=None,
 ):
@@ -563,33 +753,18 @@ def build_quality(
     quality = {
         "overall": overall,
         "warnings": warnings,
+        "profileUsable": overall != "poor",
         "sampleCount": len(samples),
         "validFrameCount": valid_count,
         "minValidFrames": min_valid_frames,
         "targetSampleCount": settings.PROFILE_SAMPLE_COUNT,
-        "bodyBufferFrameCount": len(
-            [sample for sample in samples if sample.get("source") == "body_buffer"]
-        ),
-        "closeSampleFrameCount": len(
-            [sample for sample in samples if sample.get("source") == "close_sample"]
-        ),
-        "faceVoteFrameCount": len(
-            [sample for sample in samples if sample.get("source") == "face_vote"]
-        ),
-        "faceVoteQualifiedFrameCount": len(
-            [sample for sample in samples if is_face_vote_candidate(sample)]
-        ),
-        "samples": samples,
     }
+
+    if not quality["profileUsable"]:
+        quality["notUsableReason"] = "low_confidence"
 
     if proximity is not None:
         quality["proximity"] = proximity
-
-    if tracking is not None:
-        quality["tracking"] = tracking
-
-    if occupancy is not None:
-        quality["occupancy"] = occupancy
 
     if sampling_mode is not None:
         quality["samplingMode"] = sampling_mode
@@ -614,10 +789,15 @@ def mock_profile_event():
         return {
             "eventId": f"vision-event-{uuid4()}",
             "detectedAt": now_iso(),
+            "occupancy": protocol_occupancy_snapshot(
+                {"present": True},
+                state_hint="single",
+            ),
             "profile": protocol_profile,
             "quality": {
                 "overall": "fair",
                 "warnings": ["mock scenario enabled: success"],
+                "profileUsable": True,
                 "sampleCount": 1,
                 "validFrameCount": 1,
             },
@@ -636,8 +816,105 @@ def mock_profile_event():
     return None
 
 
+def mock_ambient_light(enabled: bool):
+    if not enabled:
+        return None
+
+    return {
+        "level": "dim",
+        "measuredAt": now_iso(),
+        "source": "camera",
+        "confidence": 0.5,
+        "sample": {"lumaMean": 80.0},
+    }
+
+
+def mock_presence_status(scenario: str, include_ambient_light: bool):
+    proximity_by_scenario = {
+        "success": {
+            "present": True,
+            "close": True,
+            "closeNow": True,
+            "closeTrigger": "close_now",
+            "personReady": True,
+            "personPresent": True,
+            "largestPersonRatio": 0.21,
+            "method": "mock",
+        },
+        "no_person": {
+            "present": False,
+            "close": False,
+            "closeNow": False,
+            "closeTrigger": None,
+            "personReady": True,
+            "personPresent": False,
+            "largestPersonRatio": 0.0,
+            "method": "mock",
+        },
+        "timeout": {
+            "present": False,
+            "close": False,
+            "closeNow": False,
+            "closeTrigger": None,
+            "personReady": True,
+            "personPresent": False,
+            "largestPersonRatio": 0.0,
+            "method": "mock",
+        },
+    }
+    state_by_scenario = {
+        "success": "approach",
+        "no_person": "empty",
+        "timeout": "waiting",
+    }
+    reason_by_scenario = {
+        "success": "mock_person_close_profile_pending",
+        "no_person": "mock_no_person",
+        "timeout": "mock_timeout_waiting",
+    }
+    proximity = proximity_by_scenario.get(scenario, {})
+
+    return build_presence_status(
+        event_id=f"vision-status-{uuid4()}",
+        state=state_by_scenario.get(scenario, "waiting"),
+        reason=reason_by_scenario.get(scenario, f"mock_{scenario}"),
+        proximity=proximity,
+        occupancy=protocol_occupancy_snapshot(proximity),
+        ambient_light=mock_ambient_light(include_ambient_light),
+    )
+
+
+def mock_departure_event(include_ambient_light: bool):
+    now_monotonic = time.time()
+    last_seen_at = now_iso()
+    time.sleep(0.001)
+
+    payload = {
+        "eventId": f"vision-departure-{uuid4()}",
+        "detectedAt": now_iso(),
+        "lastSeenAt": last_seen_at,
+        "reason": "left_frame",
+        "absenceDurationMs": int((time.time() - now_monotonic) * 1000),
+    }
+
+    ambient_light = mock_ambient_light(include_ambient_light)
+    if ambient_light is not None:
+        payload["ambientLight"] = ambient_light
+
+    return payload
+
+
 def sample_frame(source, index, proximity=None, track=None):
-    image = capture_image()
+    owner_status = get_front_camera_owner()
+    if owner_status.get("owner") != "vision":
+        raise FrontCameraBusy(
+            owner_status=owner_status,
+            reason="front_camera_owner_changed",
+        )
+
+    with front_camera_io_lock():
+        image = read_camera("front", warmup_frames=1)
+
     inference_image = resize_for_profile_inference(image)
     quality = image_quality(image)
     profile = infer_image(inference_image)
@@ -689,22 +966,6 @@ def sample_frame(source, index, proximity=None, track=None):
 
     return sample
 
-
-def save_trace_sample(trace, sample):
-    if trace is None:
-        return
-
-    trace.save_sample(
-        index=sample["summary"]["index"],
-        raw_image=sample["rawImage"],
-        inference_image=sample["inferenceImage"],
-        profile=sample["profile"],
-        protocol_profile=sample["protocolProfile"],
-        frame_quality=sample["quality"],
-        valid=sample["valid"],
-    )
-
-
 def to_public_sample(sample):
     return dict(sample["summary"])
 
@@ -721,7 +982,7 @@ def is_face_vote_candidate(sample):
     )
 
 
-def collect_face_vote_samples(samples, proximity, track, trace):
+def collect_face_vote_samples(samples, proximity, track):
     if not settings.PROFILE_FACE_VOTE_ENABLED:
         return
 
@@ -742,7 +1003,6 @@ def collect_face_vote_samples(samples, proximity, track, trace):
             track=track,
         )
         samples.append(sample)
-        save_trace_sample(trace, sample)
 
         if is_face_vote_candidate(sample):
             qualified_count += 1
@@ -760,6 +1020,7 @@ def build_presence_status(
     occupancy=None,
     sample=None,
     detail=None,
+    ambient_light=None,
 ):
     proximity = proximity or {}
     payload = {
@@ -774,17 +1035,14 @@ def build_presence_status(
         "proximity": proximity,
     }
 
-    if tracking is not None:
-        payload["tracking"] = tracking
+    payload["occupancy"] = (
+        normalize_protocol_occupancy(occupancy, proximity)
+        if occupancy is not None
+        else protocol_occupancy_snapshot(proximity)
+    )
 
-    if occupancy is not None:
-        payload["occupancy"] = occupancy
-
-    if sample is not None:
-        payload["sample"] = sample
-
-    if detail is not None:
-        payload["detail"] = detail
+    if ambient_light is not None:
+        payload["ambientLight"] = ambient_light
 
     return payload
 
@@ -792,89 +1050,49 @@ def build_presence_status(
 def profile_update(message_type, payload):
     return {
         "message_type": message_type,
-        "payload": payload,
+        "payload": dict(payload),
     }
 
 
-def collect_profile_update(include_status: bool = False):
-    if settings.MOCK_SCENARIO != "off":
-        event_payload = mock_profile_event()
+def collect_front_profile_update(
+    event_id,
+    proximity,
+    track,
+    close_enough,
+    ambient_light,
+    include_status,
+):
+    owner_result = wait_for_front_camera_owner(event_id)
 
-        if event_payload is not None:
-            return profile_update("vision.profile_result", event_payload)
+    if not owner_result.get("ok"):
+        reason = owner_result.get("error") or "front_camera_busy"
+        mark_vision_session_waiting_front_camera(
+            reason=reason,
+            owner_status=owner_result,
+        )
 
         if include_status:
-            return profile_update(
-                "vision.presence_status",
-                build_presence_status(
-                    event_id=f"vision-status-{uuid4()}",
-                    state="empty"
-                    if settings.MOCK_SCENARIO == "no_person"
-                    else "waiting",
-                    reason=f"mock_{settings.MOCK_SCENARIO}",
-                ),
+            return build_front_camera_waiting_update(
+                event_id=event_id,
+                reason=reason,
+                proximity=proximity,
+                tracking=track.public_state(),
+                occupancy=get_occupancy_gate().public_state(),
+                ambient_light=ambient_light,
+                owner_status=owner_result,
             )
 
         return None
 
-    event_id = f"vision-event-{uuid4()}"
-    trace = None
-    proximity = None
+    try:
+        mark_vision_session_profiling(reason="front_profile_sampling")
+        track.prune_body_samples()
+        samples = list(track.body_samples)
 
-    if settings.PROXIMITY_ENABLED:
-        proximity, proximity_image = check_proximity_once_with_image()
-        signature = target_signature_from_proximity(proximity)
-        occupancy_gate = get_occupancy_gate()
-
-        if not proximity["present"]:
-            occupancy_gate.mark_absent()
-            mark_active_track_missing()
-            if include_status:
-                return profile_update(
-                    "vision.presence_status",
-                    build_presence_status(
-                        event_id=event_id,
-                        state="empty",
-                        reason="no_person",
-                        proximity=proximity,
-                        occupancy=occupancy_gate.public_state(),
-                    ),
-                )
-            return None
-
-        occupancy_gate.mark_present()
-        close_enough = bool(proximity.get("close") or proximity.get("closeNow"))
-        proximity["closeTrigger"] = (
-            "close_streak"
-            if proximity.get("close")
-            else "close_now"
-            if proximity.get("closeNow")
-            else None
-        )
-        track_state = "close" if close_enough else "approach"
-        track = ensure_active_track(signature, track_state)
-
-        if close_enough and not occupancy_gate.can_trigger():
-            if include_status:
-                return profile_update(
-                    "vision.presence_status",
-                    build_presence_status(
-                        event_id=event_id,
-                        state="occupied",
-                        reason="occupancy_gate_locked",
-                        proximity=proximity,
-                        tracking=track.public_state(),
-                        occupancy=occupancy_gate.public_state(),
-                    ),
-                )
-
-            return None
-
-        trace = ProcessTrace(event_id)
-        trace.save_proximity(proximity_image, proximity)
+        for index, sample in enumerate(samples, start=1):
+            sample["summary"]["index"] = index
 
         if not close_enough:
-            track.prune_body_samples()
             body_sample = sample_frame(
                 source="body_buffer",
                 index=len(track.body_samples) + 1,
@@ -884,14 +1102,11 @@ def collect_profile_update(include_status: bool = False):
             if body_sample["protocolProfile"]["personPresent"]:
                 track.append_body_sample(body_sample)
 
-            trace.finish(
-                status="not_pushed",
+            mark_vision_session_presence(
+                "approach_detected",
                 reason="person_present_but_not_close",
-                payload={
-                    "proximity": proximity,
-                    "tracking": track.public_state(),
-                    "sample": to_public_sample(body_sample),
-                },
+                proximity=proximity,
+                occupancy=get_occupancy_gate().public_state(),
             )
 
             if include_status:
@@ -903,13 +1118,380 @@ def collect_profile_update(include_status: bool = False):
                         reason="person_present_but_not_close",
                         proximity=proximity,
                         tracking=track.public_state(),
-                        occupancy=occupancy_gate.public_state(),
+                        occupancy=get_occupancy_gate().public_state(),
                         sample=to_public_sample(body_sample),
+                        ambient_light=ambient_light,
                     ),
                 )
 
             return None
+
+        close_sample = sample_frame(
+            source="close_sample",
+            index=len(samples) + 1,
+            proximity=proximity,
+            track=track,
+        )
+        samples.append(close_sample)
+
+        if close_sample["protocolProfile"]["personPresent"]:
+            track.append_body_sample(close_sample)
+
+        collect_face_vote_samples(samples, proximity, track)
+
+        valid_samples = [sample for sample in samples if sample["valid"]]
+        public_samples = [to_public_sample(sample) for sample in samples]
+        required_valid_frames = 1
+
+        if len(valid_samples) < required_valid_frames:
+            mark_vision_session_unusable(reason="not_enough_valid_frames")
+            if include_status:
+                return profile_update(
+                    "vision.presence_status",
+                    build_presence_status(
+                        event_id=event_id,
+                        state="unusable",
+                        reason="not_enough_valid_frames",
+                        proximity=proximity,
+                        tracking=track.public_state(),
+                        occupancy=get_occupancy_gate().public_state(),
+                        ambient_light=ambient_light,
+                        detail={
+                            "validFrameCount": len(valid_samples),
+                            "minValidFrames": required_valid_frames,
+                        },
+                    ),
+                )
+            return None
+
+        aggregated = aggregate_samples(samples)
+
+        if aggregated is None:
+            mark_vision_session_unusable(reason="not_enough_valid_frames")
+            if include_status:
+                return profile_update(
+                    "vision.presence_status",
+                    build_presence_status(
+                        event_id=event_id,
+                        state="unusable",
+                        reason="not_enough_valid_frames",
+                        proximity=proximity,
+                        tracking=track.public_state(),
+                        occupancy=get_occupancy_gate().public_state(),
+                        ambient_light=ambient_light,
+                        detail={
+                            "validFrameCount": len(valid_samples),
+                            "minValidFrames": required_valid_frames,
+                        },
+                    ),
+                )
+            return None
+
+        _, protocol_profile = aggregated
+        quality = build_quality(
+            protocol_profile,
+            public_samples,
+            len(valid_samples),
+            proximity=proximity,
+            min_valid_frames=required_valid_frames,
+            sampling_mode="top_presence_front_profile",
+        )
+
+        if protocol_profile["confidence"] < settings.PROFILE_MIN_CONFIDENCE:
+            mark_vision_session_unusable(reason="confidence_below_threshold")
+            if include_status:
+                return profile_update(
+                    "vision.presence_status",
+                    build_presence_status(
+                        event_id=event_id,
+                        state="unusable",
+                        reason="confidence_below_threshold",
+                        proximity=proximity,
+                        tracking=track.public_state(),
+                        occupancy=get_occupancy_gate().public_state(),
+                        ambient_light=ambient_light,
+                        detail={
+                            "confidence": protocol_profile["confidence"],
+                            "minConfidence": settings.PROFILE_MIN_CONFIDENCE,
+                        },
+                    ),
+                )
+            return None
+
+        payload = {
+            "eventId": event_id,
+            "detectedAt": now_iso(),
+            "occupancy": normalize_protocol_occupancy(
+                get_occupancy_gate().public_state(),
+                proximity,
+            ),
+            "profile": protocol_profile,
+            "quality": quality,
+        }
+
+        track.update(track.signature, "pushed", match_score=track.match_score)
+        get_occupancy_gate().mark_pushed(event_id)
+        reset_active_track()
+        mark_vision_session_profile_pushed(payload)
+
+        return profile_update("vision.profile_result", payload)
+
+    except FrontCameraBusy as exc:
+        mark_vision_session_waiting_front_camera(
+            reason=exc.reason,
+            owner_status=exc.owner_status,
+        )
+
+        if include_status:
+            return build_front_camera_waiting_update(
+                event_id=event_id,
+                reason=exc.reason,
+                proximity=proximity,
+                tracking=track.public_state(),
+                occupancy=get_occupancy_gate().public_state(),
+                ambient_light=ambient_light,
+                owner_status=exc.owner_status,
+            )
+
+        return None
+
+    finally:
+        release_front_camera("vision", reason=f"profile_done:{event_id}")
+
+
+def collect_profile_update(
+    include_status: bool = False,
+    include_ambient_light: bool = False,
+    include_departure: bool = False,
+):
+    global _mock_pending_profile_payload, _mock_pending_departure_payload
+
+    if settings.MOCK_SCENARIO != "off":
+        scenario = settings.MOCK_SCENARIO
+
+        if _mock_pending_profile_payload is not None:
+            event_payload = _mock_pending_profile_payload
+            _mock_pending_profile_payload = None
+            mark_vision_session_profile_pushed(event_payload)
+            return profile_update("vision.profile_result", event_payload)
+
+        if _mock_pending_departure_payload is not None:
+            pending_departure = _mock_pending_departure_payload
+            _mock_pending_departure_payload = None
+            event_payload = mock_departure_event(
+                pending_departure.get("includeAmbientLight", False)
+            )
+            mark_vision_session_departed(event_payload)
+            return profile_update("vision.person_departed", event_payload)
+
+        if scenario in {"success", "no_person", "timeout"} and include_status:
+            if scenario == "success":
+                mock_proximity = {"present": True}
+                mark_vision_session_presence(
+                    "approach_detected",
+                    reason="mock_person_close_profile_pending",
+                    proximity=mock_proximity,
+                    occupancy=protocol_occupancy_snapshot(mock_proximity),
+                )
+                _mock_pending_profile_payload = mock_profile_event()
+                if include_departure:
+                    _mock_pending_departure_payload = {
+                        "includeAmbientLight": include_ambient_light,
+                    }
+            else:
+                mark_vision_session_departed(
+                    {
+                        "eventId": f"vision-departure-{uuid4()}",
+                        "detectedAt": now_iso(),
+                        "reason": f"mock_{scenario}",
+                    }
+                )
+            return profile_update(
+                "vision.presence_status",
+                mock_presence_status(scenario, include_ambient_light),
+            )
+
+        event_payload = mock_profile_event()
+
+        if event_payload is not None:
+            mark_vision_session_profile_pushed(event_payload)
+            return profile_update("vision.profile_result", event_payload)
+
+        return None
+
+    event_id = f"vision-event-{uuid4()}"
+    proximity = None
+
+    if settings.PROXIMITY_ENABLED:
+        proximity, proximity_image = check_proximity_once_with_image()
+        ambient_light = (
+            estimate_ambient_light(proximity_image)
+            if include_ambient_light
+            else None
+        )
+        signature = target_signature_from_proximity(proximity)
+        occupancy_gate = get_occupancy_gate()
+
+        if not proximity["present"]:
+            occupancy_gate.mark_absent()
+            mark_active_track_missing()
+            departure_payload = _departure_tracker.mark_absent(
+                reason="no_person",
+                ambient_light=ambient_light,
+            )
+
+            try_on_status = active_try_on_status()
+
+            if departure_payload is not None and try_on_status:
+                mark_active_try_on_departed(departure_payload)
+                mark_vision_session_tryon_departed(departure_payload)
+
+            if departure_payload is not None and not try_on_status:
+                mark_vision_session_departed(departure_payload)
+
+            if departure_payload is not None and include_departure:
+                return profile_update("vision.person_departed", departure_payload)
+
+            if include_status:
+                return profile_update(
+                    "vision.presence_status",
+                    build_presence_status(
+                        event_id=event_id,
+                        state="empty",
+                        reason="no_person",
+                        proximity=proximity,
+                        occupancy=occupancy_gate.public_state(),
+                        ambient_light=ambient_light,
+                    ),
+                )
+            return None
+
+        occupancy_gate.mark_present()
+        _departure_tracker.mark_present()
+        close_enough = bool(proximity.get("close") or proximity.get("closeNow"))
+        proximity["closeTrigger"] = (
+            "close_streak"
+            if proximity.get("close")
+            else "close_now"
+            if proximity.get("closeNow")
+            else None
+        )
+        track_state = "close" if close_enough else "approach"
+        track = ensure_active_track(signature, track_state)
+        occupancy_snapshot = protocol_occupancy_snapshot(proximity)
+
+        if occupancy_snapshot["state"] == "multiple":
+            mark_vision_session_presence(
+                "multiple",
+                reason="multiple_people_detected",
+                proximity=proximity,
+                occupancy=occupancy_snapshot,
+            )
+
+            if include_status:
+                return profile_update(
+                    "vision.presence_status",
+                    build_presence_status(
+                        event_id=event_id,
+                        state="occupied",
+                        reason="multiple_people_detected",
+                        proximity=proximity,
+                        tracking=track.public_state(),
+                        occupancy=occupancy_snapshot,
+                        ambient_light=ambient_light,
+                    ),
+                )
+
+            return None
+
+        try_on_status = active_try_on_status()
+        if try_on_status is not None:
+            mark_vision_session_presence(
+                "tryon_active",
+                reason="front_camera_reserved_by_tryon",
+                proximity=proximity,
+                occupancy=occupancy_snapshot,
+            )
+
+            if include_status:
+                return profile_update(
+                    "vision.presence_status",
+                    build_presence_status(
+                        event_id=event_id,
+                        state="waiting",
+                        reason="front_camera_reserved_by_tryon",
+                        proximity=proximity,
+                        tracking=track.public_state(),
+                        occupancy=occupancy_snapshot,
+                        ambient_light=ambient_light,
+                    ),
+                )
+
+            return None
+
+        if close_enough and not occupancy_gate.can_trigger():
+            mark_vision_session_presence(
+                "profile_pushed",
+                reason="occupancy_gate_locked",
+                proximity=proximity,
+                occupancy=occupancy_gate.public_state(),
+            )
+
+            if include_status:
+                return profile_update(
+                    "vision.presence_status",
+                    build_presence_status(
+                        event_id=event_id,
+                        state="occupied",
+                        reason="occupancy_gate_locked",
+                        proximity=proximity,
+                        tracking=track.public_state(),
+                        occupancy=occupancy_gate.public_state(),
+                        ambient_light=ambient_light,
+                    ),
+                )
+
+            return None
+
+        if include_status and track.announce_presence_once(track_state):
+            mark_vision_session_presence(
+                "approach_detected",
+                reason=(
+                    "person_close_profile_pending"
+                    if close_enough
+                    else "person_present_but_not_close"
+                ),
+                proximity=proximity,
+                occupancy=occupancy_gate.public_state(),
+            )
+
+            return profile_update(
+                "vision.presence_status",
+                build_presence_status(
+                    event_id=event_id,
+                    state="approach",
+                    reason=(
+                        "person_close_profile_pending"
+                        if close_enough
+                        else "person_present_but_not_close"
+                    ),
+                    proximity=proximity,
+                    tracking=track.public_state(),
+                    occupancy=occupancy_gate.public_state(),
+                    ambient_light=ambient_light,
+                ),
+            )
+
+        return collect_front_profile_update(
+            event_id=event_id,
+            proximity=proximity,
+            track=track,
+            close_enough=close_enough,
+            ambient_light=ambient_light,
+            include_status=include_status,
+        )
     else:
+        ambient_light = None
         signature = {
             "source": "disabled",
             "centerX": 0.5,
@@ -918,7 +1500,6 @@ def collect_profile_update(include_status: bool = False):
             "count": 1,
         }
         track = ensure_active_track(signature, "close")
-        trace = ProcessTrace(event_id)
         occupancy_gate = get_occupancy_gate()
         occupancy_gate.mark_present()
 
@@ -932,159 +1513,20 @@ def collect_profile_update(include_status: bool = False):
                         reason="occupancy_gate_locked",
                         tracking=track.public_state(),
                         occupancy=occupancy_gate.public_state(),
+                        ambient_light=ambient_light,
                     ),
                 )
 
             return None
 
-    track.prune_body_samples()
-    samples = list(track.body_samples)
-
-    for index, sample in enumerate(samples, start=1):
-        sample["summary"]["index"] = index
-        save_trace_sample(trace, sample)
-
-    close_sample = sample_frame(
-        source="close_sample",
-        index=len(samples) + 1,
+    return collect_front_profile_update(
+        event_id=event_id,
         proximity=proximity,
         track=track,
+        close_enough=True,
+        ambient_light=ambient_light,
+        include_status=include_status,
     )
-    samples.append(close_sample)
-    save_trace_sample(trace, close_sample)
-
-    if close_sample["protocolProfile"]["personPresent"]:
-        track.append_body_sample(close_sample)
-
-    collect_face_vote_samples(samples, proximity, track, trace)
-
-    valid_samples = [sample for sample in samples if sample["valid"]]
-    public_samples = [to_public_sample(sample) for sample in samples]
-    required_valid_frames = 1
-
-    if len(valid_samples) < required_valid_frames:
-        if trace is not None:
-            trace.finish(
-                status="not_pushed",
-                reason="not_enough_valid_frames",
-                payload={
-                    "validFrameCount": len(valid_samples),
-                    "minValidFrames": required_valid_frames,
-                    "samples": public_samples,
-                    "proximity": proximity,
-                    "tracking": track.public_state(),
-                },
-            )
-        if include_status:
-            return profile_update(
-                "vision.presence_status",
-                build_presence_status(
-                    event_id=event_id,
-                    state="unusable",
-                    reason="not_enough_valid_frames",
-                    proximity=proximity,
-                    tracking=track.public_state(),
-                    occupancy=get_occupancy_gate().public_state(),
-                    detail={
-                        "validFrameCount": len(valid_samples),
-                        "minValidFrames": required_valid_frames,
-                    },
-                ),
-            )
-        return None
-
-    aggregated = aggregate_samples(samples)
-
-    if aggregated is None:
-        if trace is not None:
-            trace.finish(
-                status="not_pushed",
-                reason="not_enough_valid_frames",
-                payload={
-                    "validFrameCount": len(valid_samples),
-                    "minValidFrames": required_valid_frames,
-                    "samples": public_samples,
-                    "proximity": proximity,
-                    "tracking": track.public_state(),
-                },
-            )
-        if include_status:
-            return profile_update(
-                "vision.presence_status",
-                build_presence_status(
-                    event_id=event_id,
-                    state="unusable",
-                    reason="not_enough_valid_frames",
-                    proximity=proximity,
-                    tracking=track.public_state(),
-                    occupancy=get_occupancy_gate().public_state(),
-                    detail={
-                        "validFrameCount": len(valid_samples),
-                        "minValidFrames": required_valid_frames,
-                    },
-                ),
-            )
-        return None
-
-    _, protocol_profile = aggregated
-    quality = build_quality(
-        protocol_profile,
-        public_samples,
-        len(valid_samples),
-        proximity=proximity,
-        tracking=track.public_state(),
-        occupancy=get_occupancy_gate().public_state(),
-        min_valid_frames=required_valid_frames,
-        sampling_mode="approach_buffer_immediate_close",
-    )
-
-    if protocol_profile["confidence"] < settings.PROFILE_MIN_CONFIDENCE:
-        if trace is not None:
-            trace.finish(
-                status="not_pushed",
-                reason="confidence_below_threshold",
-                payload={
-                    "profile": protocol_profile,
-                    "quality": quality,
-                },
-            )
-        if include_status:
-            return profile_update(
-                "vision.presence_status",
-                build_presence_status(
-                    event_id=event_id,
-                    state="unusable",
-                    reason="confidence_below_threshold",
-                    proximity=proximity,
-                    tracking=track.public_state(),
-                    occupancy=get_occupancy_gate().public_state(),
-                    detail={
-                        "confidence": protocol_profile["confidence"],
-                        "minConfidence": settings.PROFILE_MIN_CONFIDENCE,
-                    },
-                ),
-            )
-        return None
-
-    payload = {
-        "eventId": event_id,
-        "detectedAt": now_iso(),
-        "profile": protocol_profile,
-        "quality": quality,
-    }
-
-    trace_dir = trace.finish(status="pushed", payload=payload) if trace else None
-
-    if trace_dir:
-        payload["quality"]["trace"] = {
-            "eventDir": trace_dir,
-        }
-
-    track.update(track.signature, "pushed", match_score=track.match_score)
-    get_occupancy_gate().mark_pushed(event_id)
-    reset_active_track()
-
-    return profile_update("vision.profile_result", payload)
 
 
 def collect_profile_event():

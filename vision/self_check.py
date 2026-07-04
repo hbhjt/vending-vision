@@ -4,7 +4,7 @@ from vision.face_detector import FaceDetector
 from vision.person_detector import PersonDetector
 from vision.logger import logger
 from vision.age_gender_estimator import AgeGenderEstimator
-from vision.camera import get_configured_camera_status
+from vision.camera_manager import get_all_camera_statuses
 
 def check_camera():
     """
@@ -19,18 +19,12 @@ def check_camera():
         }
 
     try:
-        status = get_configured_camera_status()
-        frame = status["frame"]
-        actual = status["actual"]
+        statuses = get_all_camera_statuses()
+        ok = all(status.get("ok") for status in statuses.values())
         return {
-            "ok": True,
-            "message": (
-                f"camera opened, index={settings.CAMERA_INDEX}, "
-                f"backend={settings.CAMERA_BACKEND}, "
-                f"frame={frame['width']}x{frame['height']}, "
-                f"actual={actual['width']}x{actual['height']}@{actual['fps']}fps"
-            ),
-            "detail": status,
+            "ok": ok,
+            "message": "top/front cameras checked",
+            "detail": statuses,
         }
     except Exception as e:
         return {
