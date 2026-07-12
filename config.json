@@ -9,6 +9,61 @@
   "camera_keep_open": true,
   "camera_read_retry_count": 2,
   "camera_reconnect_delay_ms": 300,
+  "models": {
+    "person_detector": {
+      "type": "yolo11",
+      "path": "models/person_detection/yolo11s.onnx",
+      "fallback_path": "models/person_detection/person_yolov8n.onnx",
+      "input_size": 640,
+      "conf_threshold": 0.35,
+      "iou_threshold": 0.45,
+      "person_class_id": 0
+    },
+    "face_detector": {
+      "type": "scrfd",
+      "path": "models/face_detection/scrfd_10g.onnx",
+      "fallback_type": "yunet",
+      "fallback_path": "models/face_detection/face_detection_yunet_2023mar.onnx",
+      "conf_threshold": 0.45
+    },
+    "age_gender": {
+      "type": "openvino",
+      "xml_path": "models/age_gender/age-gender-recognition-retail-0013.xml",
+      "bin_path": "models/age_gender/age-gender-recognition-retail-0013.bin",
+      "fallback_type": "caffe"
+    },
+    "pose": {
+      "type": "yolo11_pose",
+      "path": "models/pose/yolo11s-pose.onnx",
+      "fallback_type": "mediapipe",
+      "conf_threshold": 0.35
+    }
+  },
+  "top_occupancy": {
+    "enabled": true,
+    "roi": [0.0, 0.0, 1.0, 1.0],
+    "history_size": 2,
+    "present_min_frames": 2,
+    "single_min_frames": 1,
+    "multiple_min_frames": 1,
+    "absent_min_seconds": 0.6,
+    "track_iou_threshold": 0.3,
+    "track_min_age_frames": 1,
+    "track_max_missed_frames": 5
+  },
+  "profile_sampling": {
+    "duration_sec": 2.0,
+    "early_finish_after_sec": 1.0,
+    "target_fps": 8,
+    "min_good_frames": 2,
+    "max_good_frames": 10,
+    "min_face_area_ratio": 0.006,
+    "min_face_score": 0.35,
+    "min_person_score": 0.30,
+    "min_blur_score": 25.0,
+    "brightness_min": 35,
+    "brightness_max": 230
+  },
   "cameras": {
     "top": {
       "index": 0,
@@ -18,7 +73,15 @@
       "fps": 30,
       "fourcc": "MJPG",
       "role": "presence",
-      "keep_open": true
+      "keep_open": true,
+      "rotate": 0,
+      "roi": {
+        "enabled": true,
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1.0,
+        "height": 1.0
+      }
     },
     "front": {
       "index": 1,
@@ -28,13 +91,19 @@
       "fps": 30,
       "fourcc": "MJPG",
       "role": "profile_tryon",
-      "keep_open": true
+      "keep_open": true,
+      "rotate": 270
     }
   },
   "front_camera_profile_max_wait_ms": 3000,
   "front_camera_profile_sample_count": 6,
-  "front_camera_profile_sample_interval_ms": 250,
+  "front_camera_profile_sample_interval_ms": 125,
   "front_camera_owner_timeout_ms": 120000,
+  "try_on_session_ttl_ms": 600000,
+  "try_on_session_history_limit": 32,
+  "try_on_max_stream_clients": 2,
+  "websocket_send_timeout_ms": 2000,
+  "websocket_queue_size": 16,
 
   "height_scale": 100,
   "height_offset": 80,
@@ -50,12 +119,9 @@
   "body_mask_type_thin_threshold": 0.32,
   "body_mask_type_fat_threshold": 0.46,
 
-  "default_timeout_ms": 8000,
-
   "profile_push_enabled": true,
   "profile_push_interval_ms": 300,
   "profile_push_cooldown_ms": 8000,
-  "profile_sample_count": 5,
   "profile_body_buffer_max_frames": 8,
   "profile_body_buffer_ttl_ms": 4000,
   "profile_track_enabled": true,
@@ -63,9 +129,9 @@
   "profile_track_max_center_shift": 0.35,
   "profile_track_min_match_score": 0.45,
   "profile_occupancy_gate_enabled": true,
-  "profile_occupancy_reset_absent_frames": 6,
-  "profile_min_confidence": 0.45,
-  "profile_min_valid_frames": 1,
+  "profile_occupancy_reset_absent_frames": 1,
+  "profile_min_confidence": 0.25,
+  "profile_min_valid_frames": 2,
   "profile_face_vote_enabled": true,
   "profile_face_vote_sample_count": 3,
   "profile_face_vote_interval_ms": 120,
@@ -75,17 +141,17 @@
   "proximity_enabled": true,
   "proximity_monitor_width": 416,
   "proximity_monitor_height": 234,
-  "proximity_present_face_ratio": 0.003,
-  "proximity_close_face_ratio": 0.015,
+  "proximity_present_face_ratio": 0.0015,
+  "proximity_close_face_ratio": 0.005,
   "proximity_close_consecutive_frames": 2,
   "proximity_person_enabled": true,
-  "proximity_present_person_ratio": 0.04,
-  "proximity_close_person_ratio": 0.18,
+  "proximity_present_person_ratio": 0.02,
+  "proximity_close_person_ratio": 0.07,
   "proximity_body_enabled": true,
   "proximity_body_min_visibility": 0.45,
   "proximity_body_min_visible_points": 6,
-  "proximity_present_body_ratio": 0.08,
-  "proximity_close_body_ratio": 0.22,
+  "proximity_present_body_ratio": 0.04,
+  "proximity_close_body_ratio": 0.08,
   "person_detector_model": "models/person_detection/person_yolov8n.onnx",
   "person_detector_input_width": 640,
   "person_detector_input_height": 640,
@@ -98,5 +164,9 @@
   "mock_scenario": "off",
 
   "host": "127.0.0.1",
-  "port": 7892
+  "port": 7892,
+
+  "log_level": "INFO",
+  "log_max_bytes": 5242880,
+  "log_backup_count": 5
 }

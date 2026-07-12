@@ -1,29 +1,104 @@
+"""
+配置管理模块
+
+负责加载和解析应用配置，支持三层优先级：
+1. 环境变量（最高优先级）
+2. config.json 文件
+3. 代码中的默认值
+
+同时处理路径解析（支持 PyInstaller 打包后的运行时路径和开发时的当前目录路径）。
+"""
+
 import json
 import os
+import sys
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 路径解析
+# ---------------------------------------------------------------------------
+
+# 运行时基准目录：PyInstaller 打包后使用 _MEIPASS 临时目录，开发时使用项目根目录
+RUNTIME_BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
+# 配置文件基准目录：默认从当前工作目录开始查找
+CONFIG_BASE_DIR = Path.cwd()
+
+
+def runtime_path(path):
+    """将配置中的相对路径解析为运行时实际路径。
+
+    解析顺序：
+    1. 如果是绝对路径，直接返回
+    2. 如果相对于当前工作目录存在，返回该路径
+    3. 否则相对于运行时基准目录（PyInstaller 打包目录）返回
+    """
+    value = Path(path)
+
+    if value.is_absolute():
+        return str(value)
+
+    cwd_path = Path.cwd() / value
+    if cwd_path.exists():
+        return str(cwd_path)
+
+    return str(RUNTIME_BASE_DIR / value)
+
+
+def _config_candidates():
+    """生成配置文件候选路径列表。
+
+    优先使用 VISION_CONFIG_FILE 环境变量指定的路径，
+    其次使用当前目录下的 config.json，
+    最后使用打包目录中的 config.json。
+    """
+    env_config = os.getenv("VISION_CONFIG_FILE")
+
+    if env_config:
+        yield Path(env_config)
+        return
+
+    yield Path.cwd() / "config.json"
+    bundled_config = RUNTIME_BASE_DIR / "config.json"
+
+    if bundled_config != Path.cwd() / "config.json":
+        yield bundled_config
 
 
 def load_json_config():
-    config_path = os.getenv("VISION_CONFIG_FILE", "config.json")
+    """从候选路径中加载 JSON 配置文件。
 
-    if not os.path.exists(config_path):
-        return {}
+    遍历所有候选路径，返回第一个成功解析的配置字典。
+    同时更新 CONFIG_BASE_DIR 为配置文件所在目录。
+    """
+    global CONFIG_BASE_DIR
 
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    for config_path in _config_candidates():
+        if not config_path.exists():
+            continue
+
+        try:
+            CONFIG_BASE_DIR = config_path.parent
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    return {}
 
 
+# 全局配置缓存：在模块加载时一次性读取 JSON 配置文件
 _json_config = load_json_config()
+
+# ---------------------------------------------------------------------------
+# 配置读取工具函数
+# ---------------------------------------------------------------------------
 
 
 def get_config_value(key, env_key, default):
     """
-    配置优先级：
-    1. 环境变量
-    2. config.json
-    3. 默认值
+    获取单个配置值，按优先级：环境变量 > config.json > 默认值。
+
+    自动根据默认值类型进行类型转换（bool/int/float/str）。
     """
     if env_key in os.environ:
         value = os.getenv(env_key)
@@ -43,6 +118,7 @@ def get_config_value(key, env_key, default):
 
 
 def get_json_config_value(key, env_key, default):
+    """获取 JSON 类型的配置值（如字典、列表），支持环境变量覆盖。"""
     if env_key in os.environ:
         try:
             return json.loads(os.getenv(env_key) or "")
@@ -53,7 +129,87 @@ def get_json_config_value(key, env_key, default):
     return value if isinstance(value, type(default)) else default
 
 
+def get_nested_config_value(section, key, env_key, default):
+    """获取嵌套配置值（从 config.json 的某个 section 下读取 key）。"""
+    if env_key in os.environ:
+        value = os.getenv(env_key)
+
+        if isinstance(default, bool):
+            return str(value).lower() == "true"
+
+        if isinstance(default, int):
+            return int(value)
+
+        if isinstance(default, float):
+            return float(value)
+
+        try:
+            if isinstance(default, (dict, list)):
+                return json.loads(value or "")
+        except Exception:
+            return default
+
+        return value
+
+    section_value = _json_config.get(section, {})
+    if not isinstance(section_value, dict):
+        return default
+
+    value = section_value.get(key, default)
+    return value if isinstance(value, type(default)) else default
+
+
+def get_model_config(name, default):
+    """获取模型配置，将 JSON 中的模型参数与默认值合并。"""
+    models = _json_config.get("models", {})
+
+    if not isinstance(models, dict):
+        return dict(default)
+
+    value = models.get(name, {})
+    config = dict(default)
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if item is not None:
+                config[key] = item
+
+    return config
+
+
+def get_section_config(section, default):
+    """获取整个 section 的配置，将 JSON 值与默认值合并覆盖。"""
+    value = _json_config.get(section, {})
+    config = dict(default)
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if item is not None:
+                config[key] = item
+
+    return config
+
+
+def get_path_config_value(key, env_key, default):
+    """获取路径类型的配置值，自动解析为运行时实际路径。"""
+    if env_key in os.environ:
+        return runtime_path(os.getenv(env_key) or default)
+
+    value = _json_config.get(key, default)
+    path = Path(value)
+
+    if path.is_absolute():
+        return str(path)
+
+    config_path = CONFIG_BASE_DIR / path
+    if config_path.exists():
+        return str(config_path)
+
+    return runtime_path(value)
+
+
 def build_camera_config(cameras, role, fallback):
+    """根据角色（top/front）构建摄像头配置，未指定的字段使用后备值。"""
     config = dict(fallback)
     role_config = cameras.get(role, {}) if isinstance(cameras, dict) else {}
 
@@ -67,6 +223,7 @@ def build_camera_config(cameras, role, fallback):
 
 
 def bool_config_value(value, default=False):
+    """安全地将配置值转换为布尔类型。"""
     if isinstance(value, bool):
         return value
 
@@ -80,6 +237,77 @@ class Settings:
     APP_NAME = "Vending Vision Module"
     APP_VERSION = "0.2.0"
     PROTOCOL = "vem.vision.v1"
+    PERSON_DETECTOR_CONFIG = get_model_config(
+        "person_detector",
+        {
+            "type": "yolo11",
+            "path": "models/person_detection/yolo11s.onnx",
+            "fallback_path": "models/person_detection/person_yolov8n.onnx",
+            "input_size": 640,
+            "conf_threshold": 0.35,
+            "iou_threshold": 0.45,
+            "person_class_id": 0,
+        },
+    )
+    FACE_DETECTOR_CONFIG = get_model_config(
+        "face_detector",
+        {
+            "type": "scrfd",
+            "path": "models/face_detection/scrfd_10g.onnx",
+            "fallback_type": "yunet",
+            "fallback_path": "models/face_detection/face_detection_yunet_2023mar.onnx",
+            "conf_threshold": 0.45,
+        },
+    )
+    AGE_GENDER_CONFIG = get_model_config(
+        "age_gender",
+        {
+            "type": "openvino",
+            "xml_path": "models/age_gender/age-gender-recognition-retail-0013.xml",
+            "bin_path": "models/age_gender/age-gender-recognition-retail-0013.bin",
+            "fallback_type": "caffe",
+        },
+    )
+    POSE_CONFIG = get_model_config(
+        "pose",
+        {
+            "type": "yolo11_pose",
+            "path": "models/pose/yolo11s-pose.onnx",
+            "fallback_type": "mediapipe",
+            "conf_threshold": 0.35,
+        },
+    )
+    TOP_OCCUPANCY_CONFIG = get_section_config(
+        "top_occupancy",
+        {
+            "enabled": True,
+            "roi": [0.0, 0.0, 1.0, 1.0],
+            "history_size": 2,
+            "present_min_frames": 2,
+            "single_min_frames": 1,
+            "multiple_min_frames": 1,
+            "absent_min_seconds": 0.6,
+            "track_iou_threshold": 0.3,
+            "track_min_age_frames": 1,
+            "track_max_missed_frames": 5,
+        },
+    )
+    PROFILE_SAMPLING_CONFIG = get_section_config(
+        "profile_sampling",
+        {
+            "duration_sec": 2.0,
+            "early_finish_after_sec": 1.0,
+            "target_fps": 8,
+            "min_good_frames": 2,
+            "max_good_frames": 10,
+            "min_face_area_ratio": 0.006,
+            "min_face_score": 0.35,
+            "min_person_score": 0.30,
+            "min_blur_score": 25.0,
+            "brightness_min": 35,
+            "brightness_max": 230,
+        },
+    )
     POSE_ENABLE_SEGMENTATION = get_config_value(
         "pose_enable_segmentation",
         "VISION_POSE_ENABLE_SEGMENTATION",
@@ -88,11 +316,6 @@ class Settings:
 
     HOST = get_config_value("host", "VISION_HOST", "127.0.0.1")
     PORT = get_config_value("port", "VISION_PORT", 7892)
-    DEFAULT_TIMEOUT_MS = get_config_value(
-        "default_timeout_ms",
-        "VISION_DEFAULT_TIMEOUT_MS",
-        8000
-    )
     PROFILE_PUSH_ENABLED = get_config_value(
         "profile_push_enabled",
         "VISION_PROFILE_PUSH_ENABLED",
@@ -107,11 +330,6 @@ class Settings:
         "profile_push_cooldown_ms",
         "VISION_PROFILE_PUSH_COOLDOWN_MS",
         8000
-    )
-    PROFILE_SAMPLE_COUNT = get_config_value(
-        "profile_sample_count",
-        "VISION_PROFILE_SAMPLE_COUNT",
-        5
     )
     PROFILE_BODY_BUFFER_MAX_FRAMES = get_config_value(
         "profile_body_buffer_max_frames",
@@ -141,7 +359,7 @@ class Settings:
     PROFILE_TRACK_MIN_MATCH_SCORE = get_config_value(
         "profile_track_min_match_score",
         "VISION_PROFILE_TRACK_MIN_MATCH_SCORE",
-        0.45
+        0.25
     )
     PROFILE_OCCUPANCY_GATE_ENABLED = get_config_value(
         "profile_occupancy_gate_enabled",
@@ -151,12 +369,12 @@ class Settings:
     PROFILE_OCCUPANCY_RESET_ABSENT_FRAMES = get_config_value(
         "profile_occupancy_reset_absent_frames",
         "VISION_PROFILE_OCCUPANCY_RESET_ABSENT_FRAMES",
-        6
+        1
     )
     PROFILE_MIN_CONFIDENCE = get_config_value(
         "profile_min_confidence",
         "VISION_PROFILE_MIN_CONFIDENCE",
-        0.45
+        0.25
     )
     PROFILE_MIN_VALID_FRAMES = get_config_value(
         "profile_min_valid_frames",
@@ -216,7 +434,7 @@ class Settings:
     PROXIMITY_CLOSE_FACE_RATIO = get_config_value(
         "proximity_close_face_ratio",
         "VISION_PROXIMITY_CLOSE_FACE_RATIO",
-        0.015
+        0.005
     )
     PROXIMITY_CLOSE_CONSECUTIVE_FRAMES = get_config_value(
         "proximity_close_consecutive_frames",
@@ -236,7 +454,7 @@ class Settings:
     PROXIMITY_CLOSE_PERSON_RATIO = get_config_value(
         "proximity_close_person_ratio",
         "VISION_PROXIMITY_CLOSE_PERSON_RATIO",
-        0.18
+        0.07
     )
     PROXIMITY_BODY_ENABLED = get_config_value(
         "proximity_body_enabled",
@@ -261,7 +479,7 @@ class Settings:
     PROXIMITY_CLOSE_BODY_RATIO = get_config_value(
         "proximity_close_body_ratio",
         "VISION_PROXIMITY_CLOSE_BODY_RATIO",
-        0.22
+        0.08
     )
     PRIMARY_FACE_MAX_HEAD_DISTANCE_RATIO = get_config_value(
         "primary_face_max_head_distance_ratio",
@@ -350,12 +568,42 @@ class Settings:
     FRONT_CAMERA_PROFILE_SAMPLE_INTERVAL_MS = get_config_value(
         "front_camera_profile_sample_interval_ms",
         "VISION_FRONT_CAMERA_PROFILE_SAMPLE_INTERVAL_MS",
-        250
+        125
     )
     FRONT_CAMERA_OWNER_TIMEOUT_MS = get_config_value(
         "front_camera_owner_timeout_ms",
         "VISION_FRONT_CAMERA_OWNER_TIMEOUT_MS",
         120000
+    )
+    TRY_ON_SESSION_TTL_MS = get_config_value(
+        "try_on_session_ttl_ms",
+        "VISION_TRY_ON_SESSION_TTL_MS",
+        10 * 60 * 1000,
+    )
+    TRY_ON_SESSION_HISTORY_LIMIT = get_config_value(
+        "try_on_session_history_limit",
+        "VISION_TRY_ON_SESSION_HISTORY_LIMIT",
+        32,
+    )
+    TRY_ON_MAX_STREAM_CLIENTS = get_config_value(
+        "try_on_max_stream_clients",
+        "VISION_TRY_ON_MAX_STREAM_CLIENTS",
+        2,
+    )
+    WEBSOCKET_SEND_TIMEOUT_MS = get_config_value(
+        "websocket_send_timeout_ms",
+        "VISION_WEBSOCKET_SEND_TIMEOUT_MS",
+        2000,
+    )
+    WEBSOCKET_QUEUE_SIZE = get_config_value(
+        "websocket_queue_size",
+        "VISION_WEBSOCKET_QUEUE_SIZE",
+        16,
+    )
+    ALLOWED_ORIGINS = tuple(
+        item.strip()
+        for item in str(os.getenv("VISION_ALLOWED_ORIGINS", "")).split(",")
+        if item.strip()
     )
 
     HEIGHT_SCALE = get_config_value("height_scale", "VISION_HEIGHT_SCALE", 100.0)
@@ -414,65 +662,119 @@ class Settings:
         1000
     )
 
-    FACE_DETECTOR_MODEL = os.getenv(
+    FACE_DETECTOR_MODEL = get_path_config_value(
+        "face_detector_model",
         "VISION_FACE_DETECTOR_MODEL",
-        "models/face_detection/face_detection_yunet_2023mar.onnx"
+        FACE_DETECTOR_CONFIG.get(
+            "fallback_path",
+            "models/face_detection/face_detection_yunet_2023mar.onnx",
+        )
+    )
+    SCRFD_FACE_DETECTOR_MODEL = get_path_config_value(
+        "scrfd_face_detector_model",
+        "VISION_SCRFD_FACE_DETECTOR_MODEL",
+        FACE_DETECTOR_CONFIG.get(
+            "path",
+            "models/face_detection/scrfd_10g.onnx",
+        )
+    )
+    FACE_DETECTOR_CONF_THRESHOLD = float(
+        FACE_DETECTOR_CONFIG.get("conf_threshold", 0.45)
     )
 
     FACE_SCORE_THRESHOLD = float(os.getenv("VISION_FACE_SCORE_THRESHOLD", "0.6"))
     FACE_NMS_THRESHOLD = float(os.getenv("VISION_FACE_NMS_THRESHOLD", "0.3"))
     FACE_TOP_K = int(os.getenv("VISION_FACE_TOP_K", "5000"))
 
-    PERSON_DETECTOR_MODEL = get_config_value(
+    PERSON_DETECTOR_MODEL = get_path_config_value(
         "person_detector_model",
         "VISION_PERSON_DETECTOR_MODEL",
-        "models/person_detection/person_yolov8n.onnx"
+        PERSON_DETECTOR_CONFIG.get("path", "models/person_detection/yolo11s.onnx")
+    )
+    PERSON_DETECTOR_FALLBACK_MODEL = get_path_config_value(
+        "person_detector_fallback_model",
+        "VISION_PERSON_DETECTOR_FALLBACK_MODEL",
+        PERSON_DETECTOR_CONFIG.get(
+            "fallback_path",
+            "models/person_detection/person_yolov8n.onnx",
+        )
     )
     PERSON_DETECTOR_INPUT_WIDTH = get_config_value(
         "person_detector_input_width",
         "VISION_PERSON_DETECTOR_INPUT_WIDTH",
-        640
+        int(PERSON_DETECTOR_CONFIG.get("input_size", 640))
     )
     PERSON_DETECTOR_INPUT_HEIGHT = get_config_value(
         "person_detector_input_height",
         "VISION_PERSON_DETECTOR_INPUT_HEIGHT",
-        640
+        int(PERSON_DETECTOR_CONFIG.get("input_size", 640))
     )
     PERSON_DETECTOR_SCORE_THRESHOLD = get_config_value(
         "person_detector_score_threshold",
         "VISION_PERSON_DETECTOR_SCORE_THRESHOLD",
-        0.35
+        float(PERSON_DETECTOR_CONFIG.get("conf_threshold", 0.35))
     )
     PERSON_DETECTOR_NMS_THRESHOLD = get_config_value(
         "person_detector_nms_threshold",
         "VISION_PERSON_DETECTOR_NMS_THRESHOLD",
-        0.45
+        float(PERSON_DETECTOR_CONFIG.get("iou_threshold", 0.45))
     )
     PERSON_DETECTOR_PERSON_CLASS_ID = get_config_value(
         "person_detector_person_class_id",
         "VISION_PERSON_DETECTOR_PERSON_CLASS_ID",
-        0
+        int(PERSON_DETECTOR_CONFIG.get("person_class_id", 0))
     )
 
-    AGE_MODEL_PROTO = os.getenv(
+    AGE_MODEL_PROTO = get_path_config_value(
+        "age_model_proto",
         "VISION_AGE_MODEL_PROTO",
         "models/age_gender/age_deploy.prototxt"
     )
-    AGE_MODEL_WEIGHTS = os.getenv(
+    AGE_MODEL_WEIGHTS = get_path_config_value(
+        "age_model_weights",
         "VISION_AGE_MODEL_WEIGHTS",
         "models/age_gender/age_net.caffemodel"
     )
-    GENDER_MODEL_PROTO = os.getenv(
+    GENDER_MODEL_PROTO = get_path_config_value(
+        "gender_model_proto",
         "VISION_GENDER_MODEL_PROTO",
         "models/age_gender/gender_deploy.prototxt"
     )
-    GENDER_MODEL_WEIGHTS = os.getenv(
+    GENDER_MODEL_WEIGHTS = get_path_config_value(
+        "gender_model_weights",
         "VISION_GENDER_MODEL_WEIGHTS",
         "models/age_gender/gender_net.caffemodel"
+    )
+    OPENVINO_AGE_GENDER_XML = get_path_config_value(
+        "openvino_age_gender_xml",
+        "VISION_OPENVINO_AGE_GENDER_XML",
+        AGE_GENDER_CONFIG.get(
+            "xml_path",
+            "models/age_gender/age-gender-recognition-retail-0013.xml",
+        )
+    )
+    OPENVINO_AGE_GENDER_BIN = get_path_config_value(
+        "openvino_age_gender_bin",
+        "VISION_OPENVINO_AGE_GENDER_BIN",
+        AGE_GENDER_CONFIG.get(
+            "bin_path",
+            "models/age_gender/age-gender-recognition-retail-0013.bin",
+        )
     )
 
     LOG_DIR = os.getenv("VISION_LOG_DIR", "logs")
     LOG_FILE = os.getenv("VISION_LOG_FILE", "logs/vision.log")
+    LOG_LEVEL = get_config_value("log_level", "VISION_LOG_LEVEL", "INFO")
+    LOG_MAX_BYTES = get_config_value(
+        "log_max_bytes",
+        "VISION_LOG_MAX_BYTES",
+        5 * 1024 * 1024
+    )
+    LOG_BACKUP_COUNT = get_config_value(
+        "log_backup_count",
+        "VISION_LOG_BACKUP_COUNT",
+        5
+    )
 
 
 settings = Settings()

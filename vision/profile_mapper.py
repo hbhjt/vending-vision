@@ -1,4 +1,23 @@
+"""
+画像映射模块
+
+负责 VisionProfile（内部数据模型）与协议格式之间的转换：
+- vision_profile_to_protocol: 内部模型 -> 协议 JSON 格式
+- calculate_confidence: 计算画像的整体置信度
+- 体型/年龄范围的映射转换
+"""
+
+
 def age_to_age_range(age):
+    """将年龄数值映射为协议定义的年龄段。
+
+    映射关系：
+    - None -> "unknown"
+    - 0-12 -> "child"
+    - 13-17 -> "teen"
+    - 18-59 -> "adult"
+    - 60+ -> "senior"
+    """
     if age is None:
         return "unknown"
 
@@ -13,6 +32,14 @@ def age_to_age_range(age):
 
 
 def body_type_to_protocol(body_type):
+    """将内部体型标识映射为协议定义的体型标识。
+
+    映射关系：
+    - thin -> "slim"（偏瘦）
+    - medium -> "regular"（标准）
+    - fat -> "strong"（偏胖）
+    - unknown -> "unknown"
+    """
     mapping = {
         "thin": "slim",
         "medium": "regular",
@@ -24,10 +51,19 @@ def body_type_to_protocol(body_type):
 
 
 def calculate_confidence(profile):
-    """
-    原型置信度估算。
+    """计算画像的整体置信度（0.1 ~ 0.95）。
 
-    不仅看字段是否存在，也要检查数值是否合理。
+    评分规则：
+    - 基础分: 0.3
+    - presence=True: +0.2
+    - 身高在合理范围 (140~200): +0.15，否则 -0.15
+    - 肩宽在合理范围 (32~55): +0.1，否则 -0.1
+    - 体型已知: +0.1
+    - 上衣颜色已知: +0.05
+    - 性别已知: +0.02（低权重，当前不稳定）
+    - 年龄已知: +0.02（低权重，当前不稳定）
+
+    最后限制在 [0.1, 0.95] 范围内。
     """
     score = 0.3
 
@@ -68,6 +104,13 @@ def calculate_confidence(profile):
 
 
 def vision_profile_to_protocol(profile):
+    """将 VisionProfile 内部模型转换为协议格式的 JSON 字典。
+
+    转换包括：
+    - 年龄 -> 年龄段 (child/teen/adult/senior)
+    - 体型 -> 协议体型 (slim/regular/strong)
+    - 计算置信度
+    """
     return {
         "personPresent": profile.presence,
         "heightCm": profile.height_cm,

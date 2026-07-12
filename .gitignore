@@ -6,6 +6,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv-packaging/
 venv/
 env/
 ENV/
@@ -21,6 +22,8 @@ logs/
 
 # Debug outputs
 debug_outputs/
+build/
+dist/
 output_*.jpg
 output_*.png
 output_*.jpeg

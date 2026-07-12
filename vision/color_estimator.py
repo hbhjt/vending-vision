@@ -1,19 +1,44 @@
+"""
+上衣颜色分类模块
+
+基于 HSV 色彩空间的上衣颜色估计器。
+利用 MediaPipe 姿态关键点定位上衣区域（肩部到髋部），
+然后对该区域进行 HSV 颜色统计分类。
+"""
+
 import cv2
 import numpy as np
 import mediapipe as mp
 
 
 class UpperColorEstimator:
+    """上衣颜色分类器。
+
+    工作原理：
+    1. 利用姿态关键点（左右肩、左右髋）定位上衣 ROI
+    2. 将 ROI 转换到 HSV 色彩空间
+    3. 根据色相(H)、饱和度(S)、明度(V) 的均值进行分类
+
+    支持的颜色类别：
+    dark, light, red, blue, green, yellow, white, black, unknown
+    """
+
     def __init__(self):
         self.mp_pose = mp.solutions.pose
 
     def estimate(self, image, pose_results) -> str:
-        """
-        根据人体关键点截取上衣区域，并估算主色。
-        返回:
-            dark / light / red / blue / green / yellow / white / black / unknown
-        """
+        """根据姿态关键点截取上衣区域并估算主色。
 
+        要求左右肩和左右髋四个关键点可见度均 >= 0.4。
+        ROI 会适当向外扩展 25%（水平）和 10%（垂直），避免截取过窄。
+
+        Args:
+            image: BGR 格式的 OpenCV 图像
+            pose_results: MediaPipe Pose 检测结果
+
+        Returns:
+            颜色字符串: dark / light / red / blue / green / yellow / white / black / unknown
+        """
         if image is None or not pose_results.pose_landmarks:
             return "unknown"
 
@@ -30,12 +55,13 @@ class UpperColorEstimator:
         if any(lm.visibility < 0.4 for lm in needed):
             return "unknown"
 
+        # 计算上衣区域边界
         x_min = int(min(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w)
         x_max = int(max(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w)
         y_min = int(min(left_shoulder.y, right_shoulder.y) * h)
         y_max = int(max(left_hip.y, right_hip.y) * h)
 
-        # 稍微扩大一点区域，避免只截到身体中心太窄
+        # 稍微扩大区域，避免只截到身体中心太窄
         pad_x = int((x_max - x_min) * 0.25)
         pad_y = int((y_max - y_min) * 0.10)
 
@@ -55,25 +81,28 @@ class UpperColorEstimator:
         return self._classify_color(upper_roi)
 
     def _classify_color(self, roi) -> str:
-        """
-        用 HSV + 亮度规则粗略判断颜色。
-        """
+        """对上衣 ROI 进行 HSV 颜色分类。
 
-        # 缩小图片，减少计算量
+        分类规则：
+        1. 先判断明暗/黑白灰（基于 V 和 S 通道）
+        2. 再根据色相 H 判断具体颜色
+
+        OpenCV HSV 范围：H=[0,179], S=[0,255], V=[0,255]
+        """
+        # 缩小图片以减少计算量
         roi = cv2.resize(roi, (64, 64))
 
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-        h_channel = hsv[:, :, 0]
-        s_channel = hsv[:, :, 1]
-        v_channel = hsv[:, :, 2]
+        h_channel = hsv[:, :, 0]  # 色相
+        s_channel = hsv[:, :, 1]  # 饱和度
+        v_channel = hsv[:, :, 2]  # 明度
 
-        # 去掉低饱和度背景影响
         mean_s = float(np.mean(s_channel))
         mean_v = float(np.mean(v_channel))
         mean_h = float(np.mean(h_channel))
 
-        # 先判断黑白灰和明暗
+        # 先判断黑白灰和明暗（低饱和度或无彩色）
         if mean_v < 60:
             return "black"
 
@@ -86,7 +115,13 @@ class UpperColorEstimator:
             else:
                 return "light"
 
-        # HSV 中 OpenCV H 范围是 0-179
+        # 基于色相判断具体颜色
+        # H 范围 (OpenCV 0-179):
+        #   红: 0-10 或 160-179
+        #   黄: 10-30
+        #   绿: 30-85
+        #   蓝: 85-130
+        #   红（下半段）: 130-160
         if mean_h < 10 or mean_h >= 160:
             return "red"
         elif 10 <= mean_h < 30:
