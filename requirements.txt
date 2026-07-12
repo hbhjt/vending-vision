@@ -1,9 +1,13 @@
+# Runtime and packaging use the same stable pins.
 # OpenCV 5 removed the Caffe importer used by age/gender .caffemodel files.
-opencv-python==4.10.0.84
-numpy==2.2.6
+# MediaPipe requires the contrib distribution; it already provides cv2, so do
+# not install opencv-python alongside it.
+opencv-contrib-python==4.10.0.84
+numpy==1.26.4
 pydantic==2.13.4
 mediapipe==0.10.14
-fastapi==0.136.3
-uvicorn==0.48.0
-python-multipart==0.0.29
-websockets==16.0
+fastapi==0.128.8
+uvicorn==0.39.0
+websockets==15.0.1
+openvino>=2024.6,<2026
+pytest>=8.0,<9

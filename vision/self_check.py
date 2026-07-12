@@ -1,3 +1,17 @@
+"""
+启动自检模块
+
+在服务启动时对各个子模块进行健康检查：
+- 摄像头可连接性
+- MediaPipe 姿态模型初始化
+- 人脸检测器初始化（含降级）
+- 人体检测器状态（模型缺失时允计降级）
+- 年龄性别模型状态（允计降级为 mock）
+
+只有 摄像头 + 姿态 + 人脸 三项必须通过，服务才算完全健康。
+人体检测和年龄性别是可选的增强功能。
+"""
+
 from vision.config import settings
 from vision.pose_estimator import PoseEstimator
 from vision.face_detector import FaceDetector
@@ -7,10 +21,9 @@ from vision.age_gender_estimator import AgeGenderEstimator
 from vision.camera_manager import get_all_camera_statuses
 
 def check_camera():
-    """
-    检查摄像头是否可打开。
+    """检查摄像头是否可打开。
 
-    mock 模式下不强制检查真实摄像头。
+    Mock 模式下不强制检查真实摄像头。
     """
     if settings.MOCK_SCENARIO != "off":
         return {
@@ -34,9 +47,7 @@ def check_camera():
 
 
 def check_pose_model():
-    """
-    检查 MediaPipe Pose 是否可初始化。
-    """
+    """检查 MediaPipe Pose 是否可正常初始化。"""
     try:
         _ = PoseEstimator()
         return {
@@ -52,9 +63,7 @@ def check_pose_model():
 
 
 def check_face_detector():
-    """
-    检查人脸检测器是否可初始化。
-    """
+    """检查人脸检测器是否可初始化（含降级）。"""
     try:
         detector = FaceDetector()
         return {
@@ -70,10 +79,10 @@ def check_face_detector():
 
 
 def check_person_detector():
-    """
-    检查轻量人体检测模型状态。
+    """检查人体检测模型状态。
 
     人体检测是 proximity 的增强项；模型不存在时允许回退到姿态辅助。
+    因此 ok 始终返回 True，通过 modelReady 字段区分实际状态。
     """
     try:
         detector = PersonDetector()
@@ -102,13 +111,10 @@ def check_person_detector():
 
 
 def check_age_gender_model():
-    """
-    检查年龄性别模型状态。
+    """检查年龄性别模型状态。
 
-    注意：
-    年龄性别模型不是强依赖。
-    如果模型文件不存在，可以 fallback 到 mock，
-    所以 ok 仍然返回 True，但 mode 会显示 mock。
+    年龄性别模型不是强依赖。模型文件不存在时可以 fallback 到 mock，
+    所以 ok 始终返回 True，通过 modelReady 和 mode 反映实际状态。
     """
     try:
         estimator = AgeGenderEstimator()
@@ -131,8 +137,13 @@ def check_age_gender_model():
         }
 
 def run_self_check():
-    """
-    运行完整自检。
+    """运行完整自检。
+
+    返回包含各项检查结果的字典。
+    只有摄像头、姿态、人脸三项全部通过，整体 ok 才为 True。
+
+    Returns:
+        {"ok": bool, "checks": {"camera": ..., "pose": ..., "face": ..., "person": ..., "ageGender": ...}}
     """
     checks = {
         "camera": check_camera(),

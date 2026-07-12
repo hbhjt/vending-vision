@@ -24,6 +24,7 @@ scripts\start_server.bat
 ```text
 http://127.0.0.1:7892/health
 http://127.0.0.1:7892/dashboard
+http://127.0.0.1:7892/metrics
 ws://127.0.0.1:7892/ws
 ```
 
@@ -87,12 +88,91 @@ GET  /health
 GET  /version
 GET  /camera/roles/status
 GET  /camera/{role}/status
+GET  /camera/{role}/snapshot.jpg
 POST /camera/{role}/reopen
 GET  /camera/front/owner
 GET  /session/status
+GET  /proximity/debug
+GET  /metrics
 GET  /try-on/{sessionId}.mjpeg
 WS   /ws
 ```
+
+## 测试与现场标定
+
+运行单元测试：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_tests.ps1
+```
+
+分析现场录制视频的 presence 阈值：
+
+```powershell
+python scripts\calibrate_presence.py camera_left_index0_20260707_203720.mp4 --frame-step 5
+```
+
+脚本会输出 `reports/presence_calibration.csv` 和 `reports/presence_calibration_summary.json`，用于观察 `largestPersonRatio`、`largestFaceRatio`、`bodyBoxRatio` 的分布。
+
+使用根目录中的顶部/中部 MP4 一键生成同步数据集和稳定性报告：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_video_stability_test.ps1
+```
+
+脚本按接近生产轮询频率抽帧，自动打开 `reports/video_dataset/test01/stability_report.html`。输出同时包括：
+
+- `top_occupancy_auto_labels.csv`：顶部占用状态和检测指标。
+- `front_profile_auto_labels.csv`：正面画像字段和质量指标。
+- `stability_timeline.csv`：双摄按时间戳对齐后的完整结果。
+- `review_labels.csv`：可用 Excel 填写人工真值的复核表。
+- `stability_summary.json`：适合程序读取的稳定性指标。
+
+自动标签只能用于快速筛查。填写 `review_labels.csv` 后重新运行 `analyze_video_stability.py`，报告会额外显示基于人工标签的召回率。
+
+## 现场摄像头方向
+
+每路摄像头可在 `config.json` 的 `cameras` 中设置 `rotate`：
+
+```json
+{
+  "front": {
+    "rotate": 270
+  }
+}
+```
+
+`rotate` 表示服务读取后对画面做的校正角度，单位是顺时针度数。中部摄像头如果物理顺时针旋转 90 度安装，通常用 `270` 做逆时针校正。启动后打开：
+
+```text
+http://127.0.0.1:7892/camera/front/snapshot.jpg
+```
+
+确认人脸和身体在截图中是正的，再测年龄、性别和试衣。
+
+顶部摄像头可以设置 ROI，只检测售货机前方交互区：
+
+```json
+{
+  "top": {
+    "roi": {
+      "enabled": true,
+      "x": 0.0,
+      "y": 0.0,
+      "width": 1.0,
+      "height": 1.0
+    }
+  }
+}
+```
+
+现场调 ROI 时打开：
+
+```text
+http://127.0.0.1:7892/proximity/debug
+```
+
+观察 `roi`、`largestPersonRatio`、`largestFaceRatio` 和 `bodyBoxRatio`，再调整 `proximity_*_ratio` 阈值。
 
 ## 上线注意
 
@@ -100,3 +180,13 @@ WS   /ws
 - 模型文件不提交到代码仓库时，需要在部署机器本地放入 `models/`。
 - 正式运行保持 `mock_scenario=off`。
 - 先完成双摄编号确认，再做顶部多人阈值和中部画像质量联调。
+- 长期运行可查看 `/metrics` 和 `logs/vision.log`，日志默认按 5MB 滚动保留 5 份。
+
+## 编码说明
+
+项目源码、文档和 Dashboard 统一使用 UTF-8。Windows PowerShell 读取中文文件时建议显式指定编码：
+
+```powershell
+Get-Content -Raw -Encoding UTF8 README.md
+Get-Content -Raw -Encoding UTF8 docs\DEPLOYMENT.md
+```

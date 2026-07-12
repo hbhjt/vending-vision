@@ -182,7 +182,7 @@
 
 ### vision.profile_result
 
-检测到用户靠近并得到可用画像后主动推送。
+顶部摄像头任一人体、人脸或姿态检测器确认有人且没有多人证据后，正面摄像头立即预采样；得到至少两帧有效画像并通过最终“当前有人且无多人”复检后主动推送。用户尚未达到近距离也可形成部分画像。
 
 ```json
 {
@@ -213,9 +213,9 @@
         "profileUsable": true,
         "sampleCount": 3,
       "validFrameCount": 2,
-      "minValidFrames": 1,
-      "targetSampleCount": 5,
-      "samplingMode": "approach_buffer_immediate_close",
+      "minValidFrames": 2,
+      "targetSampleCount": 6,
+      "samplingMode": "top_presence_front_profile",
       "proximity": {
         "present": true,
         "close": true,
@@ -249,6 +249,8 @@
 | `confidence` | number | 0 到 1 的整体置信度 |
 
 `profile_result.payload.occupancy` 是本次画像采样窗口对应的占用状态快照，语义同 `presence_status.payload.occupancy`。推荐层应先检查 `quality.profileUsable` 和 `occupancy.state`，只有可用单人画像才用于推荐。
+
+画像允许只包含部分有效推荐字段；缺失值保持协议规定的 `null` 或 `unknown`。推荐层不得因为单个字段缺失而丢弃整份画像，应对缺失字段使用通用推荐策略。低置信度仍通过现有 `profile.confidence` 表达。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -338,13 +340,13 @@
   "timestamp": "2026-07-03T10:00:00.100Z",
   "payload": {
     "sessionId": "try-on-session-001",
-    "previewUrl": "http://127.0.0.1:7892/try-on/try-on-session-001.mjpeg",
+    "previewUrl": "http://127.0.0.1:7892/try-on/try-on-session-001.mjpeg?token=<opaque-token>",
     "streamType": "mjpeg"
   }
 }
 ```
 
-前端只渲染 `previewUrl`，不直接调用物理摄像头。试衣期间视觉服务暂停新的中部摄像头画像采集，顶部摄像头仍继续推送 `presence_status` 和 `person_departed`。
+前端只渲染视觉服务原样返回的完整 `previewUrl`（包括随机 token），不直接调用物理摄像头，也不自行拼接 URL。试衣期间视觉服务暂停新的中部摄像头画像采集，顶部摄像头仍继续推送 `presence_status` 和 `person_departed`。
 
 ### vision.try_on.stop / vision.try_on.stopped
 

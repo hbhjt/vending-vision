@@ -1,22 +1,46 @@
+"""
+FastAPI 应用入口模块
+
+提供售货机视觉服务的 HTTP 和 WebSocket API：
+- HTTP: 健康检查、版本信息、摄像头状态/快照、指标、调试仪表盘
+- WebSocket: 画像推送协议（presence_status / profile_result / person_departed）
+- 试衣 MJPEG 流: HTTP multipart 流式传输
+
+核心工作循环：
+presence_broadcast_loop() 独立轮询顶部摄像头并推送轻量状态；
+profile_collection_worker() 按需运行中部摄像头画像采样，不阻塞来人/离开事件。
+"""
+
+from __future__ import annotations
+
 import asyncio
+import copy
 import json
+import ipaddress
+import threading
 from json import JSONDecodeError
 from pathlib import Path
+from typing import Optional
+from uuid import uuid4
 
+import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from vision.camera_manager import (
     get_all_camera_statuses,
     get_camera_config,
     get_camera_status,
+    read_camera,
     release_all_cameras,
     reset_camera,
 )
 from vision.camera_owner import get_front_camera_owner
-from vision.config import settings
+from vision.config import runtime_path, settings
 from vision.logger import logger
-from vision.profile_push import collect_profile_update
+from vision.metrics import metrics
+from vision.presence_runtime import get_presence_runtime
+from vision.profile_push import collect_front_profile_update, collect_profile_update
 from vision.protocol import APP_VERSION, PROTOCOL, envelope, error_envelope
 from vision.self_check import run_self_check
 from vision.session_state import (
@@ -39,14 +63,23 @@ app = FastAPI(
     version=APP_VERSION,
 )
 
-
+# 启动时的自检结果缓存
 startup_check = None
-DASHBOARD_FILE = Path(__file__).parent / "dashboard" / "profile_dashboard.html"
+# 调试仪表盘 HTML 文件路径
+DASHBOARD_FILE = Path(runtime_path("dashboard/profile_dashboard.html"))
 
 
 @app.on_event("startup")
 def on_startup():
+    """服务启动事件：运行自检并记录结果。"""
     global startup_check
+
+    try:
+        host = str(settings.HOST).strip().lower()
+        if host != "localhost" and not ipaddress.ip_address(host).is_loopback:
+            raise RuntimeError("VISION_HOST must be a loopback address in production")
+    except ValueError as exc:
+        raise RuntimeError("VISION_HOST must be a numeric loopback address") from exc
 
     logger.info("Running vision module self check...")
     startup_check = run_self_check()
@@ -59,11 +92,17 @@ def on_startup():
 
 @app.on_event("shutdown")
 def on_shutdown():
+    """服务关闭事件：停止后台工作线程并释放所有摄像头资源。"""
+    for task in (_presence_worker_task, _profile_worker_task):
+        if task is not None and not task.done():
+            task.cancel()
+
     release_all_cameras()
     logger.info("Camera streams released")
 
 
 def get_startup_check():
+    """获取自检结果（懒执行：首次调用时运行）。"""
     global startup_check
 
     if startup_check is None:
@@ -73,6 +112,11 @@ def get_startup_check():
 
 
 def get_runtime_status():
+    """获取运行时状态摘要。
+
+    在 Mock 模式之外，还会实时检查摄像头连接状态。
+    返回：cameraReady, modelReady, ageGenderReady, ageGenderMode 等信息。
+    """
     check = get_startup_check()
     checks = dict(check["checks"])
 
@@ -99,8 +143,10 @@ def get_runtime_status():
     age_gender_ready = checks["ageGender"]["modelReady"]
     age_gender_mode = checks["ageGender"]["mode"]
 
+    runtime_check = dict(check)
+    runtime_check["checks"] = checks
     return {
-        "check": check,
+        "check": runtime_check,
         "cameraReady": camera_ready,
         "modelReady": model_ready,
         "ageGenderReady": age_gender_ready,
@@ -109,6 +155,11 @@ def get_runtime_status():
 
 
 def validate_envelope(message):
+    """验证 WebSocket 消息的外层封包格式。
+
+    检查必填字段（protocol, type, messageId, timestamp, payload）
+    及其类型是否正确。
+    """
     if not isinstance(message, dict):
         return "message must be a JSON object"
 
@@ -132,6 +183,13 @@ def validate_envelope(message):
 
 
 def validate_message_payload(message_type: str, payload: dict):
+    """根据消息类型验证 payload 的字段格式。
+
+    支持的验证：
+    - vision.hello: protocolVersion, capabilities, clientRole, machineCode
+    - vision.try_on.start: sessionId, catalogKey, variantId
+    - vision.try_on.stop: sessionId, reason
+    """
     if message_type == "vision.hello":
         protocol_version = payload.get("protocolVersion")
         capabilities = payload.get("capabilities")
@@ -186,14 +244,18 @@ def validate_message_payload(message_type: str, payload: dict):
 
 @app.get("/")
 def root():
+    """根路径：返回 API 索引和服务基本信息。"""
     return {
         "message": "Vending Vision Module is running",
         "api": {
             "dashboard": "/dashboard",
             "camera_roles_status": "/camera/roles/status",
             "front_camera_owner": "/camera/front/owner",
+            "camera_snapshot": "/camera/{role}/snapshot.jpg",
+            "proximity_debug": "/proximity/debug",
             "try_on_preview": "/try-on/{sessionId}.mjpeg",
             "session_status": "/session/status",
+            "metrics": "/metrics",
             "ws": "/ws",
             "health": "/health",
             "version": "/version",
@@ -247,12 +309,10 @@ def version():
         "host": settings.HOST,
         "port": settings.PORT,
         "mock_scenario": settings.MOCK_SCENARIO,
-        "default_timeout_ms": settings.DEFAULT_TIMEOUT_MS,
         "profile_push": {
             "enabled": settings.PROFILE_PUSH_ENABLED,
             "push_interval_ms": settings.PROFILE_PUSH_INTERVAL_MS,
             "push_cooldown_ms": settings.PROFILE_PUSH_COOLDOWN_MS,
-            "sample_count": settings.PROFILE_SAMPLE_COUNT,
             "body_buffer_max_frames": settings.PROFILE_BODY_BUFFER_MAX_FRAMES,
             "body_buffer_ttl_ms": settings.PROFILE_BODY_BUFFER_TTL_MS,
             "track_enabled": settings.PROFILE_TRACK_ENABLED,
@@ -357,7 +417,14 @@ def version():
             "websocket_protocol": True,
             "timeout_control": True,
             "logging": True,
+            "metrics": True,
             "mock_scenario": True,
+        },
+        "logging": {
+            "level": settings.LOG_LEVEL,
+            "file": settings.LOG_FILE,
+            "max_bytes": settings.LOG_MAX_BYTES,
+            "backup_count": settings.LOG_BACKUP_COUNT,
         },
     }
 
@@ -377,10 +444,47 @@ def camera_role_status(role: str):
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
+@app.get("/camera/{role}/snapshot.jpg")
+def camera_role_snapshot(role: str):
+    try:
+        get_camera_config(role)
+        if role == "front" and (
+            get_front_camera_owner().get("owner") != "idle"
+            or get_try_on_status().get("activeSessionId")
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={"ok": False, "error": "front camera is reserved"},
+            )
+        image = read_camera(role, warmup_frames=1)
+        ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+
+        if not ok:
+            return JSONResponse(
+                status_code=500,
+                content={"ok": False, "error": "failed to encode snapshot"},
+            )
+
+        return Response(content=encoded.tobytes(), media_type="image/jpeg")
+    except ValueError as e:
+        return JSONResponse(status_code=404, content={"ok": False, "error": str(e)})
+    except Exception as e:
+        logger.exception(f"HTTP /camera/{role}/snapshot.jpg failed")
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
 @app.post("/camera/{role}/reopen")
 def camera_role_reopen(role: str):
     try:
         get_camera_config(role)
+        if role == "front" and (
+            get_front_camera_owner().get("owner") != "idle"
+            or get_try_on_status().get("activeSessionId")
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={"ok": False, "error": "front camera is reserved"},
+            )
         reset_camera(role)
         return get_camera_status(role)
     except ValueError as e:
@@ -400,9 +504,25 @@ def session_status():
     return get_vision_session_status()
 
 
+@app.get("/proximity/debug")
+def proximity_debug():
+    snapshot = get_presence_runtime().latest()
+    if snapshot is None:
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "error": "presence monitor has not produced a snapshot"},
+        )
+    return {"ok": True, "proximity": snapshot.get("proximity"), "snapshot": snapshot}
+
+
+@app.get("/metrics")
+def metrics_snapshot():
+    return metrics.snapshot()
+
+
 @app.get("/try-on/{session_id}.mjpeg")
-def try_on_mjpeg(session_id: str):
-    if not is_try_on_session_active(session_id):
+def try_on_mjpeg(session_id: str, token: Optional[str] = None):
+    if not token or not is_try_on_session_active(session_id, stream_token=token):
         return JSONResponse(
             status_code=404,
             content={"ok": False, "error": "try-on session is not active"},
@@ -410,9 +530,356 @@ def try_on_mjpeg(session_id: str):
 
     media_type = "multipart/x-mixed-replace; boundary=frame"
     return StreamingResponse(
-        iter_try_on_mjpeg(session_id),
+        iter_try_on_mjpeg(session_id, stream_token=str(token)),
         media_type=media_type,
     )
+
+
+# ---------------------------------------------------------------------------
+# 画像广播子系统
+# ---------------------------------------------------------------------------
+
+# 已注册的 WebSocket 客户端（key: websocket id, value: client info）
+_profile_clients: dict[int, dict] = {}
+_profile_clients_lock = asyncio.Lock()
+# Top-camera events and front-camera profiling intentionally run as separate
+# tasks.  A slow front inference must never delay presence/departure events.
+_presence_worker_task: asyncio.Task | None = None
+_profile_worker_task: asyncio.Task | None = None
+_profile_cancel_event: threading.Event | None = None
+
+
+async def register_profile_client(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    capabilities: set[str],
+    owned_try_on_session_ids: set,
+):
+    """Register a post-hello client and start the lightweight worker."""
+    global _presence_worker_task
+
+    async with _profile_clients_lock:
+        existing = _profile_clients.pop(id(websocket), None)
+        if existing and existing.get("sender_task"):
+            existing["sender_task"].cancel()
+        queue = asyncio.Queue(maxsize=max(int(settings.WEBSOCKET_QUEUE_SIZE), 1))
+        client = {
+            "websocket": websocket,
+            "send_lock": send_lock,
+            "capabilities": set(capabilities),
+            "owned_try_on_session_ids": owned_try_on_session_ids,
+            "owner_id": str(id(websocket)),
+            "queue": queue,
+        }
+        client["sender_task"] = asyncio.create_task(profile_client_sender(client))
+        _profile_clients[id(websocket)] = {
+            **client,
+        }
+        metrics.set_gauge("profile_broadcast_clients", len(_profile_clients))
+
+        if _presence_worker_task is None or _presence_worker_task.done():
+            _presence_worker_task = asyncio.create_task(presence_broadcast_loop())
+            logger.info("Presence broadcast worker started")
+
+
+def cleanup_owned_try_on_sessions(session_ids: set, reason: str, owner_id: str | None = None):
+    """清理客户端拥有的试衣会话（断开连接时调用）。"""
+    for session_id in list(session_ids):
+        try:
+            stopped = stop_try_on_session(
+                session_id, reason=reason, owner_id=owner_id,
+            )
+            mark_vision_session_tryon_stopped(stopped)
+            session_ids.discard(session_id)
+            logger.info(
+                f"Stopped try-on session reason={reason}, sessionId={session_id}"
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to stop try-on session reason={reason}, "
+                f"sessionId={session_id}"
+            )
+
+
+async def unregister_profile_client(websocket: WebSocket):
+    global _profile_cancel_event
+    async with _profile_clients_lock:
+        removed = _profile_clients.pop(id(websocket), None)
+        no_clients = not _profile_clients
+
+    if removed is not None:
+        sender_task = removed.get("sender_task")
+        if sender_task is not None and sender_task is not asyncio.current_task():
+            sender_task.cancel()
+        cleanup_owned_try_on_sessions(
+            removed["owned_try_on_session_ids"],
+            reason="websocket_disconnected",
+            owner_id=removed.get("owner_id"),
+        )
+        async with _profile_clients_lock:
+            metrics.set_gauge("profile_broadcast_clients", len(_profile_clients))
+        if no_clients and _profile_cancel_event is not None:
+            _profile_cancel_event.set()
+        logger.info("Profile broadcast client unregistered")
+
+
+async def profile_client_snapshot():
+    async with _profile_clients_lock:
+        return list(_profile_clients.values())
+
+
+async def profile_worker_capabilities():
+    clients = await profile_client_snapshot()
+    capabilities = set()
+
+    for client in clients:
+        capabilities.update(client["capabilities"])
+
+    return clients, capabilities
+
+
+def filter_payload_for_client(payload: dict, capabilities: set[str]):
+    if "ambient_light" in capabilities:
+        return payload
+
+    filtered = copy.deepcopy(payload)
+    filtered.pop("ambientLight", None)
+    return filtered
+
+
+def should_deliver_profile_message(message_type: str, capabilities: set[str]):
+    if message_type == "vision.profile_result":
+        return "profile_push" in capabilities
+
+    if message_type == "vision.presence_status":
+        return "presence_status" in capabilities
+
+    if message_type == "vision.person_departed":
+        return "person_departed" in capabilities
+
+    return True
+
+
+async def profile_client_sender(client: dict):
+    """Deliver one client's queue without stalling other subscribers."""
+    websocket = client["websocket"]
+    try:
+        while True:
+            message = await client["queue"].get()
+            if message is None:
+                return
+            async with client["send_lock"]:
+                await asyncio.wait_for(
+                    websocket.send_json(message),
+                    timeout=max(settings.WEBSOCKET_SEND_TIMEOUT_MS, 1) / 1000.0,
+                )
+            metrics.increment(
+                "profile_broadcast_sent_total",
+                message_type=message.get("type", "unknown"),
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        metrics.increment("profile_broadcast_send_failure_total")
+        logger.exception("Profile client sender failed")
+        await unregister_profile_client(websocket)
+
+
+def queue_profile_message(client: dict, message_type: str, payload: dict):
+    capabilities = client["capabilities"]
+
+    if not should_deliver_profile_message(message_type, capabilities):
+        return
+
+    event_payload = filter_payload_for_client(payload, capabilities)
+    message_prefix = {
+        "vision.profile_result": "result",
+        "vision.person_departed": "departure",
+    }.get(message_type, "status")
+
+    message = envelope(
+        message_type=message_type,
+        message_id=f"{message_prefix}-{event_payload['eventId']}-{uuid4()}",
+        payload=event_payload,
+    )
+    try:
+        client["queue"].put_nowait(message)
+    except asyncio.QueueFull as exc:
+        raise RuntimeError("profile client queue is full") from exc
+
+
+async def broadcast_profile_update(update: dict):
+    """向所有已注册客户端广播画像更新消息。
+
+    发送失败时自动注销该客户端（清理过期连接）。"""
+    clients = await profile_client_snapshot()
+    stale_clients = []
+
+    for client in clients:
+        try:
+            queue_profile_message(
+                client,
+                update["message_type"],
+                update["payload"],
+            )
+        except Exception:
+            stale_clients.append(client["websocket"])
+            metrics.increment("profile_broadcast_send_failure_total")
+            logger.exception("Profile broadcast send failed")
+
+    for websocket in stale_clients:
+        await unregister_profile_client(websocket)
+
+
+async def broadcast_profile_error(code: str, message: str, retryable: bool = True):
+    clients = await profile_client_snapshot()
+    stale_clients = []
+
+    for client in clients:
+        try:
+            client["queue"].put_nowait(
+                error_envelope(code=code, message=message, retryable=retryable)
+            )
+        except asyncio.QueueFull:
+            stale_clients.append(client["websocket"])
+        except Exception:
+            stale_clients.append(client["websocket"])
+            metrics.increment("profile_broadcast_error_send_failure_total")
+            logger.exception("Profile broadcast error send failed")
+
+    for websocket in stale_clients:
+        await unregister_profile_client(websocket)
+
+
+async def profile_collection_worker(candidate, cancel_event: threading.Event):
+    """Run slow front-camera sampling without blocking top-camera polling."""
+    global _profile_worker_task, _profile_cancel_event
+    runtime = get_presence_runtime()
+    pushed = False
+    try:
+        update = await asyncio.to_thread(
+            collect_front_profile_update,
+            candidate.event_id,
+            candidate.proximity,
+            candidate.track,
+            bool(candidate.proximity.get("close")),
+            candidate.ambient_light,
+            True,
+            cancel_event,
+            lambda: (not cancel_event.is_set() and runtime.is_candidate_valid(candidate.generation)),
+            lambda: (runtime.latest() or {}).get("occupancy", {}),
+            lambda: bool(
+                ((runtime.latest() or {}).get("proximity") or {}).get("close")
+            ),
+        )
+        # collect_front_profile_update validates the latest top-camera snapshot
+        # immediately before committing a result.  A successful result then
+        # locks the occupancy gate, so checking is_candidate_valid() again here
+        # would incorrectly discard the just-committed profile.
+        if update is not None and not cancel_event.is_set():
+            pushed = update.get("message_type") == "vision.profile_result"
+            await broadcast_profile_update(update)
+    except asyncio.CancelledError:
+        cancel_event.set()
+        raise
+    except Exception as exc:
+        logger.exception("Profile collection worker failed")
+        await broadcast_profile_error("internal_error", str(exc), retryable=True)
+    finally:
+        runtime.finish_collection(candidate.generation, pushed=pushed)
+        _profile_cancel_event = None
+        _profile_worker_task = None
+
+
+async def presence_broadcast_loop():
+    """Poll the top camera continuously and schedule profiling separately."""
+    global _profile_worker_task, _profile_cancel_event
+    while True:
+        try:
+            loop_started = asyncio.get_running_loop().time()
+            clients, capabilities = await profile_worker_capabilities()
+
+            if not clients:
+                logger.info("Presence broadcast worker stopped: no clients")
+                if _profile_cancel_event is not None:
+                    _profile_cancel_event.set()
+                return
+
+            if settings.MOCK_SCENARIO != "off":
+                mock_update = await asyncio.to_thread(
+                    collect_profile_update,
+                    "presence_status" in capabilities,
+                    "ambient_light" in capabilities,
+                    "person_departed" in capabilities,
+                )
+                if mock_update is not None:
+                    await broadcast_profile_update(mock_update)
+                await asyncio.sleep(settings.PROFILE_PUSH_INTERVAL_MS / 1000.0)
+                continue
+
+            result = await asyncio.to_thread(
+                get_presence_runtime().poll,
+                "presence_status" in capabilities,
+                "ambient_light" in capabilities,
+                "person_departed" in capabilities,
+            )
+            metrics.observe_ms(
+                "presence_worker_collect_duration_ms",
+                (asyncio.get_running_loop().time() - loop_started) * 1000,
+            )
+
+            if _profile_cancel_event is not None and not get_presence_runtime().is_candidate_valid(
+                getattr(_profile_worker_task, "candidate_generation", -1)
+            ):
+                _profile_cancel_event.set()
+
+            if result.update is not None:
+                metrics.increment(
+                    "presence_worker_update_total",
+                    message_type=result.update["message_type"],
+                )
+                await broadcast_profile_update(result.update)
+
+            if (
+                result.candidate is not None
+                and "profile_push" in capabilities
+                and (_profile_worker_task is None or _profile_worker_task.done())
+            ):
+                _profile_cancel_event = threading.Event()
+                _profile_worker_task = asyncio.create_task(
+                    profile_collection_worker(result.candidate, _profile_cancel_event)
+                )
+                _profile_worker_task.candidate_generation = result.candidate.generation
+
+            await asyncio.sleep(settings.PROFILE_PUSH_INTERVAL_MS / 1000.0)
+
+        except RuntimeError as e:
+            metrics.increment("presence_worker_error_total", code="camera_unavailable")
+            await broadcast_profile_error(
+                code="camera_unavailable",
+                message=str(e),
+                retryable=True,
+            )
+            logger.exception("Presence broadcast camera error")
+            await asyncio.sleep(settings.PROFILE_PUSH_INTERVAL_MS / 1000.0)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as e:
+            metrics.increment("presence_worker_error_total", code="internal_error")
+            await broadcast_profile_error(
+                code="internal_error",
+                message=str(e),
+                retryable=True,
+            )
+            logger.exception("Presence broadcast loop failed")
+            await asyncio.sleep(settings.PROFILE_PUSH_INTERVAL_MS / 1000.0)
+
+
+async def profile_broadcast_loop():
+    """Backward-compatible name for callers of the old worker entry point."""
+    await presence_broadcast_loop()
 
 
 async def send_error(
@@ -431,87 +898,49 @@ async def send_error(
             session_id=session_id,
             retryable=retryable,
             detail=detail,
-            message_id=message_id,
+            message_id=f"error-{message_id or 'server'}-{uuid4()}",
         )
     )
 
 
-async def profile_push_loop(
-    websocket: WebSocket,
-    send_lock: asyncio.Lock,
-    presence_status_enabled: bool = False,
-    ambient_light_enabled: bool = False,
-    person_departed_enabled: bool = False,
-):
-    while True:
-        try:
-            update = await asyncio.to_thread(
-                collect_profile_update,
-                presence_status_enabled,
-                ambient_light_enabled,
-                person_departed_enabled,
-            )
-
-            if update is None:
-                await asyncio.sleep(settings.PROFILE_PUSH_INTERVAL_MS / 1000.0)
-                continue
-
-            event_payload = update["payload"]
-            message_type = update["message_type"]
-            message_prefix = {
-                "vision.profile_result": "result",
-                "vision.person_departed": "departure",
-            }.get(message_type, "status")
-
-            async with send_lock:
-                await websocket.send_json(
-                    envelope(
-                        message_type=message_type,
-                        message_id=f"{message_prefix}-{event_payload['eventId']}",
-                        payload=event_payload,
-                    )
-                )
-
-            if message_type == "vision.profile_result":
-                logger.info(f"Profile push sent eventId={event_payload['eventId']}")
-                await asyncio.sleep(settings.PROFILE_PUSH_COOLDOWN_MS / 1000.0)
-            else:
-                await asyncio.sleep(settings.PROFILE_PUSH_INTERVAL_MS / 1000.0)
-
-        except RuntimeError as e:
-            async with send_lock:
-                await websocket.send_json(
-                    error_envelope(
-                        code="camera_unavailable",
-                        message=str(e),
-                        retryable=True,
-                    )
-                )
-            logger.exception("Profile push camera error")
-            await asyncio.sleep(settings.PROFILE_PUSH_COOLDOWN_MS / 1000.0)
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as e:
-            async with send_lock:
-                await websocket.send_json(
-                    error_envelope(
-                        code="internal_error",
-                        message=str(e),
-                        retryable=True,
-                    )
-                )
-            logger.exception("Profile push loop failed")
-            await asyncio.sleep(settings.PROFILE_PUSH_COOLDOWN_MS / 1000.0)
+def websocket_origin_allowed(websocket: WebSocket) -> bool:
+    """Accept native clients without Origin and allow configured local WebViews."""
+    origin = websocket.headers.get("origin")
+    if not origin:
+        return True
+    origin_host = str(settings.HOST)
+    if ":" in origin_host and not origin_host.startswith("["):
+        origin_host = f"[{origin_host}]"
+    default_origins = {
+        f"http://{origin_host}:{settings.PORT}",
+        f"http://localhost:{settings.PORT}",
+    }
+    allowed = set(settings.ALLOWED_ORIGINS) or default_origins
+    return origin in allowed
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    push_task: asyncio.Task | None = None
+    """WebSocket 主端点。
+
+    处理以下消息类型：
+    - vision.hello: 握手 + 能力协商 + 注册画像广播客户端
+    - vision.ping: 心跳（回复 vision.pong）
+    - vision.try_on.start: 启动试衣会话
+    - vision.try_on.stop: 停止试衣会话
+    - vision.start_profile / vision.cancel: 不支持（主动推送协议中不需要）
+
+    断开连接时自动清理试衣会话和广播注册。
+    """
     send_lock = asyncio.Lock()
+    owned_try_on_session_ids = set()
+    handshake_complete = False
 
     await websocket.accept()
+    if not websocket_origin_allowed(websocket):
+        await websocket.close(code=1008)
+        logger.warning("WebSocket rejected due to untrusted Origin")
+        return
     logger.info("WebSocket connected")
 
     try:
@@ -579,12 +1008,20 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                 continue
 
+            if message_type != "vision.hello" and not handshake_complete:
+                async with send_lock:
+                    await send_error(
+                        websocket,
+                        code="invalid_message",
+                        message="vision.hello is required before business messages",
+                        retryable=False,
+                        message_id=message_id,
+                    )
+                continue
+
             if message_type == "vision.hello":
                 status = get_runtime_status()
                 client_capabilities = set(payload.get("capabilities") or [])
-                presence_status_enabled = "presence_status" in client_capabilities
-                ambient_light_enabled = "ambient_light" in client_capabilities
-                person_departed_enabled = "person_departed" in client_capabilities
 
                 server_capabilities = [
                     "profile_push",
@@ -597,7 +1034,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json(
                         envelope(
                             message_type="vision.ready",
-                            message_id="ready-001",
+                            message_id=f"ready-{uuid4()}",
                             payload={
                                 "serverName": "vem-vision-python",
                                 "serverVersion": APP_VERSION,
@@ -615,20 +1052,20 @@ async def websocket_endpoint(websocket: WebSocket):
                                 code="model_not_ready",
                                 message="required vision model is not ready",
                                 retryable=True,
+                                message_id=f"error-model-not-ready-{uuid4()}",
                             )
                         )
                     continue
 
-                if settings.PROFILE_PUSH_ENABLED and push_task is None:
-                    push_task = asyncio.create_task(
-                        profile_push_loop(
-                            websocket,
-                            send_lock,
-                            presence_status_enabled=presence_status_enabled,
-                            ambient_light_enabled=ambient_light_enabled,
-                            person_departed_enabled=person_departed_enabled,
-                        )
+                if settings.PROFILE_PUSH_ENABLED:
+                    await register_profile_client(
+                        websocket,
+                        send_lock,
+                        client_capabilities,
+                        owned_try_on_session_ids,
                     )
+
+                handshake_complete = True
 
                 continue
 
@@ -637,7 +1074,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json(
                         envelope(
                             message_type="vision.pong",
-                            message_id="pong-001",
+                            message_id=f"pong-{message_id}-{uuid4()}",
                             payload={},
                         )
                     )
@@ -649,6 +1086,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         payload.get("sessionId"),
                         catalog_key=payload.get("catalogKey"),
                         variant_id=payload.get("variantId"),
+                        owner_id=str(id(websocket)),
                     )
                 except ValueError as e:
                     async with send_lock:
@@ -660,7 +1098,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             message_id=message_id,
                         )
                     continue
-                except Exception as e:
+                except (PermissionError, RuntimeError) as e:
                     logger.exception("Try-on start failed")
                     async with send_lock:
                         await websocket.send_json(
@@ -668,17 +1106,20 @@ async def websocket_endpoint(websocket: WebSocket):
                                 code="try_on_unavailable",
                                 message=str(e),
                                 retryable=True,
-                                message_id=message_id,
+                                message_id=f"error-{message_id}-{uuid4()}",
                             )
                         )
                     continue
 
+                if _profile_cancel_event is not None:
+                    _profile_cancel_event.set()
                 mark_vision_session_tryon_started(session)
+                owned_try_on_session_ids.add(session["sessionId"])
                 async with send_lock:
                     await websocket.send_json(
                         envelope(
                             message_type="vision.try_on.started",
-                            message_id=f"try-on-started-{session['sessionId']}",
+                            message_id=f"try-on-started-{session['sessionId']}-{uuid4()}",
                             payload={
                                 "sessionId": session["sessionId"],
                                 "previewUrl": session["previewUrl"],
@@ -693,6 +1134,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     stopped = stop_try_on_session(
                         payload.get("sessionId"),
                         reason=payload.get("reason"),
+                        owner_id=str(id(websocket)),
                     )
                 except ValueError as e:
                     async with send_lock:
@@ -704,7 +1146,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             message_id=message_id,
                         )
                     continue
-                except Exception as e:
+                except (PermissionError, RuntimeError) as e:
                     logger.exception("Try-on stop failed")
                     async with send_lock:
                         await websocket.send_json(
@@ -712,17 +1154,18 @@ async def websocket_endpoint(websocket: WebSocket):
                                 code="try_on_unavailable",
                                 message=str(e),
                                 retryable=True,
-                                message_id=message_id,
+                                message_id=f"error-{message_id}-{uuid4()}",
                             )
                         )
                     continue
 
                 mark_vision_session_tryon_stopped(stopped)
+                owned_try_on_session_ids.discard(stopped["sessionId"])
                 async with send_lock:
                     await websocket.send_json(
                         envelope(
                             message_type="vision.try_on.stopped",
-                            message_id=f"try-on-stopped-{stopped['sessionId']}",
+                            message_id=f"try-on-stopped-{stopped['sessionId']}-{uuid4()}",
                             payload={
                                 "sessionId": stopped["sessionId"],
                                 "reason": stopped["reason"],
@@ -758,9 +1201,9 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
     finally:
-        if push_task is not None:
-            push_task.cancel()
-            try:
-                await push_task
-            except asyncio.CancelledError:
-                pass
+        await unregister_profile_client(websocket)
+        cleanup_owned_try_on_sessions(
+            owned_try_on_session_ids,
+            reason="websocket_disconnected",
+            owner_id=str(id(websocket)),
+        )
