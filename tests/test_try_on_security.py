@@ -50,6 +50,18 @@ class TryOnSecurityTest(unittest.TestCase):
         self.assertEqual(first["streamToken"], second["streamToken"])
         self.assertEqual(self.manager.status()["sessionCount"], 1)
 
+    def test_client_stop_reason_is_normalized_for_server_contract(self):
+        self.manager.start("try-on-stop-reason", owner_id="client-a")
+        stopped = self.manager.stop(
+            "try-on-stop-reason", reason="user_exit", owner_id="client-a"
+        )
+        self.assertEqual(stopped["reason"], "client_stop")
+
+    def test_protocol_maximum_session_id_is_accepted(self):
+        session_id = "s" * 128
+        session = self.manager.start(session_id, owner_id="client-a")
+        self.assertEqual(session["sessionId"], session_id)
+
     def test_camera_owner_lease_can_be_renewed(self):
         owner = FrontCameraOwner()
         original_timeout = settings.FRONT_CAMERA_OWNER_TIMEOUT_MS

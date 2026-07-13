@@ -1,0 +1,34 @@
+{
+  "schemaVersion": "vending-vision-site-config/v1",
+  "host": "127.0.0.1",
+  "port": 7892,
+  "allowed_origins": [
+    "http://127.0.0.1:7892",
+    "http://localhost:7892",
+    "http://tauri.localhost"
+  ],
+  "cameras": {
+    "top": {
+      "index": 0,
+      "backend": "dshow",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "fourcc": "MJPG",
+      "role": "presence",
+      "keep_open": true,
+      "rotate": 0
+    },
+    "front": {
+      "index": 1,
+      "backend": "dshow",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "fourcc": "MJPG",
+      "role": "profile_tryon",
+      "keep_open": true,
+      "rotate": 270
+    }
+  }
+}

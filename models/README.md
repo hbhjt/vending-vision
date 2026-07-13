@@ -20,7 +20,9 @@ models/
     └── gender_net.caffemodel
 ```
 
-GitHub 仓库默认不上传 `.onnx`、`.caffemodel` 等模型权重，只保留目录说明和轻量配置文件。部署到售货机时，需要把模型权重文件放回上述路径。
+生产 `.onnx`、`.caffemodel` 权重使用 Git LFS 跟踪，并由
+`model-manifest.json` 固定角色、路径和 SHA-256。候选构建会拒绝未解析的
+LFS pointer、缺失文件或 hash 不匹配；现场不得补充或替换模型。
 
 ## 人体检测模型
 

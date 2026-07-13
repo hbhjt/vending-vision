@@ -14,6 +14,7 @@ ROOT = Path(SPECPATH)
 
 datas = [
     (str(ROOT / "config.json"), "."),
+    (str(ROOT / "config"), "config"),
     (str(ROOT / "dashboard"), "dashboard"),
     (str(ROOT / "models"), "models"),
 ]
@@ -39,6 +40,7 @@ metadata_packages = [
     "mediapipe",
     "opencv-contrib-python",
     "openvino",
+    "jsonschema",
 ]
 
 for package in metadata_packages:

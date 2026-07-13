@@ -18,6 +18,7 @@ import copy
 import json
 import ipaddress
 import threading
+from datetime import datetime
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Optional
@@ -139,7 +140,13 @@ def get_runtime_status():
             }
 
     camera_ready = checks["camera"]["ok"]
-    model_ready = checks["pose"]["ok"] and checks["face"]["ok"]
+    model_ready = (
+        checks["modelManifest"]["ok"]
+        and checks["pose"]["ok"]
+        and checks["face"]["ok"]
+        and checks["person"]["modelReady"]
+        and checks["ageGender"]["modelReady"]
+    )
     age_gender_ready = checks["ageGender"]["modelReady"]
     age_gender_mode = checks["ageGender"]["mode"]
 
@@ -176,6 +183,16 @@ def validate_envelope(message):
         if not message.get(field).strip():
             return f"{field} must not be empty"
 
+    if len(message["messageId"]) > 128:
+        return "messageId must not exceed 128 characters"
+
+    try:
+        timestamp = datetime.fromisoformat(message["timestamp"].replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            return "timestamp must include a timezone"
+    except ValueError:
+        return "timestamp must be an ISO datetime"
+
     if not isinstance(message.get("payload"), dict):
         return "payload must be an object"
 
@@ -190,6 +207,15 @@ def validate_message_payload(message_type: str, payload: dict):
     - vision.try_on.start: sessionId, catalogKey, variantId
     - vision.try_on.stop: sessionId, reason
     """
+    supported_types = {
+        "vision.hello",
+        "vision.ping",
+        "vision.try_on.start",
+        "vision.try_on.stop",
+    }
+    if message_type not in supported_types:
+        return f"unsupported client message type: {message_type}"
+
     if message_type == "vision.hello":
         protocol_version = payload.get("protocolVersion")
         capabilities = payload.get("capabilities")
@@ -206,38 +232,55 @@ def validate_message_payload(message_type: str, payload: dict):
         if not isinstance(capabilities, list):
             return "payload.capabilities must be an array"
 
-        if not all(isinstance(item, str) and item.strip() for item in capabilities):
-            return "payload.capabilities must contain non-empty strings"
+        if not all(
+            isinstance(item, str) and item.strip() and len(item) <= 64
+            for item in capabilities
+        ):
+            return "payload.capabilities must contain strings of 1-64 characters"
 
-        if client_role is not None and not isinstance(client_role, str):
-            return "payload.clientRole must be a string"
+        if not isinstance(client_role, str) or not client_role.strip():
+            return "payload.clientRole must be a non-empty string"
 
-        if machine_code is not None and not isinstance(machine_code, str):
-            return "payload.machineCode must be a string"
+        if machine_code is not None and (
+            not isinstance(machine_code, str)
+            or not machine_code
+            or len(machine_code) > 64
+        ):
+            return "payload.machineCode must contain 1-64 characters"
 
     if message_type == "vision.try_on.start":
         session_id = payload.get("sessionId")
         catalog_key = payload.get("catalogKey")
         variant_id = payload.get("variantId")
 
-        if not isinstance(session_id, str) or not session_id.strip():
-            return "payload.sessionId must be a non-empty string"
+        if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
+            return "payload.sessionId must contain 1-128 characters"
 
-        if catalog_key is not None and not isinstance(catalog_key, str):
-            return "payload.catalogKey must be a string"
+        if catalog_key is not None and (
+            not isinstance(catalog_key, str) or not catalog_key or len(catalog_key) > 128
+        ):
+            return "payload.catalogKey must contain 1-128 characters"
 
-        if variant_id is not None and not isinstance(variant_id, str):
-            return "payload.variantId must be a string"
+        if variant_id is not None and (
+            not isinstance(variant_id, str) or not variant_id or len(variant_id) > 128
+        ):
+            return "payload.variantId must contain 1-128 characters"
 
     if message_type == "vision.try_on.stop":
         session_id = payload.get("sessionId")
         reason = payload.get("reason")
 
-        if not isinstance(session_id, str) or not session_id.strip():
-            return "payload.sessionId must be a non-empty string"
+        if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
+            return "payload.sessionId must contain 1-128 characters"
 
-        if reason is not None and not isinstance(reason, str):
-            return "payload.reason must be a string"
+        if reason is not None and reason not in {
+            "user_exit",
+            "route_leave",
+            "replaced",
+            "error",
+            "unknown",
+        }:
+            return "payload.reason is not a supported try-on stop reason"
 
     return None
 
@@ -257,6 +300,7 @@ def root():
             "session_status": "/session/status",
             "metrics": "/metrics",
             "ws": "/ws",
+            "diagnostic_ws": "/debug/ws",
             "health": "/health",
             "version": "/version",
         },
@@ -919,8 +963,7 @@ def websocket_origin_allowed(websocket: WebSocket) -> bool:
     return origin in allowed
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]):
     """WebSocket 主端点。
 
     处理以下消息类型：
@@ -941,7 +984,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1008)
         logger.warning("WebSocket rejected due to untrusted Origin")
         return
-    logger.info("WebSocket connected")
+    logger.info("WebSocket connected roles=%s", sorted(allowed_client_roles))
 
     try:
         while True:
@@ -1008,6 +1051,23 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                 continue
 
+            if (
+                message_type == "vision.hello"
+                and payload.get("clientRole") not in allowed_client_roles
+            ):
+                async with send_lock:
+                    await send_error(
+                        websocket,
+                        code="invalid_message",
+                        message=(
+                            "payload.clientRole must be one of: "
+                            + ", ".join(sorted(allowed_client_roles))
+                        ),
+                        retryable=False,
+                        message_id=message_id,
+                    )
+                continue
+
             if message_type != "vision.hello" and not handshake_complete:
                 async with send_lock:
                     await send_error(
@@ -1045,17 +1105,29 @@ async def websocket_endpoint(websocket: WebSocket):
                         )
                     )
 
-                if not status["modelReady"]:
+                # The VEM daemon treats vision as a non-sale-critical capability.
+                # Complete the protocol handshake even when cameras/models are
+                # degraded so the runtime can expose diagnostics and retry after
+                # the site is calibrated. Profile workers remain guarded by the
+                # runtime checks and will publish a retryable error when needed.
+                if not status["modelReady"] or not status["cameraReady"]:
                     async with send_lock:
                         await websocket.send_json(
                             error_envelope(
-                                code="model_not_ready",
-                                message="required vision model is not ready",
+                                code=(
+                                    "model_not_ready"
+                                    if not status["modelReady"]
+                                    else "camera_unavailable"
+                                ),
+                                message=(
+                                    "required vision model is not ready"
+                                    if not status["modelReady"]
+                                    else "configured camera is not ready"
+                                ),
                                 retryable=True,
-                                message_id=f"error-model-not-ready-{uuid4()}",
+                                message_id=f"error-degraded-{uuid4()}",
                             )
                         )
-                    continue
 
                 if settings.PROFILE_PUSH_ENABLED:
                     await register_profile_client(
@@ -1207,3 +1279,15 @@ async def websocket_endpoint(websocket: WebSocket):
             reason="websocket_disconnected",
             owner_id=str(id(websocket)),
         )
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """VEM machine protocol surface; accepts only machine-role clients."""
+    await websocket_session(websocket, {"machine"})
+
+
+@app.websocket("/debug/ws")
+async def dashboard_websocket_endpoint(websocket: WebSocket):
+    """Vendor diagnostic surface; isolated from the machine protocol route."""
+    await websocket_session(websocket, {"dashboard"})

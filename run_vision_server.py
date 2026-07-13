@@ -10,6 +10,7 @@
 """
 
 import multiprocessing
+import argparse
 import os
 import sys
 import threading
@@ -49,15 +50,30 @@ def configure_workdir():
         os.chdir(Path(sys.executable).resolve().parent)
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="售货机视觉运行时")
+    parser.add_argument(
+        "--config",
+        help="VEM 托管的外部现场配置；启用严格的失败关闭模式",
+    )
+    parser.add_argument("--no-browser", action="store_true")
+    return parser.parse_args(argv)
+
+
 def main():
     """主入口函数：配置环境并启动 uvicorn 服务器。"""
     # PyInstaller 多进程支持
     multiprocessing.freeze_support()
+    args = parse_args()
     configure_workdir()
     # 抑制 TensorFlow/MediaPipe 的冗余日志输出
     os.environ.setdefault("GLOG_minloglevel", "2")
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
     os.environ.setdefault("VISION_MOCK_SCENARIO", "off")
+    if args.config:
+        config_path = Path(args.config).expanduser().resolve(strict=True)
+        os.environ["VISION_CONFIG_FILE"] = str(config_path)
+        os.environ["VISION_CONFIG_MODE"] = "managed"
 
     import uvicorn
 
@@ -79,7 +95,7 @@ def main():
     print("")
 
     # 自动打开浏览器到仪表盘
-    if bool_env("VISION_OPEN_BROWSER", True):
+    if not args.no_browser and bool_env("VISION_OPEN_BROWSER", True):
         threading.Timer(2.0, lambda: webbrowser.open(dashboard_url)).start()
 
     uvicorn.run(
