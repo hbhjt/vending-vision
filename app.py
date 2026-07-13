@@ -1045,17 +1045,29 @@ async def websocket_endpoint(websocket: WebSocket):
                         )
                     )
 
-                if not status["modelReady"]:
+                # The VEM daemon treats vision as a non-sale-critical capability.
+                # Complete the protocol handshake even when cameras/models are
+                # degraded so the runtime can expose diagnostics and retry after
+                # the site is calibrated. Profile workers remain guarded by the
+                # runtime checks and will publish a retryable error when needed.
+                if not status["modelReady"] or not status["cameraReady"]:
                     async with send_lock:
                         await websocket.send_json(
                             error_envelope(
-                                code="model_not_ready",
-                                message="required vision model is not ready",
+                                code=(
+                                    "model_not_ready"
+                                    if not status["modelReady"]
+                                    else "camera_not_ready"
+                                ),
+                                message=(
+                                    "required vision model is not ready"
+                                    if not status["modelReady"]
+                                    else "configured camera is not ready"
+                                ),
                                 retryable=True,
-                                message_id=f"error-model-not-ready-{uuid4()}",
+                                message_id=f"error-degraded-{uuid4()}",
                             )
                         )
-                    continue
 
                 if settings.PROFILE_PUSH_ENABLED:
                     await register_profile_client(
