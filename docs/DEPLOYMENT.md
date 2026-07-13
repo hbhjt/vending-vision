@@ -55,7 +55,7 @@ python -m pip install opencv-contrib-python==4.10.0.84
 如 machine WebView 使用其他本机 Origin，通过环境变量显式配置：
 
 ```powershell
-$env:VISION_ALLOWED_ORIGINS="http://127.0.0.1:7892,http://localhost:1420"
+$env:VISION_ALLOWED_ORIGINS="http://127.0.0.1:7892,http://localhost:1420,http://tauri.localhost"
 ```
 
 MJPEG `previewUrl` 包含会话级随机访问令牌，前端必须完整使用
