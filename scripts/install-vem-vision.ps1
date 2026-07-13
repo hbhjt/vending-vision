@@ -18,7 +18,8 @@ if ($LASTEXITCODE -gt 7) { throw "robocopy failed with exit code $LASTEXITCODE" 
 if ($LASTEXITCODE -ne 0) { throw 'vision dependency installation failed' }
 
 $visionOrigins = 'http://127.0.0.1:7892,http://localhost:7892,http://tauri.localhost'
-$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/d /c set VISION_MOCK_SCENARIO=off&& set VISION_HOST=127.0.0.1&& set VISION_ALLOWED_ORIGINS=$visionOrigins&& \\\"$Python\\\" -m uvicorn app:app --host 127.0.0.1 --port 7892" -WorkingDirectory $InstallRoot
+$command = "set VISION_MOCK_SCENARIO=off&& set VISION_HOST=127.0.0.1&& set VISION_ALLOWED_ORIGINS=$visionOrigins&& `"$Python`" -m uvicorn app:app --host 127.0.0.1 --port 7892"
+$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/d /c `"$command`"" -WorkingDirectory $InstallRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType InteractiveToken -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Days 3650) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
