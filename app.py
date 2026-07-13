@@ -257,6 +257,7 @@ def root():
             "session_status": "/session/status",
             "metrics": "/metrics",
             "ws": "/ws",
+            "diagnostic_ws": "/dashboard/ws",
             "health": "/health",
             "version": "/version",
         },
@@ -919,8 +920,7 @@ def websocket_origin_allowed(websocket: WebSocket) -> bool:
     return origin in allowed
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]):
     """WebSocket 主端点。
 
     处理以下消息类型：
@@ -941,7 +941,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1008)
         logger.warning("WebSocket rejected due to untrusted Origin")
         return
-    logger.info("WebSocket connected")
+    logger.info("WebSocket connected roles=%s", sorted(allowed_client_roles))
 
     try:
         while True:
@@ -1008,6 +1008,23 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                 continue
 
+            if (
+                message_type == "vision.hello"
+                and payload.get("clientRole") not in allowed_client_roles
+            ):
+                async with send_lock:
+                    await send_error(
+                        websocket,
+                        code="invalid_message",
+                        message=(
+                            "payload.clientRole must be one of: "
+                            + ", ".join(sorted(allowed_client_roles))
+                        ),
+                        retryable=False,
+                        message_id=message_id,
+                    )
+                continue
+
             if message_type != "vision.hello" and not handshake_complete:
                 async with send_lock:
                     await send_error(
@@ -1057,7 +1074,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 code=(
                                     "model_not_ready"
                                     if not status["modelReady"]
-                                    else "camera_not_ready"
+                                    else "camera_unavailable"
                                 ),
                                 message=(
                                     "required vision model is not ready"
@@ -1219,3 +1236,15 @@ async def websocket_endpoint(websocket: WebSocket):
             reason="websocket_disconnected",
             owner_id=str(id(websocket)),
         )
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """VEM machine protocol surface; accepts only machine-role clients."""
+    await websocket_session(websocket, {"machine"})
+
+
+@app.websocket("/dashboard/ws")
+async def dashboard_websocket_endpoint(websocket: WebSocket):
+    """Vendor diagnostic surface; isolated from the machine protocol route."""
+    await websocket_session(websocket, {"dashboard"})

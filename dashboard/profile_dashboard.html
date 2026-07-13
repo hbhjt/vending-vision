@@ -1084,10 +1084,10 @@
     function defaultWsUrl() {
       if (location.protocol === "http:" || location.protocol === "https:") {
         const scheme = location.protocol === "https:" ? "wss" : "ws";
-        return `${scheme}://${location.host}/ws`;
+        return `${scheme}://${location.host}/dashboard/ws`;
       }
 
-      return "ws://127.0.0.1:7892/ws";
+      return "ws://127.0.0.1:7892/dashboard/ws";
     }
 
     function nowIso() {
