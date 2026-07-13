@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "vending-vision-model-manifest/v1",
+  "sourceArtifact": {
+    "name": "vending-vision.zip",
+    "digest": "sha256:9dc9dda0fb60a69cfac142bbbfd09f769b8ef965c0f4d3bbc8ccf3a8e33d4b1b",
+    "status": "experimental-provenance"
+  },
+  "models": [
+    {
+      "role": "person_detection",
+      "path": "models/person_detection/person_yolov8n.onnx",
+      "sha256": "190ba5f1e61411a001683e349d6b2cdb0804c0dc67a5e34cd8ff6fd00ee54b4d"
+    },
+    {
+      "role": "face_detection",
+      "path": "models/face_detection/face_detection_yunet_2023mar.onnx",
+      "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+    },
+    {
+      "role": "age_network_definition",
+      "path": "models/age_gender/age_deploy.prototxt",
+      "sha256": "af2a268d12bda7821140461319828a8560ce7739db9568d6b3827a60487a6333"
+    },
+    {
+      "role": "age_network_weights",
+      "path": "models/age_gender/age_net.caffemodel",
+      "sha256": "6dde5d07df5ca1d66ff39e525693f05ccfb9d2c437e188fdd1a10d42e57fabd6"
+    },
+    {
+      "role": "gender_network_definition",
+      "path": "models/age_gender/gender_deploy.prototxt",
+      "sha256": "c1961acc32e6e9ce855f6ec4973e9a939cc2d49089a8aaefeafa0e100fb110cc"
+    },
+    {
+      "role": "gender_network_weights",
+      "path": "models/age_gender/gender_net.caffemodel",
+      "sha256": "ac7571b281ae078817764b645a20541bd6aa1babeac20a45e6d8de7d61ba0e50"
+    }
+  ]
+}

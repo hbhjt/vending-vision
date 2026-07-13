@@ -51,9 +51,7 @@ test_reports/
 .DS_Store
 Thumbs.db
 
-# Model files
-models/**/*.onnx
-models/**/*.caffemodel
+# 生产模型权重通过 Git LFS 进入候选发布物；LFS pointer 未解析或 hash 不符时构建失败。
 models/**/*.pb
 models/**/*.tflite
 models/**/*.pth
@@ -65,3 +63,5 @@ models/**/*.pt
 !models/**/*.txt
 !models/**/*.prototxt
 !models/**/*.md
+!models/**/*.onnx
+!models/**/*.caffemodel

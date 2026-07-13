@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vending-vision.invalid/schemas/site-config/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "host", "port", "allowed_origins", "cameras"],
+  "properties": {
+    "schemaVersion": { "const": "vending-vision-site-config/v1" },
+    "host": { "enum": ["127.0.0.1", "::1", "localhost"] },
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "allowed_origins": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^http://" }
+    },
+    "cameras": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["top", "front"],
+      "properties": {
+        "top": { "$ref": "#/$defs/topCamera" },
+        "front": { "$ref": "#/$defs/frontCamera" }
+      }
+    },
+    "top_occupancy": { "$ref": "#/$defs/topOccupancy" },
+    "profile_sampling": { "$ref": "#/$defs/profileSampling" },
+    "profile_push_interval_ms": { "type": "integer", "minimum": 50, "maximum": 10000 },
+    "profile_push_cooldown_ms": { "type": "integer", "minimum": 0, "maximum": 120000 },
+    "profile_min_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "profile_min_valid_frames": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "proximity_present_face_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+    "proximity_close_face_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+    "proximity_close_consecutive_frames": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "proximity_present_person_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+    "proximity_close_person_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+    "proximity_present_body_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+    "proximity_close_body_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+    "front_camera_profile_max_wait_ms": { "type": "integer", "minimum": 100, "maximum": 120000 },
+    "front_camera_profile_sample_count": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "front_camera_profile_sample_interval_ms": { "type": "integer", "minimum": 10, "maximum": 10000 },
+    "front_camera_owner_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 3600000 },
+    "try_on_session_ttl_ms": { "type": "integer", "minimum": 1000, "maximum": 3600000 },
+    "try_on_max_stream_clients": { "type": "integer", "minimum": 1, "maximum": 8 }
+  },
+  "$defs": {
+    "topOccupancy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "roi": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "type": "number", "minimum": 0, "maximum": 1 } },
+        "history_size": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "present_min_frames": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "single_min_frames": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "multiple_min_frames": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "absent_min_seconds": { "type": "number", "minimum": 0, "maximum": 30 },
+        "track_iou_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "track_min_age_frames": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "track_max_missed_frames": { "type": "integer", "minimum": 0, "maximum": 100 }
+      }
+    },
+    "profileSampling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "duration_sec": { "type": "number", "minimum": 0.1, "maximum": 30 },
+        "early_finish_after_sec": { "type": "number", "minimum": 0, "maximum": 30 },
+        "target_fps": { "type": "number", "minimum": 1, "maximum": 60 },
+        "min_good_frames": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "max_good_frames": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "min_face_area_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "min_face_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "min_person_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "min_blur_score": { "type": "number", "minimum": 0 },
+        "brightness_min": { "type": "number", "minimum": 0, "maximum": 255 },
+        "brightness_max": { "type": "number", "minimum": 0, "maximum": 255 }
+      }
+    },
+    "cameraBase": {
+      "type": "object",
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "backend": { "type": "string", "minLength": 1 },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "fps": { "type": "integer", "minimum": 1 },
+        "fourcc": { "type": "string", "minLength": 1, "maxLength": 4 },
+        "keep_open": { "type": "boolean" },
+        "rotate": { "enum": [0, 90, 180, 270] }
+      }
+    },
+    "topCamera": {
+      "allOf": [
+        { "$ref": "#/$defs/cameraBase" },
+        {
+          "additionalProperties": false,
+          "required": ["index", "role"],
+          "properties": {
+            "index": { "type": "integer", "minimum": 0 },
+            "backend": { "type": "string", "minLength": 1 },
+            "width": { "type": "integer", "minimum": 1 },
+            "height": { "type": "integer", "minimum": 1 },
+            "fps": { "type": "integer", "minimum": 1 },
+            "fourcc": { "type": "string", "minLength": 1, "maxLength": 4 },
+            "keep_open": { "type": "boolean" },
+            "rotate": { "enum": [0, 90, 180, 270] },
+            "role": { "const": "presence" }
+          }
+        }
+      ]
+    },
+    "frontCamera": {
+      "allOf": [
+        { "$ref": "#/$defs/cameraBase" },
+        {
+          "additionalProperties": false,
+          "required": ["index", "role"],
+          "properties": {
+            "index": { "type": "integer", "minimum": 0 },
+            "backend": { "type": "string", "minLength": 1 },
+            "width": { "type": "integer", "minimum": 1 },
+            "height": { "type": "integer", "minimum": 1 },
+            "fps": { "type": "integer", "minimum": 1 },
+            "fourcc": { "type": "string", "minLength": 1, "maxLength": 4 },
+            "keep_open": { "type": "boolean" },
+            "rotate": { "enum": [0, 90, 180, 270] },
+            "role": { "const": "profile_tryon" }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -14,6 +14,10 @@ import os
 import sys
 from pathlib import Path
 
+import jsonschema
+
+from vision._build_version import APP_VERSION as BUILD_APP_VERSION
+
 # ---------------------------------------------------------------------------
 # 路径解析
 # ---------------------------------------------------------------------------
@@ -22,6 +26,69 @@ from pathlib import Path
 RUNTIME_BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
 # 配置文件基准目录：默认从当前工作目录开始查找
 CONFIG_BASE_DIR = Path.cwd()
+MANAGED_CONFIG_MODE = os.getenv("VISION_CONFIG_MODE", "").strip().lower() == "managed"
+
+
+class ConfigError(RuntimeError):
+    """VEM 托管的外部现场配置无效。"""
+
+
+def _validate_managed_config(config, config_path):
+    if not isinstance(config, dict):
+        raise ConfigError(f"managed configuration must be an object: {config_path}")
+
+    schema_path = RUNTIME_BASE_DIR / "config" / "vending-vision-site-config-v1.schema.json"
+    try:
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        allowed_keys = set(schema["properties"])
+    except Exception as exc:
+        raise ConfigError("打包的现场配置 schema 不可用") from exc
+    try:
+        jsonschema.Draft202012Validator(schema).validate(config)
+    except jsonschema.ValidationError as exc:
+        raise ConfigError(f"托管现场配置不符合 schema: {exc.message}") from exc
+    unknown = sorted(set(config) - allowed_keys)
+    if unknown:
+        raise ConfigError(f"managed configuration contains unknown keys: {', '.join(unknown)}")
+    if config.get("schemaVersion") != "vending-vision-site-config/v1":
+        raise ConfigError("managed configuration schemaVersion must be vending-vision-site-config/v1")
+    host = config.get("host")
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        raise ConfigError("managed configuration host must be loopback")
+    port = config.get("port")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ConfigError("managed configuration port must be an integer from 1 to 65535")
+    origins = config.get("allowed_origins")
+    if not isinstance(origins, list) or not origins or not all(
+        isinstance(item, str) and item.startswith("http://") for item in origins
+    ):
+        raise ConfigError("managed configuration allowed_origins must contain local HTTP origins")
+
+    cameras = config.get("cameras")
+    if not isinstance(cameras, dict) or set(cameras) != {"top", "front"}:
+        raise ConfigError("managed configuration must define exactly top and front cameras")
+    camera_keys = {
+        "index", "backend", "width", "height", "fps", "fourcc", "role",
+        "keep_open", "rotate", "roi",
+    }
+    expected_roles = {"top": "presence", "front": "profile_tryon"}
+    for camera_name, camera in cameras.items():
+        if not isinstance(camera, dict):
+            raise ConfigError(f"camera {camera_name} must be an object")
+        camera_unknown = sorted(set(camera) - camera_keys)
+        if camera_unknown:
+            raise ConfigError(
+                f"camera {camera_name} contains unknown keys: {', '.join(camera_unknown)}"
+            )
+        index = camera.get("index")
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise ConfigError(f"camera {camera_name}.index must be a non-negative integer")
+        if camera.get("role") != expected_roles[camera_name]:
+            raise ConfigError(f"camera {camera_name}.role is invalid")
+        if camera.get("rotate", 0) not in {0, 90, 180, 270}:
+            raise ConfigError(f"camera {camera_name}.rotate must be 0, 90, 180, or 270")
+
+    return config
 
 
 def runtime_path(path):
@@ -72,7 +139,21 @@ def load_json_config():
     """
     global CONFIG_BASE_DIR
 
-    for config_path in _config_candidates():
+    candidates = list(_config_candidates())
+    if MANAGED_CONFIG_MODE:
+        if not os.getenv("VISION_CONFIG_FILE"):
+            raise ConfigError("managed launch requires --config")
+        config_path = candidates[0]
+        if not config_path.is_file():
+            raise ConfigError(f"managed configuration does not exist: {config_path}")
+        try:
+            parsed = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ConfigError(f"managed configuration is not valid UTF-8 JSON: {config_path}") from exc
+        CONFIG_BASE_DIR = config_path.parent
+        return _validate_managed_config(parsed, config_path)
+
+    for config_path in candidates:
         if not config_path.exists():
             continue
 
@@ -100,7 +181,7 @@ def get_config_value(key, env_key, default):
 
     自动根据默认值类型进行类型转换（bool/int/float/str）。
     """
-    if env_key in os.environ:
+    if not MANAGED_CONFIG_MODE and env_key in os.environ:
         value = os.getenv(env_key)
 
         if isinstance(default, bool):
@@ -119,7 +200,7 @@ def get_config_value(key, env_key, default):
 
 def get_json_config_value(key, env_key, default):
     """获取 JSON 类型的配置值（如字典、列表），支持环境变量覆盖。"""
-    if env_key in os.environ:
+    if not MANAGED_CONFIG_MODE and env_key in os.environ:
         try:
             return json.loads(os.getenv(env_key) or "")
         except Exception:
@@ -131,7 +212,7 @@ def get_json_config_value(key, env_key, default):
 
 def get_nested_config_value(section, key, env_key, default):
     """获取嵌套配置值（从 config.json 的某个 section 下读取 key）。"""
-    if env_key in os.environ:
+    if not MANAGED_CONFIG_MODE and env_key in os.environ:
         value = os.getenv(env_key)
 
         if isinstance(default, bool):
@@ -192,7 +273,7 @@ def get_section_config(section, default):
 
 def get_path_config_value(key, env_key, default):
     """获取路径类型的配置值，自动解析为运行时实际路径。"""
-    if env_key in os.environ:
+    if not MANAGED_CONFIG_MODE and env_key in os.environ:
         return runtime_path(os.getenv(env_key) or default)
 
     value = _json_config.get(key, default)
@@ -235,7 +316,7 @@ def bool_config_value(value, default=False):
 
 class Settings:
     APP_NAME = "Vending Vision Module"
-    APP_VERSION = "0.2.0"
+    APP_VERSION = BUILD_APP_VERSION
     PROTOCOL = "vem.vision.v1"
     PERSON_DETECTOR_CONFIG = get_model_config(
         "person_detector",
@@ -600,10 +681,14 @@ class Settings:
         "VISION_WEBSOCKET_QUEUE_SIZE",
         16,
     )
-    ALLOWED_ORIGINS = tuple(
-        item.strip()
-        for item in str(os.getenv("VISION_ALLOWED_ORIGINS", "")).split(",")
-        if item.strip()
+    ALLOWED_ORIGINS = (
+        tuple(get_json_config_value("allowed_origins", "VISION_ALLOWED_ORIGINS_JSON", []))
+        if MANAGED_CONFIG_MODE
+        else tuple(
+            item.strip()
+            for item in str(os.getenv("VISION_ALLOWED_ORIGINS", "")).split(",")
+            if item.strip()
+        )
     )
 
     HEIGHT_SCALE = get_config_value("height_scale", "VISION_HEIGHT_SCALE", 100.0)

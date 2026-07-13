@@ -19,4 +19,4 @@ person_yolov8n.onnx
 }
 ```
 
-当前解析器按 COCO `person` 类别 ID `0` 读取常见 YOLOv5/YOLOv8 ONNX 输出。多数现成 YOLOv8 ONNX 是固定 640x640 输入，因此默认输入尺寸为 640。模型不存在或推理失败时，视觉服务会自动回退到人脸面积和 MediaPipe Pose 姿态框辅助，不会影响服务启动。
+当前解析器按 COCO `person` 类别 ID `0` 读取常见 YOLOv5/YOLOv8 ONNX 输出。多数现成 YOLOv8 ONNX 是固定 640x640 输入，因此默认输入尺寸为 640。开发模式可在模型异常时观察降级信息；候选 release 的安装验收要求清单中的人体检测模型存在、hash 正确且能初始化，否则 `modelReady=false`。

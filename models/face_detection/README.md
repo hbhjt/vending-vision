@@ -12,6 +12,6 @@ face_detection_yunet_2023mar.onnx
 models/face_detection/face_detection_yunet_2023mar.onnx
 ```
 
-该 ONNX 模型不建议上传到 GitHub。部署时请在售货机本机把模型文件放到本目录。
+该 ONNX 模型通过 Git LFS 进入不可变候选 bundle，售货机现场不得单独放置或替换。
 
-如果该模型不存在，服务会自动回退到 OpenCV Haar 人脸检测。Haar 可以保证服务继续运行，但弱光、侧脸、遮挡和小人脸场景的稳定性会下降。
+Haar 仅是开发诊断回退。清单模型缺失或 hash 不匹配时候选安装验收必须报告 `modelReady=false`。

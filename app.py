@@ -18,6 +18,7 @@ import copy
 import json
 import ipaddress
 import threading
+from datetime import datetime
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Optional
@@ -139,7 +140,13 @@ def get_runtime_status():
             }
 
     camera_ready = checks["camera"]["ok"]
-    model_ready = checks["pose"]["ok"] and checks["face"]["ok"]
+    model_ready = (
+        checks["modelManifest"]["ok"]
+        and checks["pose"]["ok"]
+        and checks["face"]["ok"]
+        and checks["person"]["modelReady"]
+        and checks["ageGender"]["modelReady"]
+    )
     age_gender_ready = checks["ageGender"]["modelReady"]
     age_gender_mode = checks["ageGender"]["mode"]
 
@@ -176,6 +183,16 @@ def validate_envelope(message):
         if not message.get(field).strip():
             return f"{field} must not be empty"
 
+    if len(message["messageId"]) > 128:
+        return "messageId must not exceed 128 characters"
+
+    try:
+        timestamp = datetime.fromisoformat(message["timestamp"].replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            return "timestamp must include a timezone"
+    except ValueError:
+        return "timestamp must be an ISO datetime"
+
     if not isinstance(message.get("payload"), dict):
         return "payload must be an object"
 
@@ -190,6 +207,15 @@ def validate_message_payload(message_type: str, payload: dict):
     - vision.try_on.start: sessionId, catalogKey, variantId
     - vision.try_on.stop: sessionId, reason
     """
+    supported_types = {
+        "vision.hello",
+        "vision.ping",
+        "vision.try_on.start",
+        "vision.try_on.stop",
+    }
+    if message_type not in supported_types:
+        return f"unsupported client message type: {message_type}"
+
     if message_type == "vision.hello":
         protocol_version = payload.get("protocolVersion")
         capabilities = payload.get("capabilities")
@@ -206,38 +232,55 @@ def validate_message_payload(message_type: str, payload: dict):
         if not isinstance(capabilities, list):
             return "payload.capabilities must be an array"
 
-        if not all(isinstance(item, str) and item.strip() for item in capabilities):
-            return "payload.capabilities must contain non-empty strings"
+        if not all(
+            isinstance(item, str) and item.strip() and len(item) <= 64
+            for item in capabilities
+        ):
+            return "payload.capabilities must contain strings of 1-64 characters"
 
-        if client_role is not None and not isinstance(client_role, str):
-            return "payload.clientRole must be a string"
+        if not isinstance(client_role, str) or not client_role.strip():
+            return "payload.clientRole must be a non-empty string"
 
-        if machine_code is not None and not isinstance(machine_code, str):
-            return "payload.machineCode must be a string"
+        if machine_code is not None and (
+            not isinstance(machine_code, str)
+            or not machine_code
+            or len(machine_code) > 64
+        ):
+            return "payload.machineCode must contain 1-64 characters"
 
     if message_type == "vision.try_on.start":
         session_id = payload.get("sessionId")
         catalog_key = payload.get("catalogKey")
         variant_id = payload.get("variantId")
 
-        if not isinstance(session_id, str) or not session_id.strip():
-            return "payload.sessionId must be a non-empty string"
+        if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
+            return "payload.sessionId must contain 1-128 characters"
 
-        if catalog_key is not None and not isinstance(catalog_key, str):
-            return "payload.catalogKey must be a string"
+        if catalog_key is not None and (
+            not isinstance(catalog_key, str) or not catalog_key or len(catalog_key) > 128
+        ):
+            return "payload.catalogKey must contain 1-128 characters"
 
-        if variant_id is not None and not isinstance(variant_id, str):
-            return "payload.variantId must be a string"
+        if variant_id is not None and (
+            not isinstance(variant_id, str) or not variant_id or len(variant_id) > 128
+        ):
+            return "payload.variantId must contain 1-128 characters"
 
     if message_type == "vision.try_on.stop":
         session_id = payload.get("sessionId")
         reason = payload.get("reason")
 
-        if not isinstance(session_id, str) or not session_id.strip():
-            return "payload.sessionId must be a non-empty string"
+        if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
+            return "payload.sessionId must contain 1-128 characters"
 
-        if reason is not None and not isinstance(reason, str):
-            return "payload.reason must be a string"
+        if reason is not None and reason not in {
+            "user_exit",
+            "route_leave",
+            "replaced",
+            "error",
+            "unknown",
+        }:
+            return "payload.reason is not a supported try-on stop reason"
 
     return None
 
@@ -257,7 +300,7 @@ def root():
             "session_status": "/session/status",
             "metrics": "/metrics",
             "ws": "/ws",
-            "diagnostic_ws": "/dashboard/ws",
+            "diagnostic_ws": "/debug/ws",
             "health": "/health",
             "version": "/version",
         },
@@ -1244,7 +1287,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket_session(websocket, {"machine"})
 
 
-@app.websocket("/dashboard/ws")
+@app.websocket("/debug/ws")
 async def dashboard_websocket_endpoint(websocket: WebSocket):
     """Vendor diagnostic surface; isolated from the machine protocol route."""
     await websocket_session(websocket, {"dashboard"})

@@ -20,7 +20,7 @@ if (-not (Test-Path $Python)) {
 
 Invoke-Checked $Python -m pip install @PipIndexArgs --upgrade pip setuptools wheel
 Invoke-Checked $Python -m pip install @PipIndexArgs -r (Join-Path $Root "requirements-packaging.txt")
-Invoke-Checked $Python -m pip install @PipIndexArgs "pyinstaller>=6.14,<7"
+Invoke-Checked $Python -m pip install @PipIndexArgs "pyinstaller==6.16.0"
 
 Invoke-Checked $Python -m PyInstaller --clean --noconfirm (Join-Path $Root "vending_vision.spec")
 

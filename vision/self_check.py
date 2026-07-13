@@ -19,6 +19,12 @@ from vision.person_detector import PersonDetector
 from vision.logger import logger
 from vision.age_gender_estimator import AgeGenderEstimator
 from vision.camera_manager import get_all_camera_statuses
+from vision.model_manifest import verify_model_manifest
+
+
+def check_model_manifest():
+    """校验不可变发布物携带的全部生产模型。"""
+    return verify_model_manifest()
 
 def check_camera():
     """检查摄像头是否可打开。
@@ -147,6 +153,7 @@ def run_self_check():
     """
     checks = {
         "camera": check_camera(),
+        "modelManifest": check_model_manifest(),
         "pose": check_pose_model(),
         "face": check_face_detector(),
         "person": check_person_detector(),
@@ -155,8 +162,11 @@ def run_self_check():
 
     required_ok = (
         checks["camera"]["ok"]
+        and checks["modelManifest"]["ok"]
         and checks["pose"]["ok"]
         and checks["face"]["ok"]
+        and checks["person"]["modelReady"]
+        and checks["ageGender"]["modelReady"]
     )
 
     return {

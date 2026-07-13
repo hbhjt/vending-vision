@@ -40,6 +40,7 @@ def parse_args():
     )
     parser.add_argument("--port", type=int, default=17892)
     parser.add_argument("--startup-timeout", type=float, default=45.0)
+    parser.add_argument("--expected-version")
     return parser.parse_args()
 
 
@@ -120,7 +121,7 @@ async def verify_websocket(port):
                             "ambient_light",
                             "try_on_session",
                         ],
-                        "clientRole": "packaging-smoke-test",
+                        "clientRole": "machine",
                         "machineCode": "PACKAGED-TEST",
                     },
                 )
@@ -207,6 +208,10 @@ def main():
             version = http_get_json(f"{base_url}/version")
             if version.get("protocol") != PROTOCOL:
                 raise AssertionError(f"protocol mismatch: {version}")
+            if args.expected_version and version.get("version") != args.expected_version:
+                raise AssertionError(
+                    f"release version mismatch: expected {args.expected_version}, got {version}"
+                )
             dashboard = http_get_text(f"{base_url}/dashboard")
             if "WebSocket" not in dashboard and "profile" not in dashboard.lower():
                 raise AssertionError("packaged dashboard content is incomplete")

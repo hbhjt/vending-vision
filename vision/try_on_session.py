@@ -7,12 +7,11 @@
 - 人物离开追踪（试衣期间人物离开时标记）
 - 会话停止与资源释放
 
-Session ID 验证规则：只允许字母、数字和 . _ : - 字符，最长 96 字符。
+Session ID 遵循 VEM 协议边界：非空字符串，最长 128 字符。
 """
 
 from __future__ import annotations
 
-import re
 import secrets
 import threading
 import time
@@ -28,10 +27,6 @@ from vision.camera_owner import (
     renew_front_camera,
 )
 from vision.config import settings
-
-
-# Session ID 格式验证：字母数字 + . _ : -，最长96字符
-SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
 
 
 def _now_iso():
@@ -56,12 +51,8 @@ def _validate_session_id(session_id: str | None):
     Raises:
         ValueError: Session ID 为空或包含不支持的字符
     """
-    if not isinstance(session_id, str) or not session_id.strip():
+    if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
         raise ValueError("payload.sessionId must be a non-empty string")
-
-    session_id = session_id.strip()
-    if not SESSION_ID_PATTERN.match(session_id):
-        raise ValueError("payload.sessionId contains unsupported characters")
 
     return session_id
 
@@ -190,7 +181,7 @@ class TryOnSessionManager:
         （人物在试衣期间离开时需要重新采集画像）。
         """
         session_id = _validate_session_id(session_id)
-        reason = reason or "client_stop"
+        request_reason = reason or "unknown"
         release_owner = False
         departed_during_tryon = False
 
@@ -210,7 +201,8 @@ class TryOnSessionManager:
             session["stoppedAt"] = _now_iso()
             session["updatedAt"] = session["stoppedAt"]
             session["updatedMonotonic"] = time.monotonic()
-            session["stopReason"] = reason
+            session["stopReason"] = "client_stop"
+            session["clientStopReason"] = request_reason
 
             if self.active_session_id == session_id:
                 self.active_session_id = None
@@ -219,12 +211,12 @@ class TryOnSessionManager:
         if release_owner:
             release_front_camera(
                 "tryon_frontend",
-                reason=f"try_on_stop:{session_id}:{reason}",
+                reason=f"try_on_stop:{session_id}:{request_reason}",
             )
 
         return {
             "sessionId": session_id,
-            "reason": reason,
+            "reason": "client_stop",
             "departedDuringTryon": departed_during_tryon,
             "shouldRefreshProfile": departed_during_tryon,
         }
