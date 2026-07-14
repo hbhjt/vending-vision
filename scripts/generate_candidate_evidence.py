@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$")
+PINNED_REQUIREMENT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)$")
 
 
 def digest_bytes(data):
@@ -35,6 +36,36 @@ def evidence_ref(path, **extra):
     }
 
 
+def read_pinned_requirements(path, seen=None):
+    path = path.resolve()
+    seen = set() if seen is None else seen
+    if path in seen:
+        raise ValueError(f"recursive requirements include: {path}")
+    seen.add(path)
+    requirements = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("-r ") or line.startswith("--requirement "):
+            included = line.split(maxsplit=1)[1]
+            requirements.extend(read_pinned_requirements(path.parent / included, seen))
+            continue
+        match = PINNED_REQUIREMENT.fullmatch(line)
+        if not match:
+            raise ValueError(f"candidate requirements must be exact pins or includes: {line}")
+        requirements.append(match.groups())
+    seen.remove(path)
+
+    deduplicated = {}
+    for name, version in requirements:
+        normalized_name = name.lower().replace("_", "-")
+        if normalized_name in deduplicated and deduplicated[normalized_name][1] != version:
+            raise ValueError(f"conflicting requirement pins for {name}")
+        deduplicated[normalized_name] = (name, version)
+    return [deduplicated[name] for name in sorted(deduplicated)]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bundle", required=True)
@@ -54,11 +85,7 @@ def main():
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     model_manifest = json.loads((root / "models/model-manifest.json").read_text(encoding="utf-8"))
-    requirements = [
-        line.strip()
-        for line in (root / "requirements-packaging.txt").read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    requirements = read_pinned_requirements(root / "requirements-packaging.txt")
 
     sbom = {
         "spdxVersion": "SPDX-2.3",
@@ -69,9 +96,9 @@ def main():
         "creationInfo": {"creators": ["Tool: vending-vision-candidate-builder"], "created": "1970-01-01T00:00:00Z"},
         "packages": [
             {
-                "name": requirement.split("==", 1)[0],
+                "name": requirement[0],
                 "SPDXID": f"SPDXRef-Package-{index}",
-                "versionInfo": requirement.split("==", 1)[1],
+                "versionInfo": requirement[1],
                 "downloadLocation": "NOASSERTION",
                 "filesAnalyzed": False,
                 "licenseConcluded": "NOASSERTION",

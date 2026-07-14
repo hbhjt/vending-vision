@@ -11,6 +11,7 @@ permissions:
 jobs:
   candidate:
     runs-on: windows-latest
+    environment: experimental-candidate
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,22 +48,19 @@ jobs:
         shell: pwsh
         env:
           VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}
-          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ secrets.VISION_SUPPLIER_SIGNER_IDENTITY }}
+          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:VISION_SUPPLIER_PRIVATE_KEY_PEM)) { throw "VISION_SUPPLIER_PRIVATE_KEY_PEM is required" }
           if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "VISION_SUPPLIER_SIGNER_IDENTITY is invalid" }
           $key = Join-Path $env:RUNNER_TEMP supplier-ed25519.pem
-          [IO.File]::WriteAllText($key, $env:VISION_SUPPLIER_PRIVATE_KEY_PEM)
-          openssl pkey -in $key -pubout -out "$env:RUNNER_TEMP/supplier-public.pem"
-          openssl pkey -pubin -in "$env:RUNNER_TEMP/supplier-public.pem" -outform DER -out "$env:RUNNER_TEMP/supplier-public.der"
-          $actual = "spki-sha256:" + (Get-FileHash "$env:RUNNER_TEMP/supplier-public.der" -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -cne $env:VISION_SUPPLIER_SIGNER_IDENTITY) { throw "supplier key identity mismatch" }
-          $bundle = Get-ChildItem candidate/vending-vision-*-windows-x86_64.zip | Select-Object -First 1
-          python scripts/generate_candidate_evidence.py --bundle $bundle.FullName --version $env:VISION_RELEASE_VERSION --commit "${{ github.sha }}" --repository "${{ github.repository }}" --signer-identity $actual --output candidate
-          Get-ChildItem candidate/*.json | ForEach-Object {
-            openssl pkeyutl -sign -rawin -inkey $key -in $_.FullName -out ($_.FullName + ".sig")
+          try {
+            [IO.File]::WriteAllText($key, $env:VISION_SUPPLIER_PRIVATE_KEY_PEM)
+            $bundle = Get-ChildItem candidate/vending-vision-*-windows-x86_64.zip | Select-Object -First 1
+            python scripts/generate_candidate_evidence.py --bundle $bundle.FullName --version $env:VISION_RELEASE_VERSION --commit "${{ github.sha }}" --repository "${{ github.repository }}" --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY --output candidate
+            python scripts/sign_candidate_evidence.py --candidate-dir candidate --private-key $key --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY
+          } finally {
+            Remove-Item $key -Force -ErrorAction SilentlyContinue
           }
-          Remove-Item $key -Force
       - uses: actions/upload-artifact@v4
         with:
           name: vending-vision-${{ env.VISION_RELEASE_VERSION }}-candidate
@@ -72,4 +70,4 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" candidate/* --prerelease --verify-tag --title "Vending Vision $env:VISION_RELEASE_VERSION" --notes "Experimental Vision Candidate Release. VEM conformance and approval must be run manually against the exact bundle digest."
+        run: gh release create "${{ github.ref_name }}" candidate/* --prerelease --verify-tag --title "Vending Vision $env:VISION_RELEASE_VERSION" --notes "Experimental Vision Candidate Release. Built independently by Vision. VEM conformance and approval run downstream against this exact tag and bundle digest."
