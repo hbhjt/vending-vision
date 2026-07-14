@@ -15,7 +15,7 @@ $PipIndexUrl = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } else { "https://py
 $PipIndexArgs = @("--index-url", $PipIndexUrl)
 
 if (-not (Test-Path $Python)) {
-    Invoke-Checked py -3.9 -m venv $Venv
+    Invoke-Checked python -m venv $Venv
 }
 
 Invoke-Checked $Python -m pip install @PipIndexArgs --upgrade pip setuptools wheel

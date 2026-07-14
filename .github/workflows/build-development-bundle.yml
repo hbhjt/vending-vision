@@ -65,11 +65,6 @@ jobs:
           python -m pytest -q
           python -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
 
-      - name: 配置打包用 Python 3.9
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
-
       - name: 构建并验证自包含 Windows bundle
         shell: pwsh
         run: |
