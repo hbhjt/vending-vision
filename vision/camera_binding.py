@@ -312,38 +312,49 @@ class DurableReplayStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             connection = sqlite3.connect(str(self.path), timeout=10, isolation_level=None)
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS consumed_jti "
-                "(jti TEXT PRIMARY KEY NOT NULL, expires_at INTEGER NOT NULL)"
-            )
+            # Do not race every first-use process through a WAL mode change.
+            # Schema creation happens inside consume's write transaction, so
+            # SQLite serialises a cold-start database exactly as it serialises
+            # the single-use insert.
+            connection.execute("PRAGMA busy_timeout = 10000")
             return connection
         except (OSError, sqlite3.Error) as exc:
             raise ReplayLedgerError("maintenance replay ledger is unavailable") from exc
 
     def consume(self, jti: str, expires_at: int, now: int) -> bool:
         with self._lock:
-            connection = None
-            try:
-                connection = self._connect()
-                connection.execute("BEGIN IMMEDIATE")
-                connection.execute("DELETE FROM consumed_jti WHERE expires_at <= ?", (now,))
-                inserted = connection.execute(
-                    "INSERT OR IGNORE INTO consumed_jti (jti, expires_at) VALUES (?, ?)",
-                    (jti, expires_at),
-                ).rowcount
-                connection.execute("COMMIT")
-                return inserted == 1
-            except (OSError, sqlite3.Error, ReplayLedgerError) as exc:
-                if connection is not None:
-                    try:
-                        connection.execute("ROLLBACK")
-                    except sqlite3.Error:
-                        pass
-                raise ReplayLedgerError("maintenance replay ledger is unavailable") from exc
-            finally:
-                if connection is not None:
-                    connection.close()
+            for attempt in range(4):
+                connection = None
+                try:
+                    connection = self._connect()
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS consumed_jti "
+                        "(jti TEXT PRIMARY KEY NOT NULL, expires_at INTEGER NOT NULL)"
+                    )
+                    connection.execute("DELETE FROM consumed_jti WHERE expires_at <= ?", (now,))
+                    inserted = connection.execute(
+                        "INSERT OR IGNORE INTO consumed_jti (jti, expires_at) VALUES (?, ?)",
+                        (jti, expires_at),
+                    ).rowcount
+                    connection.execute("COMMIT")
+                    return inserted == 1
+                except (OSError, sqlite3.Error, ReplayLedgerError) as exc:
+                    if connection is not None:
+                        try:
+                            connection.execute("ROLLBACK")
+                        except sqlite3.Error:
+                            pass
+                    transient = isinstance(exc, sqlite3.OperationalError) and (
+                        "locked" in str(exc).lower() or "busy" in str(exc).lower()
+                    )
+                    if transient and attempt < 3:
+                        time.sleep(0.05 * (2 ** attempt))
+                        continue
+                    raise ReplayLedgerError("maintenance replay ledger is unavailable") from exc
+                finally:
+                    if connection is not None:
+                        connection.close()
 
 
 class MaintenanceCapabilityVerifier:

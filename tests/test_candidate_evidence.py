@@ -9,7 +9,13 @@ from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from scripts import generate_candidate_evidence
-from scripts.dependency_lock import read_hash_locked_requirements
+from scripts.dependency_lock import (
+    active_hash_locked_requirements,
+    installed_distributions,
+    read_hash_locked_requirements,
+    resolved_license,
+    selected_wheels,
+)
 from scripts.sign_candidate_evidence import DOCUMENTS, canonical_bytes
 from vision.camera_binding import DurableReplayStore, MaintenanceCapabilityVerifier
 
@@ -26,6 +32,55 @@ def test_release_lock_contains_hashes_for_full_runtime_and_packaging_closure():
     assert packages["anyio"]["version"]
     assert packages["cv2-enumerate-cameras"]["hashes"]
     assert all(package["hashes"] for package in packages.values())
+
+
+def test_release_lock_includes_the_windows_click_console_dependency_in_the_win32_closure():
+    packages = read_hash_locked_requirements(ROOT / "requirements.txt")
+
+    assert packages["colorama"]["version"] == "0.4.6"
+    assert packages["colorama"]["marker"] == 'sys_platform == "win32"'
+    assert packages["colorama"]["hashes"]
+    assert "colorama" in active_hash_locked_requirements(packages, {"sys_platform": "win32"})
+    assert "colorama" not in active_hash_locked_requirements(packages, {"sys_platform": "linux"})
+
+
+def test_win32_marked_lock_selects_a_complete_offline_wheel_closure(tmp_path):
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    wheel = wheelhouse / "colorama-0.4.6-py2.py3-none-any.whl"
+    wheel.write_bytes(b"Windows marker closure fixture")
+    lock_path = tmp_path / "requirements.lock"
+    lock_path.write_text(
+        'colorama==0.4.6 ; sys_platform == "win32" \\\n'
+        f'    --hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}\n',
+        encoding="utf-8",
+    )
+
+    windows_lock = active_hash_locked_requirements(
+        read_hash_locked_requirements(lock_path), {"sys_platform": "win32"}
+    )
+
+    assert selected_wheels(windows_lock, wheelhouse) == {
+        "colorama": {"filename": wheel.name, "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()}
+    }
+
+
+def test_windows_ci_and_candidate_publish_force_the_win32_offline_closure():
+    ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    publish = (ROOT / ".github/workflows/publish-candidate.yml").read_text(encoding="utf-8")
+
+    assert (ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.11.9"
+    assert ci.count("--target-sys-platform win32") == 1
+    assert "python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt" in ci
+    assert "python scripts/dependency_lock.py --wheelhouse wheelhouse --python python --target-sys-platform win32" in publish
+    assert "python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt" in publish
+
+
+def test_reviewed_license_facts_match_the_locked_cffi_and_pillow_wheel_metadata():
+    installed = installed_distributions(sys.executable)
+
+    assert resolved_license("cffi", installed["cffi"]) == "MIT-0"
+    assert resolved_license("pillow", installed["pillow"]) == "MIT-CMU"
 
 
 def test_candidate_sbom_uses_hash_locked_installed_wheels_and_real_gpl_license(tmp_path, monkeypatch):
@@ -77,6 +132,39 @@ def test_candidate_sbom_uses_hash_locked_installed_wheels_and_real_gpl_license(t
     assert package["licenseConcluded"] == "GPL-3.0-or-later"
     assert package["checksums"] == [{"algorithm": "SHA256", "checksumValue": wheel_hash}]
     assert package["downloadLocation"] != "NOASSERTION"
+
+
+def test_candidate_sbom_declares_and_concludes_the_reviewed_cffi_and_pillow_facts(tmp_path, monkeypatch):
+    bundle = tmp_path / "vending-vision-0.2.1-rc.1-windows-x86_64.zip"
+    bundle.write_bytes(b"candidate-bundle")
+    dependencies = [
+        {
+            "name": name,
+            "version": version,
+            "license": license_expression,
+            "wheel": {"filename": f"{name}-{version}.whl", "sha256": hashlib.sha256(name.encode()).hexdigest()},
+        }
+        for name, version, license_expression in (
+            ("cffi", "2.1.0", "MIT-0"),
+            ("Pillow", "12.3.0", "MIT-CMU"),
+        )
+    ]
+    monkeypatch.setattr(generate_candidate_evidence, "verify_dependency_closure", lambda *_: dependencies)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate_candidate_evidence.py", "--bundle", str(bundle), "--version", "0.2.1-rc.1",
+            "--commit", "b" * 40, "--repository", "hbhjt/vending-vision",
+            "--signer-identity", SIGNER, "--wheelhouse", str(tmp_path), "--output", str(tmp_path / "candidate"),
+        ],
+    )
+
+    generate_candidate_evidence.main()
+
+    packages = json.loads((tmp_path / "candidate" / "vision-sbom.spdx.json").read_text(encoding="utf-8"))["packages"]
+    facts = {item["name"].lower(): (item["licenseDeclared"], item["licenseConcluded"]) for item in packages}
+    assert facts == {"cffi": ("MIT-0", "MIT-0"), "pillow": ("MIT-CMU", "MIT-CMU")}
 
 
 def test_packaged_smoke_managed_fixture_mints_exact_endpoint_capabilities(tmp_path):

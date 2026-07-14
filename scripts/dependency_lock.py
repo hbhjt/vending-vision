@@ -9,11 +9,12 @@ import re
 import subprocess
 from pathlib import Path
 
+from packaging.markers import Marker, default_environment
+from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
 
 HASH = re.compile(r"--hash=sha256:([0-9a-f]{64})$")
-PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s]+)$")
 
 
 class DependencyLockError(ValueError):
@@ -46,28 +47,43 @@ def _logical_lines(path: Path):
 
 
 def read_hash_locked_requirements(path: str | Path) -> dict[str, dict]:
-    """Read a flat pip-compatible exact-pin lock with at least one hash each."""
+    """Read a flat pip-compatible exact-pin lock with at least one hash each.
+
+    Markers are retained in the returned inventory so a Windows lock can hold
+    Windows-only transitive dependencies while Linux CI validates its own
+    installable subset from the same immutable file.
+    """
     entries: dict[str, dict] = {}
     for line in _logical_lines(Path(path)):
         if line.startswith("--index-url ") or line.startswith("--trusted-host "):
             continue
-        parts = line.split()
-        if not parts:
-            continue
-        match = PIN.fullmatch(parts[0])
-        if not match:
+        requirement_text, separator, hash_text = line.partition(" --hash=")
+        if not separator:
+            raise DependencyLockError(f"lock entry must include SHA-256 hashes: {line}")
+        try:
+            requirement = Requirement(requirement_text.strip())
+        except Exception as exc:
+            raise DependencyLockError(f"lock entry must be an exact package pin: {line}") from exc
+        specifiers = list(requirement.specifier)
+        if requirement.url or requirement.extras or len(specifiers) != 1 or specifiers[0].operator != "==" or "*" in specifiers[0].version:
             raise DependencyLockError(f"lock entry must be an exact package pin: {line}")
         hashes = []
-        for part in parts[1:]:
+        for part in ("--hash=" + hash_text).split():
             hash_match = HASH.fullmatch(part)
             if hash_match is None:
                 raise DependencyLockError(f"lock entry has unsupported option: {line}")
             hashes.append(hash_match.group(1))
         if not hashes:
             raise DependencyLockError(f"lock entry must include at least one SHA-256: {line}")
-        name, version = match.groups()
+        name = requirement.name
+        version = specifiers[0].version
         normalized = canonicalize_name(name)
-        entry = {"name": name, "version": version, "hashes": sorted(set(hashes))}
+        entry = {
+            "name": name,
+            "version": version,
+            "hashes": sorted(set(hashes)),
+            "marker": str(requirement.marker) if requirement.marker else None,
+        }
         previous = entries.get(normalized)
         if previous and previous != entry:
             raise DependencyLockError(f"lock repeats {name} with a conflicting version or hash set")
@@ -75,6 +91,21 @@ def read_hash_locked_requirements(path: str | Path) -> dict[str, dict]:
     if not entries:
         raise DependencyLockError("requirements lock has no package entries")
     return entries
+
+
+def active_hash_locked_requirements(
+    lock: dict[str, dict], marker_environment: dict[str, str] | None = None
+) -> dict[str, dict]:
+    """Select precisely the lock entries that pip would use for one target."""
+    environment = default_environment()
+    if marker_environment:
+        environment.update(marker_environment)
+    result = {}
+    for normalized, entry in lock.items():
+        marker = entry.get("marker")
+        if marker is None or Marker(marker).evaluate(environment):
+            result[normalized] = entry
+    return result
 
 
 def selected_wheels(lock: dict[str, dict], wheelhouse: str | Path) -> dict[str, dict]:
@@ -140,7 +171,7 @@ LICENSE_OVERRIDES = {
     "anyio": "MIT",
     "attrs": "MIT",
     "certifi": "MPL-2.0",
-    "cffi": "MIT",
+    "cffi": "MIT-0",
     "click": "BSD-3-Clause",
     "contourpy": "BSD-3-Clause",
     "cryptography": "Apache-2.0 OR BSD-3-Clause",
@@ -168,7 +199,7 @@ LICENSE_OVERRIDES = {
     "openvino-telemetry": "Apache-2.0",
     "opt-einsum": "MIT",
     "packaging": "Apache-2.0 OR BSD-2-Clause",
-    "pillow": "HPND",
+    "pillow": "MIT-CMU",
     "pip": "MIT",
     "pluggy": "MIT",
     "protobuf": "BSD-3-Clause",
@@ -198,8 +229,20 @@ LICENSE_OVERRIDES = {
 }
 
 
+METADATA_LICENSE_EXPRESSION_FACTS = {
+    "cffi": "MIT-0",
+    "pillow": "MIT-CMU",
+}
+
+
 def resolved_license(normalized_name: str, installed: dict) -> str:
     """Return reviewed SPDX, refusing an unknown package rather than NOASSERTION."""
+    metadata_expression = installed.get("licenseExpression", "").strip()
+    expected_metadata_expression = METADATA_LICENSE_EXPRESSION_FACTS.get(normalized_name)
+    if expected_metadata_expression and metadata_expression != expected_metadata_expression:
+        raise DependencyLockError(
+            f"{normalized_name} metadata license expression must be {expected_metadata_expression}"
+        )
     if normalized_name == "cv2-enumerate-cameras":
         metadata_license = installed.get("license", "")
         if "GNU GENERAL PUBLIC LICENSE" not in metadata_license.upper() or "VERSION 3" not in metadata_license.upper():
@@ -210,8 +253,15 @@ def resolved_license(normalized_name: str, installed: dict) -> str:
     return value
 
 
-def verify_dependency_closure(lock_path: str | Path, wheelhouse: str | Path, python: str) -> list[dict]:
-    lock = read_hash_locked_requirements(lock_path)
+def verify_dependency_closure(
+    lock_path: str | Path,
+    wheelhouse: str | Path,
+    python: str,
+    marker_environment: dict[str, str] | None = None,
+) -> list[dict]:
+    lock = active_hash_locked_requirements(
+        read_hash_locked_requirements(lock_path), marker_environment
+    )
     wheels = selected_wheels(lock, wheelhouse)
     installed = installed_distributions(python)
     result = []
@@ -236,8 +286,14 @@ def main():
     parser.add_argument("--requirements-lock", default="requirements.txt")
     parser.add_argument("--wheelhouse", required=True)
     parser.add_argument("--python", default="python")
+    parser.add_argument("--target-sys-platform", choices=("linux", "win32"))
     args = parser.parse_args()
-    inventory = verify_dependency_closure(args.requirements_lock, args.wheelhouse, args.python)
+    marker_environment = (
+        {"sys_platform": args.target_sys_platform} if args.target_sys_platform else None
+    )
+    inventory = verify_dependency_closure(
+        args.requirements_lock, args.wheelhouse, args.python, marker_environment
+    )
     print(json.dumps({"dependencies": inventory}, ensure_ascii=False, sort_keys=True))
 
 

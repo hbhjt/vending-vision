@@ -242,6 +242,33 @@ def test_replay_ledger_consumes_one_jti_once_across_processes(tmp_path):
     assert observed.count(False) == 3
 
 
+def test_replay_ledger_cold_start_is_stable_across_repeated_four_process_races(tmp_path):
+    """First creation must not race WAL/schema setup into a ledger outage."""
+    context = multiprocessing.get_context("spawn")
+    for round_number in range(6):
+        start = context.Event()
+        outcomes = context.Queue()
+        ledger = tmp_path / f"cold-start-{round_number}.sqlite"
+        workers = [
+            context.Process(
+                target=_consume_replay_in_separate_process,
+                args=(str(ledger), start, outcomes),
+            )
+            for _ in range(4)
+        ]
+        for worker in workers:
+            worker.start()
+        start.set()
+        observed = [outcomes.get(timeout=15) for _ in workers]
+        for worker in workers:
+            worker.join(timeout=15)
+            assert worker.exitcode == 0
+
+        assert observed.count(True) == 1
+        assert observed.count(False) == 3
+        assert not any(str(outcome).startswith("error:ReplayLedgerError") for outcome in observed)
+
+
 def test_missing_daemon_public_key_and_session_material_is_an_explicit_maintenance_blocker(tmp_path):
     verifier = MaintenanceCapabilityVerifier(None, None, DurableReplayStore(tmp_path / "replay.json"))
 

@@ -45,7 +45,7 @@ jobs:
       - name: 离线安装并校验锁定闭包
         run: |
           python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
-          python scripts/dependency_lock.py --wheelhouse wheelhouse --python python
+          python scripts/dependency_lock.py --wheelhouse wheelhouse --python python --target-sys-platform win32
       - name: 运行完整测试
         run: python -m pytest -q
       - name: 校验 Python 源码
