@@ -182,7 +182,7 @@ http://127.0.0.1:7892/proximity/debug
 
 ## 上线注意
 
-- 推荐 Python 3.10。
+- 开发、CI 和 Candidate 打包统一使用 `.python-version` 固定的 Python 3.11.9，并共享 `requirements.txt` 的精确依赖版本。
 - 生产模型由 `models/model-manifest.json` 声明并通过 Git LFS 进入候选 bundle；现场不得补模型。
 - 正式运行保持 `mock_scenario=off`。
 - 先完成双摄编号确认，再做顶部多人阈值和中部画像质量联调。
@@ -190,9 +190,9 @@ http://127.0.0.1:7892/proximity/debug
 
 ## 候选发布边界
 
-- PR 和普通 `main` 只运行验证，不发布候选。
+- PR 和普通 `main` 只运行验证，不发布可部署 bundle；仓库不再维护另一套 Development 构建。
 - 仅合并到 `main` 的受保护 `vX.Y.Z-rc.N` tag 触发 Experimental Candidate Release。
-- release 同时发布原始 zip、descriptor、SPDX SBOM、SLSA provenance、artifact attestation 及各自的 Ed25519 detached signature。
+- release 同时发布原始 zip、descriptor、完整展开共享依赖的 SPDX SBOM、SLSA provenance、artifact attestation，及与 VEM 验证器契约一致的 Ed25519 签名信封。
 - VEM 之后由操作员手动输入 tag 与预期 bundle digest，执行独立 conformance/approval；供应仓不安装、不批准、也不重打包候选。
 - `scripts/verify_real_camera_capability.py` 用于现场真实双摄能力验收，强制 `mockScenario=off` 并验证 presence、单人可用画像、离开和试衣 MJPEG。
 
