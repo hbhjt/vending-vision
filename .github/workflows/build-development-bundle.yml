@@ -1,0 +1,154 @@
+name: 构建开发视觉包
+
+run-name: Development Vision ${{ inputs.source_commit }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: 已合并到 main 的精确源码 commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  development-bundle:
+    name: Windows Development Bundle
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          lfs: true
+
+      - name: 校验已合并源码并派生开发版本
+        id: metadata
+        shell: pwsh
+        run: |
+          $commit = $env:SOURCE_COMMIT.Trim().ToLowerInvariant()
+          if ($commit -notmatch '^[a-f0-9]{40}$') {
+            throw 'source_commit must be a full lowercase Git commit SHA'
+          }
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($actual -cne $commit) {
+            throw "checkout mismatch: expected $commit, got $actual"
+          }
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor $commit origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Development bundle source_commit must be merged into main'
+          }
+          $short = $commit.Substring(0, 8)
+          $version = "0.2.0-dev.$short"
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          "short=$short" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "VISION_DEVELOPMENT_VERSION=$version" >> $env:GITHUB_ENV
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 测试精确源码和模型
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements-packaging.txt
+          python -m pytest -q
+          python -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
+
+      - name: 构建并验证自包含 Windows bundle
+        shell: pwsh
+        run: |
+          python scripts/set_release_version.py $env:VISION_DEVELOPMENT_VERSION
+          ./scripts/build_exe.ps1
+          python scripts/verify_packaged_exe.py --expected-version $env:VISION_DEVELOPMENT_VERSION
+
+      - name: 生成 Development evidence
+        shell: pwsh
+        env:
+          SOURCE_COMMIT_VERIFIED: ${{ steps.metadata.outputs.commit }}
+          SOURCE_SHORT: ${{ steps.metadata.outputs.short }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $PWD 'development'
+          New-Item -ItemType Directory -Path $output -Force | Out-Null
+
+          $bundleName = "vending-vision-$env:VISION_DEVELOPMENT_VERSION-windows-x86_64.zip"
+          $bundlePath = Join-Path $output $bundleName
+          Compress-Archive -Path 'dist/vending-vision' -DestinationPath $bundlePath -CompressionLevel Optimal
+          $bundle = Get-Item -LiteralPath $bundlePath
+          $bundleHash = (Get-FileHash -LiteralPath $bundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          $runtimeRoot = (Resolve-Path 'dist/vending-vision').Path
+          $files = @(Get-ChildItem -LiteralPath $runtimeRoot -File -Recurse | Sort-Object FullName | ForEach-Object {
+            [ordered]@{
+              path = $_.FullName.Substring($runtimeRoot.Length).TrimStart('\', '/').Replace('\', '/')
+              bytes = [int64]$_.Length
+              sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          })
+          $fileManifestPath = Join-Path $output 'development-file-manifest.json'
+          [ordered]@{
+            schemaVersion = 'vending-vision-development-file-manifest/v1'
+            kind = 'vision-development-file-manifest'
+            classification = 'Development / Not Approved'
+            sourceCommit = $env:SOURCE_COMMIT_VERIFIED
+            files = $files
+          } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $fileManifestPath -Encoding utf8NoBOM
+
+          $modelManifestPath = Join-Path $output 'model-manifest.json'
+          Copy-Item -LiteralPath 'models/model-manifest.json' -Destination $modelManifestPath
+          $modelManifestHash = (Get-FileHash -LiteralPath $modelManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $fileManifestHash = (Get-FileHash -LiteralPath $fileManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          $evidencePath = Join-Path $output 'development-build-evidence.json'
+          [ordered]@{
+            schemaVersion = 'vending-vision-development-build-evidence/v1'
+            kind = 'vision-development-build-evidence'
+            classification = 'Development / Not Approved'
+            repository = $env:GITHUB_REPOSITORY
+            sourceCommit = $env:SOURCE_COMMIT_VERIFIED
+            version = $env:VISION_DEVELOPMENT_VERSION
+            platform = [ordered]@{ os = 'windows'; architecture = 'x86_64' }
+            workflow = [ordered]@{
+              name = $env:GITHUB_WORKFLOW
+              runId = $env:GITHUB_RUN_ID
+              runAttempt = $env:GITHUB_RUN_ATTEMPT
+            }
+            bundle = [ordered]@{ file = $bundleName; bytes = [int64]$bundle.Length; sha256 = $bundleHash }
+            modelManifest = [ordered]@{ file = 'model-manifest.json'; sha256 = $modelManifestHash }
+            fileManifest = [ordered]@{ file = 'development-file-manifest.json'; sha256 = $fileManifestHash }
+            verification = [ordered]@{
+              tests = 'passed'
+              modelManifest = 'passed'
+              packagedRuntime = 'passed'
+            }
+          } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $evidencePath -Encoding utf8NoBOM
+
+          $checksums = @(
+            $bundlePath,
+            $evidencePath,
+            $fileManifestPath,
+            $modelManifestPath
+          ) | ForEach-Object {
+            $item = Get-Item -LiteralPath $_
+            $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($item.Name)"
+          }
+          $checksums | Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS') -Encoding ascii
+
+      - name: 上传短期 Development artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vending-vision-development-${{ steps.metadata.outputs.short }}
+          path: development/*
+          if-no-files-found: error
+          retention-days: 7
