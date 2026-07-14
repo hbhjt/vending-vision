@@ -9,7 +9,7 @@
   ],
   "maintenance_capability_keyring_path": "C:\\ProgramData\\VEM\\vision\\daemon-maintenance-keys.json",
   "maintenance_session_path": "C:\\ProgramData\\VEM\\vision\\daemon-maintenance-session.json",
-  "maintenance_replay_path": "C:\\ProgramData\\VEM\\vision\\camera-maintenance-replay.json",
+  "maintenance_replay_path": "C:\\ProgramData\\VEM\\vision\\camera-maintenance-replay.sqlite",
   "cameras": {
     "top": {
       "backend": "dshow",

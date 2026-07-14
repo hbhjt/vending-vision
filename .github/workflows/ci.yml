@@ -16,7 +16,12 @@ jobs:
         with:
           python-version-file: ".python-version"
           cache: pip
-      - run: python -m pip install -r requirements.txt
+      - name: 下载完整锁定 wheel 闭包
+        run: python -m pip download --only-binary=:all: --require-hashes --dest wheelhouse -r requirements.txt
+      - name: 离线安装并校验锁定闭包
+        run: |
+          python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
+          python scripts/dependency_lock.py --wheelhouse wheelhouse --python python
       - run: python -m pytest -q
       - run: python -m py_compile app.py run_vision_server.py vision/*.py scripts/*.py
       - run: python -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
@@ -35,8 +40,12 @@ jobs:
         with:
           python-version-file: ".python-version"
           cache: pip
-      - name: 安装依赖
-        run: python -m pip install -r requirements.txt
+      - name: 下载完整锁定 wheel 闭包
+        run: python -m pip download --only-binary=:all: --require-hashes --dest wheelhouse -r requirements.txt
+      - name: 离线安装并校验锁定闭包
+        run: |
+          python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
+          python scripts/dependency_lock.py --wheelhouse wheelhouse --python python
       - name: 运行完整测试
         run: python -m pytest -q
       - name: 校验 Python 源码

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import secrets
+import sqlite3
 import tempfile
 import threading
 import time
@@ -296,54 +297,53 @@ class MaintenanceCapabilityError(ValueError):
         self.status_code = status_code
 
 
+class ReplayLedgerError(RuntimeError):
+    """The durable replay ledger could not provide fail-closed protection."""
+
+
 class DurableReplayStore:
-    """Daemon/vision-local, restart-safe single-use capability replay ledger."""
+    """Windows-safe, cross-process atomic single-use capability replay ledger."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self._lock = threading.RLock()
 
-    def _load(self) -> dict[str, int]:
-        if not self.path.exists():
-            return {}
-        try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError("maintenance replay store is unreadable") from exc
-        if not isinstance(value, dict):
-            raise RuntimeError("maintenance replay store has an unsupported format")
-        used = value.get("used")
-        if value.get("version") != 1 or not isinstance(used, dict):
-            raise RuntimeError("maintenance replay store has an unsupported format")
-        if any(isinstance(expiry, bool) or not isinstance(expiry, int) for expiry in used.values()):
-            raise RuntimeError("maintenance replay store has invalid expiry data")
-        return dict(used)
-
-    def _save(self, used: dict[str, int]) -> None:
+    def _connect(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"version": 1, "used": used}, handle, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-        except Exception:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-            raise
+            connection = sqlite3.connect(str(self.path), timeout=10, isolation_level=None)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS consumed_jti "
+                "(jti TEXT PRIMARY KEY NOT NULL, expires_at INTEGER NOT NULL)"
+            )
+            return connection
+        except (OSError, sqlite3.Error) as exc:
+            raise ReplayLedgerError("maintenance replay ledger is unavailable") from exc
 
     def consume(self, jti: str, expires_at: int, now: int) -> bool:
         with self._lock:
-            used = {key: expiry for key, expiry in self._load().items() if expiry > now}
-            if jti in used:
-                return False
-            used[jti] = expires_at
-            self._save(used)
-            return True
+            connection = None
+            try:
+                connection = self._connect()
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("DELETE FROM consumed_jti WHERE expires_at <= ?", (now,))
+                inserted = connection.execute(
+                    "INSERT OR IGNORE INTO consumed_jti (jti, expires_at) VALUES (?, ?)",
+                    (jti, expires_at),
+                ).rowcount
+                connection.execute("COMMIT")
+                return inserted == 1
+            except (OSError, sqlite3.Error, ReplayLedgerError) as exc:
+                if connection is not None:
+                    try:
+                        connection.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                raise ReplayLedgerError("maintenance replay ledger is unavailable") from exc
+            finally:
+                if connection is not None:
+                    connection.close()
 
 
 class MaintenanceCapabilityVerifier:
@@ -456,15 +456,19 @@ class MaintenanceCapabilityVerifier:
         now = int(self._clock())
         if now >= session["expiresAt"]:
             raise MaintenanceCapabilityError("maintenance capability session has expired", 401)
+        # Clock skew only protects a recently-issued token's iat boundary.  It
+        # must never make a daemon signing key usable before its own notBefore.
+        if now < key["notBefore"]:
+            raise MaintenanceCapabilityError("maintenance capability signing key is not active yet", 401)
         if claims.get("iss") != self.ISSUER or claims.get("aud") != self.AUDIENCE:
             raise MaintenanceCapabilityError("maintenance capability has the wrong issuer or audience", 403)
         if claims.get("machine") != session["machineCode"] or claims.get("session") != session["sessionId"] or key_id != session["keyId"]:
             raise MaintenanceCapabilityError("maintenance capability is for another machine or maintenance session", 403)
         if claims.get("purpose") != self.PURPOSE:
             raise MaintenanceCapabilityError("maintenance capability has the wrong purpose", 403)
-        scopes, issued_at, expires_at, jti = claims.get("scope"), claims.get("iat"), claims.get("exp"), claims.get("jti")
-        if not isinstance(scopes, list) or not all(isinstance(scope, str) and scope for scope in scopes) or required_scope not in scopes:
-            raise MaintenanceCapabilityError("maintenance capability lacks required scope", 403)
+        scope, issued_at, expires_at, jti = claims.get("scope"), claims.get("iat"), claims.get("exp"), claims.get("jti")
+        if not isinstance(scope, str) or scope != required_scope:
+            raise MaintenanceCapabilityError("maintenance capability lacks exact endpoint scope", 403)
         if (isinstance(issued_at, bool) or isinstance(expires_at, bool) or not isinstance(issued_at, int)
                 or not isinstance(expires_at, int) or issued_at > now + self.CLOCK_SKEW_SECONDS
                 or expires_at <= now or expires_at <= issued_at or expires_at - issued_at > self.MAX_TTL_SECONDS):
@@ -473,7 +477,13 @@ class MaintenanceCapabilityVerifier:
             raise MaintenanceCapabilityError("maintenance capability is outside key or session lifetime", 401)
         if not isinstance(jti, str) or not jti:
             raise MaintenanceCapabilityError("maintenance capability lacks replay id", 401)
-        if not self._replay_store.consume(jti, expires_at, now):
+        try:
+            consumed = self._replay_store.consume(jti, expires_at, now)
+        except ReplayLedgerError as exc:
+            raise MaintenanceCapabilityError(
+                "maintenance capability issuer material is blocked: replay ledger is unavailable", 503
+            ) from exc
+        if not consumed:
             raise MaintenanceCapabilityError("maintenance capability was already used", 409)
         return claims
 
@@ -536,17 +546,27 @@ class CameraMaintenanceService:
             raise ValueError(f"unknown camera role: {role}")
         if self._access is None:
             raise RuntimeError("camera test is unavailable")
-        candidate = self._candidate(candidate_id)
+        # A role test is a capture from one immutable enumeration snapshot.  Do
+        # not attach whichever generation happens to be current after the
+        # camera has returned a frame: a refresh/replug during capture must
+        # invalidate that capture rather than let confirm authenticate it.
+        with self._lock:
+            candidate = self._candidate(candidate_id)
+            generation = self._generation
+            snapshot = self._snapshot
         result = self._access.test(role, candidate)
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise RuntimeError("camera test did not produce successful evidence")
-        evidence_id = secrets.token_urlsafe(18)
-        expires_at = int(self._clock()) + TEST_EVIDENCE_TTL_SECONDS
-        self._evidence[evidence_id] = {"role": role, "candidateId": candidate_id,
-                                       "generation": self._generation, "expiresAt": expires_at, "used": False}
-        return {"role": role, "candidateId": candidate_id, "generation": self._generation, **result,
-                "evidence": {"id": evidence_id, "role": role, "candidateId": candidate_id,
-                             "generation": self._generation, "expiresAt": expires_at}}
+        with self._lock:
+            if self._generation != generation or self._snapshot is not snapshot:
+                raise ValueError("candidate generation changed while camera test was running")
+            evidence_id = secrets.token_urlsafe(18)
+            expires_at = int(self._clock()) + TEST_EVIDENCE_TTL_SECONDS
+            self._evidence[evidence_id] = {"role": role, "candidateId": candidate_id,
+                                           "generation": generation, "expiresAt": expires_at, "used": False}
+            return {"role": role, "candidateId": candidate_id, "generation": generation, **result,
+                    "evidence": {"id": evidence_id, "role": role, "candidateId": candidate_id,
+                                 "generation": generation, "expiresAt": expires_at}}
 
     def confirm(self, role: str, candidate_id: str, *, test_evidence_id: str | None = None,
                 operator_visual_confirmation: bool = False, expected_generation: str | None = None) -> dict:
@@ -638,7 +658,7 @@ def default_camera_binding_path() -> Path:
 
 
 def default_maintenance_replay_path() -> Path:
-    return default_camera_binding_path().with_name("camera-maintenance-replay.json")
+    return default_camera_binding_path().with_name("camera-maintenance-replay.sqlite")
 
 
 _camera_leases = CameraLeaseRegistry()

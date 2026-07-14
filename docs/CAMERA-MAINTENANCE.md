@@ -34,7 +34,7 @@ daemon-owned local files; it never contains a shared secret or signing key:
 {
   "maintenance_capability_keyring_path": "C:\\ProgramData\\VEM\\vision\\daemon-maintenance-keys.json",
   "maintenance_session_path": "C:\\ProgramData\\VEM\\vision\\daemon-maintenance-session.json",
-  "maintenance_replay_path": "C:\\ProgramData\\VEM\\vision\\camera-maintenance-replay.json"
+  "maintenance_replay_path": "C:\\ProgramData\\VEM\\vision\\camera-maintenance-replay.sqlite"
 }
 ```
 
@@ -47,11 +47,12 @@ Vision to read, but never make the daemon private key available to Vision.
 
 Each JWT uses `alg: EdDSA`, `typ: JWT`, and the active `kid`; claims must bind
 `iss=vem.vending-daemon`, `aud=vem.vision.camera-maintenance`, `machine`,
-`session`, `purpose=vision.camera-maintenance`, exact endpoint `scope`, `iat`,
-`exp`, and `jti`. Vision accepts at most a 300-second TTL, validates the key
-and session lifetimes, and atomically persists consumed JTIs in the replay
-ledger so restart does not permit replay. Missing/invalid daemon material is
-an explicit HTTP 503 maintenance blocker, not a development fallback.
+`session`, `purpose=vision.camera-maintenance`, one exact endpoint `scope`
+(not a scope list or superset), `iat`, `exp`, and `jti`. Vision accepts at most
+a 300-second TTL, requires `now >= key.notBefore` (clock skew only bounds a
+future `iat`), validates key/session lifetimes, and atomically consumes JTIs
+in a SQLite unique-key transaction. Ledger corruption is fail-closed and is
+returned as a v2 HTTP 503 maintenance error, never an unstructured 500.
 
 ## Operator workflow
 
@@ -71,6 +72,11 @@ Every endpoint needs a fresh, single-use capability with its exact scope:
    `expectedGeneration`. Confirmation atomically rejects an index/replug
    generation change, wrong role, expired/used evidence, or a missing visual
    check.
+
+A role test captures one immutable candidate-generation snapshot. If refresh
+occurs while the protected capture is running, Vision drops its result rather
+than attaching the newer generation to an older frame; only a newly run test
+can produce confirmable evidence.
 
 Preview and role test perform a protected runtime handoff: a persistent Vision
 stream releases its lease for the short maintenance capture, then resumes

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import socket
@@ -15,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import websockets
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 PROTOCOL = "vem.vision.v1"
@@ -28,6 +31,86 @@ PROFILE_FIELDS = {
     "upperColor",
     "confidence",
 }
+
+
+def _base64url(value):
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def create_managed_maintenance_fixture(temp_dir, *, port, now=None):
+    """Create daemon-owned public validation material for a packaged v2 smoke.
+
+    The private key remains only in this smoke-process closure.  The packaged
+    Vision process receives the same public-key/session files that managed
+    production receives, never an issuer secret.
+    """
+    temp_dir = Path(temp_dir)
+    now = int(time.time() if now is None else now)
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    keyring_path = temp_dir / "daemon-maintenance-keys.json"
+    session_path = temp_dir / "daemon-maintenance-session.json"
+    replay_path = temp_dir / "camera-maintenance-replay.sqlite"
+    key_id = "packaged-smoke-ed25519"
+    machine_code = "VEM-PACKAGED-SMOKE"
+    session_id = "packaged-maintenance-session"
+    expires_at = now + 240
+    keyring_path.write_text(json.dumps({
+        "version": 1,
+        "issuer": "vem.vending-daemon",
+        "keys": [{
+            "id": key_id,
+            "publicKey": _base64url(public_key),
+            "notBefore": now - 5,
+            "notAfter": now + 300,
+        }],
+    }), encoding="utf-8")
+    session_path.write_text(json.dumps({
+        "version": 1,
+        "machineCode": machine_code,
+        "sessionId": session_id,
+        "keyId": key_id,
+        "expiresAt": expires_at,
+    }), encoding="utf-8")
+    config_path = temp_dir / "managed-site.json"
+    config_path.write_text(json.dumps({
+        "schemaVersion": "vending-vision-site-config/v1",
+        "host": "127.0.0.1",
+        "port": port,
+        "allowed_origins": [f"http://127.0.0.1:{port}", "http://tauri.localhost"],
+        "maintenance_capability_keyring_path": str(keyring_path),
+        "maintenance_session_path": str(session_path),
+        "maintenance_replay_path": str(replay_path),
+        "cameras": {
+            "top": {"backend": "dshow", "role": "presence", "keep_open": True, "rotate": 0},
+            "front": {"backend": "dshow", "role": "profile_tryon", "keep_open": True, "rotate": 0},
+        },
+    }), encoding="utf-8")
+    sequence = 0
+
+    def mint_capability(scope):
+        nonlocal sequence
+        sequence += 1
+        header = {"alg": "EdDSA", "typ": "JWT", "kid": key_id}
+        claims = {
+            "iss": "vem.vending-daemon",
+            "aud": "vem.vision.camera-maintenance",
+            "machine": machine_code,
+            "session": session_id,
+            "purpose": "vision.camera-maintenance",
+            "scope": scope,
+            "iat": now,
+            "exp": now + 120,
+            "jti": f"packaged-smoke-{sequence}",
+        }
+        encoded_header = _base64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+        encoded_claims = _base64url(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
+        signature = private_key.sign(f"{encoded_header}.{encoded_claims}".encode("ascii"))
+        return f"{encoded_header}.{encoded_claims}.{_base64url(signature)}"
+
+    return config_path, mint_capability
 
 
 def parse_args():
@@ -69,12 +152,22 @@ def http_get_text(url, timeout=5.0):
         return response.read().decode("utf-8")
 
 
-def http_status_json(url, timeout=5.0):
+def http_status_json(url, timeout=5.0, *, method="GET", headers=None):
+    request = urllib.request.Request(url, method=method, headers=headers or {})
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def http_status(url, timeout=5.0, *, method="GET", headers=None):
+    request = urllib.request.Request(url, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status
+    except HTTPError as exc:
+        return exc.code
 
 
 def wait_for_http(base_url, process, timeout):
@@ -179,6 +272,71 @@ def ensure_port_available(port):
             raise RuntimeError(f"port {port} is already in use") from exc
 
 
+def verify_managed_camera_maintenance_contract(base_url, mint_capability):
+    """Exercise the real packaged default adapter through authenticated v2 routes."""
+    read_status, contract = http_status_json(
+        f"{base_url}/maintenance/cameras",
+        headers={"X-Vision-Maintenance-Capability": mint_capability("camera.read")},
+    )
+    if read_status != 200:
+        raise AssertionError(f"managed camera read capability failed: {read_status} {contract}")
+    if contract.get("contractVersion") != "vem.vision.camera-maintenance/v2":
+        raise AssertionError(f"managed camera contract version mismatch: {contract}")
+    if not isinstance(contract.get("candidates"), list) or not isinstance(contract.get("roles"), dict):
+        raise AssertionError(f"managed camera contract is incomplete: {contract}")
+
+    refresh_status, refreshed = http_status_json(
+        f"{base_url}/maintenance/cameras/refresh",
+        method="POST",
+        headers={"X-Vision-Maintenance-Capability": mint_capability("camera.refresh")},
+    )
+    if refresh_status != 200:
+        raise AssertionError(f"managed camera refresh capability failed: {refresh_status} {refreshed}")
+    if refreshed.get("contractVersion") != "vem.vision.camera-maintenance/v2":
+        raise AssertionError(f"managed refreshed camera contract version mismatch: {refreshed}")
+
+
+def verify_managed_production_surface(exe_path, *, port, startup_timeout, temp_dir):
+    """Run managed production mode, not the supplier development/dashboard mode."""
+    config_path, mint_capability = create_managed_maintenance_fixture(temp_dir, port=port)
+    env = os.environ.copy()
+    env.update({
+        "VISION_OPEN_BROWSER": "0",
+        "VISION_MOCK_SCENARIO": "off",
+        "VISION_DEVELOPMENT_DASHBOARD": "1",  # managed mode must still hide it
+        "VISION_WORKDIR": str(temp_dir),
+    })
+    process = subprocess.Popen(
+        [str(exe_path), "--no-browser", "--config", str(config_path)],
+        cwd=str(exe_path.parent),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        base_url = f"http://127.0.0.1:{port}"
+        wait_for_http(base_url, process, startup_timeout)
+        verify_managed_camera_maintenance_contract(base_url, mint_capability)
+        for legacy_url in ("/dashboard", "/camera/top/snapshot.jpg", "/camera/top/reopen"):
+            method = "POST" if legacy_url.endswith("/reopen") else "GET"
+            status = http_status(f"{base_url}{legacy_url}", method=method)
+            if status != 404:
+                raise AssertionError(f"managed production unexpectedly exposed {legacy_url}: {status}")
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        output = process.stdout.read() if process.stdout else ""
+        if process.returncode not in {0, 1, -15} and output:
+            print(output, file=sys.stderr)
+
+
 def main():
     args = parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -191,6 +349,8 @@ def main():
 
     assert_bundled_resources(exe_path)
     ensure_port_available(args.port)
+    managed_port = args.port + 1
+    ensure_port_available(managed_port)
 
     with tempfile.TemporaryDirectory(prefix="vending-vision-package-") as temp_dir:
         env = os.environ.copy()
@@ -242,10 +402,6 @@ def main():
                     "packaged default must explicitly block maintenance without daemon issuer material"
                 )
             asyncio.run(verify_websocket(args.port))
-            print("PACKAGED_EXE_VERIFICATION=PASS")
-            print(f"EXE={exe_path}")
-            print(f"SERVER_VERSION={version.get('version')}")
-            print(f"AGE_GENDER_MODE={health.get('ageGenderMode')}")
         finally:
             process.terminate()
             try:
@@ -256,7 +412,16 @@ def main():
             output = process.stdout.read() if process.stdout else ""
             if process.returncode not in {0, 1, -15} and output:
                 print(output, file=sys.stderr)
-
+        verify_managed_production_surface(
+            exe_path,
+            port=managed_port,
+            startup_timeout=args.startup_timeout,
+            temp_dir=Path(temp_dir) / "managed-production",
+        )
+        print("PACKAGED_EXE_VERIFICATION=PASS")
+        print(f"EXE={exe_path}")
+        print(f"SERVER_VERSION={version.get('version')}")
+        print(f"AGE_GENDER_MODE={health.get('ageGenderMode')}")
 
 if __name__ == "__main__":
     main()

@@ -6,9 +6,13 @@ import json
 import re
 from pathlib import Path
 
+try:  # direct ``python scripts/...`` and package import both remain supported
+    from scripts.dependency_lock import verify_dependency_closure
+except ModuleNotFoundError:  # pragma: no cover - exercised by release workflow
+    from dependency_lock import verify_dependency_closure
+
 
 SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$")
-PINNED_REQUIREMENT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)$")
 
 
 def digest_bytes(data):
@@ -36,36 +40,6 @@ def evidence_ref(path, **extra):
     }
 
 
-def read_pinned_requirements(path, seen=None):
-    path = path.resolve()
-    seen = set() if seen is None else seen
-    if path in seen:
-        raise ValueError(f"recursive requirements include: {path}")
-    seen.add(path)
-    requirements = []
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("-r ") or line.startswith("--requirement "):
-            included = line.split(maxsplit=1)[1]
-            requirements.extend(read_pinned_requirements(path.parent / included, seen))
-            continue
-        match = PINNED_REQUIREMENT.fullmatch(line)
-        if not match:
-            raise ValueError(f"candidate requirements must be exact pins or includes: {line}")
-        requirements.append(match.groups())
-    seen.remove(path)
-
-    deduplicated = {}
-    for name, version in requirements:
-        normalized_name = name.lower().replace("_", "-")
-        if normalized_name in deduplicated and deduplicated[normalized_name][1] != version:
-            raise ValueError(f"conflicting requirement pins for {name}")
-        deduplicated[normalized_name] = (name, version)
-    return [deduplicated[name] for name in sorted(deduplicated)]
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bundle", required=True)
@@ -73,6 +47,9 @@ def main():
     parser.add_argument("--commit", required=True)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--signer-identity", required=True)
+    parser.add_argument("--requirements-lock", default="requirements.txt")
+    parser.add_argument("--wheelhouse", required=True)
+    parser.add_argument("--python", default="python")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     if not SEMVER.fullmatch(args.version) or "-rc." not in args.version:
@@ -85,7 +62,7 @@ def main():
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     model_manifest = json.loads((root / "models/model-manifest.json").read_text(encoding="utf-8"))
-    requirements = read_pinned_requirements(root / "requirements-packaging.txt")
+    requirements = verify_dependency_closure(args.requirements_lock, args.wheelhouse, args.python)
 
     sbom = {
         "spdxVersion": "SPDX-2.3",
@@ -96,13 +73,19 @@ def main():
         "creationInfo": {"creators": ["Tool: vending-vision-candidate-builder"], "created": "1970-01-01T00:00:00Z"},
         "packages": [
             {
-                "name": requirement[0],
+                "name": requirement["name"],
                 "SPDXID": f"SPDXRef-Package-{index}",
-                "versionInfo": requirement[1],
-                "downloadLocation": "NOASSERTION",
+                "versionInfo": requirement["version"],
+                "downloadLocation": f"pkg:pypi/{requirement['name']}@{requirement['version']}",
                 "filesAnalyzed": False,
-                "licenseConcluded": "NOASSERTION",
-                "licenseDeclared": "NOASSERTION",
+                "checksums": [{"algorithm": "SHA256", "checksumValue": requirement["wheel"]["sha256"]}],
+                "licenseConcluded": requirement["license"],
+                "licenseDeclared": requirement["license"],
+                "externalRefs": [{
+                    "referenceCategory": "PACKAGE-MANAGER",
+                    "referenceType": "purl",
+                    "referenceLocator": f"pkg:pypi/{requirement['name']}@{requirement['version']}",
+                }],
             }
             for index, requirement in enumerate(requirements, start=1)
         ],

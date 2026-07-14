@@ -1,8 +1,0 @@
-# Packaging consumes the exact runtime dependency set instead of duplicating it.
--r requirements.txt
-
-# Packaging toolchain pins.
-pip==26.0.1
-setuptools==82.0.1
-wheel==0.47.0
-pyinstaller==6.16.0

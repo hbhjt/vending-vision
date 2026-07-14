@@ -3,19 +3,45 @@ import hashlib
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 from scripts import generate_candidate_evidence
+from scripts.dependency_lock import read_hash_locked_requirements
 from scripts.sign_candidate_evidence import DOCUMENTS, canonical_bytes
+from vision.camera_binding import DurableReplayStore, MaintenanceCapabilityVerifier
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SIGNER = "spki-sha256:" + "a" * 64
 
 
-def test_candidate_sbom_expands_shared_runtime_and_packaging_pins(tmp_path, monkeypatch):
+def test_release_lock_contains_hashes_for_full_runtime_and_packaging_closure():
+    packages = read_hash_locked_requirements(ROOT / "requirements.txt")
+
+    assert packages["opencv-contrib-python"]["version"] == "4.10.0.84"
+    assert packages["pyinstaller"]["version"] == "6.16.0"
+    assert packages["anyio"]["version"]
+    assert packages["cv2-enumerate-cameras"]["hashes"]
+    assert all(package["hashes"] for package in packages.values())
+
+
+def test_candidate_sbom_uses_hash_locked_installed_wheels_and_real_gpl_license(tmp_path, monkeypatch):
     bundle = tmp_path / "vending-vision-0.2.1-rc.1-windows-x86_64.zip"
     bundle.write_bytes(b"candidate-bundle")
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    wheel = wheelhouse / "cv2_enumerate_cameras-1.1.16-py3-none-any.whl"
+    wheel.write_bytes(b"selected wheel bytes")
+    wheel_hash = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(
+        "cv2-enumerate-cameras==1.1.16 \\\n"
+        f"    --hash=sha256:{wheel_hash}\n",
+        encoding="utf-8",
+    )
     output = tmp_path / "candidate"
     monkeypatch.setattr(
         sys,
@@ -32,6 +58,12 @@ def test_candidate_sbom_expands_shared_runtime_and_packaging_pins(tmp_path, monk
             "hbhjt/vending-vision",
             "--signer-identity",
             SIGNER,
+            "--requirements-lock",
+            str(lock),
+            "--wheelhouse",
+            str(wheelhouse),
+            "--python",
+            sys.executable,
             "--output",
             str(output),
         ],
@@ -40,10 +72,34 @@ def test_candidate_sbom_expands_shared_runtime_and_packaging_pins(tmp_path, monk
     generate_candidate_evidence.main()
 
     sbom = json.loads((output / "vision-sbom.spdx.json").read_text(encoding="utf-8"))
-    packages = {package["name"]: package["versionInfo"] for package in sbom["packages"]}
-    assert packages["opencv-contrib-python"] == "4.10.0.84"
-    assert packages["pyinstaller"] == "6.16.0"
-    assert "-r requirements.txt" not in packages
+    package = next(item for item in sbom["packages"] if item["name"] == "cv2-enumerate-cameras")
+    assert package["licenseDeclared"] == "GPL-3.0-or-later"
+    assert package["licenseConcluded"] == "GPL-3.0-or-later"
+    assert package["checksums"] == [{"algorithm": "SHA256", "checksumValue": wheel_hash}]
+    assert package["downloadLocation"] != "NOASSERTION"
+
+
+def test_packaged_smoke_managed_fixture_mints_exact_endpoint_capabilities(tmp_path):
+    from scripts.verify_packaged_exe import create_managed_maintenance_fixture
+
+    now = int(time.time())
+    config_path, mint_capability = create_managed_maintenance_fixture(tmp_path, port=17893, now=now)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert config["schemaVersion"] == "vending-vision-site-config/v1"
+    assert "mock_scenario" not in config
+    assert config["maintenance_replay_path"].endswith("camera-maintenance-replay.sqlite")
+
+    verifier = MaintenanceCapabilityVerifier(
+        config["maintenance_capability_keyring_path"],
+        config["maintenance_session_path"],
+        DurableReplayStore(config["maintenance_replay_path"]),
+        clock=lambda: now,
+    )
+    read = mint_capability("camera.read")
+    assert verifier.verify(read, "camera.read")["scope"] == "camera.read"
+    refresh = mint_capability("camera.refresh")
+    assert verifier.verify(refresh, "camera.refresh")["scope"] == "camera.refresh"
 
 
 def test_candidate_signatures_match_vem_role_digest_contract(tmp_path):

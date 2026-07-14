@@ -5,7 +5,7 @@ Windows 候选版本使用 PyInstaller `onedir`。本地构建只属于开发产
 
 ```powershell
 cd D:\ai-cv\vending_vision
-powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1 -Wheelhouse .\wheelhouse
 ```
 
 输出位于 `dist\vending-vision\vending-vision.exe`。必须分发完整
@@ -32,7 +32,7 @@ vending-vision.exe --no-browser --config C:\ProgramData\VEM\vision\config\site.j
 
 打包约束：
 
-- 依赖使用精确版本；Python 运行时和全部依赖进入 onedir bundle。
+- 依赖使用 Python 3.11.9 的单一完整传递 hash lock；构建只从已由 `pip download --require-hashes` 取得的 wheelhouse 以 `--no-index --require-hashes` 安装。Python 运行时和全部依赖进入 onedir bundle。
 - `models/model-manifest.json` 中的 Git LFS 模型必须已解析且 hash 校验通过。
 - 托管启动不读取相邻可编辑 `config.json`，`--config` 缺失或无效时失败关闭。
 - `config.json`、`config/`、Dashboard 和模型作为供应方 bundle 资源进入产物；

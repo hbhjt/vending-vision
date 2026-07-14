@@ -102,7 +102,8 @@ python scripts\verify_real_camera_capability.py `
 ## 仅供供应方开发
 
 ```powershell
-python -m pip install -r requirements.txt
+python -m pip download --only-binary=:all: --require-hashes -d wheelhouse -r requirements.txt
+python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
 scripts\start_server.bat
 python -m pytest -q
 ```
