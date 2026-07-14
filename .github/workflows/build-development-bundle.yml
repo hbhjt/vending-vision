@@ -55,7 +55,7 @@ jobs:
       - name: 配置测试用 Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version-file: '.python-version'
           cache: pip
 
       - name: 测试精确源码和模型
@@ -69,7 +69,6 @@ jobs:
         shell: pwsh
         run: |
           python scripts/set_release_version.py $env:VISION_DEVELOPMENT_VERSION
-          python -m venv .venv-packaging
           ./scripts/build_exe.ps1
           python scripts/verify_packaged_exe.py --expected-version $env:VISION_DEVELOPMENT_VERSION
 
