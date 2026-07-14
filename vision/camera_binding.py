@@ -1,24 +1,31 @@
-"""Vision-owned stable camera-role binding and maintenance contract.
+"""Vision-owned, fail-closed camera role binding.
 
-The camera backend index is deliberately an observation, never the persisted
-identity.  The small public service below is the only API the HTTP layer and
-camera runtime need: it hides discovery, persistence, ambiguity handling and
-role resolution behind a versioned local contract.
+The Windows discovery boundary deliberately does *not* correlate independent
+PnP and OpenCV enumerations.  A candidate is usable only when one adapter has
+proved the stable identity and the capture source belong to the same device.
+Backend indexes are maintenance observations, never persisted identities.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import subprocess
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 
-CAMERA_MAINTENANCE_CONTRACT_VERSION = "vem.vision.camera-maintenance/v1"
+CAMERA_MAINTENANCE_CONTRACT_VERSION = "vem.vision.camera-maintenance/v2"
 CAMERA_ROLES = ("top", "front")
+TEST_EVIDENCE_TTL_SECONDS = 120
 
 
 class CameraDiscovery(Protocol):
@@ -37,8 +44,14 @@ class CameraAccess(Protocol):
     def test(self, candidate: "CameraCandidate") -> dict: ...
 
 
+class WindowsMediaSourceAdapter(Protocol):
+    """Public boundary for an adapter that can prove identity-to-source mapping."""
+
+    def enumerate_sources(self) -> list[dict]: ...
+
+
 class JsonBindingStore:
-    """Atomically stores Vision-owned identities outside the site-config schema."""
+    """Atomically stores only Vision-owned stable identities."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -63,8 +76,7 @@ class JsonBindingStore:
         fd, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-                handle.write("\n")
+                handle.write(payload + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self.path)
@@ -76,46 +88,20 @@ class JsonBindingStore:
             raise
 
 
-class WindowsCameraDiscovery:
-    """Enumerates Windows PnP identities and observes transient OpenCV indexes.
+class PowerShellWindowsMediaSourceAdapter:
+    """Enumerates Media Foundation identities but never invents an OpenCV index."""
 
-    DirectShow exposes numeric indexes while Windows PnP exposes persistent
-    instance IDs.  We only pair them when the observations are one-to-one;
-    otherwise the contract deliberately leaves the index unknown rather than
-    guessing a binding.
-    """
-
-    def __init__(self, max_indexes: int = 8, backend: str = "dshow"):
-        self.max_indexes = max_indexes
-        self.backend = backend
-
-    def enumerate(self) -> list[dict]:
-        identities = self._windows_identities()
-        indexes = self._backend_indexes()
-        matched_indexes = indexes if len(identities) == len(indexes) else [None] * len(identities)
-        return [
-            {
-                "stableId": identity["stableId"],
-                "label": identity["label"],
-                "backend": self.backend,
-                "index": index,
-                "available": index is not None,
-            }
-            for identity, index in zip(identities, matched_indexes)
-        ]
-
-    def _windows_identities(self) -> list[dict]:
+    def enumerate_sources(self) -> list[dict]:
         if os.name != "nt":
             return []
-        command = (
-            "Get-PnpDevice -PresentOnly | Where-Object {$_.Class -eq 'Camera'} | "
-            "Select-Object -Property InstanceId,FriendlyName,Status | ConvertTo-Json -Compress"
-        )
+        command = r'''Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$class=[Windows.Devices.Enumeration.DeviceInformation,Windows.Devices.Enumeration,ContentType=WindowsRuntime]
+$enum=[Windows.Devices.Enumeration.DeviceInformation,Windows.Devices.Enumeration,ContentType=WindowsRuntime]::FindAllAsync([Windows.Devices.Enumeration.DeviceClass]::VideoCapture)
+$devices=[System.WindowsRuntimeSystemExtensions]::AsTask($enum).Result
+@($devices | ForEach-Object { [PSCustomObject]@{ stableId=$_.Id; label=$_.Name; backend='mediafoundation'; source=$_.Id } }) | ConvertTo-Json -Compress'''
         result = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-            text=True,
-            capture_output=True,
-            check=False,
+            text=True, capture_output=True, check=False,
         )
         if result.returncode != 0 or not result.stdout.strip():
             return []
@@ -125,104 +111,115 @@ class WindowsCameraDiscovery:
             return []
         if isinstance(values, dict):
             values = [values]
-        if not isinstance(values, list):
-            return []
-        identities = []
-        for value in values:
-            instance_id = value.get("InstanceId") if isinstance(value, dict) else None
-            if not isinstance(instance_id, str) or not instance_id:
-                continue
-            identities.append(
-                {
-                    "stableId": instance_id,
-                    "label": value.get("FriendlyName") or instance_id,
-                }
-            )
-        return sorted(identities, key=lambda item: item["stableId"])
+        return values if isinstance(values, list) else []
 
-    def _backend_indexes(self) -> list[int]:
-        try:
-            import cv2
-        except ImportError:
-            return []
-        backend = getattr(cv2, "CAP_DSHOW", 0) if self.backend.lower() == "dshow" else 0
-        indexes = []
-        for index in range(self.max_indexes):
-            capture = cv2.VideoCapture(index, backend)
-            try:
-                if capture.isOpened():
-                    indexes.append(index)
-            finally:
-                capture.release()
-        return indexes
+
+class WindowsCameraDiscovery:
+    """Windows Media Foundation source enumeration, with a fail-closed adapter.
+
+    The Windows Runtime VideoCapture API returns a media-source identifier from
+    the same enumeration that returned the device identity.  OpenCV's numeric
+    DirectShow indexes are not that API, so this default adapter deliberately
+    leaves ``index`` empty until a capture adapter can prove a source mapping.
+    It is therefore safe on a machine with multiple or replugged cameras.
+    """
+
+    def __init__(self, adapter: WindowsMediaSourceAdapter | None = None):
+        self._adapter = adapter or PowerShellWindowsMediaSourceAdapter()
+
+    def enumerate(self) -> list[dict]:
+        values = self._adapter.enumerate_sources()
+        result = []
+        for value in values:
+            stable_id = value.get("stableId") if isinstance(value, dict) else None
+            if not isinstance(stable_id, str) or not stable_id:
+                continue
+            index = value.get("index")
+            proven = value.get("mappingState") == "proven" and isinstance(index, int) and index >= 0
+            result.append({
+                "stableId": stable_id,
+                "label": str(value.get("label") or stable_id),
+                "backend": str(value.get("backend") or "mediafoundation"),
+                "index": index if proven else None,
+                "available": proven,
+                "mappingState": "proven" if proven else "unproven",
+                "source": value.get("source") or stable_id,
+            })
+        return result
+
+class CameraLeaseRegistry:
+    """One local owner across runtime, preview and role test capture."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._owners: dict[str, str] = {}
+
+    def acquire(self, candidate_id: str, owner: str):
+        with self._lock:
+            current = self._owners.get(candidate_id)
+            if current is not None:
+                raise RuntimeError(f"camera is leased by {current}")
+            self._owners[candidate_id] = owner
+        return _CameraLease(self, candidate_id, owner)
+
+    def _release(self, candidate_id: str, owner: str) -> None:
+        with self._lock:
+            if self._owners.get(candidate_id) == owner:
+                self._owners.pop(candidate_id, None)
+
+
+class _CameraLease:
+    def __init__(self, registry: CameraLeaseRegistry, candidate_id: str, owner: str):
+        self._registry, self._candidate_id, self._owner = registry, candidate_id, owner
+
+    def release(self) -> None:
+        self._registry._release(self._candidate_id, self._owner)
 
 
 class OpenCvCameraAccess:
-    """Short-lived local-only camera access used by maintenance preview/test."""
+    """Short-lived maintenance access sharing the process-wide lease registry."""
 
-    def _open(self, candidate: CameraCandidate):
+    def __init__(self, leases: CameraLeaseRegistry | None = None):
+        self.leases = leases or _camera_leases
+
+    def _open(self, candidate: "CameraCandidate"):
         from vision.camera import open_camera
-
         if candidate.index is None:
-            raise RuntimeError("camera has no current backend index")
+            raise RuntimeError("camera mapping is unproven; no capture source is available")
         return open_camera(camera_index=candidate.index, backend_name=candidate.backend)
 
-    def preview(self, candidate: CameraCandidate) -> bytes:
+    def preview(self, candidate: "CameraCandidate") -> bytes:
         import cv2
-
         from vision.camera import read_warmup_frame
-
-        capture = self._open(candidate)
+        lease = self.leases.acquire(candidate.stable_id, "maintenance-preview")
         try:
-            frame = read_warmup_frame(capture, 1)
-            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            if not ok:
-                raise RuntimeError("failed to encode camera preview")
-            return encoded.tobytes()
+            capture = self._open(candidate)
+            try:
+                frame = read_warmup_frame(capture, 1)
+                ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if not ok:
+                    raise RuntimeError("failed to encode camera preview")
+                return encoded.tobytes()
+            finally:
+                capture.release()
         finally:
-            capture.release()
+            lease.release()
 
-    def test(self, candidate: CameraCandidate) -> dict:
+    def test(self, candidate: "CameraCandidate") -> dict:
         from vision.camera import describe_capture, read_warmup_frame
-
-        capture = self._open(candidate)
+        lease = self.leases.acquire(candidate.stable_id, "maintenance-test")
         try:
-            frame = read_warmup_frame(capture, 1)
-            height, width = frame.shape[:2]
-            return {
-                "ok": True,
-                "frame": {"width": width, "height": height},
-                "backendObservation": {
-                    "backend": candidate.backend,
-                    "index": candidate.index,
-                    "available": True,
-                    "actual": describe_capture(capture),
-                },
-            }
+            capture = self._open(candidate)
+            try:
+                frame = read_warmup_frame(capture, 1)
+                height, width = frame.shape[:2]
+                return {"ok": True, "frame": {"width": width, "height": height},
+                        "backendObservation": {"backend": candidate.backend, "index": candidate.index,
+                                               "available": True, "mappingState": "proven"}}
+            finally:
+                capture.release()
         finally:
-            capture.release()
-
-
-def default_camera_binding_path() -> Path:
-    if os.name == "nt":
-        root = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
-    else:
-        root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return root / "VendingVision" / "camera-bindings.json"
-
-
-_maintenance_service: CameraMaintenanceService | None = None
-
-
-def get_camera_maintenance() -> CameraMaintenanceService:
-    global _maintenance_service
-    if _maintenance_service is None:
-        _maintenance_service = CameraMaintenanceService(
-            WindowsCameraDiscovery(),
-            JsonBindingStore(default_camera_binding_path()),
-            OpenCvCameraAccess(),
-        )
-    return _maintenance_service
+            lease.release()
 
 
 @dataclass(frozen=True)
@@ -232,6 +229,7 @@ class CameraCandidate:
     backend: str
     index: int | None
     available: bool
+    mapping_state: str
 
     @classmethod
     def from_observation(cls, value: dict) -> "CameraCandidate":
@@ -241,75 +239,112 @@ class CameraCandidate:
         index = value.get("index")
         if isinstance(index, bool) or (index is not None and not isinstance(index, int)):
             raise ValueError("camera candidate index must be an integer or null")
-        return cls(
-            stable_id=stable_id,
-            label=str(value.get("label") or stable_id),
-            backend=str(value.get("backend") or "unknown"),
-            index=index,
-            available=bool(value.get("available", False)),
-        )
+        mapping_state = value.get("mappingState", "proven" if value.get("available") else "unproven")
+        if mapping_state not in {"proven", "unproven"}:
+            raise ValueError("camera candidate mappingState is invalid")
+        available = bool(value.get("available", False)) and mapping_state == "proven" and index is not None
+        return cls(stable_id, str(value.get("label") or stable_id), str(value.get("backend") or "unknown"),
+                   index, available, mapping_state)
 
     def contract_value(self) -> dict:
-        return {
-            "id": self.stable_id,
-            "label": self.label,
-            "backendObservation": {
-                "backend": self.backend,
-                "index": self.index,
-                "available": self.available,
-            },
-        }
+        return {"id": self.stable_id, "label": self.label, "backendObservation": {
+            "backend": self.backend, "index": self.index, "available": self.available,
+            "mappingState": self.mapping_state,
+        }}
+
+
+class MaintenanceCapabilityError(ValueError):
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class MaintenanceCapabilityVerifier:
+    """Verifies a single-use, scoped maintenance capability without JWT deps."""
+
+    def __init__(self, secret: str | None, clock=time.time):
+        self._secret = secret.encode() if secret else None
+        self._clock = clock
+        self._used: dict[str, int] = {}
+        self._lock = threading.RLock()
+
+    def verify(self, token: str | None, required_scope: str) -> dict:
+        if not self._secret or not token:
+            raise MaintenanceCapabilityError("maintenance capability is required", 401)
+        try:
+            encoded, signature = token.split(".", 1)
+            expected = hmac.new(self._secret, encoded.encode(), hashlib.sha256).hexdigest()
+            padded = encoded + "=" * (-len(encoded) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(padded))
+        except Exception as exc:
+            raise MaintenanceCapabilityError("maintenance capability is invalid", 401) from exc
+        if not hmac.compare_digest(signature, expected):
+            raise MaintenanceCapabilityError("maintenance capability is invalid", 401)
+        now = int(self._clock())
+        if not isinstance(claims, dict) or claims.get("purpose") != "vision.camera-maintenance":
+            raise MaintenanceCapabilityError("maintenance capability has the wrong purpose", 403)
+        scopes, expires_at, jti = claims.get("scope"), claims.get("exp"), claims.get("jti")
+        if not isinstance(scopes, list) or required_scope not in scopes:
+            raise MaintenanceCapabilityError("maintenance capability lacks required scope", 403)
+        if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= now:
+            raise MaintenanceCapabilityError("maintenance capability has expired", 401)
+        if not isinstance(jti, str) or not jti:
+            raise MaintenanceCapabilityError("maintenance capability lacks replay id", 401)
+        with self._lock:
+            self._used = {key: expiry for key, expiry in self._used.items() if expiry > now}
+            if jti in self._used:
+                raise MaintenanceCapabilityError("maintenance capability was already used", 409)
+            self._used[jti] = expires_at
+        return claims
 
 
 class CameraMaintenanceService:
-    """Owns local camera candidates and reports the versioned maintenance view."""
+    """A cached candidate generation and atomic role/evidence state machine."""
 
-    def __init__(
-        self,
-        discovery: CameraDiscovery,
-        store: BindingStore,
-        access: CameraAccess | None = None,
-    ):
-        self._discovery = discovery
-        self._store = store
-        self._access = access
-        loaded = store.load()
-        self._bindings = loaded if isinstance(loaded, dict) else {}
+    _mutation_lock = threading.RLock()
 
-    def candidates(self) -> list[CameraCandidate]:
-        return sorted(
-            (CameraCandidate.from_observation(value) for value in self._discovery.enumerate()),
-            key=lambda candidate: candidate.stable_id,
-        )
+    def __init__(self, discovery: CameraDiscovery, store: BindingStore, access: CameraAccess | None = None, *, clock=time.time):
+        self._discovery, self._store, self._access, self._clock = discovery, store, access, clock
+        self._bindings = store.load()
+        if not isinstance(self._bindings, dict):
+            raise RuntimeError("camera binding store returned invalid bindings")
+        self._snapshot: list[CameraCandidate] | None = None
+        self._generation_number = 0
+        self._generation = ""
+        self._evidence: dict[str, dict] = {}
+        self._lock = threading.RLock()
+
+    def refresh(self) -> dict:
+        with self._lock:
+            observations = self._discovery.enumerate()
+            self._snapshot = sorted((CameraCandidate.from_observation(value) for value in observations), key=lambda c: c.stable_id)
+            self._generation_number += 1
+            digest = hashlib.sha256(json.dumps([c.contract_value() for c in self._snapshot], sort_keys=True).encode()).hexdigest()[:16]
+            self._generation = f"{self._generation_number}-{digest}"
+            return {"generation": self._generation, "candidates": [c.contract_value() for c in self._snapshot]}
+
+    def refresh_after_read_failure(self) -> dict:
+        return self.refresh()
+
+    def _candidates(self) -> list[CameraCandidate]:
+        if self._snapshot is None:
+            self.refresh()
+        return list(self._snapshot or [])
 
     def contract(self) -> dict:
-        candidates = self.candidates()
-        return {
-            "contractVersion": CAMERA_MAINTENANCE_CONTRACT_VERSION,
-            "candidates": [candidate.contract_value() for candidate in candidates],
-            "roles": {
-                role: self._role_status(role, candidates)
-                for role in CAMERA_ROLES
-            },
-        }
+        candidates = self._candidates()
+        return {"contractVersion": CAMERA_MAINTENANCE_CONTRACT_VERSION, "generation": self._generation,
+                "candidates": [candidate.contract_value() for candidate in candidates],
+                "roles": {role: self._role_status(role, candidates) for role in CAMERA_ROLES}}
 
-    def confirm(self, role: str, candidate_id: str) -> dict:
+    def resolve(self, role: str) -> CameraCandidate:
         if role not in CAMERA_ROLES:
             raise ValueError(f"unknown camera role: {role}")
-        candidates = self.candidates()
-        matches = [candidate for candidate in candidates if candidate.stable_id == candidate_id]
-        if len(matches) != 1 or not matches[0].available:
-            raise ValueError("camera candidate is missing, ambiguous, or unavailable")
-        for other_role, binding in self._bindings.items():
-            if (
-                other_role != role
-                and isinstance(binding, dict)
-                and binding.get("stableId") == candidate_id
-            ):
-                raise ValueError("camera candidate is already confirmed for another role")
-        self._bindings[role] = {"stableId": candidate_id}
-        self._store.save(self._bindings)
-        return self._role_status(role, candidates)
+        candidates = self._candidates()
+        status = self._role_status(role, candidates)
+        if status["state"] != "ready":
+            raise RuntimeError(f"{role} camera is not ready: {status.get('reason')}")
+        return next(candidate for candidate in candidates if candidate.stable_id == status["candidateId"])
 
     def preview(self, candidate_id: str) -> bytes:
         if self._access is None:
@@ -321,73 +356,115 @@ class CameraMaintenanceService:
             raise ValueError(f"unknown camera role: {role}")
         if self._access is None:
             raise RuntimeError("camera test is unavailable")
-        result = self._access.test(self._candidate(candidate_id))
-        if not isinstance(result, dict):
-            raise RuntimeError("camera test returned invalid evidence")
-        return {"role": role, "candidateId": candidate_id, **result}
+        candidate = self._candidate(candidate_id)
+        result = self._access.test(candidate)
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise RuntimeError("camera test did not produce successful evidence")
+        evidence_id = secrets.token_urlsafe(18)
+        expires_at = int(self._clock()) + TEST_EVIDENCE_TTL_SECONDS
+        self._evidence[evidence_id] = {"role": role, "candidateId": candidate_id,
+                                       "generation": self._generation, "expiresAt": expires_at, "used": False}
+        return {"role": role, "candidateId": candidate_id, "generation": self._generation, **result,
+                "evidence": {"id": evidence_id, "role": role, "candidateId": candidate_id,
+                             "generation": self._generation, "expiresAt": expires_at}}
 
-    def resolve(self, role: str) -> CameraCandidate:
+    def confirm(self, role: str, candidate_id: str, *, test_evidence_id: str | None = None,
+                operator_visual_confirmation: bool = False) -> dict:
         if role not in CAMERA_ROLES:
             raise ValueError(f"unknown camera role: {role}")
-        binding = self._bindings.get(role)
-        candidate_id = binding.get("stableId") if isinstance(binding, dict) else None
-        if not isinstance(candidate_id, str):
-            raise RuntimeError(f"{role} camera is not confirmed")
-        candidates = [candidate for candidate in self.candidates() if candidate.stable_id == candidate_id]
-        if len(candidates) != 1 or not candidates[0].available:
-            raise RuntimeError(f"{role} camera is not ready")
-        return candidates[0]
+        with self._mutation_lock, self._lock:
+            candidate = self._candidate(candidate_id)
+            if not operator_visual_confirmation:
+                self._consume_evidence(test_evidence_id, role, candidate_id)
+            # Reload under the mutation lock so a second service cannot confirm
+            # against stale persisted state within this process.
+            current = self._store.load()
+            if not isinstance(current, dict):
+                raise RuntimeError("camera binding store returned invalid bindings")
+            for other_role, binding in current.items():
+                if other_role != role and isinstance(binding, dict) and binding.get("stableId") == candidate.stable_id:
+                    raise ValueError("camera candidate is already confirmed for another role")
+            current[role] = {
+                "stableId": candidate.stable_id,
+                "confirmation": {
+                    "method": "operator_visual" if operator_visual_confirmation else "role_test",
+                    "generation": self._generation,
+                    "confirmedAt": int(self._clock()),
+                },
+            }
+            self._store.save(current)
+            self._bindings = current
+            return self._role_status(role, self._candidates())
+
+    def _consume_evidence(self, evidence_id: str | None, role: str, candidate_id: str) -> None:
+        if not isinstance(evidence_id, str):
+            raise ValueError("fresh successful role test evidence is required")
+        evidence = self._evidence.get(evidence_id)
+        if evidence is None:
+            raise ValueError("test evidence is unknown")
+        if evidence["used"]:
+            raise ValueError("test evidence is already consumed")
+        if evidence["expiresAt"] <= int(self._clock()):
+            raise ValueError("test evidence has expired")
+        if evidence["role"] != role:
+            raise ValueError("test evidence is for another role")
+        if evidence["candidateId"] != candidate_id or evidence["generation"] != self._generation:
+            raise ValueError("test evidence does not match the current candidate generation")
+        evidence["used"] = True
 
     def _candidate(self, candidate_id: str) -> CameraCandidate:
-        candidates = [candidate for candidate in self.candidates() if candidate.stable_id == candidate_id]
-        if len(candidates) != 1:
+        matches = [candidate for candidate in self._candidates() if candidate.stable_id == candidate_id]
+        if len(matches) != 1:
             raise ValueError("camera candidate is missing or ambiguous")
-        candidate = candidates[0]
+        candidate = matches[0]
         if not candidate.available:
-            raise ValueError("camera candidate is unavailable")
+            raise ValueError("camera candidate mapping is unproven or unavailable")
         return candidate
 
     def _role_status(self, role: str, candidates: list[CameraCandidate]) -> dict:
         binding = self._bindings.get(role)
-        if not isinstance(binding, dict) or not binding.get("stableId"):
-            return {
-                "role": role,
-                "state": "unbound",
-                "ready": False,
-                "reason": "camera_not_confirmed",
-            }
-        candidate_id = binding["stableId"]
+        candidate_id = binding.get("stableId") if isinstance(binding, dict) else None
+        if not isinstance(candidate_id, str) or not candidate_id:
+            return {"role": role, "state": "unbound", "ready": False, "reason": "camera_not_confirmed"}
+        duplicate_roles = [name for name, value in self._bindings.items()
+                           if isinstance(value, dict) and value.get("stableId") == candidate_id]
+        if len(duplicate_roles) > 1:
+            return {"role": role, "state": "ambiguous", "ready": False, "candidateId": candidate_id,
+                    "reason": "stable_identity_bound_to_multiple_roles"}
         matches = [candidate for candidate in candidates if candidate.stable_id == candidate_id]
-        if len(matches) == 0:
-            return {
-                "role": role,
-                "state": "missing",
-                "ready": False,
-                "candidateId": candidate_id,
-                "reason": "bound_camera_missing",
-            }
+        if not matches:
+            return {"role": role, "state": "missing", "ready": False, "candidateId": candidate_id,
+                    "reason": "bound_camera_missing"}
         if len(matches) > 1:
-            return {
-                "role": role,
-                "state": "ambiguous",
-                "ready": False,
-                "candidateId": candidate_id,
-                "reason": "stable_identity_is_not_unique",
-            }
+            return {"role": role, "state": "ambiguous", "ready": False, "candidateId": candidate_id,
+                    "reason": "stable_identity_is_not_unique"}
         candidate = matches[0]
+        if candidate.mapping_state != "proven":
+            return {"role": role, "state": "ambiguous", "ready": False, "candidateId": candidate_id,
+                    "reason": "camera_mapping_unproven", "backendObservation": candidate.contract_value()["backendObservation"]}
         if not candidate.available:
-            return {
-                "role": role,
-                "state": "missing",
-                "ready": False,
-                "candidateId": candidate_id,
-                "reason": "bound_camera_unavailable",
-                "backendObservation": candidate.contract_value()["backendObservation"],
-            }
-        return {
-            "role": role,
-            "state": "ready",
-            "ready": True,
-            "candidateId": candidate_id,
-            "backendObservation": candidate.contract_value()["backendObservation"],
-        }
+            return {"role": role, "state": "missing", "ready": False, "candidateId": candidate_id,
+                    "reason": "bound_camera_unavailable", "backendObservation": candidate.contract_value()["backendObservation"]}
+        return {"role": role, "state": "ready", "ready": True, "candidateId": candidate_id,
+                "backendObservation": candidate.contract_value()["backendObservation"]}
+
+
+def default_camera_binding_path() -> Path:
+    root = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) if os.name == "nt" else Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return root / "VendingVision" / "camera-bindings.json"
+
+
+_camera_leases = CameraLeaseRegistry()
+_maintenance_service: CameraMaintenanceService | None = None
+
+
+def acquire_runtime_camera_lease(candidate_id: str, role: str):
+    """Claim the same local lease namespace used by preview and role tests."""
+    return _camera_leases.acquire(candidate_id, f"runtime:{role}")
+
+
+def get_camera_maintenance() -> CameraMaintenanceService:
+    global _maintenance_service
+    if _maintenance_service is None:
+        _maintenance_service = CameraMaintenanceService(WindowsCameraDiscovery(), JsonBindingStore(default_camera_binding_path()), OpenCvCameraAccess())
+    return _maintenance_service

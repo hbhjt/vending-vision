@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vending-vision.invalid/schemas/camera-maintenance/v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contractVersion", "generation", "candidates", "roles"],
+  "properties": {
+    "contractVersion": { "const": "vem.vision.camera-maintenance/v2" },
+    "generation": { "type": "string", "minLength": 1 },
+    "candidates": { "type": "array", "items": { "$ref": "#/$defs/candidate" } },
+    "roles": {
+      "type": "object", "additionalProperties": false, "required": ["top", "front"],
+      "properties": { "top": { "$ref": "#/$defs/roleStatus" }, "front": { "$ref": "#/$defs/roleStatus" } }
+    }
+  },
+  "$defs": {
+    "backendObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["backend", "index", "available", "mappingState"],
+      "properties": {
+        "backend": { "type": "string", "minLength": 1 },
+        "index": { "type": ["integer", "null"], "minimum": 0 },
+        "available": { "type": "boolean" },
+        "mappingState": { "enum": ["proven", "unproven"] }
+      }
+    },
+    "candidate": {
+      "type": "object", "additionalProperties": false, "required": ["id", "label", "backendObservation"],
+      "properties": { "id": { "type": "string", "minLength": 1 }, "label": { "type": "string", "minLength": 1 }, "backendObservation": { "$ref": "#/$defs/backendObservation" } }
+    },
+    "roleStatus": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["role", "state", "ready", "reason"], "properties": { "role": { "enum": ["top", "front"] }, "state": { "const": "unbound" }, "ready": { "const": false }, "reason": { "const": "camera_not_confirmed" } } },
+        { "type": "object", "additionalProperties": false, "required": ["role", "state", "ready", "candidateId", "reason"], "properties": { "role": { "enum": ["top", "front"] }, "state": { "const": "missing" }, "ready": { "const": false }, "candidateId": { "type": "string", "minLength": 1 }, "reason": { "enum": ["bound_camera_missing", "bound_camera_unavailable"] }, "backendObservation": { "$ref": "#/$defs/backendObservation" } } },
+        { "type": "object", "additionalProperties": false, "required": ["role", "state", "ready", "candidateId", "reason"], "properties": { "role": { "enum": ["top", "front"] }, "state": { "const": "ambiguous" }, "ready": { "const": false }, "candidateId": { "type": "string", "minLength": 1 }, "reason": { "enum": ["stable_identity_is_not_unique", "stable_identity_bound_to_multiple_roles", "camera_mapping_unproven"] }, "backendObservation": { "$ref": "#/$defs/backendObservation" } } },
+        { "type": "object", "additionalProperties": false, "required": ["role", "state", "ready", "candidateId", "backendObservation"], "properties": { "role": { "enum": ["top", "front"] }, "state": { "const": "ready" }, "ready": { "const": true }, "candidateId": { "type": "string", "minLength": 1 }, "backendObservation": { "$ref": "#/$defs/backendObservation" } } }
+      ]
+    },
+    "error": { "type": "object", "additionalProperties": false, "required": ["contractVersion", "error"], "properties": { "contractVersion": { "const": "vem.vision.camera-maintenance/v2" }, "error": { "type": "object", "additionalProperties": false, "required": ["code", "message"], "properties": { "code": { "type": "string", "minLength": 1 }, "message": { "type": "string", "minLength": 1 } } } } }
+  }
+}

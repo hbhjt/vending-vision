@@ -54,8 +54,9 @@ HTTP 或 WebSocket 契约失败属于安装失败，必须回滚。
 ## 真实 VEM 现场验收
 
 通过安装验收后，使用 Vision 的本机维护合同枚举候选、预览、测试并确认
-top/front 角色。稳定 PnP 身份仅由 Vision 持久化；backend index 是每次枚举的
-瞬时观察，不能写入现场配置或 VEM：
+top/front 角色。每个请求必须携带短期、单次维护 capability；稳定身份和捕获源
+无法由同一枚举边界证明时，Vision 会 fail closed 为非就绪。backend index 仅是
+已认证维护观察，不能写入现场配置或 VEM：
 
 ```text
 GET http://127.0.0.1:7892/maintenance/cameras

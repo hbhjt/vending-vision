@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 
 from vision.camera import describe_capture, open_camera, read_warmup_frame
-from vision.camera_binding import get_camera_maintenance
+from vision.camera_binding import acquire_runtime_camera_lease, get_camera_maintenance
 from vision.config import settings
 from vision.frame_transform import camera_rotation, rotate_frame
 from vision.logger import logger
@@ -66,20 +66,44 @@ def _keep_open(config: dict) -> bool:
 
 def _open_role_camera(config: dict):
     """根据角色配置打开对应的摄像头。"""
-    return open_camera(
-        camera_index=int(config.get("index", settings.CAMERA_INDEX)),
+    candidate_id = config.get("stableId")
+    role = config.get("role")
+    if not isinstance(candidate_id, str) or not isinstance(role, str):
+        raise RuntimeError("camera runtime requires a resolved stable role binding")
+    lease = acquire_runtime_camera_lease(candidate_id, role)
+    try:
+        capture = open_camera(
+        camera_index=int(config["index"]),
         backend_name=config.get("backend", settings.CAMERA_BACKEND),
         width=int(config.get("width", settings.CAMERA_WIDTH) or 0),
         height=int(config.get("height", settings.CAMERA_HEIGHT) or 0),
         fps=int(config.get("fps", settings.CAMERA_FPS) or 0),
         fourcc=config.get("fourcc", settings.CAMERA_FOURCC),
-    )
+        )
+        return _LeaseBoundCapture(capture, lease)
+    except Exception:
+        lease.release()
+        raise
+
+
+class _LeaseBoundCapture:
+    """Makes runtime acquisition share one ownership lifecycle with maintenance."""
+    def __init__(self, capture, lease):
+        self._capture, self._lease = capture, lease
+
+    def __getattr__(self, name):
+        return getattr(self._capture, name)
+
+    def release(self):
+        try:
+            self._capture.release()
+        finally:
+            self._lease.release()
 
 
 def _requested_config(config: dict) -> dict:
     """构建请求配置的摘要信息，包含旋转、ROI 等变换参数。"""
     return {
-        "index": int(config.get("index", settings.CAMERA_INDEX)),
         "backend": config.get("backend", settings.CAMERA_BACKEND),
         "width": int(config.get("width", settings.CAMERA_WIDTH) or 0),
         "height": int(config.get("height", settings.CAMERA_HEIGHT) or 0),
@@ -104,7 +128,6 @@ def _frame_status(role: str, config: dict, cap, image, raw_image=None) -> dict:
     return {
         "ok": True,
         "role": role,
-        "index": int(config.get("index", settings.CAMERA_INDEX)),
         "backend": config.get("backend", settings.CAMERA_BACKEND),
         "requested": _requested_config(config),
         "actual": describe_capture(cap),
@@ -230,6 +253,10 @@ class ManagedCameraStream:
                 with self.lock:
                     self.last_error = str(exc)
                     self._release_locked()
+                    # Device/read failure is an explicit re-enumeration trigger;
+                    # normal per-frame reads only use the cached generation.
+                    get_camera_maintenance().refresh_after_read_failure()
+                    self.config = _camera_config(self.role)
 
                 metrics.increment("camera_read_failure_total", role=self.role)
                 logger.warning(

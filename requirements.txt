@@ -12,3 +12,4 @@ websockets==15.0.1
 openvino==2025.4.1
 pytest==8.4.2
 jsonschema==4.25.1
+httpx==0.28.1

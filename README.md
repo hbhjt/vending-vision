@@ -59,9 +59,10 @@ scripts\stop_server.bat
 }
 ```
 
-现场部署不写入 Windows 摄像头编号。Vision 在本机枚举稳定 PnP 身份和当前
-backend index；操作员通过版本化维护合同预览、测试并确认 top/front 角色。具体
-合同见 [摄像头维护合同](docs/CAMERA-MAINTENANCE.md)。
+现场部署不写入 Windows 摄像头编号。Vision 仅在同一 Windows 媒体枚举边界能
+证明稳定身份与捕获源的关系时才公开可用候选；否则明确保持非就绪。操作员使用
+短期、单次维护 capability 预览、测试并确认 top/front 角色。具体合同见
+[摄像头维护合同](docs/CAMERA-MAINTENANCE.md)。
 
 ```text
 GET http://127.0.0.1:7892/camera/roles/status

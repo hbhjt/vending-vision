@@ -72,7 +72,7 @@ def open_camera(
     如果摄像头无法打开，抛出 RuntimeError。
     """
     if camera_index is None:
-        camera_index = settings.CAMERA_INDEX
+        raise RuntimeError("camera capture requires a resolved Vision role binding")
 
     backend = get_camera_backend(backend_name)
     cap = cv2.VideoCapture(camera_index, backend)
