@@ -173,6 +173,7 @@ LICENSE_OVERRIDES = {
     "certifi": "MPL-2.0",
     "cffi": "MIT-0",
     "click": "BSD-3-Clause",
+    "colorama": "BSD-3-Clause",
     "contourpy": "BSD-3-Clause",
     "cryptography": "Apache-2.0 OR BSD-3-Clause",
     "cv2-enumerate-cameras": "GPL-3.0-or-later",
