@@ -17,6 +17,7 @@ import asyncio
 import copy
 import json
 import ipaddress
+import os
 import threading
 from datetime import datetime
 from json import JSONDecodeError
@@ -25,7 +26,7 @@ from typing import Optional
 from uuid import uuid4
 
 import cv2
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from vision.camera_manager import (
@@ -35,6 +36,14 @@ from vision.camera_manager import (
     read_camera,
     release_all_cameras,
     reset_camera,
+)
+from vision.camera_binding import (
+    CAMERA_MAINTENANCE_CONTRACT_VERSION,
+    DurableReplayStore,
+    MaintenanceCapabilityError,
+    MaintenanceCapabilityVerifier,
+    default_maintenance_replay_path,
+    get_camera_maintenance,
 )
 from vision.camera_owner import get_front_camera_owner
 from vision.config import runtime_path, settings
@@ -68,6 +77,11 @@ app = FastAPI(
 startup_check = None
 # 调试仪表盘 HTML 文件路径
 DASHBOARD_FILE = Path(runtime_path("dashboard/profile_dashboard.html"))
+_maintenance_authorizer = MaintenanceCapabilityVerifier(
+    settings.MAINTENANCE_CAPABILITY_KEYRING_PATH,
+    settings.MAINTENANCE_SESSION_PATH,
+    DurableReplayStore(settings.MAINTENANCE_REPLAY_PATH or default_maintenance_replay_path()),
+)
 
 
 @app.on_event("startup")
@@ -293,8 +307,8 @@ def root():
         "api": {
             "dashboard": "/dashboard",
             "camera_roles_status": "/camera/roles/status",
+            "camera_maintenance": "/maintenance/cameras",
             "front_camera_owner": "/camera/front/owner",
-            "camera_snapshot": "/camera/{role}/snapshot.jpg",
             "proximity_debug": "/proximity/debug",
             "try_on_preview": "/try-on/{sessionId}.mjpeg",
             "session_status": "/session/status",
@@ -309,6 +323,8 @@ def root():
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
+    if not settings.DEVELOPMENT_DASHBOARD_ENABLED:
+        return HTMLResponse(status_code=404, content="<h1>development dashboard disabled</h1>")
     if not DASHBOARD_FILE.exists():
         return HTMLResponse(
             status_code=404,
@@ -399,7 +415,6 @@ def version():
             ),
         },
         "calibration": {
-            "camera_index": settings.CAMERA_INDEX,
             "camera_backend": settings.CAMERA_BACKEND,
             "camera_width": settings.CAMERA_WIDTH,
             "camera_height": settings.CAMERA_HEIGHT,
@@ -430,8 +445,8 @@ def version():
             ),
         },
         "cameras": {
-            "top": settings.TOP_CAMERA_CONFIG,
-            "front": settings.FRONT_CAMERA_CONFIG,
+            "top": {key: value for key, value in settings.TOP_CAMERA_CONFIG.items() if key != "index"},
+            "front": {key: value for key, value in settings.FRONT_CAMERA_CONFIG.items() if key != "index"},
             "front_owner": get_front_camera_owner(),
             "try_on": get_try_on_status(),
             "vision_session": get_vision_session_status(),
@@ -477,6 +492,100 @@ def camera_roles_status():
     return get_all_camera_statuses()
 
 
+def _maintenance_error(exc: Exception, status_code: int = 409):
+    return JSONResponse(
+        status_code=status_code,
+        content={"contractVersion": CAMERA_MAINTENANCE_CONTRACT_VERSION,
+                 "error": {"code": type(exc).__name__, "message": str(exc)}},
+    )
+
+
+def _require_maintenance_capability(request: Request, scope: str):
+    try:
+        _maintenance_authorizer.verify(request.headers.get("X-Vision-Maintenance-Capability"), scope)
+    except MaintenanceCapabilityError as exc:
+        return _maintenance_error(exc, exc.status_code)
+    return None
+
+
+@app.get("/maintenance/cameras")
+def camera_maintenance_contract(request: Request):
+    """Versioned loopback contract; device identities stay opaque to VEM."""
+    denied = _require_maintenance_capability(request, "camera.read")
+    if denied:
+        return denied
+    return get_camera_maintenance().contract()
+
+
+@app.post("/maintenance/cameras/refresh")
+def camera_maintenance_refresh(request: Request):
+    denied = _require_maintenance_capability(request, "camera.refresh")
+    if denied:
+        return denied
+    get_camera_maintenance().refresh()
+    return get_camera_maintenance().contract()
+
+
+@app.get("/maintenance/cameras/{candidate_id}/preview.jpg")
+def camera_maintenance_preview(candidate_id: str, request: Request):
+    denied = _require_maintenance_capability(request, "camera.preview")
+    if denied:
+        return denied
+    try:
+        return Response(
+            content=get_camera_maintenance().preview(candidate_id),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+    except (ValueError, RuntimeError) as exc:
+        return _maintenance_error(exc)
+
+
+@app.post("/maintenance/cameras/{role}/test")
+def camera_maintenance_test(role: str, request: Request, payload: dict = Body(...)):
+    denied = _require_maintenance_capability(request, "camera.test")
+    if denied:
+        return denied
+    try:
+        if set(payload) != {"candidateId"}:
+            raise ValueError("test request must contain only candidateId")
+        candidate_id = payload.get("candidateId")
+        if not isinstance(candidate_id, str):
+            raise ValueError("candidateId is required")
+        return get_camera_maintenance().test(role, candidate_id)
+    except (ValueError, RuntimeError) as exc:
+        return _maintenance_error(exc)
+
+
+@app.post("/maintenance/cameras/{role}/confirm")
+def camera_maintenance_confirm(role: str, request: Request, payload: dict = Body(...)):
+    denied = _require_maintenance_capability(request, "camera.confirm")
+    if denied:
+        return denied
+    try:
+        required = {"candidateId", "testEvidenceId", "operatorVisualConfirmation", "expectedGeneration"}
+        if set(payload) != required:
+            raise ValueError("confirm request must contain candidateId, testEvidenceId, operatorVisualConfirmation and expectedGeneration")
+        candidate_id = payload.get("candidateId")
+        if not isinstance(candidate_id, str):
+            raise ValueError("candidateId is required")
+        test_evidence_id = payload.get("testEvidenceId")
+        expected_generation = payload.get("expectedGeneration")
+        visual = payload.get("operatorVisualConfirmation")
+        if not isinstance(test_evidence_id, str) or not test_evidence_id:
+            raise ValueError("confirm requires testEvidenceId")
+        if visual is not True:
+            raise ValueError("confirm requires explicit operatorVisualConfirmation")
+        if not isinstance(expected_generation, str) or not expected_generation:
+            raise ValueError("confirm requires expectedGeneration")
+        return get_camera_maintenance().confirm(
+            role, candidate_id, test_evidence_id=test_evidence_id,
+            operator_visual_confirmation=visual, expected_generation=expected_generation,
+        )
+    except (ValueError, RuntimeError) as exc:
+        return _maintenance_error(exc)
+
+
 @app.get("/camera/{role}/status")
 def camera_role_status(role: str):
     try:
@@ -490,6 +599,10 @@ def camera_role_status(role: str):
 
 @app.get("/camera/{role}/snapshot.jpg")
 def camera_role_snapshot(role: str):
+    # This legacy diagnostic is intentionally absent from managed production.
+    # Only the scoped /maintenance preview capability may return camera bytes.
+    if not settings.DEVELOPMENT_DASHBOARD_ENABLED:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "not found"})
     try:
         get_camera_config(role)
         if role == "front" and (
@@ -519,6 +632,8 @@ def camera_role_snapshot(role: str):
 
 @app.post("/camera/{role}/reopen")
 def camera_role_reopen(role: str):
+    if not settings.DEVELOPMENT_DASHBOARD_ENABLED:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "not found"})
     try:
         get_camera_config(role)
         if role == "front" and (

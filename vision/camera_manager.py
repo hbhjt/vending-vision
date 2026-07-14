@@ -15,6 +15,7 @@ import time
 from datetime import datetime
 
 from vision.camera import describe_capture, open_camera, read_warmup_frame
+from vision.camera_binding import acquire_runtime_camera_lease, get_camera_maintenance
 from vision.config import settings
 from vision.frame_transform import camera_rotation, rotate_frame
 from vision.logger import logger
@@ -36,12 +37,21 @@ def _time_iso(value):
 def _camera_config(role: str) -> dict:
     """根据角色获取摄像头配置字典。"""
     if role == "top":
-        return dict(settings.TOP_CAMERA_CONFIG)
+        config = dict(settings.TOP_CAMERA_CONFIG)
+    elif role == "front":
+        config = dict(settings.FRONT_CAMERA_CONFIG)
+    else:
+        raise ValueError(f"unknown camera role: {role}")
 
-    if role == "front":
-        return dict(settings.FRONT_CAMERA_CONFIG)
-
-    raise ValueError(f"unknown camera role: {role}")
+    candidate = get_camera_maintenance().resolve(role)
+    config.update(
+        {
+            "index": candidate.index,
+            "backend": candidate.backend,
+            "stableId": candidate.stable_id,
+        }
+    )
+    return config
 
 
 def _keep_open(config: dict) -> bool:
@@ -56,20 +66,44 @@ def _keep_open(config: dict) -> bool:
 
 def _open_role_camera(config: dict):
     """根据角色配置打开对应的摄像头。"""
-    return open_camera(
-        camera_index=int(config.get("index", settings.CAMERA_INDEX)),
+    candidate_id = config.get("stableId")
+    role = config.get("role")
+    if not isinstance(candidate_id, str) or not isinstance(role, str):
+        raise RuntimeError("camera runtime requires a resolved stable role binding")
+    lease = acquire_runtime_camera_lease(candidate_id, role)
+    try:
+        capture = open_camera(
+        camera_index=int(config["index"]),
         backend_name=config.get("backend", settings.CAMERA_BACKEND),
         width=int(config.get("width", settings.CAMERA_WIDTH) or 0),
         height=int(config.get("height", settings.CAMERA_HEIGHT) or 0),
         fps=int(config.get("fps", settings.CAMERA_FPS) or 0),
         fourcc=config.get("fourcc", settings.CAMERA_FOURCC),
-    )
+        )
+        return _LeaseBoundCapture(capture, lease)
+    except Exception:
+        lease.release()
+        raise
+
+
+class _LeaseBoundCapture:
+    """Makes runtime acquisition share one ownership lifecycle with maintenance."""
+    def __init__(self, capture, lease):
+        self._capture, self._lease = capture, lease
+
+    def __getattr__(self, name):
+        return getattr(self._capture, name)
+
+    def release(self):
+        try:
+            self._capture.release()
+        finally:
+            self._lease.release()
 
 
 def _requested_config(config: dict) -> dict:
     """构建请求配置的摘要信息，包含旋转、ROI 等变换参数。"""
     return {
-        "index": int(config.get("index", settings.CAMERA_INDEX)),
         "backend": config.get("backend", settings.CAMERA_BACKEND),
         "width": int(config.get("width", settings.CAMERA_WIDTH) or 0),
         "height": int(config.get("height", settings.CAMERA_HEIGHT) or 0),
@@ -94,7 +128,6 @@ def _frame_status(role: str, config: dict, cap, image, raw_image=None) -> dict:
     return {
         "ok": True,
         "role": role,
-        "index": int(config.get("index", settings.CAMERA_INDEX)),
         "backend": config.get("backend", settings.CAMERA_BACKEND),
         "requested": _requested_config(config),
         "actual": describe_capture(cap),
@@ -124,12 +157,14 @@ class ManagedCameraStream:
         self.role = role                      # 摄像头角色: top / front
         self.config = dict(config)            # 摄像头配置
         self.lock = threading.RLock()         # 线程锁
+        self._maintenance_condition = threading.Condition(self.lock)
         self.cap = None                       # OpenCV VideoCapture 对象
         self.opened_at = None                 # 最近一次打开的时间戳
         self.last_frame_at = None             # 最近一次成功读取帧的时间戳
         self.frame_count = 0                  # 累计读取帧数
         self.reconnect_count = 0              # 累计重连次数
         self.last_error = None                # 最近一次错误信息
+        self._maintenance_handoffs = 0
 
     def _release_locked(self):
         """释放摄像头资源（需在持有锁时调用）。"""
@@ -153,11 +188,26 @@ class ManagedCameraStream:
             self._release_locked()
             self.last_error = None
 
+    def quiesce_for_maintenance(self):
+        """Yield a persistent runtime capture to one protected maintenance action."""
+        with self._maintenance_condition:
+            self._maintenance_handoffs += 1
+            self._release_locked()
+        return _RuntimeMaintenanceHandoff(self)
+
+    def _resume_after_maintenance(self):
+        with self._maintenance_condition:
+            self._maintenance_handoffs = max(0, self._maintenance_handoffs - 1)
+            self._maintenance_condition.notify_all()
+
     def _ensure_open_locked(self):
         """确保摄像头已打开（需在持有锁时调用）。
 
         如果摄像头未打开或已关闭，则重新打开。
         """
+        while self._maintenance_handoffs:
+            if not self._maintenance_condition.wait(timeout=10.0):
+                raise RuntimeError(f"{self.role} camera maintenance handoff timed out")
         if self.cap is not None and self.cap.isOpened():
             return
 
@@ -220,6 +270,10 @@ class ManagedCameraStream:
                 with self.lock:
                     self.last_error = str(exc)
                     self._release_locked()
+                    # Device/read failure is an explicit re-enumeration trigger;
+                    # normal per-frame reads only use the cached generation.
+                    get_camera_maintenance().refresh_after_read_failure()
+                    self.config = _camera_config(self.role)
 
                 metrics.increment("camera_read_failure_total", role=self.role)
                 logger.warning(
@@ -261,6 +315,22 @@ class ManagedCameraStream:
             return status
 
 
+class _RuntimeMaintenanceHandoff:
+    def __init__(self, stream: ManagedCameraStream):
+        self._stream = stream
+        self._released = False
+
+    def release(self):
+        if not self._released:
+            self._released = True
+            self._stream._resume_after_maintenance()
+
+
+class _NoopRuntimeMaintenanceHandoff:
+    def release(self):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 全局摄像头流注册表
 # ---------------------------------------------------------------------------
@@ -284,7 +354,30 @@ def get_camera_stream(role: str) -> ManagedCameraStream:
         if stream is None:
             stream = ManagedCameraStream(role, config)
             _streams[role] = stream
+        elif stream.config != config:
+            stream.release()
+            stream = ManagedCameraStream(role, config)
+            _streams[role] = stream
         return stream
+
+
+def quiesce_runtime_camera(candidate_id: str):
+    """Temporarily release the persistent stream bound to one stable identity.
+
+    The caller owns the returned handoff until its preview/test capture closes.
+    Runtime reads then resume lazily through the normal single owner pipeline.
+    """
+    with _streams_lock:
+        streams = list(_streams.values())
+    matching = [
+        stream for stream in streams
+        if stream.config.get("stableId") == candidate_id
+    ]
+    if not matching:
+        return _NoopRuntimeMaintenanceHandoff()
+    if len(matching) != 1:
+        raise RuntimeError("camera runtime ownership is ambiguous")
+    return matching[0].quiesce_for_maintenance()
 
 
 def read_camera(role: str, warmup_frames: int | None = None):
@@ -345,11 +438,15 @@ def get_all_camera_statuses() -> dict:
         try:
             statuses[role] = get_camera_status(role)
         except Exception as exc:
+            try:
+                requested = _requested_config(_camera_config(role))
+            except Exception:
+                requested = None
             statuses[role] = {
                 "ok": False,
                 "role": role,
                 "error": str(exc),
-                "requested": _requested_config(_camera_config(role)),
+                "requested": requested,
             }
 
     return statuses

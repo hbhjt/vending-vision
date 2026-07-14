@@ -11,6 +11,7 @@ echo ================================
 cd /d %~dp0\..
 
 set VISION_MOCK_SCENARIO=off
+set VISION_DEVELOPMENT_DASHBOARD=true
 set VISION_HOST=127.0.0.1
 set VISION_ALLOWED_ORIGINS=http://127.0.0.1:7892,http://localhost:7892,http://tauri.localhost
 

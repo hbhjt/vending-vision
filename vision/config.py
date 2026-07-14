@@ -68,7 +68,7 @@ def _validate_managed_config(config, config_path):
     if not isinstance(cameras, dict) or set(cameras) != {"top", "front"}:
         raise ConfigError("managed configuration must define exactly top and front cameras")
     camera_keys = {
-        "index", "backend", "width", "height", "fps", "fourcc", "role",
+        "backend", "width", "height", "fps", "fourcc", "role",
         "keep_open", "rotate", "roi",
     }
     expected_roles = {"top": "presence", "front": "profile_tryon"}
@@ -80,9 +80,6 @@ def _validate_managed_config(config, config_path):
             raise ConfigError(
                 f"camera {camera_name} contains unknown keys: {', '.join(camera_unknown)}"
             )
-        index = camera.get("index")
-        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
-            raise ConfigError(f"camera {camera_name}.index must be a non-negative integer")
         if camera.get("role") != expected_roles[camera_name]:
             raise ConfigError(f"camera {camera_name}.role is invalid")
         if camera.get("rotate", 0) not in {0, 90, 180, 270}:
@@ -287,6 +284,18 @@ def get_path_config_value(key, env_key, default):
         return str(config_path)
 
     return runtime_path(value)
+
+
+def get_optional_path_config_value(key, env_key):
+    """Read an optional path without turning a missing value into ``.``."""
+    value = None
+    if not MANAGED_CONFIG_MODE and env_key in os.environ:
+        value = os.getenv(env_key)
+    else:
+        value = _json_config.get(key)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return get_path_config_value(key, env_key, value)
 
 
 def build_camera_config(cameras, role, fallback):
@@ -578,7 +587,6 @@ class Settings:
         110.0
     )
 
-    CAMERA_INDEX = get_config_value("camera_index", "VISION_CAMERA_INDEX", 0)
     CAMERA_BACKEND = get_config_value("camera_backend", "VISION_CAMERA_BACKEND", "dshow")
     CAMERA_WIDTH = get_config_value("camera_width", "VISION_CAMERA_WIDTH", 0)
     CAMERA_HEIGHT = get_config_value("camera_height", "VISION_CAMERA_HEIGHT", 0)
@@ -606,7 +614,6 @@ class Settings:
     )
     CAMERAS = get_json_config_value("cameras", "VISION_CAMERAS", {})
     LEGACY_CAMERA_CONFIG = {
-        "index": CAMERA_INDEX,
         "backend": CAMERA_BACKEND,
         "width": CAMERA_WIDTH,
         "height": CAMERA_HEIGHT,
@@ -616,7 +623,6 @@ class Settings:
     }
     TOP_CAMERA_CONFIG = build_camera_config(CAMERAS, "top", LEGACY_CAMERA_CONFIG)
     FRONT_CAMERA_CONFIG = build_camera_config(CAMERAS, "front", LEGACY_CAMERA_CONFIG)
-    TOP_CAMERA_INDEX = int(TOP_CAMERA_CONFIG.get("index", CAMERA_INDEX))
     TOP_CAMERA_BACKEND = TOP_CAMERA_CONFIG.get("backend", CAMERA_BACKEND)
     TOP_CAMERA_WIDTH = int(TOP_CAMERA_CONFIG.get("width", CAMERA_WIDTH) or 0)
     TOP_CAMERA_HEIGHT = int(TOP_CAMERA_CONFIG.get("height", CAMERA_HEIGHT) or 0)
@@ -626,7 +632,6 @@ class Settings:
         TOP_CAMERA_CONFIG.get("keep_open"),
         CAMERA_KEEP_OPEN
     )
-    FRONT_CAMERA_INDEX = int(FRONT_CAMERA_CONFIG.get("index", CAMERA_INDEX))
     FRONT_CAMERA_BACKEND = FRONT_CAMERA_CONFIG.get("backend", CAMERA_BACKEND)
     FRONT_CAMERA_WIDTH = int(FRONT_CAMERA_CONFIG.get("width", CAMERA_WIDTH) or 0)
     FRONT_CAMERA_HEIGHT = int(FRONT_CAMERA_CONFIG.get("height", CAMERA_HEIGHT) or 0)
@@ -688,6 +693,26 @@ class Settings:
             item.strip()
             for item in str(os.getenv("VISION_ALLOWED_ORIGINS", "")).split(",")
             if item.strip()
+        )
+    )
+
+    # The daemon owns these materials. Vision receives only public key/session
+    # validation state and therefore cannot mint maintenance capabilities.
+    MAINTENANCE_CAPABILITY_KEYRING_PATH = get_optional_path_config_value(
+        "maintenance_capability_keyring_path", "VISION_MAINTENANCE_CAPABILITY_KEYRING_PATH"
+    )
+    MAINTENANCE_SESSION_PATH = get_optional_path_config_value(
+        "maintenance_session_path", "VISION_MAINTENANCE_SESSION_PATH"
+    )
+    MAINTENANCE_REPLAY_PATH = get_optional_path_config_value(
+        "maintenance_replay_path", "VISION_MAINTENANCE_REPLAY_PATH"
+    )
+    DEVELOPMENT_DASHBOARD_ENABLED = (
+        not MANAGED_CONFIG_MODE
+        and bool_config_value(
+            get_config_value(
+                "development_dashboard", "VISION_DEVELOPMENT_DASHBOARD", False
+            )
         )
     )
 

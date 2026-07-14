@@ -32,8 +32,8 @@ def valid_config():
         "host": "127.0.0.1",
         "port": 7892,
         "cameras": {
-            "top": {"index": 0, "role": "presence", "rotate": 0},
-            "front": {"index": 1, "role": "profile_tryon", "rotate": 270},
+            "top": {"role": "presence", "rotate": 0},
+            "front": {"role": "profile_tryon", "rotate": 270},
         },
         "allowed_origins": ["http://tauri.localhost"],
     }
@@ -62,3 +62,26 @@ def test_managed_config_cannot_enable_mock(tmp_path):
     config = tmp_path / "mock.json"
     config.write_text(json.dumps({**valid_config(), "mock_scenario": "success"}), encoding="utf-8")
     assert import_config(config).returncode != 0
+
+
+def test_managed_site_config_cannot_persist_camera_indexes(tmp_path):
+    config = tmp_path / "legacy-index.json"
+    value = valid_config()
+    value["cameras"]["top"]["index"] = 4
+    config.write_text(json.dumps(value), encoding="utf-8")
+
+    assert import_config(config).returncode != 0
+
+
+def test_managed_config_declares_daemon_owned_maintenance_validation_material(tmp_path):
+    config = tmp_path / "maintenance-material.json"
+    value = valid_config()
+    value.update({
+        "maintenance_capability_keyring_path": r"C:\\ProgramData\\VEM\\vision\\daemon-maintenance-keys.json",
+        "maintenance_session_path": r"C:\\ProgramData\\VEM\\vision\\daemon-maintenance-session.json",
+        "maintenance_replay_path": r"C:\\ProgramData\\VEM\\vision\\camera-maintenance-replay.json",
+    })
+    config.write_text(json.dumps(value), encoding="utf-8")
+
+    result = import_config(config)
+    assert result.returncode == 0, result.stderr

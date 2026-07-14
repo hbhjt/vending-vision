@@ -1,3 +1,8 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$Wheelhouse
+)
+
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
 
@@ -12,8 +17,9 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Venv = Join-Path $Root ".venv-packaging"
 $Python = Join-Path $Venv "Scripts\python.exe"
 $ExpectedPythonVersion = (Get-Content (Join-Path $Root ".python-version") -Raw).Trim()
-$PipIndexUrl = if ($env:PIP_INDEX_URL) { $env:PIP_INDEX_URL } else { "https://pypi.org/simple" }
-$PipIndexArgs = @("--index-url", $PipIndexUrl)
+if (-not (Test-Path -LiteralPath $Wheelhouse -PathType Container)) {
+    throw "A pre-validated offline wheelhouse is required: $Wheelhouse"
+}
 
 $ActualPythonVersion = (& python -c "import platform; print(platform.python_version())").Trim()
 if ($ActualPythonVersion -cne $ExpectedPythonVersion) {
@@ -31,7 +37,7 @@ if (-not (Test-Path $Python)) {
     Invoke-Checked python -m venv $Venv
 }
 
-Invoke-Checked $Python -m pip install @PipIndexArgs -r (Join-Path $Root "requirements-packaging.txt")
+Invoke-Checked $Python -m pip install --no-index --find-links $Wheelhouse --require-hashes -r (Join-Path $Root "requirements.txt")
 
 Invoke-Checked $Python -m PyInstaller --clean --noconfirm (Join-Path $Root "vending_vision.spec")
 
