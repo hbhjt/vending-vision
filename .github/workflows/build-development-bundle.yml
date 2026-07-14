@@ -52,7 +52,8 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           "VISION_DEVELOPMENT_VERSION=$version" >> $env:GITHUB_ENV
 
-      - uses: actions/setup-python@v5
+      - name: 配置测试用 Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
@@ -64,10 +65,16 @@ jobs:
           python -m pytest -q
           python -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
 
+      - name: 配置打包用 Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
       - name: 构建并验证自包含 Windows bundle
         shell: pwsh
         run: |
           python scripts/set_release_version.py $env:VISION_DEVELOPMENT_VERSION
+          python -m venv .venv-packaging
           ./scripts/build_exe.ps1
           python scripts/verify_packaged_exe.py --expected-version $env:VISION_DEVELOPMENT_VERSION
 
