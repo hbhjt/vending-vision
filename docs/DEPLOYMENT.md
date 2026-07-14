@@ -53,12 +53,15 @@ HTTP 或 WebSocket 契约失败属于安装失败，必须回滚。
 
 ## 真实 VEM 现场验收
 
-通过安装验收后，在受保护现场配置中填写真实摄像头编号和旋转角度，并确认截图方向：
+通过安装验收后，使用 Vision 的本机维护合同枚举候选、预览、测试并确认
+top/front 角色。稳定 PnP 身份仅由 Vision 持久化；backend index 是每次枚举的
+瞬时观察，不能写入现场配置或 VEM：
 
 ```text
-GET http://127.0.0.1:7892/camera/roles/status
-GET http://127.0.0.1:7892/camera/top/snapshot.jpg
-GET http://127.0.0.1:7892/camera/front/snapshot.jpg
+GET http://127.0.0.1:7892/maintenance/cameras
+GET http://127.0.0.1:7892/maintenance/cameras/{candidateId}/preview.jpg
+POST http://127.0.0.1:7892/maintenance/cameras/top/test
+POST http://127.0.0.1:7892/maintenance/cameras/top/confirm
 ```
 
 操作员依次靠近、单人站入交互区域、进入试衣并离开，同时运行：

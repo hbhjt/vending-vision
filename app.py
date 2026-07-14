@@ -25,7 +25,7 @@ from typing import Optional
 from uuid import uuid4
 
 import cv2
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from vision.camera_manager import (
@@ -36,6 +36,7 @@ from vision.camera_manager import (
     release_all_cameras,
     reset_camera,
 )
+from vision.camera_binding import get_camera_maintenance
 from vision.camera_owner import get_front_camera_owner
 from vision.config import runtime_path, settings
 from vision.logger import logger
@@ -293,6 +294,7 @@ def root():
         "api": {
             "dashboard": "/dashboard",
             "camera_roles_status": "/camera/roles/status",
+            "camera_maintenance": "/maintenance/cameras",
             "front_camera_owner": "/camera/front/owner",
             "camera_snapshot": "/camera/{role}/snapshot.jpg",
             "proximity_debug": "/proximity/debug",
@@ -475,6 +477,46 @@ def version():
 @app.get("/camera/roles/status")
 def camera_roles_status():
     return get_all_camera_statuses()
+
+
+@app.get("/maintenance/cameras")
+def camera_maintenance_contract():
+    """Versioned loopback contract; device identities stay opaque to VEM."""
+    return get_camera_maintenance().contract()
+
+
+@app.get("/maintenance/cameras/{candidate_id}/preview.jpg")
+def camera_maintenance_preview(candidate_id: str):
+    try:
+        return Response(
+            content=get_camera_maintenance().preview(candidate_id),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+    except (ValueError, RuntimeError) as exc:
+        return JSONResponse(status_code=409, content={"ok": False, "error": str(exc)})
+
+
+@app.post("/maintenance/cameras/{role}/test")
+def camera_maintenance_test(role: str, payload: dict = Body(...)):
+    try:
+        candidate_id = payload.get("candidateId")
+        if not isinstance(candidate_id, str):
+            raise ValueError("candidateId is required")
+        return get_camera_maintenance().test(role, candidate_id)
+    except (ValueError, RuntimeError) as exc:
+        return JSONResponse(status_code=409, content={"ok": False, "error": str(exc)})
+
+
+@app.post("/maintenance/cameras/{role}/confirm")
+def camera_maintenance_confirm(role: str, payload: dict = Body(...)):
+    try:
+        candidate_id = payload.get("candidateId")
+        if not isinstance(candidate_id, str):
+            raise ValueError("candidateId is required")
+        return get_camera_maintenance().confirm(role, candidate_id)
+    except (ValueError, RuntimeError) as exc:
+        return JSONResponse(status_code=409, content={"ok": False, "error": str(exc)})
 
 
 @app.get("/camera/{role}/status")

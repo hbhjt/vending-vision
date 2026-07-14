@@ -68,7 +68,7 @@ def _validate_managed_config(config, config_path):
     if not isinstance(cameras, dict) or set(cameras) != {"top", "front"}:
         raise ConfigError("managed configuration must define exactly top and front cameras")
     camera_keys = {
-        "index", "backend", "width", "height", "fps", "fourcc", "role",
+        "backend", "width", "height", "fps", "fourcc", "role",
         "keep_open", "rotate", "roi",
     }
     expected_roles = {"top": "presence", "front": "profile_tryon"}
@@ -80,9 +80,6 @@ def _validate_managed_config(config, config_path):
             raise ConfigError(
                 f"camera {camera_name} contains unknown keys: {', '.join(camera_unknown)}"
             )
-        index = camera.get("index")
-        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
-            raise ConfigError(f"camera {camera_name}.index must be a non-negative integer")
         if camera.get("role") != expected_roles[camera_name]:
             raise ConfigError(f"camera {camera_name}.role is invalid")
         if camera.get("rotate", 0) not in {0, 90, 180, 270}:

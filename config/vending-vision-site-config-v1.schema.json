@@ -80,7 +80,6 @@
     "cameraBase": {
       "type": "object",
       "properties": {
-        "index": { "type": "integer", "minimum": 0 },
         "backend": { "type": "string", "minLength": 1 },
         "width": { "type": "integer", "minimum": 1 },
         "height": { "type": "integer", "minimum": 1 },
@@ -95,9 +94,8 @@
         { "$ref": "#/$defs/cameraBase" },
         {
           "additionalProperties": false,
-          "required": ["index", "role"],
+          "required": ["role"],
           "properties": {
-            "index": { "type": "integer", "minimum": 0 },
             "backend": { "type": "string", "minLength": 1 },
             "width": { "type": "integer", "minimum": 1 },
             "height": { "type": "integer", "minimum": 1 },
@@ -115,9 +113,8 @@
         { "$ref": "#/$defs/cameraBase" },
         {
           "additionalProperties": false,
-          "required": ["index", "role"],
+          "required": ["role"],
           "properties": {
-            "index": { "type": "integer", "minimum": 0 },
             "backend": { "type": "string", "minLength": 1 },
             "width": { "type": "integer", "minimum": 1 },
             "height": { "type": "integer", "minimum": 1 },

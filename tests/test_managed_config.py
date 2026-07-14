@@ -32,8 +32,8 @@ def valid_config():
         "host": "127.0.0.1",
         "port": 7892,
         "cameras": {
-            "top": {"index": 0, "role": "presence", "rotate": 0},
-            "front": {"index": 1, "role": "profile_tryon", "rotate": 270},
+            "top": {"role": "presence", "rotate": 0},
+            "front": {"role": "profile_tryon", "rotate": 270},
         },
         "allowed_origins": ["http://tauri.localhost"],
     }
@@ -61,4 +61,13 @@ def test_managed_config_is_required_and_validated(tmp_path):
 def test_managed_config_cannot_enable_mock(tmp_path):
     config = tmp_path / "mock.json"
     config.write_text(json.dumps({**valid_config(), "mock_scenario": "success"}), encoding="utf-8")
+    assert import_config(config).returncode != 0
+
+
+def test_managed_site_config_cannot_persist_camera_indexes(tmp_path):
+    config = tmp_path / "legacy-index.json"
+    value = valid_config()
+    value["cameras"]["top"]["index"] = 4
+    config.write_text(json.dumps(value), encoding="utf-8")
+
     assert import_config(config).returncode != 0

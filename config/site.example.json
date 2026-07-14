@@ -9,7 +9,6 @@
   ],
   "cameras": {
     "top": {
-      "index": 0,
       "backend": "dshow",
       "width": 1280,
       "height": 720,
@@ -20,7 +19,6 @@
       "rotate": 0
     },
     "front": {
-      "index": 1,
       "backend": "dshow",
       "width": 1280,
       "height": 720,

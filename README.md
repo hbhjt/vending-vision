@@ -48,12 +48,10 @@ scripts\stop_server.bat
 {
   "cameras": {
     "top": {
-      "index": 0,
       "role": "presence",
       "keep_open": true
     },
     "front": {
-      "index": 1,
       "role": "profile_tryon",
       "keep_open": true
     }
@@ -61,10 +59,13 @@ scripts\stop_server.bat
 }
 ```
 
-现场部署时先确认 Windows 摄像头编号，再修改 `cameras.top.index` 和 `cameras.front.index`。修改后用下面接口确认两路摄像头状态：
+现场部署不写入 Windows 摄像头编号。Vision 在本机枚举稳定 PnP 身份和当前
+backend index；操作员通过版本化维护合同预览、测试并确认 top/front 角色。具体
+合同见 [摄像头维护合同](docs/CAMERA-MAINTENANCE.md)。
 
 ```text
 GET http://127.0.0.1:7892/camera/roles/status
+GET http://127.0.0.1:7892/maintenance/cameras
 ```
 
 ## 目录结构

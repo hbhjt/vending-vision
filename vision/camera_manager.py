@@ -15,6 +15,7 @@ import time
 from datetime import datetime
 
 from vision.camera import describe_capture, open_camera, read_warmup_frame
+from vision.camera_binding import get_camera_maintenance
 from vision.config import settings
 from vision.frame_transform import camera_rotation, rotate_frame
 from vision.logger import logger
@@ -36,12 +37,21 @@ def _time_iso(value):
 def _camera_config(role: str) -> dict:
     """根据角色获取摄像头配置字典。"""
     if role == "top":
-        return dict(settings.TOP_CAMERA_CONFIG)
+        config = dict(settings.TOP_CAMERA_CONFIG)
+    elif role == "front":
+        config = dict(settings.FRONT_CAMERA_CONFIG)
+    else:
+        raise ValueError(f"unknown camera role: {role}")
 
-    if role == "front":
-        return dict(settings.FRONT_CAMERA_CONFIG)
-
-    raise ValueError(f"unknown camera role: {role}")
+    candidate = get_camera_maintenance().resolve(role)
+    config.update(
+        {
+            "index": candidate.index,
+            "backend": candidate.backend,
+            "stableId": candidate.stable_id,
+        }
+    )
+    return config
 
 
 def _keep_open(config: dict) -> bool:
@@ -284,6 +294,10 @@ def get_camera_stream(role: str) -> ManagedCameraStream:
         if stream is None:
             stream = ManagedCameraStream(role, config)
             _streams[role] = stream
+        elif stream.config != config:
+            stream.release()
+            stream = ManagedCameraStream(role, config)
+            _streams[role] = stream
         return stream
 
 
@@ -345,11 +359,15 @@ def get_all_camera_statuses() -> dict:
         try:
             statuses[role] = get_camera_status(role)
         except Exception as exc:
+            try:
+                requested = _requested_config(_camera_config(role))
+            except Exception:
+                requested = None
             statuses[role] = {
                 "ok": False,
                 "role": role,
                 "error": str(exc),
-                "requested": _requested_config(_camera_config(role)),
+                "requested": requested,
             }
 
     return statuses
