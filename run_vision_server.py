@@ -88,14 +88,22 @@ def main():
 
     print("")
     print("Vending Vision service is starting...")
-    print(f"Dashboard: {dashboard_url}")
+    print(
+        f"Dashboard: {dashboard_url}"
+        if settings.DEVELOPMENT_DASHBOARD_ENABLED
+        else "Dashboard: disabled in managed production mode"
+    )
     print(f"Health:    {base_url}/health")
     print("Keep this window open while the vision service is running.")
     print("Press Ctrl+C to stop.")
     print("")
 
     # 自动打开浏览器到仪表盘
-    if not args.no_browser and bool_env("VISION_OPEN_BROWSER", True):
+    if (
+        settings.DEVELOPMENT_DASHBOARD_ENABLED
+        and not args.no_browser
+        and bool_env("VISION_OPEN_BROWSER", True)
+    ):
         threading.Timer(2.0, lambda: webbrowser.open(dashboard_url)).start()
 
     uvicorn.run(

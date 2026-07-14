@@ -10,7 +10,10 @@
     "candidates": { "type": "array", "items": { "$ref": "#/$defs/candidate" } },
     "roles": {
       "type": "object", "additionalProperties": false, "required": ["top", "front"],
-      "properties": { "top": { "$ref": "#/$defs/roleStatus" }, "front": { "$ref": "#/$defs/roleStatus" } }
+      "properties": {
+        "top": { "allOf": [{ "$ref": "#/$defs/roleStatus" }, { "properties": { "role": { "const": "top" } } }] },
+        "front": { "allOf": [{ "$ref": "#/$defs/roleStatus" }, { "properties": { "role": { "const": "front" } } }] }
+      }
     }
   },
   "$defs": {

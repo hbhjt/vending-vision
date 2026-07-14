@@ -40,6 +40,13 @@ vending-vision.exe --no-browser `
 host、非法端口或 mock 配置时会直接启动失败。环境变量和相邻 `config.json`
 回退只保留给不带 `--config` 的供应方开发流程。
 
+相机维护还需要 VEM 写入的 daemon 验证材料路径：
+`maintenance_capability_keyring_path`、`maintenance_session_path` 与
+`maintenance_replay_path`。keyring 仅含可轮换的 Ed25519 公钥，session 文件
+仅含当前 machine/session/key 标识和过期时间；daemon 私钥不会进入 Vision
+bundle、site config 或环境变量。缺失这些材料时 Vision 正常启动但相机维护合同
+明确返回 503 blocked，绝不会退回共享 HMAC secret。
+
 安装验收必须证明：
 
 - 精确的 bundle digest 和按版本寻址的安装目录；
@@ -54,9 +61,11 @@ HTTP 或 WebSocket 契约失败属于安装失败，必须回滚。
 ## 真实 VEM 现场验收
 
 通过安装验收后，使用 Vision 的本机维护合同枚举候选、预览、测试并确认
-top/front 角色。每个请求必须携带短期、单次维护 capability；稳定身份和捕获源
-无法由同一枚举边界证明时，Vision 会 fail closed 为非就绪。backend index 仅是
-已认证维护观察，不能写入现场配置或 VEM：
+top/front 角色。每个请求必须携带 daemon 签发、Ed25519 验签的短期单次
+maintenance capability；稳定 DirectShow moniker 和当前 OpenCV index 从同一
+`cv2-enumerate-cameras` 边界取得。重插后的 index 改变会被刷新解析到原绑定；
+无法证明映射的异常 adapter 才产生 explicit ambiguous/non-ready。backend index
+仅是已认证维护观察，不能写入现场配置或 VEM：
 
 ```text
 GET http://127.0.0.1:7892/maintenance/cameras
@@ -64,6 +73,10 @@ GET http://127.0.0.1:7892/maintenance/cameras/{candidateId}/preview.jpg
 POST http://127.0.0.1:7892/maintenance/cameras/top/test
 POST http://127.0.0.1:7892/maintenance/cameras/top/confirm
 ```
+
+confirm 请求必须同时带 `testEvidenceId`、`operatorVisualConfirmation: true`
+和 `expectedGeneration`；它们与同 role 的真实测试结果在一个原子确认中校验。
+运行时保持打开的流会在预览/测试期间受保护地 handoff，维护完成后恢复。
 
 操作员依次靠近、单人站入交互区域、进入试衣并离开，同时运行：
 

@@ -286,6 +286,18 @@ def get_path_config_value(key, env_key, default):
     return runtime_path(value)
 
 
+def get_optional_path_config_value(key, env_key):
+    """Read an optional path without turning a missing value into ``.``."""
+    value = None
+    if not MANAGED_CONFIG_MODE and env_key in os.environ:
+        value = os.getenv(env_key)
+    else:
+        value = _json_config.get(key)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return get_path_config_value(key, env_key, value)
+
+
 def build_camera_config(cameras, role, fallback):
     """根据角色（top/front）构建摄像头配置，未指定的字段使用后备值。"""
     config = dict(fallback)
@@ -681,6 +693,26 @@ class Settings:
             item.strip()
             for item in str(os.getenv("VISION_ALLOWED_ORIGINS", "")).split(",")
             if item.strip()
+        )
+    )
+
+    # The daemon owns these materials. Vision receives only public key/session
+    # validation state and therefore cannot mint maintenance capabilities.
+    MAINTENANCE_CAPABILITY_KEYRING_PATH = get_optional_path_config_value(
+        "maintenance_capability_keyring_path", "VISION_MAINTENANCE_CAPABILITY_KEYRING_PATH"
+    )
+    MAINTENANCE_SESSION_PATH = get_optional_path_config_value(
+        "maintenance_session_path", "VISION_MAINTENANCE_SESSION_PATH"
+    )
+    MAINTENANCE_REPLAY_PATH = get_optional_path_config_value(
+        "maintenance_replay_path", "VISION_MAINTENANCE_REPLAY_PATH"
+    )
+    DEVELOPMENT_DASHBOARD_ENABLED = (
+        not MANAGED_CONFIG_MODE
+        and bool_config_value(
+            get_config_value(
+                "development_dashboard", "VISION_DEVELOPMENT_DASHBOARD", False
+            )
         )
     )
 

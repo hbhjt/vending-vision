@@ -28,6 +28,9 @@ http://127.0.0.1:7892/metrics
 ws://127.0.0.1:7892/ws
 ```
 
+`/dashboard` 和旧 snapshot 诊断默认关闭。仅供应方开发时可在启动前显式设置
+`VISION_DEVELOPMENT_DASHBOARD=true`；带 `--config` 的 VEM 托管生产启动固定关闭。
+
 VEM 托管运行不使用上述源码启动方式。候选发布物必须由受保护的 RC tag
 构建为自包含 Windows bundle，VEM 以
 `vending-vision.exe --config C:\ProgramData\VEM\vision\config\site.json`
@@ -59,9 +62,10 @@ scripts\stop_server.bat
 }
 ```
 
-现场部署不写入 Windows 摄像头编号。Vision 仅在同一 Windows 媒体枚举边界能
+现场部署不写入 Windows 摄像头编号。Vision 仅在同一 Windows DirectShow 枚举边界能
 证明稳定身份与捕获源的关系时才公开可用候选；否则明确保持非就绪。操作员使用
-短期、单次维护 capability 预览、测试并确认 top/front 角色。具体合同见
+由 daemon 签发的短期、单次 Ed25519 maintenance capability 预览、测试并确认
+top/front 角色；Vision 只读取 daemon 公钥和活动维护会话验证材料。具体合同见
 [摄像头维护合同](docs/CAMERA-MAINTENANCE.md)。
 
 ```text
@@ -94,11 +98,11 @@ logs/               本机运行日志
 ```text
 GET  /health
 GET  /version
-GET  /camera/roles/status
-GET  /camera/{role}/status
-GET  /camera/{role}/snapshot.jpg
-POST /camera/{role}/reopen
-GET  /camera/front/owner
+GET  /maintenance/cameras
+POST /maintenance/cameras/refresh
+GET  /maintenance/cameras/{candidateId}/preview.jpg
+POST /maintenance/cameras/{role}/test
+POST /maintenance/cameras/{role}/confirm
 GET  /session/status
 GET  /proximity/debug
 GET  /metrics
@@ -150,13 +154,7 @@ powershell -ExecutionPolicy Bypass -File scripts\run_video_stability_test.ps1
 }
 ```
 
-`rotate` 表示服务读取后对画面做的校正角度，单位是顺时针度数。中部摄像头如果物理顺时针旋转 90 度安装，通常用 `270` 做逆时针校正。启动后打开：
-
-```text
-http://127.0.0.1:7892/camera/front/snapshot.jpg
-```
-
-确认人脸和身体在截图中是正的，再测年龄、性别和试衣。
+`rotate` 表示服务读取后对画面做的校正角度，单位是顺时针度数。中部摄像头如果物理顺时针旋转 90 度安装，通常用 `270` 做逆时针校正。用具有 `camera.preview` capability 的维护预览确认人脸和身体在画面中是正的，再测年龄、性别和试衣。生产环境不存在无认证的 `/camera/{role}/snapshot.jpg`。
 
 顶部摄像头可以设置 ROI，只检测售货机前方交互区：
 
@@ -185,6 +183,7 @@ http://127.0.0.1:7892/proximity/debug
 ## 上线注意
 
 - 开发、CI 和 Candidate 打包统一使用 `.python-version` 固定的 Python 3.11.9，并共享 `requirements.txt` 的精确依赖版本。
+- Windows 正式枚举使用严格 pin 的 `cv2-enumerate-cameras` DirectShow moniker/index 边界；同一稳定 moniker 在 replug 后可解析为新 index。
 - 生产模型由 `models/model-manifest.json` 声明并通过 Git LFS 进入候选 bundle；现场不得补模型。
 - 正式运行保持 `mock_scenario=off`。
 - 先完成双摄编号确认，再做顶部多人阈值和中部画像质量联调。
@@ -197,6 +196,7 @@ http://127.0.0.1:7892/proximity/debug
 - release 同时发布原始 zip、descriptor、完整展开共享依赖的 SPDX SBOM、SLSA provenance、artifact attestation，及与 VEM 验证器契约一致的 Ed25519 签名信封。
 - VEM 之后由操作员手动输入 tag 与预期 bundle digest，执行独立 conformance/approval；供应仓不安装、不批准、也不重打包候选。
 - `scripts/verify_real_camera_capability.py` 用于现场真实双摄能力验收，强制 `mockScenario=off` 并验证 presence、单人可用画像、离开和试衣 MJPEG。
+- `/dashboard` 与旧 `/camera/{role}/snapshot.jpg` 仅在供应方开发启动显式设置 `VISION_DEVELOPMENT_DASHBOARD=true` 时开放；托管生产模式固定关闭。
 
 ## 编码说明
 

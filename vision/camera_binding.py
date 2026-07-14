@@ -10,17 +10,18 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import hmac
 import json
 import os
 import secrets
-import subprocess
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 
 CAMERA_MAINTENANCE_CONTRACT_VERSION = "vem.vision.camera-maintenance/v2"
@@ -41,10 +42,10 @@ class BindingStore(Protocol):
 class CameraAccess(Protocol):
     def preview(self, candidate: "CameraCandidate") -> bytes: ...
 
-    def test(self, candidate: "CameraCandidate") -> dict: ...
+    def test(self, role: str, candidate: "CameraCandidate") -> dict: ...
 
 
-class WindowsMediaSourceAdapter(Protocol):
+class WindowsCameraSourceAdapter(Protocol):
     """Public boundary for an adapter that can prove identity-to-source mapping."""
 
     def enumerate_sources(self) -> list[dict]: ...
@@ -88,44 +89,61 @@ class JsonBindingStore:
             raise
 
 
-class PowerShellWindowsMediaSourceAdapter:
-    """Enumerates Media Foundation identities but never invents an OpenCV index."""
+class Cv2EnumerateCamerasDirectShowAdapter:
+    """Pinned DirectShow enumeration/capture boundary for Windows production.
+
+    ``cv2-enumerate-cameras`` obtains the DirectShow moniker path and the
+    matching ``cv2.VideoCapture(index, CAP_DSHOW)`` index in *one* native
+    enumeration.  The path is our persistent identity; the index is merely the
+    current DirectShow opening source and may change after a USB replug.
+    """
+
+    def __init__(self, *, enumerate_cameras=None, dshow_backend: int | None = None):
+        self._enumerate_cameras = enumerate_cameras
+        self._dshow_backend = dshow_backend
+
+    def _load(self):
+        if self._enumerate_cameras is not None and self._dshow_backend is not None:
+            return self._enumerate_cameras, self._dshow_backend
+        if os.name != "nt":
+            return None, None
+        try:
+            import cv2
+            from cv2_enumerate_cameras import enumerate_cameras
+        except ImportError as exc:
+            raise RuntimeError(
+                "Windows camera enumeration dependency cv2-enumerate-cameras is unavailable"
+            ) from exc
+        return enumerate_cameras, cv2.CAP_DSHOW
 
     def enumerate_sources(self) -> list[dict]:
-        if os.name != "nt":
+        enumerate_cameras, dshow_backend = self._load()
+        if enumerate_cameras is None:
             return []
-        command = r'''Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$class=[Windows.Devices.Enumeration.DeviceInformation,Windows.Devices.Enumeration,ContentType=WindowsRuntime]
-$enum=[Windows.Devices.Enumeration.DeviceInformation,Windows.Devices.Enumeration,ContentType=WindowsRuntime]::FindAllAsync([Windows.Devices.Enumeration.DeviceClass]::VideoCapture)
-$devices=[System.WindowsRuntimeSystemExtensions]::AsTask($enum).Result
-@($devices | ForEach-Object { [PSCustomObject]@{ stableId=$_.Id; label=$_.Name; backend='mediafoundation'; source=$_.Id } }) | ConvertTo-Json -Compress'''
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-            text=True, capture_output=True, check=False,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return []
-        try:
-            values = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return []
-        if isinstance(values, dict):
-            values = [values]
-        return values if isinstance(values, list) else []
+        result = []
+        for camera in enumerate_cameras(dshow_backend):
+            stable_id = getattr(camera, "path", None)
+            index = getattr(camera, "index", None)
+            if not isinstance(stable_id, str) or not stable_id.strip():
+                continue
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                continue
+            result.append({
+                "stableId": stable_id,
+                "label": str(getattr(camera, "name", None) or stable_id),
+                "backend": "dshow",
+                "index": index,
+                "available": True,
+                "mappingState": "proven",
+            })
+        return result
 
 
 class WindowsCameraDiscovery:
-    """Windows Media Foundation source enumeration, with a fail-closed adapter.
+    """Windows DirectShow discovery with a stable moniker-to-index proof."""
 
-    The Windows Runtime VideoCapture API returns a media-source identifier from
-    the same enumeration that returned the device identity.  OpenCV's numeric
-    DirectShow indexes are not that API, so this default adapter deliberately
-    leaves ``index`` empty until a capture adapter can prove a source mapping.
-    It is therefore safe on a machine with multiple or replugged cameras.
-    """
-
-    def __init__(self, adapter: WindowsMediaSourceAdapter | None = None):
-        self._adapter = adapter or PowerShellWindowsMediaSourceAdapter()
+    def __init__(self, adapter: WindowsCameraSourceAdapter | None = None):
+        self._adapter = adapter or Cv2EnumerateCamerasDirectShowAdapter()
 
     def enumerate(self) -> list[dict]:
         values = self._adapter.enumerate_sources()
@@ -139,7 +157,7 @@ class WindowsCameraDiscovery:
             result.append({
                 "stableId": stable_id,
                 "label": str(value.get("label") or stable_id),
-                "backend": str(value.get("backend") or "mediafoundation"),
+                "backend": str(value.get("backend") or "dshow"),
                 "index": index if proven else None,
                 "available": proven,
                 "mappingState": "proven" if proven else "unproven",
@@ -179,8 +197,14 @@ class _CameraLease:
 class OpenCvCameraAccess:
     """Short-lived maintenance access sharing the process-wide lease registry."""
 
-    def __init__(self, leases: CameraLeaseRegistry | None = None):
+    def __init__(self, leases: CameraLeaseRegistry | None = None, *, runtime_handoff=None):
         self.leases = leases or _camera_leases
+        self._runtime_handoff = runtime_handoff
+
+    def _handoff_runtime(self, candidate: "CameraCandidate"):
+        if self._runtime_handoff is None:
+            return _NoopHandoff()
+        return self._runtime_handoff(candidate.stable_id)
 
     def _open(self, candidate: "CameraCandidate"):
         from vision.camera import open_camera
@@ -191,35 +215,48 @@ class OpenCvCameraAccess:
     def preview(self, candidate: "CameraCandidate") -> bytes:
         import cv2
         from vision.camera import read_warmup_frame
-        lease = self.leases.acquire(candidate.stable_id, "maintenance-preview")
+        handoff = self._handoff_runtime(candidate)
         try:
-            capture = self._open(candidate)
+            lease = self.leases.acquire(candidate.stable_id, "maintenance-preview")
             try:
-                frame = read_warmup_frame(capture, 1)
-                ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                if not ok:
-                    raise RuntimeError("failed to encode camera preview")
-                return encoded.tobytes()
+                capture = self._open(candidate)
+                try:
+                    frame = read_warmup_frame(capture, 1)
+                    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                    if not ok:
+                        raise RuntimeError("failed to encode camera preview")
+                    return encoded.tobytes()
+                finally:
+                    capture.release()
             finally:
-                capture.release()
+                lease.release()
         finally:
-            lease.release()
+            handoff.release()
 
-    def test(self, candidate: "CameraCandidate") -> dict:
-        from vision.camera import describe_capture, read_warmup_frame
-        lease = self.leases.acquire(candidate.stable_id, "maintenance-test")
+    def test(self, role: str, candidate: "CameraCandidate") -> dict:
+        from vision.camera import read_warmup_frame
+        handoff = self._handoff_runtime(candidate)
         try:
-            capture = self._open(candidate)
+            lease = self.leases.acquire(candidate.stable_id, "maintenance-test")
             try:
-                frame = read_warmup_frame(capture, 1)
-                height, width = frame.shape[:2]
-                return {"ok": True, "frame": {"width": width, "height": height},
-                        "backendObservation": {"backend": candidate.backend, "index": candidate.index,
-                                               "available": True, "mappingState": "proven"}}
+                capture = self._open(candidate)
+                try:
+                    frame = read_warmup_frame(capture, 1)
+                    height, width = frame.shape[:2]
+                    return {"ok": True, "role": role, "frame": {"width": width, "height": height},
+                            "backendObservation": {"backend": candidate.backend, "index": candidate.index,
+                                                   "available": True, "mappingState": "proven"}}
+                finally:
+                    capture.release()
             finally:
-                capture.release()
+                lease.release()
         finally:
-            lease.release()
+            handoff.release()
+
+
+class _NoopHandoff:
+    def release(self) -> None:
+        return None
 
 
 @dataclass(frozen=True)
@@ -259,42 +296,185 @@ class MaintenanceCapabilityError(ValueError):
         self.status_code = status_code
 
 
-class MaintenanceCapabilityVerifier:
-    """Verifies a single-use, scoped maintenance capability without JWT deps."""
+class DurableReplayStore:
+    """Daemon/vision-local, restart-safe single-use capability replay ledger."""
 
-    def __init__(self, secret: str | None, clock=time.time):
-        self._secret = secret.encode() if secret else None
-        self._clock = clock
-        self._used: dict[str, int] = {}
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
         self._lock = threading.RLock()
 
+    def _load(self) -> dict[str, int]:
+        if not self.path.exists():
+            return {}
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("maintenance replay store is unreadable") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError("maintenance replay store has an unsupported format")
+        used = value.get("used")
+        if value.get("version") != 1 or not isinstance(used, dict):
+            raise RuntimeError("maintenance replay store has an unsupported format")
+        if any(isinstance(expiry, bool) or not isinstance(expiry, int) for expiry in used.values()):
+            raise RuntimeError("maintenance replay store has invalid expiry data")
+        return dict(used)
+
+    def _save(self, used: dict[str, int]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"version": 1, "used": used}, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def consume(self, jti: str, expires_at: int, now: int) -> bool:
+        with self._lock:
+            used = {key: expiry for key, expiry in self._load().items() if expiry > now}
+            if jti in used:
+                return False
+            used[jti] = expires_at
+            self._save(used)
+            return True
+
+
+class MaintenanceCapabilityVerifier:
+    """Verifier-only Ed25519 contract for daemon-issued maintenance JWTs.
+
+    Vision reads daemon-owned public-key and active-session material.  It never
+    receives a signing private key and rejects a token when either material is
+    absent, expired, or rotated away.
+    """
+
+    ISSUER = "vem.vending-daemon"
+    AUDIENCE = "vem.vision.camera-maintenance"
+    PURPOSE = "vision.camera-maintenance"
+    MAX_TTL_SECONDS = 300
+    CLOCK_SKEW_SECONDS = 30
+
+    def __init__(
+        self,
+        keyring_path: str | Path | None,
+        session_path: str | Path | None,
+        replay_store: DurableReplayStore | None,
+        clock=time.time,
+    ):
+        self._keyring_path = Path(keyring_path) if keyring_path else None
+        self._session_path = Path(session_path) if session_path else None
+        self._replay_store = replay_store
+        self._clock = clock
+
+    @staticmethod
+    def _b64decode(value: str) -> bytes:
+        if not isinstance(value, str) or not value:
+            raise ValueError("base64url value is required")
+        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+    @classmethod
+    def _decode_json(cls, value: str, label: str) -> dict:
+        try:
+            parsed = json.loads(cls._b64decode(value))
+        except Exception as exc:
+            raise MaintenanceCapabilityError(f"maintenance capability {label} is invalid", 401) from exc
+        if not isinstance(parsed, dict):
+            raise MaintenanceCapabilityError(f"maintenance capability {label} is invalid", 401)
+        return parsed
+
+    @staticmethod
+    def _load_json(path: Path, material: str) -> dict:
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise MaintenanceCapabilityError(
+                f"maintenance capability issuer material is blocked: {material} is unavailable", 503
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise MaintenanceCapabilityError(
+                f"maintenance capability issuer material is blocked: {material} is invalid", 503
+            )
+        return parsed
+
+    def _issuer_material(self) -> tuple[dict, dict]:
+        if self._keyring_path is None or self._session_path is None or self._replay_store is None:
+            raise MaintenanceCapabilityError(
+                "maintenance capability issuer material is blocked: daemon keyring/session is not configured", 503
+            )
+        keyring = self._load_json(self._keyring_path, "daemon keyring")
+        session = self._load_json(self._session_path, "daemon maintenance session")
+        if keyring.get("version") != 1 or keyring.get("issuer") != self.ISSUER or not isinstance(keyring.get("keys"), list):
+            raise MaintenanceCapabilityError("maintenance capability issuer material is blocked: daemon keyring is invalid", 503)
+        required_session = {"version": 1}
+        if session.get("version") != required_session["version"]:
+            raise MaintenanceCapabilityError("maintenance capability issuer material is blocked: daemon maintenance session is invalid", 503)
+        for field in ("machineCode", "sessionId", "keyId"):
+            if not isinstance(session.get(field), str) or not session[field]:
+                raise MaintenanceCapabilityError("maintenance capability issuer material is blocked: daemon maintenance session is invalid", 503)
+        if isinstance(session.get("expiresAt"), bool) or not isinstance(session.get("expiresAt"), int):
+            raise MaintenanceCapabilityError("maintenance capability issuer material is blocked: daemon maintenance session is invalid", 503)
+        return keyring, session
+
+    @staticmethod
+    def _matching_key(keyring: dict, key_id: str) -> dict:
+        matches = [key for key in keyring["keys"] if isinstance(key, dict) and key.get("id") == key_id]
+        if len(matches) != 1:
+            raise MaintenanceCapabilityError("maintenance capability key is unknown", 401)
+        key = matches[0]
+        for field in ("publicKey", "notBefore", "notAfter"):
+            if field not in key:
+                raise MaintenanceCapabilityError("maintenance capability key is invalid", 401)
+        if isinstance(key["notBefore"], bool) or isinstance(key["notAfter"], bool) or not isinstance(key["notBefore"], int) or not isinstance(key["notAfter"], int):
+            raise MaintenanceCapabilityError("maintenance capability key is invalid", 401)
+        return key
+
     def verify(self, token: str | None, required_scope: str) -> dict:
-        if not self._secret or not token:
+        keyring, session = self._issuer_material()
+        if not token:
             raise MaintenanceCapabilityError("maintenance capability is required", 401)
         try:
-            encoded, signature = token.split(".", 1)
-            expected = hmac.new(self._secret, encoded.encode(), hashlib.sha256).hexdigest()
-            padded = encoded + "=" * (-len(encoded) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(padded))
+            encoded_header, encoded_claims, encoded_signature = token.split(".")
         except Exception as exc:
             raise MaintenanceCapabilityError("maintenance capability is invalid", 401) from exc
-        if not hmac.compare_digest(signature, expected):
-            raise MaintenanceCapabilityError("maintenance capability is invalid", 401)
+        header = self._decode_json(encoded_header, "header")
+        claims = self._decode_json(encoded_claims, "claims")
+        key_id = header.get("kid")
+        if header.get("alg") != "EdDSA" or header.get("typ") != "JWT" or not isinstance(key_id, str) or not key_id:
+            raise MaintenanceCapabilityError("maintenance capability header is invalid", 401)
+        key = self._matching_key(keyring, key_id)
+        try:
+            public_key = Ed25519PublicKey.from_public_bytes(self._b64decode(key["publicKey"]))
+            public_key.verify(self._b64decode(encoded_signature), f"{encoded_header}.{encoded_claims}".encode())
+        except (ValueError, InvalidSignature) as exc:
+            raise MaintenanceCapabilityError("maintenance capability signature is invalid", 401) from exc
         now = int(self._clock())
-        if not isinstance(claims, dict) or claims.get("purpose") != "vision.camera-maintenance":
+        if now >= session["expiresAt"]:
+            raise MaintenanceCapabilityError("maintenance capability session has expired", 401)
+        if claims.get("iss") != self.ISSUER or claims.get("aud") != self.AUDIENCE:
+            raise MaintenanceCapabilityError("maintenance capability has the wrong issuer or audience", 403)
+        if claims.get("machine") != session["machineCode"] or claims.get("session") != session["sessionId"] or key_id != session["keyId"]:
+            raise MaintenanceCapabilityError("maintenance capability is for another machine or maintenance session", 403)
+        if claims.get("purpose") != self.PURPOSE:
             raise MaintenanceCapabilityError("maintenance capability has the wrong purpose", 403)
-        scopes, expires_at, jti = claims.get("scope"), claims.get("exp"), claims.get("jti")
-        if not isinstance(scopes, list) or required_scope not in scopes:
+        scopes, issued_at, expires_at, jti = claims.get("scope"), claims.get("iat"), claims.get("exp"), claims.get("jti")
+        if not isinstance(scopes, list) or not all(isinstance(scope, str) and scope for scope in scopes) or required_scope not in scopes:
             raise MaintenanceCapabilityError("maintenance capability lacks required scope", 403)
-        if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= now:
+        if (isinstance(issued_at, bool) or isinstance(expires_at, bool) or not isinstance(issued_at, int)
+                or not isinstance(expires_at, int) or issued_at > now + self.CLOCK_SKEW_SECONDS
+                or expires_at <= now or expires_at <= issued_at or expires_at - issued_at > self.MAX_TTL_SECONDS):
             raise MaintenanceCapabilityError("maintenance capability has expired", 401)
+        if issued_at < key["notBefore"] or expires_at > key["notAfter"] or expires_at > session["expiresAt"]:
+            raise MaintenanceCapabilityError("maintenance capability is outside key or session lifetime", 401)
         if not isinstance(jti, str) or not jti:
             raise MaintenanceCapabilityError("maintenance capability lacks replay id", 401)
-        with self._lock:
-            self._used = {key: expiry for key, expiry in self._used.items() if expiry > now}
-            if jti in self._used:
-                raise MaintenanceCapabilityError("maintenance capability was already used", 409)
-            self._used[jti] = expires_at
+        if not self._replay_store.consume(jti, expires_at, now):
+            raise MaintenanceCapabilityError("maintenance capability was already used", 409)
         return claims
 
 
@@ -357,7 +537,7 @@ class CameraMaintenanceService:
         if self._access is None:
             raise RuntimeError("camera test is unavailable")
         candidate = self._candidate(candidate_id)
-        result = self._access.test(candidate)
+        result = self._access.test(role, candidate)
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise RuntimeError("camera test did not produce successful evidence")
         evidence_id = secrets.token_urlsafe(18)
@@ -369,13 +549,16 @@ class CameraMaintenanceService:
                              "generation": self._generation, "expiresAt": expires_at}}
 
     def confirm(self, role: str, candidate_id: str, *, test_evidence_id: str | None = None,
-                operator_visual_confirmation: bool = False) -> dict:
+                operator_visual_confirmation: bool = False, expected_generation: str | None = None) -> dict:
         if role not in CAMERA_ROLES:
             raise ValueError(f"unknown camera role: {role}")
         with self._mutation_lock, self._lock:
+            if not isinstance(expected_generation, str) or expected_generation != self._generation:
+                raise ValueError("confirm expected generation does not match the current candidate generation")
+            if operator_visual_confirmation is not True:
+                raise ValueError("explicit operator visual confirmation is required")
             candidate = self._candidate(candidate_id)
-            if not operator_visual_confirmation:
-                self._consume_evidence(test_evidence_id, role, candidate_id)
+            self._consume_evidence(test_evidence_id, role, candidate_id)
             # Reload under the mutation lock so a second service cannot confirm
             # against stale persisted state within this process.
             current = self._store.load()
@@ -387,7 +570,7 @@ class CameraMaintenanceService:
             current[role] = {
                 "stableId": candidate.stable_id,
                 "confirmation": {
-                    "method": "operator_visual" if operator_visual_confirmation else "role_test",
+                    "method": "role_test_and_operator_visual",
                     "generation": self._generation,
                     "confirmedAt": int(self._clock()),
                 },
@@ -454,6 +637,10 @@ def default_camera_binding_path() -> Path:
     return root / "VendingVision" / "camera-bindings.json"
 
 
+def default_maintenance_replay_path() -> Path:
+    return default_camera_binding_path().with_name("camera-maintenance-replay.json")
+
+
 _camera_leases = CameraLeaseRegistry()
 _maintenance_service: CameraMaintenanceService | None = None
 
@@ -463,8 +650,17 @@ def acquire_runtime_camera_lease(candidate_id: str, role: str):
     return _camera_leases.acquire(candidate_id, f"runtime:{role}")
 
 
+def _handoff_runtime_camera(candidate_id: str):
+    # Delayed import keeps camera-manager's normal dependency direction intact.
+    from vision.camera_manager import quiesce_runtime_camera
+    return quiesce_runtime_camera(candidate_id)
+
+
 def get_camera_maintenance() -> CameraMaintenanceService:
     global _maintenance_service
     if _maintenance_service is None:
-        _maintenance_service = CameraMaintenanceService(WindowsCameraDiscovery(), JsonBindingStore(default_camera_binding_path()), OpenCvCameraAccess())
+        _maintenance_service = CameraMaintenanceService(
+            WindowsCameraDiscovery(), JsonBindingStore(default_camera_binding_path()),
+            OpenCvCameraAccess(runtime_handoff=_handoff_runtime_camera),
+        )
     return _maintenance_service

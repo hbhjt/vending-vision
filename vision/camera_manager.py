@@ -157,12 +157,14 @@ class ManagedCameraStream:
         self.role = role                      # 摄像头角色: top / front
         self.config = dict(config)            # 摄像头配置
         self.lock = threading.RLock()         # 线程锁
+        self._maintenance_condition = threading.Condition(self.lock)
         self.cap = None                       # OpenCV VideoCapture 对象
         self.opened_at = None                 # 最近一次打开的时间戳
         self.last_frame_at = None             # 最近一次成功读取帧的时间戳
         self.frame_count = 0                  # 累计读取帧数
         self.reconnect_count = 0              # 累计重连次数
         self.last_error = None                # 最近一次错误信息
+        self._maintenance_handoffs = 0
 
     def _release_locked(self):
         """释放摄像头资源（需在持有锁时调用）。"""
@@ -186,11 +188,26 @@ class ManagedCameraStream:
             self._release_locked()
             self.last_error = None
 
+    def quiesce_for_maintenance(self):
+        """Yield a persistent runtime capture to one protected maintenance action."""
+        with self._maintenance_condition:
+            self._maintenance_handoffs += 1
+            self._release_locked()
+        return _RuntimeMaintenanceHandoff(self)
+
+    def _resume_after_maintenance(self):
+        with self._maintenance_condition:
+            self._maintenance_handoffs = max(0, self._maintenance_handoffs - 1)
+            self._maintenance_condition.notify_all()
+
     def _ensure_open_locked(self):
         """确保摄像头已打开（需在持有锁时调用）。
 
         如果摄像头未打开或已关闭，则重新打开。
         """
+        while self._maintenance_handoffs:
+            if not self._maintenance_condition.wait(timeout=10.0):
+                raise RuntimeError(f"{self.role} camera maintenance handoff timed out")
         if self.cap is not None and self.cap.isOpened():
             return
 
@@ -298,6 +315,22 @@ class ManagedCameraStream:
             return status
 
 
+class _RuntimeMaintenanceHandoff:
+    def __init__(self, stream: ManagedCameraStream):
+        self._stream = stream
+        self._released = False
+
+    def release(self):
+        if not self._released:
+            self._released = True
+            self._stream._resume_after_maintenance()
+
+
+class _NoopRuntimeMaintenanceHandoff:
+    def release(self):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 全局摄像头流注册表
 # ---------------------------------------------------------------------------
@@ -326,6 +359,25 @@ def get_camera_stream(role: str) -> ManagedCameraStream:
             stream = ManagedCameraStream(role, config)
             _streams[role] = stream
         return stream
+
+
+def quiesce_runtime_camera(candidate_id: str):
+    """Temporarily release the persistent stream bound to one stable identity.
+
+    The caller owns the returned handoff until its preview/test capture closes.
+    Runtime reads then resume lazily through the normal single owner pipeline.
+    """
+    with _streams_lock:
+        streams = list(_streams.values())
+    matching = [
+        stream for stream in streams
+        if stream.config.get("stableId") == candidate_id
+    ]
+    if not matching:
+        return _NoopRuntimeMaintenanceHandoff()
+    if len(matching) != 1:
+        raise RuntimeError("camera runtime ownership is ambiguous")
+    return matching[0].quiesce_for_maintenance()
 
 
 def read_camera(role: str, warmup_frames: int | None = None):

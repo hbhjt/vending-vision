@@ -39,8 +39,10 @@ from vision.camera_manager import (
 )
 from vision.camera_binding import (
     CAMERA_MAINTENANCE_CONTRACT_VERSION,
+    DurableReplayStore,
     MaintenanceCapabilityError,
     MaintenanceCapabilityVerifier,
+    default_maintenance_replay_path,
     get_camera_maintenance,
 )
 from vision.camera_owner import get_front_camera_owner
@@ -76,7 +78,9 @@ startup_check = None
 # 调试仪表盘 HTML 文件路径
 DASHBOARD_FILE = Path(runtime_path("dashboard/profile_dashboard.html"))
 _maintenance_authorizer = MaintenanceCapabilityVerifier(
-    os.getenv("VISION_CAMERA_MAINTENANCE_CAPABILITY_SECRET")
+    settings.MAINTENANCE_CAPABILITY_KEYRING_PATH,
+    settings.MAINTENANCE_SESSION_PATH,
+    DurableReplayStore(settings.MAINTENANCE_REPLAY_PATH or default_maintenance_replay_path()),
 )
 
 
@@ -305,7 +309,6 @@ def root():
             "camera_roles_status": "/camera/roles/status",
             "camera_maintenance": "/maintenance/cameras",
             "front_camera_owner": "/camera/front/owner",
-            "camera_snapshot": "/camera/{role}/snapshot.jpg",
             "proximity_debug": "/proximity/debug",
             "try_on_preview": "/try-on/{sessionId}.mjpeg",
             "session_status": "/session/status",
@@ -320,6 +323,8 @@ def root():
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
+    if not settings.DEVELOPMENT_DASHBOARD_ENABLED:
+        return HTMLResponse(status_code=404, content="<h1>development dashboard disabled</h1>")
     if not DASHBOARD_FILE.exists():
         return HTMLResponse(
             status_code=404,
@@ -558,19 +563,24 @@ def camera_maintenance_confirm(role: str, request: Request, payload: dict = Body
     if denied:
         return denied
     try:
-        allowed = {"candidateId", "testEvidenceId", "operatorVisualConfirmation"}
-        if not set(payload).issubset(allowed):
-            raise ValueError("confirm request contains unsupported fields")
+        required = {"candidateId", "testEvidenceId", "operatorVisualConfirmation", "expectedGeneration"}
+        if set(payload) != required:
+            raise ValueError("confirm request must contain candidateId, testEvidenceId, operatorVisualConfirmation and expectedGeneration")
         candidate_id = payload.get("candidateId")
         if not isinstance(candidate_id, str):
             raise ValueError("candidateId is required")
         test_evidence_id = payload.get("testEvidenceId")
-        visual = payload.get("operatorVisualConfirmation") is True
-        if not isinstance(test_evidence_id, str) and not visual:
-            raise ValueError("confirm requires testEvidenceId or operatorVisualConfirmation")
+        expected_generation = payload.get("expectedGeneration")
+        visual = payload.get("operatorVisualConfirmation")
+        if not isinstance(test_evidence_id, str) or not test_evidence_id:
+            raise ValueError("confirm requires testEvidenceId")
+        if visual is not True:
+            raise ValueError("confirm requires explicit operatorVisualConfirmation")
+        if not isinstance(expected_generation, str) or not expected_generation:
+            raise ValueError("confirm requires expectedGeneration")
         return get_camera_maintenance().confirm(
             role, candidate_id, test_evidence_id=test_evidence_id,
-            operator_visual_confirmation=visual,
+            operator_visual_confirmation=visual, expected_generation=expected_generation,
         )
     except (ValueError, RuntimeError) as exc:
         return _maintenance_error(exc)
@@ -589,6 +599,10 @@ def camera_role_status(role: str):
 
 @app.get("/camera/{role}/snapshot.jpg")
 def camera_role_snapshot(role: str):
+    # This legacy diagnostic is intentionally absent from managed production.
+    # Only the scoped /maintenance preview capability may return camera bytes.
+    if not settings.DEVELOPMENT_DASHBOARD_ENABLED:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "not found"})
     try:
         get_camera_config(role)
         if role == "front" and (
@@ -618,6 +632,8 @@ def camera_role_snapshot(role: str):
 
 @app.post("/camera/{role}/reopen")
 def camera_role_reopen(role: str):
+    if not settings.DEVELOPMENT_DASHBOARD_ENABLED:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "not found"})
     try:
         get_camera_config(role)
         if role == "front" and (

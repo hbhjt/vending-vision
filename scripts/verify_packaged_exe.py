@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from urllib.error import HTTPError
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,6 +69,14 @@ def http_get_text(url, timeout=5.0):
         return response.read().decode("utf-8")
 
 
+def http_status_json(url, timeout=5.0):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
 def wait_for_http(base_url, process, timeout):
     deadline = time.monotonic() + timeout
     last_error = None
@@ -95,6 +104,12 @@ def assert_bundled_resources(exe_path):
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise AssertionError(f"missing packaged resources: {missing}")
+    camera_adapter = internal / "cv2_enumerate_cameras"
+    if not any(camera_adapter.glob("_windows_backend*.pyd")):
+        raise AssertionError("missing packaged cv2-enumerate-cameras Windows DirectShow adapter")
+    crypto = internal / "cryptography"
+    if not crypto.is_dir():
+        raise AssertionError("missing packaged Ed25519 capability verifier")
 
 
 async def verify_websocket(port):
@@ -185,6 +200,9 @@ def main():
                 "VISION_PORT": str(args.port),
                 "VISION_MOCK_SCENARIO": "success",
                 "VISION_OPEN_BROWSER": "0",
+                # Production keeps diagnostic routes absent; packaging verifies
+                # the explicitly opted-in supplier development dashboard only.
+                "VISION_DEVELOPMENT_DASHBOARD": "1",
                 "VISION_WORKDIR": temp_dir,
             }
         )
@@ -218,6 +236,11 @@ def main():
             metrics = http_get_json(f"{base_url}/metrics")
             if not isinstance(metrics, dict):
                 raise AssertionError("metrics endpoint did not return an object")
+            maintenance_status, maintenance = http_status_json(f"{base_url}/maintenance/cameras")
+            if maintenance_status != 503 or "blocked" not in str(maintenance):
+                raise AssertionError(
+                    "packaged default must explicitly block maintenance without daemon issuer material"
+                )
             asyncio.run(verify_websocket(args.port))
             print("PACKAGED_EXE_VERIFICATION=PASS")
             print(f"EXE={exe_path}")

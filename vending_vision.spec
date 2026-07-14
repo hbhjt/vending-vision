@@ -19,9 +19,12 @@ datas = [
     (str(ROOT / "models"), "models"),
 ]
 datas += collect_data_files("mediapipe")
+datas += collect_data_files("cv2_enumerate_cameras")
 
 binaries = []
 binaries += collect_dynamic_libs("mediapipe")
+binaries += collect_dynamic_libs("cv2_enumerate_cameras")
+binaries += collect_dynamic_libs("cryptography")
 
 hiddenimports = [
     "uvicorn.lifespan.on",
@@ -31,6 +34,12 @@ hiddenimports = [
     "uvicorn.protocols.websockets.websockets_impl",
 ]
 hiddenimports += collect_submodules("mediapipe")
+hiddenimports += [
+    "cv2_enumerate_cameras",
+    "cv2_enumerate_cameras.windows_backend",
+    "cv2_enumerate_cameras._windows_backend",
+    "cryptography.hazmat.backends.openssl",
+]
 
 metadata_packages = [
     "fastapi",
@@ -41,6 +50,8 @@ metadata_packages = [
     "opencv-contrib-python",
     "openvino",
     "jsonschema",
+    "cv2-enumerate-cameras",
+    "cryptography",
 ]
 
 for package in metadata_packages:

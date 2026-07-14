@@ -13,3 +13,8 @@ openvino==2025.4.1
 pytest==8.4.2
 jsonschema==4.25.1
 httpx==0.28.1
+# Windows production discovery returns DirectShow moniker paths and the matching
+# OpenCV capture index from one native enumeration boundary.
+cv2-enumerate-cameras==1.1.16
+# Vision only verifies daemon-issued Ed25519 maintenance capabilities.
+cryptography==46.0.7

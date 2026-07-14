@@ -3,6 +3,6 @@
   "$id": "https://vending-vision.invalid/schemas/camera-maintenance/v2/requests",
   "$defs": {
     "test": { "type": "object", "additionalProperties": false, "required": ["candidateId"], "properties": { "candidateId": { "type": "string", "minLength": 1 } } },
-    "confirm": { "type": "object", "additionalProperties": false, "required": ["candidateId"], "properties": { "candidateId": { "type": "string", "minLength": 1 }, "testEvidenceId": { "type": "string", "minLength": 1 }, "operatorVisualConfirmation": { "type": "boolean" } }, "oneOf": [ { "required": ["testEvidenceId"] }, { "required": ["operatorVisualConfirmation"], "properties": { "operatorVisualConfirmation": { "const": true } } } ] }
+    "confirm": { "type": "object", "additionalProperties": false, "required": ["candidateId", "testEvidenceId", "operatorVisualConfirmation", "expectedGeneration"], "properties": { "candidateId": { "type": "string", "minLength": 1 }, "testEvidenceId": { "type": "string", "minLength": 1 }, "operatorVisualConfirmation": { "const": true }, "expectedGeneration": { "type": "string", "minLength": 1 } } }
   }
 }
