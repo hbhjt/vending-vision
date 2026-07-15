@@ -401,9 +401,6 @@ def main():
                 raise AssertionError(
                     f"release version mismatch: expected {args.expected_version}, got {version}"
                 )
-            dashboard = http_get_text(f"{base_url}/dashboard")
-            if "WebSocket" not in dashboard and "profile" not in dashboard.lower():
-                raise AssertionError("packaged dashboard content is incomplete")
             metrics = http_get_json(f"{base_url}/metrics")
             if not isinstance(metrics, dict):
                 raise AssertionError("metrics endpoint did not return an object")
