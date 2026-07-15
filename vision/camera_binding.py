@@ -533,8 +533,23 @@ class CameraMaintenanceService:
         return list(self._snapshot or [])
 
     def contract(self) -> dict:
-        candidates = self._candidates()
-        return {"contractVersion": CAMERA_MAINTENANCE_CONTRACT_VERSION, "generation": self._generation,
+        with self._lock:
+            candidates = self._candidates()
+            return self._contract(candidates)
+
+    def cached_contract(self) -> dict:
+        """Return the last stable candidate generation without discovering devices.
+
+        A fresh process has no in-memory generation yet, even when role bindings
+        were persisted.  Treat those roles as not ready until an explicit
+        maintenance read/refresh has populated the candidate snapshot.
+        """
+        with self._lock:
+            candidates = list(self._snapshot or [])
+            return self._contract(candidates, generation=self._generation or "unobserved")
+
+    def _contract(self, candidates: list[CameraCandidate], *, generation: str | None = None) -> dict:
+        return {"contractVersion": CAMERA_MAINTENANCE_CONTRACT_VERSION, "generation": generation or self._generation,
                 "candidates": [candidate.contract_value() for candidate in candidates],
                 "roles": {role: self._role_status(role, candidates) for role in CAMERA_ROLES}}
 
