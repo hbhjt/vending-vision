@@ -32,7 +32,9 @@ jobs:
           cache: pip
       - name: 下载完整锁定 wheel 闭包
         shell: pwsh
-        run: python -m pip download --only-binary=:all: --require-hashes --dest wheelhouse -r requirements.txt
+        run: >-
+          python -m pip download --only-binary=:all: --require-hashes
+          --dest wheelhouse -r requirements.txt
       - name: 离线安装、校验精确源码和模型
         shell: pwsh
         run: |
