@@ -303,7 +303,7 @@ def verify_managed_production_surface(exe_path, *, port, startup_timeout, temp_d
     env.update({
         "VISION_OPEN_BROWSER": "0",
         "VISION_MOCK_SCENARIO": "off",
-        "VISION_DEVELOPMENT_DASHBOARD": "1",  # managed mode must still hide it
+        "VISION_DEVELOPMENT_DASHBOARD": "true",  # managed mode must still hide it
         "VISION_WORKDIR": str(temp_dir),
     })
     process = subprocess.Popen(
@@ -353,22 +353,31 @@ def main():
     ensure_port_available(managed_port)
 
     with tempfile.TemporaryDirectory(prefix="vending-vision-package-") as temp_dir:
+        temp_dir = Path(temp_dir)
+        # Exercise the supported supplier-development config path; managed
+        # production is verified separately below and must keep this route hidden.
+        dev_config_path = temp_dir / "config.json"
+        dev_config_path.write_text(
+            json.dumps(
+                {
+                    "host": "127.0.0.1",
+                    "port": args.port,
+                    "development_dashboard": True,
+                }
+            ),
+            encoding="utf-8",
+        )
         env = os.environ.copy()
         env.update(
             {
-                "VISION_HOST": "127.0.0.1",
-                "VISION_PORT": str(args.port),
                 "VISION_MOCK_SCENARIO": "success",
                 "VISION_OPEN_BROWSER": "0",
-                # Production keeps diagnostic routes absent; packaging verifies
-                # the explicitly opted-in supplier development dashboard only.
-                "VISION_DEVELOPMENT_DASHBOARD": "1",
-                "VISION_WORKDIR": temp_dir,
+                "VISION_WORKDIR": str(temp_dir),
             }
         )
         process = subprocess.Popen(
             [str(exe_path)],
-            cwd=str(exe_path.parent),
+            cwd=str(temp_dir),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
