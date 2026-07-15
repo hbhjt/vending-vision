@@ -18,7 +18,7 @@ from vision.face_detector import FaceDetector
 from vision.person_detector import PersonDetector
 from vision.logger import logger
 from vision.age_gender_estimator import AgeGenderEstimator
-from vision.camera_manager import get_all_camera_statuses
+from vision.camera_binding import get_camera_maintenance
 from vision.model_manifest import verify_model_manifest
 
 
@@ -27,9 +27,10 @@ def check_model_manifest():
     return verify_model_manifest()
 
 def check_camera():
-    """检查摄像头是否可打开。
+    """检查摄像头角色是否已稳定绑定且当前可枚举。
 
-    Mock 模式下不强制检查真实摄像头。
+    启动健康检查不得打开真实设备；取帧质量由受保护的维护
+    test/confirm 流程验收。Mock 模式下不强制检查真实摄像头。
     """
     if settings.MOCK_SCENARIO != "off":
         return {
@@ -38,12 +39,17 @@ def check_camera():
         }
 
     try:
-        statuses = get_all_camera_statuses()
-        ok = all(status.get("ok") for status in statuses.values())
+        contract = get_camera_maintenance().contract()
+        roles = contract.get("roles", {})
+        ok = all(roles.get(role, {}).get("ready") is True for role in ("top", "front"))
         return {
             "ok": ok,
-            "message": "top/front cameras checked",
-            "detail": statuses,
+            "message": "top/front camera role bindings checked",
+            "detail": {
+                "contractVersion": contract.get("contractVersion"),
+                "generation": contract.get("generation"),
+                "roles": roles,
+            },
         }
     except Exception as e:
         return {
