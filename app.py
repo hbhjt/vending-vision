@@ -52,7 +52,7 @@ from vision.metrics import metrics
 from vision.presence_runtime import get_presence_runtime
 from vision.profile_push import collect_front_profile_update, collect_profile_update
 from vision.protocol import APP_VERSION, PROTOCOL, envelope, error_envelope
-from vision.self_check import run_self_check
+from vision.self_check import check_camera, run_self_check
 from vision.session_state import (
     get_vision_session_status,
     mark_vision_session_tryon_started,
@@ -129,29 +129,13 @@ def get_startup_check():
 def get_runtime_status():
     """获取运行时状态摘要。
 
-    在 Mock 模式之外，还会实时检查摄像头连接状态。
+    摄像头状态来自启动时的稳定角色枚举，不在健康请求中打开设备；
+    真实取帧由维护 test/confirm 和业务读取路径负责。
     返回：cameraReady, modelReady, ageGenderReady, ageGenderMode 等信息。
     """
     check = get_startup_check()
     checks = dict(check["checks"])
-
-    if settings.MOCK_SCENARIO == "off":
-        try:
-            camera_statuses = get_all_camera_statuses()
-            camera_ok = all(
-                status.get("ok")
-                for status in camera_statuses.values()
-            )
-            checks["camera"] = {
-                "ok": camera_ok,
-                "message": "top/front cameras checked",
-                "detail": camera_statuses,
-            }
-        except Exception as e:
-            checks["camera"] = {
-                "ok": False,
-                "message": str(e),
-            }
+    checks["camera"] = check_camera()
 
     camera_ready = checks["camera"]["ok"]
     model_ready = (

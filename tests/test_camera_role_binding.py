@@ -80,6 +80,37 @@ def make_service(*, discovery=None, store=None, access=None, clock=time.time):
     )
 
 
+def test_startup_camera_check_uses_role_contract_without_opening_devices(monkeypatch):
+    from vision import self_check
+
+    contract = {
+        "contractVersion": CAMERA_MAINTENANCE_CONTRACT_VERSION,
+        "generation": "1-test",
+        "roles": {
+            "top": {"role": "top", "ready": True, "state": "ready"},
+            "front": {"role": "front", "ready": False, "state": "unbound"},
+        },
+    }
+
+    class ContractOnlyMaintenance:
+        def contract(self):
+            return contract
+
+    monkeypatch.setattr(self_check.settings, "MOCK_SCENARIO", "off")
+    monkeypatch.setattr(
+        self_check, "get_camera_maintenance", lambda: ContractOnlyMaintenance()
+    )
+
+    result = self_check.check_camera()
+
+    assert result["ok"] is False
+    assert result["detail"] == {
+        "contractVersion": CAMERA_MAINTENANCE_CONTRACT_VERSION,
+        "generation": "1-test",
+        "roles": contract["roles"],
+    }
+
+
 def test_windows_discovery_never_zips_independent_pnp_and_opencv_orderings(monkeypatch):
     class MediaSourceAdapter:
         def enumerate_sources(self):
@@ -700,6 +731,36 @@ def test_production_removes_legacy_snapshot_bypass_and_hides_development_dashboa
     blocked = client.get("/maintenance/cameras")
     assert blocked.status_code == 503
     assert "blocked" in blocked.json()["error"]["message"]
+
+
+def test_health_status_does_not_reopen_real_cameras(monkeypatch):
+    import app
+
+    monkeypatch.setattr(
+        app,
+        "startup_check",
+        {
+            "ok": False,
+            "checks": {
+                "camera": {"ok": False, "message": "front camera unbound"},
+                "modelManifest": {"ok": True},
+                "pose": {"ok": True},
+                "face": {"ok": True},
+                "person": {"modelReady": True},
+                "ageGender": {"modelReady": True, "mode": "model"},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        app,
+        "get_all_camera_statuses",
+        lambda: (_ for _ in ()).throw(AssertionError("health reopened a camera")),
+    )
+
+    status = app.get_runtime_status()
+
+    assert status["cameraReady"] is False
+    assert status["modelReady"] is True
 
 
 def test_release_version_does_not_publish_camera_index(monkeypatch):
