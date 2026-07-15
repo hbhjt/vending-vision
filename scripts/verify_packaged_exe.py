@@ -372,6 +372,7 @@ def main():
             {
                 "VISION_MOCK_SCENARIO": "success",
                 "VISION_OPEN_BROWSER": "0",
+                "VISION_CONFIG_FILE": str(dev_config_path),
                 "VISION_WORKDIR": str(temp_dir),
             }
         )
