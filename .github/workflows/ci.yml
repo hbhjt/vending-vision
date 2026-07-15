@@ -17,7 +17,9 @@ jobs:
           python-version-file: ".python-version"
           cache: pip
       - name: 下载完整锁定 wheel 闭包
-        run: python -m pip download --only-binary=:all: --require-hashes --dest wheelhouse -r requirements.txt
+        run: >-
+          python -m pip download --only-binary=:all: --require-hashes
+          --dest wheelhouse -r requirements.txt
       - name: 离线安装并校验锁定闭包
         run: |
           python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
@@ -41,7 +43,9 @@ jobs:
           python-version-file: ".python-version"
           cache: pip
       - name: 下载完整锁定 wheel 闭包
-        run: python -m pip download --only-binary=:all: --require-hashes --dest wheelhouse -r requirements.txt
+        run: >-
+          python -m pip download --only-binary=:all: --require-hashes
+          --dest wheelhouse -r requirements.txt
       - name: 离线安装并校验锁定闭包
         run: |
           python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
