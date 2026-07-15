@@ -219,9 +219,13 @@ def test_packaged_smoke_managed_fixture_mints_exact_endpoint_capabilities(tmp_pa
     from scripts.verify_packaged_exe import create_managed_maintenance_fixture
 
     now = int(time.time())
-    config_path, mint_capability = create_managed_maintenance_fixture(tmp_path, port=17893, now=now)
+    fixture_root = tmp_path / "managed-production"
+    config_path, mint_capability = create_managed_maintenance_fixture(
+        fixture_root, port=17893, now=now
+    )
     config = json.loads(config_path.read_text(encoding="utf-8"))
 
+    assert fixture_root.is_dir()
     assert config["schemaVersion"] == "vending-vision-site-config/v1"
     assert "mock_scenario" not in config
     assert config["maintenance_replay_path"].endswith("camera-maintenance-replay.sqlite")
