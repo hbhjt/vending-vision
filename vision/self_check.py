@@ -27,9 +27,10 @@ def check_model_manifest():
     return verify_model_manifest()
 
 def check_camera():
-    """检查摄像头角色是否已稳定绑定且当前可枚举。
+    """检查已缓存的摄像头角色绑定状态。
 
-    启动健康检查不得打开真实设备；取帧质量由受保护的维护
+    启动健康检查不得枚举或打开真实设备；进程尚未通过维护 GET/refresh
+    建立稳定快照时明确报告 cameraReady=false。取帧质量由受保护的维护
     test/confirm 流程验收。Mock 模式下不强制检查真实摄像头。
     """
     if settings.MOCK_SCENARIO != "off":
@@ -39,7 +40,7 @@ def check_camera():
         }
 
     try:
-        contract = get_camera_maintenance().contract()
+        contract = get_camera_maintenance().cached_contract()
         roles = contract.get("roles", {})
         ok = all(roles.get(role, {}).get("ready") is True for role in ("top", "front"))
         return {

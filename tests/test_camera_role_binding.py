@@ -80,35 +80,29 @@ def make_service(*, discovery=None, store=None, access=None, clock=time.time):
     )
 
 
-def test_startup_camera_check_uses_role_contract_without_opening_devices(monkeypatch):
+def test_startup_camera_check_uses_cached_contract_without_discovering_devices(monkeypatch):
     from vision import self_check
 
-    contract = {
-        "contractVersion": CAMERA_MAINTENANCE_CONTRACT_VERSION,
-        "generation": "1-test",
-        "roles": {
-            "top": {"role": "top", "ready": True, "state": "ready"},
-            "front": {"role": "front", "ready": False, "state": "unbound"},
-        },
-    }
-
-    class ContractOnlyMaintenance:
-        def contract(self):
-            return contract
+    discovery = MutableDiscovery()
+    service = make_service(
+        discovery=discovery,
+        store=InMemoryBindings({
+            "top": {"stableId": "usb#top-001"},
+            "front": {"stableId": "usb#front-002"},
+        }),
+    )
 
     monkeypatch.setattr(self_check.settings, "MOCK_SCENARIO", "off")
-    monkeypatch.setattr(
-        self_check, "get_camera_maintenance", lambda: ContractOnlyMaintenance()
-    )
+    monkeypatch.setattr(self_check, "get_camera_maintenance", lambda: service)
 
     result = self_check.check_camera()
 
+    assert discovery.calls == 0
     assert result["ok"] is False
-    assert result["detail"] == {
-        "contractVersion": CAMERA_MAINTENANCE_CONTRACT_VERSION,
-        "generation": "1-test",
-        "roles": contract["roles"],
-    }
+    assert result["detail"]["contractVersion"] == CAMERA_MAINTENANCE_CONTRACT_VERSION
+    assert result["detail"]["generation"] == "unobserved"
+    assert result["detail"]["roles"]["top"]["ready"] is False
+    assert result["detail"]["roles"]["front"]["ready"] is False
 
 
 def test_windows_discovery_never_zips_independent_pnp_and_opencv_orderings(monkeypatch):
@@ -668,7 +662,8 @@ def test_loopback_http_requires_single_use_maintenance_capability(monkeypatch, t
     import app
 
     private_key, authorizer = daemon_authorizer(tmp_path)
-    service = make_service(access=RecordingCameraAccess())
+    discovery = MutableDiscovery()
+    service = make_service(discovery=discovery, access=RecordingCameraAccess())
     monkeypatch.setattr("app.get_camera_maintenance", lambda: service)
     monkeypatch.setattr(app, "_maintenance_authorizer", authorizer)
     client = TestClient(app.app)
@@ -685,12 +680,16 @@ def test_loopback_http_requires_single_use_maintenance_capability(monkeypatch, t
     token = capability(private_key, scope="camera.read", jti="read-once")
     listed = client.get("/maintenance/cameras", headers={"X-Vision-Maintenance-Capability": token})
     assert listed.status_code == 200
+    assert discovery.calls == 1
+    assert len(listed.json()["candidates"]) == 2
     jsonschema.validate(listed.json(), {"$ref": "#/$defs/contract", "$defs": responses_schema["$defs"]})
     assert client.get("/maintenance/cameras", headers={"X-Vision-Maintenance-Capability": token}).status_code == 409
 
     refresh_token = capability(private_key, scope="camera.refresh", jti="refresh-once")
     refreshed = client.post("/maintenance/cameras/refresh", headers={"X-Vision-Maintenance-Capability": refresh_token})
     assert refreshed.status_code == 200
+    assert discovery.calls == 2
+    assert len(refreshed.json()["candidates"]) == 2
     jsonschema.validate(refreshed.json(), {"$ref": "#/$defs/refresh", "$defs": responses_schema["$defs"]})
 
     bad_confirm = capability(private_key, scope="camera.confirm", jti="bad-confirm")
@@ -761,6 +760,48 @@ def test_health_status_does_not_reopen_real_cameras(monkeypatch):
 
     assert status["cameraReady"] is False
     assert status["modelReady"] is True
+
+
+def test_packaged_verifier_prints_captured_stdout_when_startup_wait_fails(
+    monkeypatch, tmp_path, capsys
+):
+    from scripts import verify_packaged_exe
+
+    class PackagedProcess:
+        def __init__(self):
+            self.returncode = None
+
+        def terminate(self):
+            self.returncode = -15
+
+        def wait(self, timeout):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    process = PackagedProcess()
+    def popen(*args, **kwargs):
+        kwargs["stdout"].write("packaged startup entered camera discovery\n")
+        kwargs["stdout"].flush()
+        return process
+
+    monkeypatch.setattr(verify_packaged_exe.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        verify_packaged_exe,
+        "wait_for_http",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("startup timed out")),
+    )
+
+    with pytest.raises(TimeoutError, match="startup timed out"):
+        verify_packaged_exe.verify_managed_production_surface(
+            tmp_path / "vending-vision.exe",
+            port=17893,
+            startup_timeout=0.01,
+            temp_dir=tmp_path / "managed-production",
+        )
+
+    assert "packaged startup entered camera discovery" in capsys.readouterr().err
 
 
 def test_release_version_does_not_publish_camera_index(monkeypatch):

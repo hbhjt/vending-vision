@@ -273,6 +273,19 @@ def ensure_port_available(port):
             raise RuntimeError(f"port {port} is already in use") from exc
 
 
+def terminate_packaged_process(process, process_log, *, verification_failed=False):
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+    process_log.seek(0)
+    output = process_log.read()
+    if output and (verification_failed or process.returncode not in {0, 1, -15}):
+        print(output, file=sys.stderr)
+
+
 def verify_managed_camera_maintenance_contract(base_url, mint_capability):
     """Exercise the real packaged default adapter through authenticated v2 routes."""
     read_status, contract = http_status_json(
@@ -307,35 +320,34 @@ def verify_managed_production_surface(exe_path, *, port, startup_timeout, temp_d
         "VISION_DEVELOPMENT_DASHBOARD": "true",  # managed mode must still hide it
         "VISION_WORKDIR": str(temp_dir),
     })
-    process = subprocess.Popen(
-        [str(exe_path), "--no-browser", "--config", str(config_path)],
-        cwd=str(exe_path.parent),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    try:
-        base_url = f"http://127.0.0.1:{port}"
-        wait_for_http(base_url, process, startup_timeout)
-        verify_managed_camera_maintenance_contract(base_url, mint_capability)
-        for legacy_url in ("/dashboard", "/camera/top/snapshot.jpg", "/camera/top/reopen"):
-            method = "POST" if legacy_url.endswith("/reopen") else "GET"
-            status = http_status(f"{base_url}{legacy_url}", method=method)
-            if status != 404:
-                raise AssertionError(f"managed production unexpectedly exposed {legacy_url}: {status}")
-    finally:
-        process.terminate()
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as process_log:
+        process = subprocess.Popen(
+            [str(exe_path), "--no-browser", "--config", str(config_path)],
+            cwd=str(exe_path.parent),
+            env=env,
+            stdout=process_log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        verification_failed = False
         try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
-        output = process.stdout.read() if process.stdout else ""
-        if process.returncode not in {0, 1, -15} and output:
-            print(output, file=sys.stderr)
+            base_url = f"http://127.0.0.1:{port}"
+            wait_for_http(base_url, process, startup_timeout)
+            verify_managed_camera_maintenance_contract(base_url, mint_capability)
+            for legacy_url in ("/dashboard", "/camera/top/snapshot.jpg", "/camera/top/reopen"):
+                method = "POST" if legacy_url.endswith("/reopen") else "GET"
+                status = http_status(f"{base_url}{legacy_url}", method=method)
+                if status != 404:
+                    raise AssertionError(f"managed production unexpectedly exposed {legacy_url}: {status}")
+        except BaseException:
+            verification_failed = True
+            raise
+        finally:
+            terminate_packaged_process(
+                process, process_log, verification_failed=verification_failed
+            )
 
 
 def main():
@@ -377,49 +389,48 @@ def main():
                 "VISION_WORKDIR": str(temp_dir),
             }
         )
-        process = subprocess.Popen(
-            [str(exe_path)],
-            cwd=str(temp_dir),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        try:
-            base_url = f"http://127.0.0.1:{args.port}"
-            health = wait_for_http(base_url, process, args.startup_timeout)
-            if not health.get("checks", {}).get("pose", {}).get("ok"):
-                raise AssertionError(f"packaged pose check failed: {health}")
-            if not health.get("checks", {}).get("face", {}).get("ok"):
-                raise AssertionError(f"packaged face check failed: {health}")
-            version = http_get_json(f"{base_url}/version")
-            if version.get("protocol") != PROTOCOL:
-                raise AssertionError(f"protocol mismatch: {version}")
-            if args.expected_version and version.get("version") != args.expected_version:
-                raise AssertionError(
-                    f"release version mismatch: expected {args.expected_version}, got {version}"
-                )
-            metrics = http_get_json(f"{base_url}/metrics")
-            if not isinstance(metrics, dict):
-                raise AssertionError("metrics endpoint did not return an object")
-            maintenance_status, maintenance = http_status_json(f"{base_url}/maintenance/cameras")
-            if maintenance_status != 503 or "blocked" not in str(maintenance):
-                raise AssertionError(
-                    "packaged default must explicitly block maintenance without daemon issuer material"
-                )
-            asyncio.run(verify_websocket(args.port))
-        finally:
-            process.terminate()
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as process_log:
+            process = subprocess.Popen(
+                [str(exe_path)],
+                cwd=str(temp_dir),
+                env=env,
+                stdout=process_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            verification_failed = False
             try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-            output = process.stdout.read() if process.stdout else ""
-            if process.returncode not in {0, 1, -15} and output:
-                print(output, file=sys.stderr)
+                base_url = f"http://127.0.0.1:{args.port}"
+                health = wait_for_http(base_url, process, args.startup_timeout)
+                if not health.get("checks", {}).get("pose", {}).get("ok"):
+                    raise AssertionError(f"packaged pose check failed: {health}")
+                if not health.get("checks", {}).get("face", {}).get("ok"):
+                    raise AssertionError(f"packaged face check failed: {health}")
+                version = http_get_json(f"{base_url}/version")
+                if version.get("protocol") != PROTOCOL:
+                    raise AssertionError(f"protocol mismatch: {version}")
+                if args.expected_version and version.get("version") != args.expected_version:
+                    raise AssertionError(
+                        f"release version mismatch: expected {args.expected_version}, got {version}"
+                    )
+                metrics = http_get_json(f"{base_url}/metrics")
+                if not isinstance(metrics, dict):
+                    raise AssertionError("metrics endpoint did not return an object")
+                maintenance_status, maintenance = http_status_json(f"{base_url}/maintenance/cameras")
+                if maintenance_status != 503 or "blocked" not in str(maintenance):
+                    raise AssertionError(
+                        "packaged default must explicitly block maintenance without daemon issuer material"
+                    )
+                asyncio.run(verify_websocket(args.port))
+            except BaseException:
+                verification_failed = True
+                raise
+            finally:
+                terminate_packaged_process(
+                    process, process_log, verification_failed=verification_failed
+                )
         verify_managed_production_surface(
             exe_path,
             port=managed_port,
