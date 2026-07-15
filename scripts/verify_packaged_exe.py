@@ -45,6 +45,7 @@ def create_managed_maintenance_fixture(temp_dir, *, port, now=None):
     production receives, never an issuer secret.
     """
     temp_dir = Path(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
     now = int(time.time() if now is None else now)
     private_key = Ed25519PrivateKey.generate()
     public_key = private_key.public_key().public_bytes(
