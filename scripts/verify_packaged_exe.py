@@ -217,24 +217,24 @@ def terminate_packaged_process(process, process_log, *, verification_failed=Fals
         print(output, file=sys.stderr)
 
 
-def verify_managed_camera_maintenance_contract(base_url):
-    """Exercise the real packaged default adapter through plain v2 routes."""
+def verify_plain_camera_maintenance_contract(base_url):
+    """Exercise the real packaged adapter through plain loopback v2 routes."""
     read_status, contract = http_status_json(f"{base_url}/maintenance/cameras")
     if read_status != 200:
-        raise AssertionError(f"managed camera read failed: {read_status} {contract}")
+        raise AssertionError(f"plain camera read failed: {read_status} {contract}")
     if contract.get("contractVersion") != "vem.vision.camera-maintenance/v2":
-        raise AssertionError(f"managed camera contract version mismatch: {contract}")
+        raise AssertionError(f"plain camera contract version mismatch: {contract}")
     if not isinstance(contract.get("candidates"), list) or not isinstance(contract.get("roles"), dict):
-        raise AssertionError(f"managed camera contract is incomplete: {contract}")
+        raise AssertionError(f"plain camera contract is incomplete: {contract}")
 
     refresh_status, refreshed = http_status_json(
         f"{base_url}/maintenance/cameras/refresh",
         method="POST",
     )
     if refresh_status != 200:
-        raise AssertionError(f"managed camera refresh failed: {refresh_status} {refreshed}")
+        raise AssertionError(f"plain camera refresh failed: {refresh_status} {refreshed}")
     if refreshed.get("contractVersion") != "vem.vision.camera-maintenance/v2":
-        raise AssertionError(f"managed refreshed camera contract version mismatch: {refreshed}")
+        raise AssertionError(f"plain refreshed camera contract version mismatch: {refreshed}")
 
 
 def verify_managed_production_surface(exe_path, *, port, startup_timeout, temp_dir):
@@ -262,7 +262,7 @@ def verify_managed_production_surface(exe_path, *, port, startup_timeout, temp_d
         try:
             base_url = f"http://127.0.0.1:{port}"
             wait_for_http(base_url, process, startup_timeout)
-            verify_managed_camera_maintenance_contract(base_url)
+            verify_plain_camera_maintenance_contract(base_url)
             for legacy_url in ("/dashboard", "/camera/top/snapshot.jpg", "/camera/top/reopen"):
                 method = "POST" if legacy_url.endswith("/reopen") else "GET"
                 status = http_status(f"{base_url}{legacy_url}", method=method)
@@ -345,11 +345,7 @@ def main():
                 metrics = http_get_json(f"{base_url}/metrics")
                 if not isinstance(metrics, dict):
                     raise AssertionError("metrics endpoint did not return an object")
-                maintenance_status, maintenance = http_status_json(f"{base_url}/maintenance/cameras")
-                if maintenance_status != 503 or "blocked" not in str(maintenance):
-                    raise AssertionError(
-                        "packaged default must explicitly block maintenance without daemon issuer material"
-                    )
+                verify_plain_camera_maintenance_contract(base_url)
                 asyncio.run(verify_websocket(args.port))
             except BaseException:
                 verification_failed = True
