@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -72,11 +74,34 @@ def test_managed_config_accepts_recorded_video_camera_source(tmp_path):
         "video_path": r"C:\\fixtures\\top.mp4",
         "loop": False,
     })
+    value["cameras"]["front"].update({
+        "source": "recorded_video",
+        "video_path": r"C:\\fixtures\\front.mp4",
+        "loop": True,
+    })
     config.write_text(json.dumps(value), encoding="utf-8")
 
     result = import_config(config)
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["cameras"]["top"].update({"source": "recorded_video"}),
+        lambda value: value["cameras"]["top"].update({"source": "recorded_video", "video_path": "top.mp4"}) or value["cameras"]["front"].update({"source": "dshow"}),
+    ],
+)
+def test_managed_config_rejects_invalid_recorded_video_source_combinations(tmp_path, mutate):
+    config = tmp_path / "invalid-recorded-video.json"
+    value = valid_config()
+    mutate(value)
+    config.write_text(json.dumps(value), encoding="utf-8")
+
+    result = import_config(config)
+
+    assert result.returncode != 0
 
 
 def test_managed_site_config_cannot_persist_camera_indexes(tmp_path):

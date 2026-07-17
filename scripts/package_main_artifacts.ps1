@@ -46,16 +46,62 @@ Compress-Archive -Path (Join-Path $RuntimeStage "*") -DestinationPath $RuntimeAr
 Compress-Archive -Path (Join-Path $FixtureStage "*") -DestinationPath $FixtureArchive -CompressionLevel Optimal
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$runtimeZip = [IO.Compression.ZipFile]::OpenRead($RuntimeArchive)
-try {
-    $fixtureEntries = @($runtimeZip.Entries | Where-Object {
-        $_.FullName -match '(^|/)fixtures(/|$)' -or $_.Name -match '\.mp4$'
-    })
-    if ($fixtureEntries.Count -gt 0) {
-        throw "Runtime archive includes recorded-video fixtures: $($fixtureEntries.FullName -join ', ')"
+function Read-ZipEntries([string]$Archive) {
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        return @($zip.Entries | ForEach-Object { $_.FullName })
+    } finally {
+        $zip.Dispose()
     }
-} finally {
-    $runtimeZip.Dispose()
+}
+
+function Read-ZipJson([string]$Archive, [string]$EntryName) {
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        $entry = $zip.GetEntry($EntryName)
+        if ($null -eq $entry) {
+            throw "Archive $Archive is missing $EntryName"
+        }
+        $reader = [IO.StreamReader]::new($entry.Open())
+        try {
+            return $reader.ReadToEnd() | ConvertFrom-Json
+        } finally {
+            $reader.Dispose()
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+$runtimeEntries = Read-ZipEntries $RuntimeArchive
+$fixtureEntries = Read-ZipEntries $FixtureArchive
+if ($runtimeEntries -notcontains "vending-vision.exe") {
+    throw "Runtime archive must contain vending-vision.exe at its root"
+}
+if ($runtimeEntries -notcontains "vision-artifact.json") {
+    throw "Runtime archive is missing vision-artifact.json"
+}
+if ($fixtureEntries -notcontains "recorded-video/expected-results.json" -or
+    $fixtureEntries -notcontains "recorded-video/top.mp4" -or
+    $fixtureEntries -notcontains "recorded-video/front.mp4" -or
+    $fixtureEntries -notcontains "vision-artifact.json") {
+    throw "Fixture archive layout is incomplete"
+}
+$runtimeFixtureEntries = @($runtimeEntries | Where-Object {
+    $_ -match '(^|/)fixtures(/|$)' -or $_ -match '(^|/)recorded-video(/|$)' -or $_ -match '\.mp4$'
+})
+if ($runtimeFixtureEntries.Count -gt 0) {
+    throw "Runtime archive includes recorded-video fixtures: $($runtimeFixtureEntries -join ', ')"
+}
+
+foreach ($archive in @($RuntimeArchive, $FixtureArchive)) {
+    $embeddedManifest = Read-ZipJson $archive "vision-artifact.json"
+    if ($embeddedManifest.schemaVersion -ne "vending-vision-main-artifacts/v1" -or
+        $embeddedManifest.commit -ne $Commit -or
+        $embeddedManifest.runtimeArchive -ne "vending-vision-windows-x86_64.zip" -or
+        $embeddedManifest.fixtureArchive -ne "vending-vision-test-fixtures.zip") {
+        throw "Archive manifest does not match delivery contract: $archive"
+    }
 }
 
 $delivery = @{
@@ -70,6 +116,17 @@ $delivery = @{
         sha256 = (Get-FileHash -Algorithm SHA256 $FixtureArchive).Hash.ToLowerInvariant()
     }
 } | ConvertTo-Json -Depth 5
-Set-Content -LiteralPath (Join-Path $OutputDirectory "vending-vision-main-artifacts.json") -Value $delivery -Encoding utf8NoBOM
+$DeliveryPath = Join-Path $OutputDirectory "vending-vision-main-artifacts.json"
+Set-Content -LiteralPath $DeliveryPath -Value $delivery -Encoding utf8NoBOM
+
+$deliveryCheck = Get-Content -LiteralPath $DeliveryPath -Raw | ConvertFrom-Json
+if ($deliveryCheck.schemaVersion -ne "vending-vision-main-artifacts/v1" -or
+    $deliveryCheck.commit -ne $Commit -or
+    $deliveryCheck.runtime.file -ne [IO.Path]::GetFileName($RuntimeArchive) -or
+    $deliveryCheck.fixtures.file -ne [IO.Path]::GetFileName($FixtureArchive) -or
+    $deliveryCheck.runtime.sha256 -ne (Get-FileHash -Algorithm SHA256 $RuntimeArchive).Hash.ToLowerInvariant() -or
+    $deliveryCheck.fixtures.sha256 -ne (Get-FileHash -Algorithm SHA256 $FixtureArchive).Hash.ToLowerInvariant()) {
+    throw "Delivery manifest does not match packaged archives"
+}
 
 Remove-Item -LiteralPath $StageDirectory -Recurse -Force

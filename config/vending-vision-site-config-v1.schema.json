@@ -46,6 +46,64 @@
     "maintenance_session_path": { "type": "string", "minLength": 1 },
     "maintenance_replay_path": { "type": "string", "minLength": 1 }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "cameras": {
+            "properties": {
+              "top": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source"]
+              }
+            },
+            "required": ["top"]
+          }
+        },
+        "required": ["cameras"]
+      },
+      "then": {
+        "properties": {
+          "cameras": {
+            "properties": {
+              "front": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source", "video_path"]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "cameras": {
+            "properties": {
+              "front": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source"]
+              }
+            },
+            "required": ["front"]
+          }
+        },
+        "required": ["cameras"]
+      },
+      "then": {
+        "properties": {
+          "cameras": {
+            "properties": {
+              "top": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source", "video_path"]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "topOccupancy": {
       "type": "object",
@@ -113,7 +171,16 @@
             "video_path": { "type": "string", "minLength": 1 },
             "loop": { "type": "boolean" },
             "role": { "const": "presence" }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source"]
+              },
+              "then": { "required": ["video_path"] }
+            }
+          ]
         }
       ]
     },
@@ -135,7 +202,16 @@
             "video_path": { "type": "string", "minLength": 1 },
             "loop": { "type": "boolean" },
             "role": { "const": "profile_tryon" }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source"]
+              },
+              "then": { "required": ["video_path"] }
+            }
+          ]
         }
       ]
     }

@@ -3,7 +3,8 @@
 Windows 候选版本使用 PyInstaller `onedir`。本地构建只属于开发产物；只有
 受保护 RC tag 工作流可以正式发布候选版本。
 
-每次成功的 `main` Windows CI 也会发布两个同提交的 Actions artifacts：
+每个 Windows CI（含 PR）都会构建、验证并检查以下交付布局；只有成功的
+`main` Windows CI 会上传两个同提交的 Actions artifacts：
 
 - `vending-vision-windows-x86_64.zip`：自包含 runtime；不含录播 fixture。
 - `vending-vision-test-fixtures.zip`：`recorded-video` 的 top/front MP4 和 expected manifest。
@@ -11,6 +12,11 @@ Windows 候选版本使用 PyInstaller `onedir`。本地构建只属于开发产
 两个 ZIP 都包含同一提交 SHA 的 `vision-artifact.json`，同伴
 `vending-vision-main-artifacts.json` 列出两个 archive 的 SHA-256。消费方按该
 commit 下载并原样安装或解压，不重新打包 Vision 内容。
+
+CI 会验证 runtime ZIP 根目录包含 `vending-vision.exe` 和 manifest，fixture ZIP
+包含 `recorded-video/top.mp4`、`front.mp4`、expected manifest 与
+`vision-artifact.json`；
+runtime ZIP 不得携带 fixture 路径或 MP4。
 
 ```powershell
 cd D:\ai-cv\vending_vision

@@ -56,11 +56,11 @@ jobs:
         run: python -m py_compile app.py run_vision_server.py vision/*.py scripts/*.py
       - name: 校验生产模型清单
         run: python -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
-      - name: 打包同提交 Windows runtime 与录播 fixture
-        if: github.ref == 'refs/heads/main'
+      - name: 构建并验证 Windows runtime 与录播交付包
         shell: pwsh
         run: |
           ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse")
+          & (Join-Path $PWD ".venv-packaging\Scripts\python.exe") scripts/verify_packaged_exe.py
           ./scripts/package_main_artifacts.ps1 -Commit "${{ github.sha }}" -OutputDirectory (Join-Path $PWD "main-artifacts")
       - name: 发布同提交 Vision artifacts
         if: github.ref == 'refs/heads/main'
