@@ -40,8 +40,8 @@ vending-vision.exe --no-browser `
 host、非法端口或 mock 配置时会直接启动失败。环境变量和相邻 `config.json`
 回退只保留给不带 `--config` 的供应方开发流程。
 
-相机维护使用与运行时相同的 loopback v2 合同，不使用 daemon 验证材料、capability
-header、JWT、session、replay ledger 或 keyring。Vision 继续拥有并持久化稳定的
+相机维护使用与运行时相同的 loopback v2 合同，不引入独立的 daemon token、
+JWT、session、replay ledger 或 keyring。Vision 继续拥有并持久化稳定的
 camera identity；VEM 只消费合同中的不透明 candidate ID 和 role readiness。
 
 安装验收必须证明：

@@ -35,7 +35,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1 -Wheelhouse .\whe
 该测试检查 bundle 资源（包括 Windows DirectShow 枚举 adapter）、`/health`、`/version`、显式开发 Dashboard、metrics、严格
 machine 角色 WebSocket 握手、ping/pong 和画像消息契约。真实摄像头、旋转、
 试衣 MJPEG 以及长会话续租必须通过现场硬件验收。生产启动不开放 Dashboard
-或旧的无认证 camera snapshot；冒烟测试仅通过显式 development flag 验证供应方
+或旧的开发 camera snapshot；冒烟测试仅通过显式 development flag 验证供应方
 调试资源已经被正确打包。
 
 VEM 托管选择使用外部现场配置启动：

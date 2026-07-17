@@ -361,7 +361,7 @@ class CameraMaintenanceService:
         # A role test is a capture from one immutable enumeration snapshot.  Do
         # not attach whichever generation happens to be current after the
         # camera has returned a frame: a refresh/replug during capture must
-        # invalidate that capture rather than let confirm authenticate it.
+        # invalidate that capture rather than let confirm bind it to the role.
         with self._lock:
             candidate = self._candidate(candidate_id)
             generation = self._generation

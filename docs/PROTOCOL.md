@@ -450,7 +450,7 @@ WebSocket 是业务协议；下面接口用于本机联调、健康检查和现�
 `/camera/roles/status` 中的 `stream.reconnectCount` 可用于判断长期运行期间摄像头是否发生过重连；`stream.lastError` 可用于定位最近一次摄像头异常。
 
 相机角色绑定使用独立的 `vem.vision.camera-maintenance/v2` loopback 合同。合同
-不使用 capability header、JWT、session、replay ledger 或 keyring：
+不引入独立的 daemon token、JWT、session、replay ledger 或 keyring：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -460,5 +460,5 @@ WebSocket 是业务协议；下面接口用于本机联调、健康检查和现�
 | `POST` | `/maintenance/cameras/{role}/test` | 产生同角色、同 generation 的测试 evidence |
 | `POST` | `/maintenance/cameras/{role}/confirm` | 同时校验 evidence、视觉确认和 expectedGeneration |
 
-生产不提供无认证 camera snapshot。`/dashboard`、`/camera/{role}/snapshot.jpg` 和
+生产不提供旧的开发 camera snapshot。`/dashboard`、`/camera/{role}/snapshot.jpg` 和
 `/camera/{role}/reopen` 仅在供应方开发时显式启用，不能由 VEM 托管配置开启。

@@ -26,8 +26,8 @@ part of managed site configuration, `/version`, or persisted binding state.
 
 ## Loopback access
 
-The maintenance DTOs and actions are plain loopback HTTP. They do not require
-capability headers, JWTs, sessions, replay state, keyrings, or persisted
+The maintenance DTOs and actions are plain loopback HTTP. They do not introduce
+separate daemon tokens, JWTs, sessions, replay state, keyrings, or persisted
 authorization files. The service startup host validation keeps these routes on
 `127.0.0.1`, `::1`, or `localhost`; camera identities remain Vision-owned and
 opaque to VEM.
