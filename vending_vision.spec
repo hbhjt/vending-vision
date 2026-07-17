@@ -24,7 +24,6 @@ datas += collect_data_files("cv2_enumerate_cameras")
 binaries = []
 binaries += collect_dynamic_libs("mediapipe")
 binaries += collect_dynamic_libs("cv2_enumerate_cameras")
-binaries += collect_dynamic_libs("cryptography")
 
 hiddenimports = [
     "uvicorn.lifespan.on",
@@ -38,7 +37,6 @@ hiddenimports += [
     "cv2_enumerate_cameras",
     "cv2_enumerate_cameras.windows_backend",
     "cv2_enumerate_cameras._windows_backend",
-    "cryptography.hazmat.backends.openssl",
 ]
 
 metadata_packages = [
@@ -51,7 +49,6 @@ metadata_packages = [
     "openvino",
     "jsonschema",
     "cv2-enumerate-cameras",
-    "cryptography",
 ]
 
 for package in metadata_packages:

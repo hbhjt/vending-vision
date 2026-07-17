@@ -449,16 +449,16 @@ WebSocket 是业务协议；下面接口用于本机联调、健康检查和现�
 
 `/camera/roles/status` 中的 `stream.reconnectCount` 可用于判断长期运行期间摄像头是否发生过重连；`stream.lastError` 可用于定位最近一次摄像头异常。
 
-相机角色绑定使用独立的 `vem.vision.camera-maintenance/v2` loopback 合同。每次
-请求都必须携带 daemon 签发、单次使用的 `X-Vision-Maintenance-Capability`：
+相机角色绑定使用独立的 `vem.vision.camera-maintenance/v2` loopback 合同。合同
+不引入独立的 daemon token、JWT、session、replay ledger 或 keyring：
 
-| 方法 | 路径 | 所需 scope | 说明 |
-| --- | --- | --- | --- |
-| `GET` | `/maintenance/cameras` | `camera.read` | 返回 candidates、generation 和 role readiness |
-| `POST` | `/maintenance/cameras/refresh` | `camera.refresh` | 显式重新枚举 DirectShow 绑定 |
-| `GET` | `/maintenance/cameras/{candidateId}/preview.jpg` | `camera.preview` | 本地 no-store 预览 |
-| `POST` | `/maintenance/cameras/{role}/test` | `camera.test` | 产生同角色、同 generation 的测试 evidence |
-| `POST` | `/maintenance/cameras/{role}/confirm` | `camera.confirm` | 同时校验 evidence、视觉确认和 expectedGeneration |
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/maintenance/cameras` | 返回 candidates、generation 和 role readiness |
+| `POST` | `/maintenance/cameras/refresh` | 显式重新枚举 DirectShow 绑定 |
+| `GET` | `/maintenance/cameras/{candidateId}/preview.jpg` | 本地 no-store 预览 |
+| `POST` | `/maintenance/cameras/{role}/test` | 产生同角色、同 generation 的测试 evidence |
+| `POST` | `/maintenance/cameras/{role}/confirm` | 同时校验 evidence、视觉确认和 expectedGeneration |
 
-生产不提供无认证 camera snapshot。`/dashboard`、`/camera/{role}/snapshot.jpg` 和
+生产不提供旧的开发 camera snapshot。`/dashboard`、`/camera/{role}/snapshot.jpg` 和
 `/camera/{role}/reopen` 仅在供应方开发时显式启用，不能由 VEM 托管配置开启。

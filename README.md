@@ -64,9 +64,9 @@ scripts\stop_server.bat
 ```
 
 现场部署不写入 Windows 摄像头编号。Vision 仅在同一 Windows DirectShow 枚举边界能
-证明稳定身份与捕获源的关系时才公开可用候选；否则明确保持非就绪。操作员使用
-由 daemon 签发的短期、单次 Ed25519 maintenance capability 预览、测试并确认
-top/front 角色；Vision 只读取 daemon 公钥和活动维护会话验证材料。具体合同见
+证明稳定身份与捕获源的关系时才公开可用候选；否则明确保持非就绪。操作员通过
+plain loopback maintenance contract 预览、测试并确认 top/front 角色；Vision 保持
+稳定身份的唯一所有者。具体合同见
 [摄像头维护合同](docs/CAMERA-MAINTENANCE.md)。
 
 ```text
@@ -155,7 +155,7 @@ powershell -ExecutionPolicy Bypass -File scripts\run_video_stability_test.ps1
 }
 ```
 
-`rotate` 表示服务读取后对画面做的校正角度，单位是顺时针度数。中部摄像头如果物理顺时针旋转 90 度安装，通常用 `270` 做逆时针校正。用具有 `camera.preview` capability 的维护预览确认人脸和身体在画面中是正的，再测年龄、性别和试衣。生产环境不存在无认证的 `/camera/{role}/snapshot.jpg`。
+`rotate` 表示服务读取后对画面做的校正角度，单位是顺时针度数。中部摄像头如果物理顺时针旋转 90 度安装，通常用 `270` 做逆时针校正。通过 loopback v2 维护合同的 `/maintenance/cameras/{candidateId}/preview.jpg` 预览确认人脸和身体在画面中是正的，再测年龄、性别和试衣。生产环境不存在 `/camera/{role}/snapshot.jpg`。
 
 顶部摄像头可以设置 ROI，只检测售货机前方交互区：
 
