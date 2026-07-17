@@ -69,9 +69,10 @@ def _validate_managed_config(config, config_path):
         raise ConfigError("managed configuration must define exactly top and front cameras")
     camera_keys = {
         "backend", "width", "height", "fps", "fourcc", "role",
-        "keep_open", "rotate", "roi",
+        "keep_open", "rotate", "roi", "source", "video_path", "loop",
     }
     expected_roles = {"top": "presence", "front": "profile_tryon"}
+    camera_sources = {}
     for camera_name, camera in cameras.items():
         if not isinstance(camera, dict):
             raise ConfigError(f"camera {camera_name} must be an object")
@@ -84,6 +85,18 @@ def _validate_managed_config(config, config_path):
             raise ConfigError(f"camera {camera_name}.role is invalid")
         if camera.get("rotate", 0) not in {0, 90, 180, 270}:
             raise ConfigError(f"camera {camera_name}.rotate must be 0, 90, 180, or 270")
+        source = str(camera.get("source", "dshow")).lower()
+        camera_sources[camera_name] = source
+        if source not in {"dshow", "recorded_video"}:
+            raise ConfigError(f"camera {camera_name}.source is invalid")
+        if source == "recorded_video" and not (
+            isinstance(camera.get("video_path"), str)
+            and camera["video_path"].strip()
+        ):
+            raise ConfigError(f"camera {camera_name}.video_path is required for recorded_video")
+
+    if len(set(camera_sources.values())) != 1:
+        raise ConfigError("managed configuration cannot mix recorded_video and dshow camera sources")
 
     return config
 
@@ -306,6 +319,10 @@ def build_camera_config(cameras, role, fallback):
     if isinstance(role_config, dict):
         for key, value in role_config.items():
             if value is not None:
+                if key == "video_path" and isinstance(value, str):
+                    path = Path(value)
+                    config[key] = str(path if path.is_absolute() else CONFIG_BASE_DIR / path)
+                    continue
                 config[key] = value
 
     config.setdefault("role", role)

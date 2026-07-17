@@ -46,6 +46,64 @@
     "maintenance_session_path": { "type": "string", "minLength": 1 },
     "maintenance_replay_path": { "type": "string", "minLength": 1 }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "cameras": {
+            "properties": {
+              "top": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source"]
+              }
+            },
+            "required": ["top"]
+          }
+        },
+        "required": ["cameras"]
+      },
+      "then": {
+        "properties": {
+          "cameras": {
+            "properties": {
+              "front": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source", "video_path"]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "cameras": {
+            "properties": {
+              "front": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source"]
+              }
+            },
+            "required": ["front"]
+          }
+        },
+        "required": ["cameras"]
+      },
+      "then": {
+        "properties": {
+          "cameras": {
+            "properties": {
+              "top": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source", "video_path"]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "topOccupancy": {
       "type": "object",
@@ -89,7 +147,10 @@
         "fps": { "type": "integer", "minimum": 1 },
         "fourcc": { "type": "string", "minLength": 1, "maxLength": 4 },
         "keep_open": { "type": "boolean" },
-        "rotate": { "enum": [0, 90, 180, 270] }
+        "rotate": { "enum": [0, 90, 180, 270] },
+        "source": { "enum": ["dshow", "recorded_video"] },
+        "video_path": { "type": "string", "minLength": 1 },
+        "loop": { "type": "boolean" }
       }
     },
     "topCamera": {
@@ -106,8 +167,20 @@
             "fourcc": { "type": "string", "minLength": 1, "maxLength": 4 },
             "keep_open": { "type": "boolean" },
             "rotate": { "enum": [0, 90, 180, 270] },
+            "source": { "enum": ["dshow", "recorded_video"] },
+            "video_path": { "type": "string", "minLength": 1 },
+            "loop": { "type": "boolean" },
             "role": { "const": "presence" }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source"]
+              },
+              "then": { "required": ["video_path"] }
+            }
+          ]
         }
       ]
     },
@@ -125,8 +198,20 @@
             "fourcc": { "type": "string", "minLength": 1, "maxLength": 4 },
             "keep_open": { "type": "boolean" },
             "rotate": { "enum": [0, 90, 180, 270] },
+            "source": { "enum": ["dshow", "recorded_video"] },
+            "video_path": { "type": "string", "minLength": 1 },
+            "loop": { "type": "boolean" },
             "role": { "const": "profile_tryon" }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "source": { "const": "recorded_video" } },
+                "required": ["source"]
+              },
+              "then": { "required": ["video_path"] }
+            }
+          ]
         }
       ]
     }

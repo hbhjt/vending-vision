@@ -1,0 +1,32 @@
+{
+  "schemaVersion": "vending-vision-recorded-video-fixture/v1",
+  "recordings": {
+    "top": {
+      "file": "top.mp4",
+      "sha256": "7e35b8e7a680e64189c48ee4f0ea1d10d087a041bec7f05687e1b09b5a506d9b",
+      "loop": false
+    },
+    "front": {
+      "file": "front.mp4",
+      "sha256": "6616fefc897f99c20f14b31f118459ad9e251dce71b33e262dc327dc34b74d17",
+      "loop": true
+    }
+  },
+  "expected": {
+    "top": {
+      "stages": [
+        {"name": "approach", "occupancy": "single", "candidate": true},
+        {"name": "departure", "occupancy": "none"}
+      ],
+      "protocolEvents": ["vision.presence_status", "vision.person_departed"],
+      "departureWithinPolls": 23
+    },
+    "front": {
+      "profile": {
+        "minimumFields": ["personPresent", "confidence", "bodyType", "upperColor"],
+        "minimumConfidence": 0.25
+      },
+      "tryOn": {"jpeg": true}
+    }
+  }
+}

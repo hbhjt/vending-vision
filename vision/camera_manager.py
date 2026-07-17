@@ -17,6 +17,7 @@ from datetime import datetime
 from vision.camera import describe_capture, open_camera, read_warmup_frame
 from vision.camera_binding import acquire_runtime_camera_lease, get_camera_maintenance
 from vision.config import settings
+from vision.frame_source import FrameSource, RecordedVideoFrameSource
 from vision.frame_transform import camera_rotation, rotate_frame
 from vision.logger import logger
 from vision.metrics import metrics
@@ -42,6 +43,9 @@ def _camera_config(role: str) -> dict:
         config = dict(settings.FRONT_CAMERA_CONFIG)
     else:
         raise ValueError(f"unknown camera role: {role}")
+
+    if str(config.get("source", "dshow")).lower() == "recorded_video":
+        return config
 
     candidate = get_camera_maintenance().resolve(role)
     config.update(
@@ -337,7 +341,50 @@ class _NoopRuntimeMaintenanceHandoff:
 
 # 按角色存储的持久化摄像头流
 _streams: dict[str, ManagedCameraStream] = {}
+_recorded_sources: dict[str, RecordedVideoFrameSource] = {}
 _streams_lock = threading.RLock()
+
+
+class DirectShowFrameSource:
+    """FrameSource adapter over the existing bound DirectShow stream lifecycle."""
+
+    def __init__(self, role: str, config: dict):
+        self.role = role
+        self.config = dict(config)
+
+    def read(self, warmup_frames: int | None = None):
+        if _keep_open(self.config):
+            return get_camera_stream(self.role).read(warmup_frames=warmup_frames)
+        cap = _open_role_camera(self.config)
+        try:
+            return _apply_camera_transform(
+                self.config,
+                read_warmup_frame(
+                    cap,
+                    settings.CAMERA_WARMUP_FRAMES if warmup_frames is None else warmup_frames,
+                ),
+            )
+        finally:
+            cap.release()
+
+    def status(self) -> dict:
+        if _keep_open(self.config):
+            return get_camera_stream(self.role).status()
+        cap = _open_role_camera(self.config)
+        try:
+            raw_image = read_warmup_frame(cap, settings.CAMERA_WARMUP_FRAMES)
+            image = _apply_camera_transform(self.config, raw_image)
+            status = _frame_status(self.role, self.config, cap, image, raw_image=raw_image)
+            status["mode"] = "single_capture"
+            return status
+        finally:
+            cap.release()
+
+    def release(self) -> None:
+        release_camera(self.role)
+
+    def reset(self) -> None:
+        reset_camera(self.role)
 
 
 def get_camera_config(role: str) -> dict:
@@ -359,6 +406,24 @@ def get_camera_stream(role: str) -> ManagedCameraStream:
             stream = ManagedCameraStream(role, config)
             _streams[role] = stream
         return stream
+
+
+def get_frame_source(role: str) -> FrameSource:
+    """Return the configured Vision-owned frame source for one logical role."""
+    config = _camera_config(role)
+    source_kind = str(config.get("source", "dshow")).lower()
+    if source_kind == "recorded_video":
+        with _streams_lock:
+            source = _recorded_sources.get(role)
+            if source is None or source.config != config:
+                if source is not None:
+                    source.release()
+                source = RecordedVideoFrameSource(role, config)
+                _recorded_sources[role] = source
+            return source
+    if source_kind != "dshow":
+        raise ValueError(f"unsupported Vision frame source: {source_kind}")
+    return DirectShowFrameSource(role, config)
 
 
 def quiesce_runtime_camera(candidate_id: str):
@@ -386,23 +451,7 @@ def read_camera(role: str, warmup_frames: int | None = None):
     如果配置为常开模式，使用持久化流；
     否则每次打开新连接，读取后立即释放。
     """
-    config = _camera_config(role)
-
-    if _keep_open(config):
-        return get_camera_stream(role).read(warmup_frames=warmup_frames)
-
-    # 非持久模式：打开 -> 读取 -> 释放
-    cap = _open_role_camera(config)
-    try:
-        return _apply_camera_transform(
-            config,
-            read_warmup_frame(
-                cap,
-                settings.CAMERA_WARMUP_FRAMES if warmup_frames is None else warmup_frames,
-            ),
-        )
-    finally:
-        cap.release()
+    return get_frame_source(role).read(warmup_frames=warmup_frames)
 
 
 def get_camera_status(role: str) -> dict:
@@ -410,21 +459,7 @@ def get_camera_status(role: str) -> dict:
 
     包含请求配置、实际输出参数、变换信息和流状态。
     """
-    config = _camera_config(role)
-
-    if _keep_open(config):
-        return get_camera_stream(role).status()
-
-    # 非持久模式：临时打开获取状态
-    cap = _open_role_camera(config)
-    try:
-        raw_image = read_warmup_frame(cap, settings.CAMERA_WARMUP_FRAMES)
-        image = _apply_camera_transform(config, raw_image)
-        status = _frame_status(role, config, cap, image, raw_image=raw_image)
-        status["mode"] = "single_capture"
-        return status
-    finally:
-        cap.release()
+    return get_frame_source(role).status()
 
 
 def get_all_camera_statuses() -> dict:
@@ -459,6 +494,10 @@ def release_camera(role: str):
 
     if stream is not None:
         stream.release()
+    with _streams_lock:
+        source = _recorded_sources.get(role)
+    if source is not None:
+        source.release()
 
 
 def reset_camera(role: str):
@@ -468,12 +507,19 @@ def reset_camera(role: str):
 
     if stream is not None:
         stream.reset()
+    with _streams_lock:
+        source = _recorded_sources.get(role)
+    if source is not None:
+        source.reset()
 
 
 def release_all_cameras():
     """释放所有摄像头资源。"""
     with _streams_lock:
         streams = list(_streams.values())
+        recorded_sources = list(_recorded_sources.values())
 
     for stream in streams:
         stream.release()
+    for source in recorded_sources:
+        source.release()
