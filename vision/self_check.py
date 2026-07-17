@@ -39,6 +39,27 @@ def check_camera():
             "message": f"mock mode enabled: {settings.MOCK_SCENARIO}"
         }
 
+    sources = {
+        "top": str(settings.TOP_CAMERA_CONFIG.get("source", "dshow")).lower(),
+        "front": str(settings.FRONT_CAMERA_CONFIG.get("source", "dshow")).lower(),
+    }
+    if set(sources.values()) == {"recorded_video"}:
+        try:
+            from vision.camera_manager import get_frame_source
+
+            status = {role: get_frame_source(role).status() for role in sources}
+            return {
+                "ok": all(item.get("ok") for item in status.values()),
+                "message": "top/front recorded video sources checked",
+                "detail": {"sources": sources, "recordings": status},
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "message": str(exc),
+                "detail": {"sources": sources},
+            }
+
     try:
         contract = get_camera_maintenance().cached_contract()
         roles = contract.get("roles", {})

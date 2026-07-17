@@ -29,6 +29,9 @@ output_*.png
 output_*.jpeg
 *.avi
 *.mp4
+!fixtures/
+!fixtures/recorded-video/
+!fixtures/recorded-video/*.mp4
 
 # Field datasets
 datasets/

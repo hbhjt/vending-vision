@@ -64,6 +64,21 @@ def test_managed_config_cannot_enable_mock(tmp_path):
     assert import_config(config).returncode != 0
 
 
+def test_managed_config_accepts_recorded_video_camera_source(tmp_path):
+    config = tmp_path / "recorded-video.json"
+    value = valid_config()
+    value["cameras"]["top"].update({
+        "source": "recorded_video",
+        "video_path": r"C:\\fixtures\\top.mp4",
+        "loop": False,
+    })
+    config.write_text(json.dumps(value), encoding="utf-8")
+
+    result = import_config(config)
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_managed_site_config_cannot_persist_camera_indexes(tmp_path):
     config = tmp_path / "legacy-index.json"
     value = valid_config()

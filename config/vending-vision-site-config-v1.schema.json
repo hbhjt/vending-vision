@@ -89,7 +89,10 @@
         "fps": { "type": "integer", "minimum": 1 },
         "fourcc": { "type": "string", "minLength": 1, "maxLength": 4 },
         "keep_open": { "type": "boolean" },
-        "rotate": { "enum": [0, 90, 180, 270] }
+        "rotate": { "enum": [0, 90, 180, 270] },
+        "source": { "enum": ["dshow", "recorded_video"] },
+        "video_path": { "type": "string", "minLength": 1 },
+        "loop": { "type": "boolean" }
       }
     },
     "topCamera": {
@@ -106,6 +109,9 @@
             "fourcc": { "type": "string", "minLength": 1, "maxLength": 4 },
             "keep_open": { "type": "boolean" },
             "rotate": { "enum": [0, 90, 180, 270] },
+            "source": { "enum": ["dshow", "recorded_video"] },
+            "video_path": { "type": "string", "minLength": 1 },
+            "loop": { "type": "boolean" },
             "role": { "const": "presence" }
           }
         }
@@ -125,6 +131,9 @@
             "fourcc": { "type": "string", "minLength": 1, "maxLength": 4 },
             "keep_open": { "type": "boolean" },
             "rotate": { "enum": [0, 90, 180, 270] },
+            "source": { "enum": ["dshow", "recorded_video"] },
+            "video_path": { "type": "string", "minLength": 1 },
+            "loop": { "type": "boolean" },
             "role": { "const": "profile_tryon" }
           }
         }

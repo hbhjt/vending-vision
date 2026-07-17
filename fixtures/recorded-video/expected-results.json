@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "vending-vision-recorded-video-fixture/v1",
+  "recordings": {
+    "top": {
+      "file": "top.mp4",
+      "sha256": "7e35b8e7a680e64189c48ee4f0ea1d10d087a041bec7f05687e1b09b5a506d9b",
+      "expected": {
+        "presence": "single",
+        "departure": "none"
+      }
+    },
+    "front": {
+      "file": "front.mp4",
+      "sha256": "6616fefc897f99c20f14b31f118459ad9e251dce71b33e262dc327dc34b74d17",
+      "expected": {
+        "profilePersonPresent": true,
+        "tryOnFrame": true
+      }
+    }
+  }
+}
