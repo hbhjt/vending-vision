@@ -64,9 +64,9 @@ scripts\stop_server.bat
 ```
 
 现场部署不写入 Windows 摄像头编号。Vision 仅在同一 Windows DirectShow 枚举边界能
-证明稳定身份与捕获源的关系时才公开可用候选；否则明确保持非就绪。操作员使用
-由 daemon 签发的短期、单次 Ed25519 maintenance capability 预览、测试并确认
-top/front 角色；Vision 只读取 daemon 公钥和活动维护会话验证材料。具体合同见
+证明稳定身份与捕获源的关系时才公开可用候选；否则明确保持非就绪。操作员通过
+plain loopback maintenance contract 预览、测试并确认 top/front 角色；Vision 保持
+稳定身份的唯一所有者。具体合同见
 [摄像头维护合同](docs/CAMERA-MAINTENANCE.md)。
 
 ```text

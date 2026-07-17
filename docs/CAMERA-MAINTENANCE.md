@@ -21,44 +21,18 @@ prove an identity-to-source mapping produce explicit non-ready evidence;
 `ambiguous` is reserved for an actually unresolvable candidate, not the normal
 Windows production path.
 
-The backend index is an authenticated maintenance observation only. It is not
+The backend index is a maintenance observation only. It is not
 part of managed site configuration, `/version`, or persisted binding state.
 
-## Daemon-issued maintenance capability
+## Loopback access
 
-Vision is verifier-only. The Vending Daemon is the only issuer and owns the
-Ed25519 private key. The managed site configuration points only to three
-daemon-owned local files; it never contains a shared secret or signing key:
-
-```json
-{
-  "maintenance_capability_keyring_path": "C:\\ProgramData\\VEM\\vision\\daemon-maintenance-keys.json",
-  "maintenance_session_path": "C:\\ProgramData\\VEM\\vision\\daemon-maintenance-session.json",
-  "maintenance_replay_path": "C:\\ProgramData\\VEM\\vision\\camera-maintenance-replay.sqlite"
-}
-```
-
-The keyring has `version: 1`, issuer `vem.vending-daemon`, and key records with
-`id`, raw Ed25519 `publicKey` (base64url), `notBefore`, and `notAfter`. The
-active session material has `version: 1`, `machineCode`, `sessionId`, `keyId`,
-and `expiresAt`. VEM atomically rotates either file when a maintenance session
-or signing key rotates. Their Windows ACL must allow the daemon to write and
-Vision to read, but never make the daemon private key available to Vision.
-
-Each JWT uses `alg: EdDSA`, `typ: JWT`, and the active `kid`; claims must bind
-`iss=vem.vending-daemon`, `aud=vem.vision.camera-maintenance`, `machine`,
-`session`, `purpose=vision.camera-maintenance`, one exact endpoint `scope`
-(not a scope list or superset), `iat`, `exp`, and `jti`. Vision accepts at most
-a 300-second TTL, requires `now >= key.notBefore` (clock skew only bounds a
-future `iat`), validates key/session lifetimes, and atomically consumes JTIs
-in a SQLite unique-key transaction. Ledger corruption is fail-closed and is
-returned as a v2 HTTP 503 maintenance error, never an unstructured 500.
+The maintenance DTOs and actions are plain loopback HTTP. They do not require
+capability headers, JWTs, sessions, replay state, keyrings, or persisted
+authorization files. The service startup host validation keeps these routes on
+`127.0.0.1`, `::1`, or `localhost`; camera identities remain Vision-owned and
+opaque to VEM.
 
 ## Operator workflow
-
-Every endpoint needs a fresh, single-use capability with its exact scope:
-`camera.read`, `camera.refresh`, `camera.preview`, `camera.test`, or
-`camera.confirm`.
 
 1. Read candidates and role readiness with `GET /maintenance/cameras`.
 2. Optionally refresh with `POST /maintenance/cameras/refresh`.

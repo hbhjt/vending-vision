@@ -3,10 +3,7 @@ import hashlib
 import json
 import subprocess
 import sys
-import time
 from pathlib import Path
-
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from scripts import generate_candidate_evidence
 from scripts.dependency_lock import (
@@ -18,7 +15,6 @@ from scripts.dependency_lock import (
     selected_wheels,
 )
 from scripts.sign_candidate_evidence import DOCUMENTS, canonical_bytes
-from vision.camera_binding import DurableReplayStore, MaintenanceCapabilityVerifier
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +46,7 @@ def test_win32_release_closure_has_reviewed_spdx_for_every_locked_package():
         read_hash_locked_requirements(ROOT / "requirements.txt"), {"sys_platform": "win32"}
     )
 
-    assert len(windows_lock) == 63
+    assert len(windows_lock) == 62
     assert set(windows_lock) == set(LICENSE_OVERRIDES)
     assert LICENSE_OVERRIDES["colorama"] == "BSD-3-Clause"
 
@@ -87,7 +83,7 @@ def test_candidate_sbom_covers_the_actual_win32_locked_closure(tmp_path, monkeyp
 
     packages = json.loads((tmp_path / "candidate" / "vision-sbom.spdx.json").read_text(encoding="utf-8"))["packages"]
     sbom_licenses = {item["name"].lower(): item["licenseDeclared"] for item in packages}
-    assert len(packages) == 63
+    assert len(packages) == 62
     assert sbom_licenses == {normalized: LICENSE_OVERRIDES[normalized] for normalized in windows_lock}
 
 
@@ -215,31 +211,17 @@ def test_candidate_sbom_declares_and_concludes_the_reviewed_cffi_and_pillow_fact
     assert facts == {"cffi": ("MIT-0", "MIT-0"), "pillow": ("MIT-CMU", "MIT-CMU")}
 
 
-def test_packaged_smoke_managed_fixture_mints_exact_endpoint_capabilities(tmp_path):
+def test_packaged_smoke_managed_fixture_uses_plain_maintenance_contract(tmp_path):
     from scripts.verify_packaged_exe import create_managed_maintenance_fixture
 
-    now = int(time.time())
     fixture_root = tmp_path / "managed-production"
-    config_path, mint_capability = create_managed_maintenance_fixture(
-        fixture_root, port=17893, now=now
-    )
+    config_path = create_managed_maintenance_fixture(fixture_root, port=17893)
     config = json.loads(config_path.read_text(encoding="utf-8"))
 
     assert fixture_root.is_dir()
     assert config["schemaVersion"] == "vending-vision-site-config/v1"
     assert "mock_scenario" not in config
-    assert config["maintenance_replay_path"].endswith("camera-maintenance-replay.sqlite")
-
-    verifier = MaintenanceCapabilityVerifier(
-        config["maintenance_capability_keyring_path"],
-        config["maintenance_session_path"],
-        DurableReplayStore(config["maintenance_replay_path"]),
-        clock=lambda: now,
-    )
-    read = mint_capability("camera.read")
-    assert verifier.verify(read, "camera.read")["scope"] == "camera.read"
-    refresh = mint_capability("camera.refresh")
-    assert verifier.verify(refresh, "camera.refresh")["scope"] == "camera.refresh"
+    assert not {"maintenance_capability_keyring_path", "maintenance_session_path", "maintenance_replay_path"} & set(config)
 
 
 def test_candidate_signatures_match_vem_role_digest_contract(tmp_path):

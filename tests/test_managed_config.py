@@ -113,7 +113,7 @@ def test_managed_site_config_cannot_persist_camera_indexes(tmp_path):
     assert import_config(config).returncode != 0
 
 
-def test_managed_config_declares_daemon_owned_maintenance_validation_material(tmp_path):
+def test_managed_config_rejects_obsolete_maintenance_authorization_material(tmp_path):
     config = tmp_path / "maintenance-material.json"
     value = valid_config()
     value.update({
@@ -124,4 +124,4 @@ def test_managed_config_declares_daemon_owned_maintenance_validation_material(tm
     config.write_text(json.dumps(value), encoding="utf-8")
 
     result = import_config(config)
-    assert result.returncode == 0, result.stderr
+    assert result.returncode != 0

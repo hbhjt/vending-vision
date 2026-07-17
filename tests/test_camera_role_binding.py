@@ -1,6 +1,4 @@
-import base64
 import json
-import multiprocessing
 import threading
 import time
 from pathlib import Path
@@ -8,8 +6,6 @@ from pathlib import Path
 import jsonschema
 import numpy as np
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from vision.camera_binding import (
@@ -17,21 +13,10 @@ from vision.camera_binding import (
     Cv2EnumerateCamerasDirectShowAdapter,
     CameraLeaseRegistry,
     CameraMaintenanceService,
-    DurableReplayStore,
     JsonBindingStore,
-    MaintenanceCapabilityError,
-    MaintenanceCapabilityVerifier,
     OpenCvCameraAccess,
     WindowsCameraDiscovery,
 )
-
-
-def _consume_replay_in_separate_process(path, start, outcomes):
-    start.wait(timeout=10)
-    try:
-        outcomes.put(DurableReplayStore(path).consume("shared-jti", 1_200, 1_010))
-    except Exception as exc:
-        outcomes.put(f"error:{type(exc).__name__}:{exc}")
 
 
 class MutableDiscovery:
@@ -180,128 +165,6 @@ def test_two_directshow_cameras_keep_confirmed_roles_after_replug_changes_indexe
     assert service.resolve("top").index == 8
     assert service.resolve("front").stable_id == "@device:pnp:front"
     assert service.resolve("front").index == 0
-
-
-def test_daemon_issued_ed25519_capability_binds_machine_session_and_survives_verifier_restart(tmp_path):
-    """Vision verifies the daemon's public key; it never has an issuer secret."""
-    private_key = Ed25519PrivateKey.generate()
-    public_key = private_key.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
-    )
-    keyring = tmp_path / "daemon-maintenance-keys.json"
-    session = tmp_path / "daemon-maintenance-session.json"
-    replay = tmp_path / "camera-maintenance-replay.sqlite"
-    keyring.write_text(json.dumps({
-        "version": 1,
-        "issuer": "vem.vending-daemon",
-        "keys": [{
-            "id": "daemon-ed25519-202607",
-            "publicKey": base64.urlsafe_b64encode(public_key).decode().rstrip("="),
-            "notBefore": 900,
-            "notAfter": 10_000,
-        }],
-    }), encoding="utf-8")
-    session.write_text(json.dumps({
-        "version": 1,
-        "machineCode": "VEM-TESTBED-01",
-        "sessionId": "maintenance-session-01",
-        "keyId": "daemon-ed25519-202607",
-        "expiresAt": 2_000,
-    }), encoding="utf-8")
-
-    claims = {
-        "iss": "vem.vending-daemon",
-        "aud": "vem.vision.camera-maintenance",
-        "machine": "VEM-TESTBED-01",
-        "session": "maintenance-session-01",
-        "purpose": "vision.camera-maintenance",
-        "scope": "camera.read",
-        "iat": 1_000,
-        "exp": 1_120,
-        "jti": "maintenance-read-once",
-    }
-    header = {"alg": "EdDSA", "kid": "daemon-ed25519-202607", "typ": "JWT"}
-    encoded_header = base64.urlsafe_b64encode(json.dumps(header, separators=(",", ":")).encode()).decode().rstrip("=")
-    encoded_claims = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).decode().rstrip("=")
-    signed = f"{encoded_header}.{encoded_claims}".encode()
-    token = f"{signed.decode()}.{base64.urlsafe_b64encode(private_key.sign(signed)).decode().rstrip('=')}"
-
-    verifier = MaintenanceCapabilityVerifier(
-        keyring, session, DurableReplayStore(replay), clock=lambda: 1_010
-    )
-    assert verifier.verify(token, "camera.read") == claims
-    with pytest.raises(MaintenanceCapabilityError) as replayed:
-        verifier.verify(token, "camera.read")
-    assert replayed.value.status_code == 409
-
-    restarted = MaintenanceCapabilityVerifier(
-        keyring, session, DurableReplayStore(replay), clock=lambda: 1_010
-    )
-    with pytest.raises(MaintenanceCapabilityError) as persisted_replay:
-        restarted.verify(token, "camera.read")
-    assert persisted_replay.value.status_code == 409
-
-
-def test_replay_ledger_consumes_one_jti_once_across_processes(tmp_path):
-    """Durable replay protection must be an atomic inter-process operation."""
-    context = multiprocessing.get_context("spawn")
-    start = context.Event()
-    outcomes = context.Queue()
-    ledger = tmp_path / "camera-maintenance-replay.sqlite"
-    workers = [
-        context.Process(
-            target=_consume_replay_in_separate_process,
-            args=(str(ledger), start, outcomes),
-        )
-        for _ in range(4)
-    ]
-    for worker in workers:
-        worker.start()
-    start.set()
-    observed = [outcomes.get(timeout=15) for _ in workers]
-    for worker in workers:
-        worker.join(timeout=15)
-        assert worker.exitcode == 0
-
-    assert observed.count(True) == 1
-    assert observed.count(False) == 3
-
-
-def test_replay_ledger_cold_start_is_stable_across_repeated_four_process_races(tmp_path):
-    """First creation must not race WAL/schema setup into a ledger outage."""
-    context = multiprocessing.get_context("spawn")
-    for round_number in range(6):
-        start = context.Event()
-        outcomes = context.Queue()
-        ledger = tmp_path / f"cold-start-{round_number}.sqlite"
-        workers = [
-            context.Process(
-                target=_consume_replay_in_separate_process,
-                args=(str(ledger), start, outcomes),
-            )
-            for _ in range(4)
-        ]
-        for worker in workers:
-            worker.start()
-        start.set()
-        observed = [outcomes.get(timeout=15) for _ in workers]
-        for worker in workers:
-            worker.join(timeout=15)
-            assert worker.exitcode == 0
-
-        assert observed.count(True) == 1
-        assert observed.count(False) == 3
-        assert not any(str(outcome).startswith("error:ReplayLedgerError") for outcome in observed)
-
-
-def test_missing_daemon_public_key_and_session_material_is_an_explicit_maintenance_blocker(tmp_path):
-    verifier = MaintenanceCapabilityVerifier(None, None, DurableReplayStore(tmp_path / "replay.json"))
-
-    with pytest.raises(MaintenanceCapabilityError) as blocked:
-        verifier.verify(None, "camera.read")
-
-    assert blocked.value.status_code == 503
-    assert "blocked" in str(blocked.value)
 
 
 def test_candidate_snapshot_is_cached_until_explicit_refresh_or_read_failure():
@@ -540,179 +403,48 @@ def test_contract_and_negative_role_states_validate_against_versioned_schema():
     jsonschema.validate(confirmed, {"$ref": "#/$defs/confirm", "$defs": responses_schema["$defs"]})
 
 
-def capability(private_key, *, scope, purpose="vision.camera-maintenance", expires_at=None, jti="one", **overrides):
-    claims = {
-        "iss": "vem.vending-daemon",
-        "aud": "vem.vision.camera-maintenance",
-        "machine": "VEM-TESTBED-01",
-        "session": "maintenance-session-01",
-        "purpose": purpose,
-        "scope": scope,
-        "iat": 1_000,
-        "exp": expires_at or 1_120,
-        "jti": jti,
-    }
-    claims.update(overrides)
-    header = {"alg": "EdDSA", "kid": "daemon-ed25519-202607", "typ": "JWT"}
-    encoded_header = base64.urlsafe_b64encode(json.dumps(header, separators=(",", ":")).encode()).decode().rstrip("=")
-    encoded_claims = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).decode().rstrip("=")
-    signed = f"{encoded_header}.{encoded_claims}".encode()
-    return f"{signed.decode()}.{base64.urlsafe_b64encode(private_key.sign(signed)).decode().rstrip('=')}"
-
-
-def daemon_authorizer(tmp_path, *, clock=lambda: 1_010):
-    private_key = Ed25519PrivateKey.generate()
-    public_key = private_key.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
-    )
-    keyring = tmp_path / "daemon-maintenance-keys.json"
-    session = tmp_path / "daemon-maintenance-session.json"
-    keyring.write_text(json.dumps({
-        "version": 1,
-        "issuer": "vem.vending-daemon",
-        "keys": [{
-            "id": "daemon-ed25519-202607",
-            "publicKey": base64.urlsafe_b64encode(public_key).decode().rstrip("="),
-            "notBefore": 900,
-            "notAfter": 10_000,
-        }],
-    }), encoding="utf-8")
-    session.write_text(json.dumps({
-        "version": 1,
-        "machineCode": "VEM-TESTBED-01",
-        "sessionId": "maintenance-session-01",
-        "keyId": "daemon-ed25519-202607",
-        "expiresAt": 2_000,
-    }), encoding="utf-8")
-    return private_key, MaintenanceCapabilityVerifier(
-        keyring, session, DurableReplayStore(tmp_path / "camera-maintenance-replay.sqlite"), clock=clock
-    )
-
-
-@pytest.mark.parametrize(
-    ("overrides", "status_code"),
-    [
-        ({"aud": "another-audience"}, 403),
-        ({"machine": "VEM-OTHER"}, 403),
-        ({"session": "another-session"}, 403),
-        ({"iat": 1_041, "exp": 1_120}, 401),
-        ({"exp": 1_301}, 401),
-    ],
-)
-def test_capability_rejects_wrong_audience_machine_session_and_lifetime(tmp_path, overrides, status_code):
-    private_key, verifier = daemon_authorizer(tmp_path)
-    token = capability(private_key, scope="camera.read", jti=f"invalid-{status_code}-{overrides}", **overrides)
-
-    with pytest.raises(MaintenanceCapabilityError) as rejected:
-        verifier.verify(token, "camera.read")
-
-    assert rejected.value.status_code == status_code
-
-
-def test_capability_scope_must_match_one_exact_maintenance_endpoint(tmp_path):
-    private_key, verifier = daemon_authorizer(tmp_path)
-
-    exact = capability(private_key, scope="camera.read", jti="exact-read")
-    assert verifier.verify(exact, "camera.read")["scope"] == "camera.read"
-
-    broader = capability(private_key, scope=["camera.read", "camera.confirm"], jti="broader-read")
-    with pytest.raises(MaintenanceCapabilityError) as rejected:
-        verifier.verify(broader, "camera.read")
-    assert rejected.value.status_code == 403
-
-
-def test_capability_rejects_a_future_signing_key_even_when_iat_is_within_skew(tmp_path):
-    private_key, verifier = daemon_authorizer(tmp_path)
-    keyring_path = tmp_path / "daemon-maintenance-keys.json"
-    keyring = json.loads(keyring_path.read_text(encoding="utf-8"))
-    keyring["keys"][0]["notBefore"] = 1_020
-    keyring_path.write_text(json.dumps(keyring), encoding="utf-8")
-
-    future_key_token = capability(
-        private_key, scope="camera.read", iat=1_020, exp=1_120, jti="future-key"
-    )
-    with pytest.raises(MaintenanceCapabilityError) as rejected:
-        verifier.verify(future_key_token, "camera.read")
-
-    assert rejected.value.status_code == 401
-    assert "not active" in str(rejected.value)
-
-
-def test_corrupt_replay_ledger_fails_closed_with_a_v2_contract_error(monkeypatch, tmp_path):
+def test_loopback_http_exposes_plain_maintenance_contract(monkeypatch):
     import app
 
-    private_key, authorizer = daemon_authorizer(tmp_path)
-    (tmp_path / "camera-maintenance-replay.sqlite").write_bytes(b"not a sqlite ledger")
-    monkeypatch.setattr(app, "_maintenance_authorizer", authorizer)
-    client = TestClient(app.app)
-
-    token = capability(private_key, scope="camera.read", jti="corrupt-ledger")
-    response = client.get(
-        "/maintenance/cameras",
-        headers={"X-Vision-Maintenance-Capability": token},
-    )
-
-    assert response.status_code == 503
-    assert response.json()["contractVersion"] == CAMERA_MAINTENANCE_CONTRACT_VERSION
-    assert response.json()["error"]["code"] == "MaintenanceCapabilityError"
-    assert "replay ledger" in response.json()["error"]["message"]
-
-
-def test_loopback_http_requires_single_use_maintenance_capability(monkeypatch, tmp_path):
-    import app
-
-    private_key, authorizer = daemon_authorizer(tmp_path)
     discovery = MutableDiscovery()
     service = make_service(discovery=discovery, access=RecordingCameraAccess())
     monkeypatch.setattr("app.get_camera_maintenance", lambda: service)
-    monkeypatch.setattr(app, "_maintenance_authorizer", authorizer)
     client = TestClient(app.app)
     responses_schema = json.loads((Path(__file__).parents[1] / "config" / "vending-vision-camera-maintenance-v2.responses.schema.json").read_text(encoding="utf-8"))
 
-    missing = client.get("/maintenance/cameras")
-    assert missing.status_code == 401
-    assert missing.json()["contractVersion"] == CAMERA_MAINTENANCE_CONTRACT_VERSION
-    customer = capability(private_key, scope="camera.read", purpose="customer", jti="customer")
-    assert client.get("/maintenance/cameras", headers={"X-Vision-Maintenance-Capability": customer}).status_code == 403
-    expired = capability(private_key, scope="camera.read", expires_at=1_009, jti="expired")
-    assert client.get("/maintenance/cameras", headers={"X-Vision-Maintenance-Capability": expired}).status_code == 401
-
-    token = capability(private_key, scope="camera.read", jti="read-once")
-    listed = client.get("/maintenance/cameras", headers={"X-Vision-Maintenance-Capability": token})
+    listed = client.get("/maintenance/cameras")
     assert listed.status_code == 200
     assert discovery.calls == 1
     assert len(listed.json()["candidates"]) == 2
     jsonschema.validate(listed.json(), {"$ref": "#/$defs/contract", "$defs": responses_schema["$defs"]})
-    assert client.get("/maintenance/cameras", headers={"X-Vision-Maintenance-Capability": token}).status_code == 409
 
-    refresh_token = capability(private_key, scope="camera.refresh", jti="refresh-once")
-    refreshed = client.post("/maintenance/cameras/refresh", headers={"X-Vision-Maintenance-Capability": refresh_token})
+    refreshed = client.post("/maintenance/cameras/refresh")
     assert refreshed.status_code == 200
     assert discovery.calls == 2
     assert len(refreshed.json()["candidates"]) == 2
     jsonschema.validate(refreshed.json(), {"$ref": "#/$defs/refresh", "$defs": responses_schema["$defs"]})
 
-    bad_confirm = capability(private_key, scope="camera.confirm", jti="bad-confirm")
-    response = client.post("/maintenance/cameras/top/confirm", json={"candidateId": "usb#top-001"}, headers={"X-Vision-Maintenance-Capability": bad_confirm})
+    preview = client.get("/maintenance/cameras/usb%23top-001/preview.jpg")
+    assert preview.status_code == 200
+    assert preview.content == b"jpeg"
+    assert preview.headers["cache-control"] == "no-store"
+
+    response = client.post("/maintenance/cameras/top/confirm", json={"candidateId": "usb#top-001"})
     assert response.status_code == 409
     assert response.json()["contractVersion"] == CAMERA_MAINTENANCE_CONTRACT_VERSION
 
-    test_token = capability(private_key, scope="camera.test", jti="role-test")
     tested = client.post(
         "/maintenance/cameras/top/test", json={"candidateId": "usb#top-001"},
-        headers={"X-Vision-Maintenance-Capability": test_token},
     )
     assert tested.status_code == 200
     jsonschema.validate(tested.json(), {"$ref": "#/$defs/test", "$defs": responses_schema["$defs"]})
     evidence = tested.json()["evidence"]
-    confirm_token = capability(private_key, scope="camera.confirm", jti="role-confirm")
     confirmed = client.post(
         "/maintenance/cameras/top/confirm",
         json={
             "candidateId": "usb#top-001", "testEvidenceId": evidence["id"],
             "operatorVisualConfirmation": True, "expectedGeneration": evidence["generation"],
         },
-        headers={"X-Vision-Maintenance-Capability": confirm_token},
     )
     assert confirmed.status_code == 200
     assert confirmed.json()["state"] == "ready"
@@ -727,9 +459,7 @@ def test_production_removes_legacy_snapshot_bypass_and_hides_development_dashboa
 
     assert client.get("/camera/top/snapshot.jpg").status_code == 404
     assert client.get("/dashboard").status_code == 404
-    blocked = client.get("/maintenance/cameras")
-    assert blocked.status_code == 503
-    assert "blocked" in blocked.json()["error"]["message"]
+    assert client.get("/maintenance/cameras").status_code == 200
 
 
 def test_health_status_does_not_reopen_real_cameras(monkeypatch):

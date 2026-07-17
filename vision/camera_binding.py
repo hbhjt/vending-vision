@@ -8,22 +8,16 @@ Backend indexes are maintenance observations, never persisted identities.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
 import secrets
-import sqlite3
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
-
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
 
 CAMERA_MAINTENANCE_CONTRACT_VERSION = "vem.vision.camera-maintenance/v2"
 CAMERA_ROLES = ("top", "front")
@@ -291,214 +285,6 @@ class CameraCandidate:
         }}
 
 
-class MaintenanceCapabilityError(ValueError):
-    def __init__(self, message: str, status_code: int):
-        super().__init__(message)
-        self.status_code = status_code
-
-
-class ReplayLedgerError(RuntimeError):
-    """The durable replay ledger could not provide fail-closed protection."""
-
-
-class DurableReplayStore:
-    """Windows-safe, cross-process atomic single-use capability replay ledger."""
-
-    def __init__(self, path: str | Path):
-        self.path = Path(path)
-        self._lock = threading.RLock()
-
-    def _connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            connection = sqlite3.connect(str(self.path), timeout=10, isolation_level=None)
-            # Do not race every first-use process through a WAL mode change.
-            # Schema creation happens inside consume's write transaction, so
-            # SQLite serialises a cold-start database exactly as it serialises
-            # the single-use insert.
-            connection.execute("PRAGMA busy_timeout = 10000")
-            return connection
-        except (OSError, sqlite3.Error) as exc:
-            raise ReplayLedgerError("maintenance replay ledger is unavailable") from exc
-
-    def consume(self, jti: str, expires_at: int, now: int) -> bool:
-        with self._lock:
-            for attempt in range(4):
-                connection = None
-                try:
-                    connection = self._connect()
-                    connection.execute("BEGIN IMMEDIATE")
-                    connection.execute(
-                        "CREATE TABLE IF NOT EXISTS consumed_jti "
-                        "(jti TEXT PRIMARY KEY NOT NULL, expires_at INTEGER NOT NULL)"
-                    )
-                    connection.execute("DELETE FROM consumed_jti WHERE expires_at <= ?", (now,))
-                    inserted = connection.execute(
-                        "INSERT OR IGNORE INTO consumed_jti (jti, expires_at) VALUES (?, ?)",
-                        (jti, expires_at),
-                    ).rowcount
-                    connection.execute("COMMIT")
-                    return inserted == 1
-                except (OSError, sqlite3.Error, ReplayLedgerError) as exc:
-                    if connection is not None:
-                        try:
-                            connection.execute("ROLLBACK")
-                        except sqlite3.Error:
-                            pass
-                    transient = isinstance(exc, sqlite3.OperationalError) and (
-                        "locked" in str(exc).lower() or "busy" in str(exc).lower()
-                    )
-                    if transient and attempt < 3:
-                        time.sleep(0.05 * (2 ** attempt))
-                        continue
-                    raise ReplayLedgerError("maintenance replay ledger is unavailable") from exc
-                finally:
-                    if connection is not None:
-                        connection.close()
-
-
-class MaintenanceCapabilityVerifier:
-    """Verifier-only Ed25519 contract for daemon-issued maintenance JWTs.
-
-    Vision reads daemon-owned public-key and active-session material.  It never
-    receives a signing private key and rejects a token when either material is
-    absent, expired, or rotated away.
-    """
-
-    ISSUER = "vem.vending-daemon"
-    AUDIENCE = "vem.vision.camera-maintenance"
-    PURPOSE = "vision.camera-maintenance"
-    MAX_TTL_SECONDS = 300
-    CLOCK_SKEW_SECONDS = 30
-
-    def __init__(
-        self,
-        keyring_path: str | Path | None,
-        session_path: str | Path | None,
-        replay_store: DurableReplayStore | None,
-        clock=time.time,
-    ):
-        self._keyring_path = Path(keyring_path) if keyring_path else None
-        self._session_path = Path(session_path) if session_path else None
-        self._replay_store = replay_store
-        self._clock = clock
-
-    @staticmethod
-    def _b64decode(value: str) -> bytes:
-        if not isinstance(value, str) or not value:
-            raise ValueError("base64url value is required")
-        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-
-    @classmethod
-    def _decode_json(cls, value: str, label: str) -> dict:
-        try:
-            parsed = json.loads(cls._b64decode(value))
-        except Exception as exc:
-            raise MaintenanceCapabilityError(f"maintenance capability {label} is invalid", 401) from exc
-        if not isinstance(parsed, dict):
-            raise MaintenanceCapabilityError(f"maintenance capability {label} is invalid", 401)
-        return parsed
-
-    @staticmethod
-    def _load_json(path: Path, material: str) -> dict:
-        try:
-            parsed = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise MaintenanceCapabilityError(
-                f"maintenance capability issuer material is blocked: {material} is unavailable", 503
-            ) from exc
-        if not isinstance(parsed, dict):
-            raise MaintenanceCapabilityError(
-                f"maintenance capability issuer material is blocked: {material} is invalid", 503
-            )
-        return parsed
-
-    def _issuer_material(self) -> tuple[dict, dict]:
-        if self._keyring_path is None or self._session_path is None or self._replay_store is None:
-            raise MaintenanceCapabilityError(
-                "maintenance capability issuer material is blocked: daemon keyring/session is not configured", 503
-            )
-        keyring = self._load_json(self._keyring_path, "daemon keyring")
-        session = self._load_json(self._session_path, "daemon maintenance session")
-        if keyring.get("version") != 1 or keyring.get("issuer") != self.ISSUER or not isinstance(keyring.get("keys"), list):
-            raise MaintenanceCapabilityError("maintenance capability issuer material is blocked: daemon keyring is invalid", 503)
-        required_session = {"version": 1}
-        if session.get("version") != required_session["version"]:
-            raise MaintenanceCapabilityError("maintenance capability issuer material is blocked: daemon maintenance session is invalid", 503)
-        for field in ("machineCode", "sessionId", "keyId"):
-            if not isinstance(session.get(field), str) or not session[field]:
-                raise MaintenanceCapabilityError("maintenance capability issuer material is blocked: daemon maintenance session is invalid", 503)
-        if isinstance(session.get("expiresAt"), bool) or not isinstance(session.get("expiresAt"), int):
-            raise MaintenanceCapabilityError("maintenance capability issuer material is blocked: daemon maintenance session is invalid", 503)
-        return keyring, session
-
-    @staticmethod
-    def _matching_key(keyring: dict, key_id: str) -> dict:
-        matches = [key for key in keyring["keys"] if isinstance(key, dict) and key.get("id") == key_id]
-        if len(matches) != 1:
-            raise MaintenanceCapabilityError("maintenance capability key is unknown", 401)
-        key = matches[0]
-        for field in ("publicKey", "notBefore", "notAfter"):
-            if field not in key:
-                raise MaintenanceCapabilityError("maintenance capability key is invalid", 401)
-        if isinstance(key["notBefore"], bool) or isinstance(key["notAfter"], bool) or not isinstance(key["notBefore"], int) or not isinstance(key["notAfter"], int):
-            raise MaintenanceCapabilityError("maintenance capability key is invalid", 401)
-        return key
-
-    def verify(self, token: str | None, required_scope: str) -> dict:
-        keyring, session = self._issuer_material()
-        if not token:
-            raise MaintenanceCapabilityError("maintenance capability is required", 401)
-        try:
-            encoded_header, encoded_claims, encoded_signature = token.split(".")
-        except Exception as exc:
-            raise MaintenanceCapabilityError("maintenance capability is invalid", 401) from exc
-        header = self._decode_json(encoded_header, "header")
-        claims = self._decode_json(encoded_claims, "claims")
-        key_id = header.get("kid")
-        if header.get("alg") != "EdDSA" or header.get("typ") != "JWT" or not isinstance(key_id, str) or not key_id:
-            raise MaintenanceCapabilityError("maintenance capability header is invalid", 401)
-        key = self._matching_key(keyring, key_id)
-        try:
-            public_key = Ed25519PublicKey.from_public_bytes(self._b64decode(key["publicKey"]))
-            public_key.verify(self._b64decode(encoded_signature), f"{encoded_header}.{encoded_claims}".encode())
-        except (ValueError, InvalidSignature) as exc:
-            raise MaintenanceCapabilityError("maintenance capability signature is invalid", 401) from exc
-        now = int(self._clock())
-        if now >= session["expiresAt"]:
-            raise MaintenanceCapabilityError("maintenance capability session has expired", 401)
-        # Clock skew only protects a recently-issued token's iat boundary.  It
-        # must never make a daemon signing key usable before its own notBefore.
-        if now < key["notBefore"]:
-            raise MaintenanceCapabilityError("maintenance capability signing key is not active yet", 401)
-        if claims.get("iss") != self.ISSUER or claims.get("aud") != self.AUDIENCE:
-            raise MaintenanceCapabilityError("maintenance capability has the wrong issuer or audience", 403)
-        if claims.get("machine") != session["machineCode"] or claims.get("session") != session["sessionId"] or key_id != session["keyId"]:
-            raise MaintenanceCapabilityError("maintenance capability is for another machine or maintenance session", 403)
-        if claims.get("purpose") != self.PURPOSE:
-            raise MaintenanceCapabilityError("maintenance capability has the wrong purpose", 403)
-        scope, issued_at, expires_at, jti = claims.get("scope"), claims.get("iat"), claims.get("exp"), claims.get("jti")
-        if not isinstance(scope, str) or scope != required_scope:
-            raise MaintenanceCapabilityError("maintenance capability lacks exact endpoint scope", 403)
-        if (isinstance(issued_at, bool) or isinstance(expires_at, bool) or not isinstance(issued_at, int)
-                or not isinstance(expires_at, int) or issued_at > now + self.CLOCK_SKEW_SECONDS
-                or expires_at <= now or expires_at <= issued_at or expires_at - issued_at > self.MAX_TTL_SECONDS):
-            raise MaintenanceCapabilityError("maintenance capability has expired", 401)
-        if issued_at < key["notBefore"] or expires_at > key["notAfter"] or expires_at > session["expiresAt"]:
-            raise MaintenanceCapabilityError("maintenance capability is outside key or session lifetime", 401)
-        if not isinstance(jti, str) or not jti:
-            raise MaintenanceCapabilityError("maintenance capability lacks replay id", 401)
-        try:
-            consumed = self._replay_store.consume(jti, expires_at, now)
-        except ReplayLedgerError as exc:
-            raise MaintenanceCapabilityError(
-                "maintenance capability issuer material is blocked: replay ledger is unavailable", 503
-            ) from exc
-        if not consumed:
-            raise MaintenanceCapabilityError("maintenance capability was already used", 409)
-        return claims
-
-
 class CameraMaintenanceService:
     """A cached candidate generation and atomic role/evidence state machine."""
 
@@ -681,10 +467,6 @@ class CameraMaintenanceService:
 def default_camera_binding_path() -> Path:
     root = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) if os.name == "nt" else Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
     return root / "VendingVision" / "camera-bindings.json"
-
-
-def default_maintenance_replay_path() -> Path:
-    return default_camera_binding_path().with_name("camera-maintenance-replay.sqlite")
 
 
 _camera_leases = CameraLeaseRegistry()

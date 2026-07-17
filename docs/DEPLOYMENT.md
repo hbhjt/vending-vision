@@ -40,12 +40,9 @@ vending-vision.exe --no-browser `
 host、非法端口或 mock 配置时会直接启动失败。环境变量和相邻 `config.json`
 回退只保留给不带 `--config` 的供应方开发流程。
 
-相机维护还需要 VEM 写入的 daemon 验证材料路径：
-`maintenance_capability_keyring_path`、`maintenance_session_path` 与
-`maintenance_replay_path`。keyring 仅含可轮换的 Ed25519 公钥，session 文件
-仅含当前 machine/session/key 标识和过期时间；daemon 私钥不会进入 Vision
-bundle、site config 或环境变量。缺失这些材料时 Vision 正常启动但相机维护合同
-明确返回 503 blocked，绝不会退回共享 HMAC secret。
+相机维护使用与运行时相同的 loopback 服务，不需要 daemon 验证材料、capability
+header、JWT、session、replay ledger 或 keyring。Vision 继续拥有并持久化稳定的
+camera identity；VEM 只消费合同中的不透明 candidate ID 和 role readiness。
 
 安装验收必须证明：
 
@@ -61,8 +58,7 @@ HTTP 或 WebSocket 契约失败属于安装失败，必须回滚。
 ## 真实 VEM 现场验收
 
 通过安装验收后，使用 Vision 的本机维护合同枚举候选、预览、测试并确认
-top/front 角色。每个请求必须携带 daemon 签发、Ed25519 验签的短期单次
-maintenance capability；稳定 DirectShow moniker 和当前 OpenCV index 从同一
+top/front 角色。维护请求直接发送到 loopback 合同；稳定 DirectShow moniker 和当前 OpenCV index 从同一
 `cv2-enumerate-cameras` 边界取得。重插后的 index 改变会被刷新解析到原绑定；
 无法证明映射的异常 adapter 才产生 explicit ambiguous/non-ready。backend index
 仅是已认证维护观察，不能写入现场配置或 VEM：

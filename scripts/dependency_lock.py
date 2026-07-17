@@ -175,7 +175,6 @@ LICENSE_OVERRIDES = {
     "click": "BSD-3-Clause",
     "colorama": "BSD-3-Clause",
     "contourpy": "BSD-3-Clause",
-    "cryptography": "Apache-2.0 OR BSD-3-Clause",
     "cv2-enumerate-cameras": "GPL-3.0-or-later",
     "cycler": "BSD-3-Clause",
     "fastapi": "MIT",
