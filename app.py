@@ -550,7 +550,7 @@ def camera_role_status(role: str):
 @app.get("/camera/{role}/snapshot.jpg")
 def camera_role_snapshot(role: str):
     # This legacy diagnostic is intentionally absent from managed production.
-    # Only the scoped /maintenance preview capability may return camera bytes.
+    # Managed production camera bytes use the plain loopback v2 maintenance preview route.
     if not settings.DEVELOPMENT_DASHBOARD_ENABLED:
         return JSONResponse(status_code=404, content={"ok": False, "error": "not found"})
     try:

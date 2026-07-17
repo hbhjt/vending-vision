@@ -124,6 +124,9 @@ def assert_bundled_resources(exe_path):
     required = [
         internal / "config.json",
         internal / "dashboard" / "profile_dashboard.html",
+        internal / "config" / "vending-vision-camera-maintenance-v2.schema.json",
+        internal / "config" / "vending-vision-camera-maintenance-v2.requests.schema.json",
+        internal / "config" / "vending-vision-camera-maintenance-v2.responses.schema.json",
         internal / "models" / "person_detection" / "person_yolov8n.onnx",
         internal / "models" / "face_detection" / "face_detection_yunet_2023mar.onnx",
         internal / "models" / "age_gender" / "age_net.caffemodel",
@@ -132,6 +135,12 @@ def assert_bundled_resources(exe_path):
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise AssertionError(f"missing packaged resources: {missing}")
+    retired = [
+        internal / "config" / "vending-vision-camera-maintenance-v1.schema.json",
+    ]
+    present_retired = [str(path) for path in retired if path.exists()]
+    if present_retired:
+        raise AssertionError(f"retired packaged resources must not be shipped: {present_retired}")
     camera_adapter = internal / "cv2_enumerate_cameras"
     if not any(camera_adapter.glob("_windows_backend*.pyd")):
         raise AssertionError("missing packaged cv2-enumerate-cameras Windows DirectShow adapter")

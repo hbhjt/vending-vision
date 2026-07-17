@@ -40,7 +40,7 @@ vending-vision.exe --no-browser `
 host、非法端口或 mock 配置时会直接启动失败。环境变量和相邻 `config.json`
 回退只保留给不带 `--config` 的供应方开发流程。
 
-相机维护使用与运行时相同的 loopback 服务，不需要 daemon 验证材料、capability
+相机维护使用与运行时相同的 loopback v2 合同，不使用 daemon 验证材料、capability
 header、JWT、session、replay ledger 或 keyring。Vision 继续拥有并持久化稳定的
 camera identity；VEM 只消费合同中的不透明 candidate ID 和 role readiness。
 
@@ -61,7 +61,7 @@ HTTP 或 WebSocket 契约失败属于安装失败，必须回滚。
 top/front 角色。维护请求直接发送到 loopback 合同；稳定 DirectShow moniker 和当前 OpenCV index 从同一
 `cv2-enumerate-cameras` 边界取得。重插后的 index 改变会被刷新解析到原绑定；
 无法证明映射的异常 adapter 才产生 explicit ambiguous/non-ready。backend index
-仅是已认证维护观察，不能写入现场配置或 VEM：
+仅是 loopback v2 维护观察值，不能写入现场配置或 VEM：
 
 ```text
 GET http://127.0.0.1:7892/maintenance/cameras

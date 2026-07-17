@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from scripts import generate_candidate_evidence
 from scripts.dependency_lock import (
     LICENSE_OVERRIDES,
@@ -222,6 +224,30 @@ def test_packaged_smoke_managed_fixture_uses_plain_maintenance_contract(tmp_path
     assert config["schemaVersion"] == "vending-vision-site-config/v1"
     assert "mock_scenario" not in config
     assert not {"maintenance_capability_keyring_path", "maintenance_session_path", "maintenance_replay_path"} & set(config)
+
+
+def test_packaged_resource_verifier_rejects_retired_maintenance_v1_schema(tmp_path):
+    from scripts.verify_packaged_exe import assert_bundled_resources
+
+    internal = tmp_path / "_internal"
+    for path in [
+        internal / "config.json",
+        internal / "dashboard" / "profile_dashboard.html",
+        internal / "config" / "vending-vision-camera-maintenance-v2.schema.json",
+        internal / "config" / "vending-vision-camera-maintenance-v2.requests.schema.json",
+        internal / "config" / "vending-vision-camera-maintenance-v2.responses.schema.json",
+        internal / "models" / "person_detection" / "person_yolov8n.onnx",
+        internal / "models" / "face_detection" / "face_detection_yunet_2023mar.onnx",
+        internal / "models" / "age_gender" / "age_net.caffemodel",
+        internal / "models" / "age_gender" / "gender_net.caffemodel",
+        internal / "cv2_enumerate_cameras" / "_windows_backend_test.pyd",
+    ]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"packaged")
+    (internal / "config" / "vending-vision-camera-maintenance-v1.schema.json").write_bytes(b"retired")
+
+    with pytest.raises(AssertionError, match="retired packaged resources"):
+        assert_bundled_resources(tmp_path / "vending-vision.exe")
 
 
 def test_candidate_signatures_match_vem_role_digest_contract(tmp_path):
