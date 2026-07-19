@@ -15,7 +15,7 @@ import time
 
 import cv2
 
-from vision.camera_manager import read_camera
+from vision.camera_manager import read_camera_with_source
 from vision.camera_owner import front_camera_io_lock, get_front_camera_owner
 from vision.config import settings
 from vision.face_detector import FaceDetector
@@ -275,7 +275,7 @@ def sample_frame(source, index, proximity=None, track=None, cancel_event=None):
                 owner_status=owner_status,
                 reason="front_camera_owner_changed_after_lock",
             )
-        image = read_camera("front", warmup_frames=1)
+        image, source_frame = read_camera_with_source("front", warmup_frames=1)
 
     inference_image = resize_for_profile_inference(image)
     quality = score_frame_quality(inference_image)
@@ -299,6 +299,7 @@ def sample_frame(source, index, proximity=None, track=None, cancel_event=None):
         "index": index,
         "source": source,
         "capturedAt": time.time(),
+        "sourceFrame": source_frame,
         "profile": profile,
         "protocolProfile": protocol_profile,
         "quality": quality,

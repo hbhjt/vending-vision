@@ -21,6 +21,7 @@ from __future__ import annotations
 import time
 from uuid import uuid4
 
+from vision.camera_manager import get_last_frame_source
 from vision.camera_owner import acquire_front_camera, release_front_camera
 from vision.config import settings
 from vision.metrics import metrics
@@ -109,8 +110,26 @@ def build_front_camera_waiting_update(
             event_id=event_id, state="waiting", reason=reason,
             proximity=proximity, tracking=tracking, occupancy=occupancy,
             ambient_light=ambient_light,
+            source="front",
+            source_frame=get_last_frame_source("front"),
         ),
     )
+
+
+def _best_front_profile_source_frame(samples):
+    """Select the most representative front profile frame metadata."""
+    valid_samples = [
+        sample for sample in samples if sample.get("sourceFrame") and sample.get("valid")
+    ]
+    if not valid_samples:
+        valid_samples = [sample for sample in samples if sample.get("sourceFrame")]
+    if not valid_samples:
+        return None
+
+    return max(
+        valid_samples,
+        key=lambda sample: float(sample.get("quality", {}).get("qualityScore", 0.0)),
+    ).get("sourceFrame")
 
 
 def collect_front_profile_update(
@@ -209,6 +228,8 @@ def collect_front_profile_update(
                         proximity=proximity, tracking=track.public_state(),
                         occupancy=get_occupancy_gate().public_state(),
                         ambient_light=ambient_light,
+                        source="front",
+                        source_frame=_best_front_profile_source_frame(samples),
                         detail={
                             "validFrameCount": len(valid_samples),
                             "minValidFrames": required_valid_frames,
@@ -231,6 +252,8 @@ def collect_front_profile_update(
                         proximity=proximity, tracking=track.public_state(),
                         occupancy=get_occupancy_gate().public_state(),
                         ambient_light=ambient_light,
+                        source="front",
+                        source_frame=_best_front_profile_source_frame(samples),
                         detail={
                             "validFrameCount": len(valid_samples),
                             "minValidFrames": required_valid_frames,
@@ -260,6 +283,8 @@ def collect_front_profile_update(
                         tracking=track.public_state(),
                         occupancy=normalize_protocol_occupancy(None, proximity),
                         ambient_light=ambient_light,
+                        source="front",
+                        source_frame=_best_front_profile_source_frame(samples),
                         detail={
                             "validFrameCount": len(valid_samples),
                             "minValidFrames": required_valid_frames,
@@ -280,6 +305,8 @@ def collect_front_profile_update(
                         proximity=proximity, tracking=track.public_state(),
                         occupancy=get_occupancy_gate().public_state(),
                         ambient_light=ambient_light,
+                        source="front",
+                        source_frame=_best_front_profile_source_frame(samples),
                         detail={
                             "confidence": protocol_profile["confidence"],
                             "minConfidence": settings.PROFILE_MIN_CONFIDENCE,
@@ -307,7 +334,11 @@ def collect_front_profile_update(
             "occupancy": final_occupancy,
             "profile": protocol_profile,
             "quality": quality,
+            "source": "front",
         }
+        best_profile_frame = _best_front_profile_source_frame(samples)
+        if best_profile_frame is not None:
+            payload["sourceFrame"] = best_profile_frame
 
         # 更新状态：track -> pushed, gate -> occupied, reset track
         track.update(track.signature, "pushed", match_score=track.match_score)
@@ -467,6 +498,11 @@ def collect_profile_update(
                 mark_vision_session_departed(departure_payload)
 
             if departure_payload is not None and include_departure:
+                departure_payload = dict(departure_payload)
+                departure_payload["source"] = "top"
+                source_frame = get_last_frame_source("top")
+                if source_frame is not None:
+                    departure_payload["sourceFrame"] = source_frame
                 return profile_update("vision.person_departed", departure_payload)
 
             return None
@@ -498,6 +534,8 @@ def collect_profile_update(
                         reason="multiple_people_detected",
                         proximity=proximity, tracking=track.public_state(),
                         occupancy=occupancy_snapshot, ambient_light=ambient_light,
+                        source="top",
+                        source_frame=get_last_frame_source("top"),
                     ),
                 )
 
@@ -518,6 +556,8 @@ def collect_profile_update(
                         reason="top_occupancy_unknown",
                         proximity=proximity, tracking=track.public_state(),
                         occupancy=occupancy_snapshot, ambient_light=ambient_light,
+                        source="top",
+                        source_frame=get_last_frame_source("top"),
                     ),
                 )
 
@@ -539,6 +579,8 @@ def collect_profile_update(
                         reason="front_camera_reserved_by_tryon",
                         proximity=proximity, tracking=track.public_state(),
                         occupancy=occupancy_snapshot, ambient_light=ambient_light,
+                        source="top",
+                        source_frame=get_last_frame_source("top"),
                     ),
                 )
 
@@ -559,6 +601,8 @@ def collect_profile_update(
                         reason="occupancy_gate_locked",
                         proximity=proximity, tracking=track.public_state(),
                         occupancy=occupancy_gate.public_state(),
+                        source="top",
+                        source_frame=get_last_frame_source("top"),
                         ambient_light=ambient_light,
                     ),
                 )
@@ -579,6 +623,8 @@ def collect_profile_update(
                     reason="single_person_profile_pending",
                     proximity=proximity, tracking=track.public_state(),
                     occupancy=occupancy_gate.public_state(),
+                    source="top",
+                    source_frame=get_last_frame_source("top"),
                     ambient_light=ambient_light,
                 ),
             )
@@ -612,6 +658,8 @@ def collect_profile_update(
                     reason="occupancy_gate_locked",
                     tracking=track.public_state(),
                     occupancy=occupancy_gate.public_state(),
+                    source="top",
+                    source_frame=get_last_frame_source("top"),
                     ambient_light=ambient_light,
                 ),
             )

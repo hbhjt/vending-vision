@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 
 import cv2
 
-from vision.camera_manager import read_camera
+from vision.camera_manager import read_camera, read_camera_with_source
 from vision.camera_owner import (
     acquire_front_camera,
     front_camera_io_lock,
@@ -365,11 +365,40 @@ def get_try_on_status():
     return _try_on_sessions.status()
 
 
+def prepare_first_try_on_frame(
+    session_id: str,
+    stream_token: str,
+    jpeg_quality: int = 80,
+):
+    """Prepare one front-camera frame for the first MJPEG chunk.
+
+    Returns:
+        tuple[bytes, dict|None]: (jpeg_bytes, source_frame_metadata)
+    """
+    _validate_session_id(session_id)
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
+    _try_on_sessions.begin_stream(session_id, stream_token)
+    try:
+        renew_front_camera("tryon_frontend", reason=f"try_on_first_frame:{session_id}")
+        with front_camera_io_lock():
+            frame, source_frame = read_camera_with_source("front", warmup_frames=1)
+
+        ok, encoded = cv2.imencode(".jpg", frame, encode_params)
+        if not ok:
+            raise RuntimeError("failed to encode try-on frame")
+        return encoded.tobytes(), source_frame
+    except Exception:
+        _try_on_sessions.end_stream(session_id)
+        raise
+
+
 def iter_try_on_mjpeg(
     session_id: str,
     stream_token: str,
     fps: float = 10.0,
     jpeg_quality: int = 80,
+    prepared_frame: bytes | None = None,
+    already_started: bool = False,
 ):
     """MJPEG 流生成器。
 
@@ -385,11 +414,22 @@ def iter_try_on_mjpeg(
         MJPEG 格式的帧数据（含 multipart 边界）
     """
     session_id = _validate_session_id(session_id)
-    _try_on_sessions.begin_stream(session_id, stream_token)
+    if not already_started:
+        _try_on_sessions.begin_stream(session_id, stream_token)
     delay = 1.0 / max(float(fps), 1.0)
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
 
     try:
+        if prepared_frame is not None:
+            if not is_try_on_session_active(session_id, stream_token=stream_token):
+                return
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n"
+                + prepared_frame
+                + b"\r\n"
+            )
+
         while is_try_on_session_active(session_id, stream_token=stream_token):
             renew_front_camera("tryon_frontend", reason=f"try_on_stream:{session_id}")
             with front_camera_io_lock():

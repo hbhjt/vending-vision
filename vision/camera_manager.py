@@ -343,6 +343,8 @@ class _NoopRuntimeMaintenanceHandoff:
 _streams: dict[str, ManagedCameraStream] = {}
 _recorded_sources: dict[str, RecordedVideoFrameSource] = {}
 _streams_lock = threading.RLock()
+_last_frame_metadata: dict[str, dict] = {}
+_role_read_locks = {role: threading.RLock() for role in CAMERA_ROLES}
 
 
 class DirectShowFrameSource:
@@ -354,7 +356,8 @@ class DirectShowFrameSource:
 
     def read(self, warmup_frames: int | None = None):
         if _keep_open(self.config):
-            return get_camera_stream(self.role).read(warmup_frames=warmup_frames)
+            stream = get_camera_stream(self.role)
+            return stream.read(warmup_frames=warmup_frames)
         cap = _open_role_camera(self.config)
         try:
             return _apply_camera_transform(
@@ -385,6 +388,9 @@ class DirectShowFrameSource:
 
     def reset(self) -> None:
         reset_camera(self.role)
+
+    def last_frame(self) -> dict | None:
+        return None
 
 
 def get_camera_config(role: str) -> dict:
@@ -426,6 +432,17 @@ def get_frame_source(role: str) -> FrameSource:
     return DirectShowFrameSource(role, config)
 
 
+def get_last_frame_source(role: str):
+    """Return cached metadata for the last frame produced for a role."""
+    try:
+        role_lock = _role_read_locks[role]
+    except KeyError as exc:
+        raise ValueError(f"unknown camera role: {role}") from exc
+    with role_lock:
+        source = _last_frame_metadata.get(role)
+        return dict(source) if source is not None else None
+
+
 def quiesce_runtime_camera(candidate_id: str):
     """Temporarily release the persistent stream bound to one stable identity.
 
@@ -445,13 +462,32 @@ def quiesce_runtime_camera(candidate_id: str):
     return matching[0].quiesce_for_maintenance()
 
 
+def read_camera_with_source(role: str, warmup_frames: int | None = None):
+    """Read one image and its source evidence as one role-local operation."""
+    try:
+        role_lock = _role_read_locks[role]
+    except KeyError as exc:
+        raise ValueError(f"unknown camera role: {role}") from exc
+    with role_lock:
+        source = get_frame_source(role)
+        image = source.read(warmup_frames=warmup_frames)
+        frame = source.last_frame() if hasattr(source, "last_frame") else None
+        if frame is not None:
+            frame = dict(frame)
+            _last_frame_metadata[role] = frame
+        else:
+            _last_frame_metadata.pop(role, None)
+        return image, frame
+
+
 def read_camera(role: str, warmup_frames: int | None = None):
     """读取指定角色摄像头的一帧。
 
     如果配置为常开模式，使用持久化流；
     否则每次打开新连接，读取后立即释放。
     """
-    return get_frame_source(role).read(warmup_frames=warmup_frames)
+    image, _ = read_camera_with_source(role, warmup_frames=warmup_frames)
+    return image
 
 
 def get_camera_status(role: str) -> dict:
@@ -489,37 +525,31 @@ def get_all_camera_statuses() -> dict:
 
 def release_camera(role: str):
     """释放指定角色的摄像头资源。"""
-    with _streams_lock:
-        stream = _streams.get(role)
-
-    if stream is not None:
-        stream.release()
-    with _streams_lock:
-        source = _recorded_sources.get(role)
-    if source is not None:
-        source.release()
+    with _role_read_locks[role]:
+        with _streams_lock:
+            stream = _streams.get(role)
+            source = _recorded_sources.get(role)
+        if stream is not None:
+            stream.release()
+        if source is not None:
+            source.release()
+        _last_frame_metadata.pop(role, None)
 
 
 def reset_camera(role: str):
     """重置指定角色的摄像头（释放并清除错误状态）。"""
-    with _streams_lock:
-        stream = _streams.get(role)
-
-    if stream is not None:
-        stream.reset()
-    with _streams_lock:
-        source = _recorded_sources.get(role)
-    if source is not None:
-        source.reset()
+    with _role_read_locks[role]:
+        with _streams_lock:
+            stream = _streams.get(role)
+            source = _recorded_sources.get(role)
+        if stream is not None:
+            stream.reset()
+        if source is not None:
+            source.reset()
+        _last_frame_metadata.pop(role, None)
 
 
 def release_all_cameras():
     """释放所有摄像头资源。"""
-    with _streams_lock:
-        streams = list(_streams.values())
-        recorded_sources = list(_recorded_sources.values())
-
-    for stream in streams:
-        stream.release()
-    for source in recorded_sources:
-        source.release()
+    for role in CAMERA_ROLES:
+        release_camera(role)

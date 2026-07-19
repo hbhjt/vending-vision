@@ -56,6 +56,7 @@ from vision.session_state import (
 )
 from vision.try_on_session import (
     get_try_on_status,
+    prepare_first_try_on_frame,
     iter_try_on_mjpeg,
     is_try_on_session_active,
     start_try_on_session,
@@ -637,10 +638,54 @@ def try_on_mjpeg(session_id: str, token: Optional[str] = None):
             content={"ok": False, "error": "try-on session is not active"},
         )
 
+    first_frame = None
+    source_frame = None
+    try:
+        first_frame, source_frame = prepare_first_try_on_frame(
+            session_id=session_id,
+            stream_token=str(token),
+        )
+    except Exception as exc:
+        logger.exception("Failed to prepare first try-on frame")
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(exc)},
+        )
+
+    headers = {}
+    if (
+        isinstance(source_frame, dict)
+        and source_frame.get("adapter") == "recorded_video"
+        and source_frame.get("role") == "front"
+        and source_frame.get("configSha256")
+        and source_frame.get("fixtureSha256")
+        and isinstance(source_frame.get("frameIndex"), int)
+        and isinstance(source_frame.get("decodedFrameCount"), int)
+        and source_frame["decodedFrameCount"] > 0
+        and 0 <= source_frame["frameIndex"] < source_frame["decodedFrameCount"]
+    ):
+        headers = {
+            "x-vem-frame-source-adapter": source_frame["adapter"],
+            "x-vem-frame-source-role": source_frame["role"],
+            "x-vem-frame-source-config-sha256": source_frame["configSha256"],
+            "x-vem-frame-source-file-sha256": source_frame["fixtureSha256"],
+            "x-vem-frame-source-frame-index": str(source_frame["frameIndex"]),
+            "x-vem-frame-source-decoded-frame-count": str(
+                source_frame["decodedFrameCount"]
+            ),
+            "x-vem-frame-session-id": session_id,
+        }
+
     media_type = "multipart/x-mixed-replace; boundary=frame"
     return StreamingResponse(
-        iter_try_on_mjpeg(session_id, stream_token=str(token)),
+        iter_try_on_mjpeg(
+            session_id,
+            stream_token=str(token),
+            prepared_frame=first_frame,
+            already_started=True,
+        ),
         media_type=media_type,
+        headers=headers,
     )
 
 

@@ -14,7 +14,7 @@
 import cv2
 import threading
 
-from vision.camera_manager import read_camera
+from vision.camera_manager import read_camera_with_source
 from vision.config import settings
 from vision.frame_transform import crop_normalized_roi
 from vision.face_detector import FaceDetector
@@ -360,11 +360,18 @@ class ProximityMonitor:
             "centerY": round(center_y, 5),
         }
 
-    def check_once(self, return_image: bool = False, camera_role: str = "top"):
+    def check_once(
+        self,
+        return_image: bool = False,
+        camera_role: str = "top",
+        return_source: bool = False,
+    ):
         """从摄像头读取一帧并执行检测（便捷方法）。"""
-        image = read_camera(camera_role, warmup_frames=1)
+        image, source_frame = read_camera_with_source(camera_role, warmup_frames=1)
         result = self.check_image(image)
 
+        if return_source:
+            return result, image, source_frame
         if return_image:
             return result, image
 
