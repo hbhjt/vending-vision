@@ -181,6 +181,20 @@ class ProfileCoreTest(unittest.TestCase):
         self.assertEqual(payload["state"], "empty")
         self.assertNotIn("ambientLight", payload)
 
+    def test_presence_status_passes_through_source_metadata(self):
+        source_frame = {"frameIndex": 1, "decodedFrameCount": 10}
+        payload = build_presence_status(
+            event_id="event-1",
+            state="approach",
+            reason="single_person_profile_pending",
+            proximity={"present": True},
+            source="top",
+            source_frame=source_frame,
+        )
+
+        self.assertEqual(payload["source"], "top")
+        self.assertIs(payload["sourceFrame"], source_frame)
+
 
 if __name__ == "__main__":
     unittest.main()

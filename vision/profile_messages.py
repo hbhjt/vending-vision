@@ -25,6 +25,8 @@ def build_presence_status(
     sample=None,
     detail=None,
     ambient_light=None,
+    source=None,
+    source_frame=None,
 ):
     """构建 vision.presence_status 消息的 payload。
 
@@ -66,6 +68,11 @@ def build_presence_status(
 
     if ambient_light is not None:
         payload["ambientLight"] = ambient_light
+
+    if source is not None:
+        payload["source"] = source
+    if source_frame is not None:
+        payload["sourceFrame"] = source_frame
 
     return payload
 

@@ -100,7 +100,11 @@ class PresenceRuntime:
 
     def poll(self, include_status: bool, include_ambient_light: bool, include_departure: bool):
         """Read exactly one top frame and produce a lightweight protocol update."""
-        proximity, image = self.monitor.check_once(return_image=True, camera_role="top")
+        proximity, image, source_frame = self.monitor.check_once(
+            return_image=True,
+            camera_role="top",
+            return_source=True,
+        )
         ambient_light = estimate_ambient_light(image) if include_ambient_light else None
         occupancy = self.occupancy_filter.update(
             proximity,
@@ -142,6 +146,10 @@ class PresenceRuntime:
                     else:
                         mark_vision_session_departed(departure)
                     if include_departure:
+                        departure = dict(departure)
+                        departure["source"] = "top"
+                        if source_frame is not None:
+                            departure["sourceFrame"] = source_frame
                         return PresencePollResult(
                             profile_update("vision.person_departed", departure),
                             None,
@@ -159,6 +167,8 @@ class PresenceRuntime:
                                 proximity=proximity,
                                 occupancy=occupancy,
                                 ambient_light=ambient_light,
+                                source="top",
+                                source_frame=source_frame,
                             ),
                         ),
                         None,
@@ -258,6 +268,8 @@ class PresenceRuntime:
                         tracking=track.public_state(),
                         occupancy=occupancy,
                         ambient_light=ambient_light,
+                        source="top",
+                        source_frame=source_frame,
                     ),
                 )
 

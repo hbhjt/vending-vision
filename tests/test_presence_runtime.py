@@ -10,9 +10,16 @@ class FakeMonitor:
         self.sequence = list(sequence)
         self.index = 0
 
-    def check_once(self, return_image=False, camera_role="top"):
+    def check_once(
+        self,
+        return_image=False,
+        camera_role="top",
+        return_source=False,
+    ):
         value = self.sequence[min(self.index, len(self.sequence) - 1)]
         self.index += 1
+        if return_source:
+            return value, None, None
         return value, None
 
 
