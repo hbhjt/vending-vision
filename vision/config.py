@@ -393,7 +393,7 @@ class Settings:
             "duration_sec": 2.0,
             "early_finish_after_sec": 1.0,
             "target_fps": 8,
-            "min_good_frames": 2,
+            "min_good_frames": 1,
             "max_good_frames": 10,
             "min_face_area_ratio": 0.006,
             "min_face_score": 0.35,
@@ -479,7 +479,7 @@ class Settings:
     PROFILE_FACE_VOTE_ENABLED = get_config_value(
         "profile_face_vote_enabled",
         "VISION_PROFILE_FACE_VOTE_ENABLED",
-        True
+        False
     )
     PROFILE_FACE_VOTE_SAMPLE_COUNT = get_config_value(
         "profile_face_vote_sample_count",

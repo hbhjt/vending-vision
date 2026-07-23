@@ -282,19 +282,6 @@ def test_expected_manifest_drives_real_presence_profile_departure_and_try_on_pip
 
     configure_recorded_sources(monkeypatch, manifest)
     reset_presence_state()
-    monkeypatch.setattr(settings, "PROFILE_SAMPLING_CONFIG", {
-        **settings.PROFILE_SAMPLING_CONFIG,
-        "duration_sec": 0.1,
-        "early_finish_after_sec": 0,
-        "target_fps": 60,
-        "min_good_frames": 1,
-        "max_good_frames": 2,
-    })
-    monkeypatch.setattr(settings, "PROFILE_MIN_VALID_FRAMES", 1)
-    monkeypatch.setattr(settings, "FRONT_CAMERA_PROFILE_SAMPLE_COUNT", 2)
-    monkeypatch.setattr(settings, "FRONT_CAMERA_PROFILE_SAMPLE_INTERVAL_MS", 1)
-    monkeypatch.setattr(settings, "PROFILE_FACE_VOTE_ENABLED", False)
-
     runtime = PresenceRuntime()
     monkeypatch.setattr(vision_app, "get_presence_runtime", lambda: runtime)
     published = []

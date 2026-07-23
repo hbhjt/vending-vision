@@ -14,12 +14,14 @@
 
 from vision.config import settings
 from vision.pose_estimator import PoseEstimator
-from vision.face_detector import FaceDetector
-from vision.person_detector import PersonDetector
 from vision.logger import logger
 from vision.age_gender_estimator import AgeGenderEstimator
 from vision.camera_binding import get_camera_maintenance
 from vision.model_manifest import verify_model_manifest
+from vision.profile_sampling import (
+    get_profile_face_detector,
+    get_profile_person_detector,
+)
 
 
 def check_model_manifest():
@@ -99,7 +101,7 @@ def check_pose_model():
 def check_face_detector():
     """检查人脸检测器是否可初始化（含降级）。"""
     try:
-        detector = FaceDetector()
+        detector = get_profile_face_detector()
         return {
             "ok": True,
             "message": f"face detector initialized: {detector.backend}"
@@ -119,7 +121,7 @@ def check_person_detector():
     因此 ok 始终返回 True，通过 modelReady 字段区分实际状态。
     """
     try:
-        detector = PersonDetector()
+        detector = get_profile_person_detector()
         status = detector.status()
 
         return {
