@@ -4,6 +4,7 @@ from unittest.mock import patch
 import numpy as np
 
 import vision.profile_sampling as profile_sampling
+from vision.schema import VisionProfile
 
 
 class FakePersonDetector:
@@ -55,6 +56,24 @@ class ProfileSamplingTest(unittest.TestCase):
 
         self.assertFalse(quality["faceDetected"])
         self.assertLess(quality["faceScore"], 0.45)
+
+    def test_quality_reuses_profile_without_duplicate_detectors(self):
+        image = np.full((240, 320, 3), 128, dtype=np.uint8)
+        profile_sampling._person_detector = FakePersonDetector(None)
+        profile_sampling._face_detector = FakeFaceDetector(None)
+        profile = VisionProfile(
+            age=30,
+            gender="female",
+            body_type="medium",
+            presence=True,
+        )
+
+        quality = profile_sampling.score_frame_quality(image, profile=profile)
+
+        self.assertTrue(quality["personDetected"])
+        self.assertTrue(quality["faceDetected"])
+        self.assertEqual(quality["personScore"], 1.0)
+        self.assertEqual(quality["faceScore"], 1.0)
 
     def test_pre_sampling_finishes_with_two_valid_frames_without_close(self):
         sample = {

@@ -99,7 +99,7 @@ def center_score_for_box(box, image_shape):
     return round(max(0.0, 1.0 - distance / 0.75), 4)
 
 
-def score_frame_quality(image):
+def score_frame_quality(image, profile=None):
     """对一帧图像进行综合质量评分。
 
     评分维度（满分约 1.0）：
@@ -113,8 +113,12 @@ def score_frame_quality(image):
     """
     quality = image_quality(image)
     height, width = image.shape[:2]
-    person_detections = get_profile_person_detector().detect(image)
-    face_detections = get_profile_face_detector().detect_faces(image)
+    person_detections = (
+        [] if profile is not None else get_profile_person_detector().detect(image)
+    )
+    face_detections = (
+        [] if profile is not None else get_profile_face_detector().detect_faces(image)
+    )
 
     # 最佳人体检测结果
     best_person = (
@@ -159,15 +163,23 @@ def score_frame_quality(image):
     # 清晰度评分
     blur_score = min(max(quality["sharpness"], 0.0) / 200.0, 1.0)
 
-    person_detected = bool(
-        best_person
-        and person_score >= settings.PROFILE_SAMPLING_CONFIG.get("min_person_score", 0.35)
-    )
-    face_detected = bool(
-        best_face
-        and face_score >= settings.PROFILE_SAMPLING_CONFIG.get("min_face_score", 0.45)
-        and face_area_ratio >= settings.PROFILE_SAMPLING_CONFIG.get("min_face_area_ratio", 0.01)
-    )
+    if profile is not None:
+        person_detected = bool(profile.presence)
+        person_score = 1.0 if person_detected else 0.0
+        face_detected = bool(
+            profile.age is not None or profile.gender != "unknown"
+        )
+        face_score = 1.0 if face_detected else 0.0
+    else:
+        person_detected = bool(
+            best_person
+            and person_score >= settings.PROFILE_SAMPLING_CONFIG.get("min_person_score", 0.35)
+        )
+        face_detected = bool(
+            best_face
+            and face_score >= settings.PROFILE_SAMPLING_CONFIG.get("min_face_score", 0.45)
+            and face_area_ratio >= settings.PROFILE_SAMPLING_CONFIG.get("min_face_area_ratio", 0.01)
+        )
 
     # 综合质量评分（各维度加权求和）
     score = (
@@ -278,8 +290,10 @@ def sample_frame(source, index, proximity=None, track=None, cancel_event=None):
         image, source_frame = read_camera_with_source("front", warmup_frames=1)
 
     inference_image = resize_for_profile_inference(image)
-    quality = score_frame_quality(inference_image)
     profile = infer_image(inference_image)
+    # The full profile pipeline already performs person, pose, and face
+    # inference. Reuse its result instead of running a second YOLO/face pass.
+    quality = score_frame_quality(inference_image, profile=profile)
 
     # 低质量或不可见人脸不强制输出年龄/性别
     if not quality["faceDetected"]:
