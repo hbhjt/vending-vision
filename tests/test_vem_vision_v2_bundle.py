@@ -194,3 +194,42 @@ def test_vendored_bundle_check_rejects_an_unmanifested_physical_file(tmp_path: P
     (bundle / "unexpected.py").write_text("# tampered\n", encoding="utf-8")
 
     assert "vendored bundle contains missing or unmanifested files" in check_bundle(bundle)
+
+
+def test_vendored_bundle_check_rejects_noncanonical_and_duplicate_manifest_json(
+    tmp_path: Path,
+):
+    pretty_bundle = tmp_path / "pretty"
+    shutil.copytree(BUNDLE_ROOT, pretty_bundle)
+    pretty_manifest = pretty_bundle / "manifest.json"
+    pretty_manifest.write_text(
+        json.dumps(json.loads(pretty_manifest.read_text("utf-8")), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    assert "manifest must use exact canonical JSON" in check_bundle(pretty_bundle)
+
+    duplicate_bundle = tmp_path / "duplicate"
+    shutil.copytree(BUNDLE_ROOT, duplicate_bundle)
+    duplicate_manifest = duplicate_bundle / "manifest.json"
+    raw = duplicate_manifest.read_text("utf-8")
+    duplicate_manifest.write_text(
+        raw.replace('"protocol":"vem.vision.v2",', '"protocol":"vem.vision.v2","protocol":"vem.vision.v2",'),
+        encoding="utf-8",
+    )
+    assert "manifest contains duplicate key: protocol" in check_bundle(duplicate_bundle)
+
+
+@pytest.mark.parametrize(
+    "declared_path", [r"fixtures\\valid.json", "C:/escape.json", "//server/share.json"]
+)
+def test_vendored_bundle_check_rejects_windows_and_unc_manifest_paths(
+    tmp_path: Path, declared_path: str
+):
+    bundle = tmp_path / "windows-path"
+    shutil.copytree(BUNDLE_ROOT, bundle)
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["files"][declared_path] = "a" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert f"manifest path is not canonical: {declared_path!r}" in check_bundle(bundle)

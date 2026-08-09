@@ -11,13 +11,20 @@ from PyInstaller.utils.hooks import (
 
 
 ROOT = Path(SPECPATH)
+CONTRACT_ROOT = ROOT / "contracts" / "vem_vision_v2"
+CONTRACT_DATA_FILES = [
+    (CONTRACT_ROOT / "manifest.json", "contracts/vem_vision_v2"),
+    (CONTRACT_ROOT / "vision-v2.schema.json", "contracts/vem_vision_v2"),
+    (CONTRACT_ROOT / "fixtures" / "valid.json", "contracts/vem_vision_v2/fixtures"),
+    (CONTRACT_ROOT / "fixtures" / "invalid.json", "contracts/vem_vision_v2/fixtures"),
+]
 
 datas = [
     (str(ROOT / "config.json"), "."),
     (str(ROOT / "config"), "config"),
     (str(ROOT / "dashboard"), "dashboard"),
     (str(ROOT / "models"), "models"),
-    (str(ROOT / "contracts"), "contracts"),
+    *[(str(source), destination) for source, destination in CONTRACT_DATA_FILES],
 ]
 datas += collect_data_files("mediapipe")
 datas += collect_data_files("cv2_enumerate_cameras")

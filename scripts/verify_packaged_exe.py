@@ -119,19 +119,42 @@ def wait_for_http(base_url, process, timeout):
     raise TimeoutError(f"service did not start within {timeout}s: {last_error}")
 
 
+def assert_v2_contract_resources(contract_root):
+    expected_contract_resources = {
+        "manifest.json",
+        "vision-v2.schema.json",
+        "fixtures/valid.json",
+        "fixtures/invalid.json",
+    }
+    if not contract_root.is_dir():
+        raise AssertionError(f"missing packaged V2 contract directory: {contract_root}")
+    actual_contract_resources = {
+        path.relative_to(contract_root).as_posix()
+        for path in contract_root.rglob("*")
+        if path.is_file()
+    }
+    if actual_contract_resources != expected_contract_resources:
+        raise AssertionError(
+            "packaged V2 contract resources are not exact: "
+            f"{sorted(actual_contract_resources)}",
+        )
+    if any(path.suffix == ".pyc" for path in contract_root.rglob("*")):
+        raise AssertionError("packaged V2 contract resources must not contain Python bytecode")
+
+
 def assert_bundled_resources(exe_path):
     internal = exe_path.parent / "_internal"
+    contract_root = internal / "contracts" / "vem_vision_v2"
     required = [
         internal / "config.json",
         internal / "dashboard" / "profile_dashboard.html",
         internal / "config" / "vending-vision-camera-maintenance-v2.schema.json",
         internal / "config" / "vending-vision-camera-maintenance-v2.requests.schema.json",
         internal / "config" / "vending-vision-camera-maintenance-v2.responses.schema.json",
-        internal / "contracts" / "vem_vision_v2" / "manifest.json",
-        internal / "contracts" / "vem_vision_v2" / "vision-v2.schema.json",
-        internal / "contracts" / "vem_vision_v2" / "fixtures" / "valid.json",
-        internal / "contracts" / "vem_vision_v2" / "fixtures" / "invalid.json",
-        internal / "contracts" / "vem_vision_v2" / "python" / "vision_v2_models.py",
+        contract_root / "manifest.json",
+        contract_root / "vision-v2.schema.json",
+        contract_root / "fixtures" / "valid.json",
+        contract_root / "fixtures" / "invalid.json",
         internal / "models" / "person_detection" / "person_yolov8n.onnx",
         internal / "models" / "face_detection" / "face_detection_yunet_2023mar.onnx",
         internal / "models" / "age_gender" / "age_net.caffemodel",
@@ -140,6 +163,7 @@ def assert_bundled_resources(exe_path):
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise AssertionError(f"missing packaged resources: {missing}")
+    assert_v2_contract_resources(contract_root)
     retired = [
         internal / "config" / "vending-vision-camera-maintenance-v1.schema.json",
     ]

@@ -5,7 +5,7 @@ import json
 import math
 from pathlib import Path
 from typing import Annotated, Any, Literal, Union
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import urlparse
 
 from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, TypeAdapter, create_model
@@ -94,17 +94,18 @@ def _validate_extensions(value: Any, schema: dict[str, Any]) -> None:
             port = parsed.port
         except (TypeError, ValueError) as error:
             raise ValueError("reference must be a valid loopback URL") from error
-        first_token = next(
-            (token for key, token in parse_qsl(parsed.query, keep_blank_values=True) if key == "token"),
-            None,
-        )
         if (
             parsed.scheme not in {"http", "https"}
             or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
             or parsed.username is not None
             or parsed.password is not None
             or (port is not None and not 1 <= port <= 65535)
-            or not first_token
+            or parsed.fragment
+            or not parsed.query.startswith("token=")
+            or "&" in parsed.query
+            or not parsed.query.removeprefix("token=")
+            or "?" in parsed.query.removeprefix("token=")
+            or len(parsed.query.removeprefix("token=")) > 512
         ):
             raise ValueError("reference must be a tokenized loopback URL")
         return
