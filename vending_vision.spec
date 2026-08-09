@@ -17,6 +17,7 @@ datas = [
     (str(ROOT / "config"), "config"),
     (str(ROOT / "dashboard"), "dashboard"),
     (str(ROOT / "models"), "models"),
+    (str(ROOT / "contracts"), "contracts"),
 ]
 datas += collect_data_files("mediapipe")
 datas += collect_data_files("cv2_enumerate_cameras")
@@ -26,6 +27,8 @@ binaries += collect_dynamic_libs("mediapipe")
 binaries += collect_dynamic_libs("cv2_enumerate_cameras")
 
 hiddenimports = [
+    "vision.v2_contract_bundle",
+    "contracts.vem_vision_v2.python.vision_v2_models",
     "uvicorn.lifespan.on",
     "uvicorn.loops.auto",
     "uvicorn.protocols.http.auto",

@@ -17,6 +17,8 @@ import threading
 import webbrowser
 from pathlib import Path
 
+from vision.v2_contract_bundle import parse_v2_boundary_message
+
 
 def bool_env(name, default=True):
     """安全地读取布尔类型的环境变量。
@@ -57,7 +59,28 @@ def parse_args(argv=None):
         help="VEM 托管的外部现场配置；启用严格的失败关闭模式",
     )
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--verify-v2-contract-bundle",
+        action="store_true",
+        help="verify the frozen V2 bundle accepts and rejects its committed fixtures",
+    )
     return parser.parse_args(argv)
+
+
+def verify_v2_contract_bundle():
+    """Probe the packaged generated contract through one accepted and rejected fixture."""
+    import json
+
+    bundle_root = Path(__file__).resolve().parent / "contracts" / "vem_vision_v2"
+    valid = json.loads((bundle_root / "fixtures" / "valid.json").read_text("utf-8"))
+    invalid = json.loads((bundle_root / "fixtures" / "invalid.json").read_text("utf-8"))
+    parse_v2_boundary_message(valid[0])
+    try:
+        parse_v2_boundary_message(invalid[0]["message"])
+    except ValueError:
+        print("V2 contract bundle probe passed")
+        return
+    raise RuntimeError("V2 contract bundle accepted its rejected fixture")
 
 
 def main():
@@ -65,6 +88,9 @@ def main():
     # PyInstaller 多进程支持
     multiprocessing.freeze_support()
     args = parse_args()
+    if args.verify_v2_contract_bundle:
+        verify_v2_contract_bundle()
+        return
     configure_workdir()
     # 抑制 TensorFlow/MediaPipe 的冗余日志输出
     os.environ.setdefault("GLOG_minloglevel", "2")

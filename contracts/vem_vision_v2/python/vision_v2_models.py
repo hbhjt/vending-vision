@@ -2,20 +2,20 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
+from typing import Annotated, Any, Literal, Union
 from urllib.parse import parse_qsl, urlparse
-from typing import Any, Literal, Union
 
 from jsonschema import Draft202012Validator, FormatChecker
-from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, StrictStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, TypeAdapter, create_model
 
 PROTOCOL = "vem.vision.v2"
 CONTRACT_BUNDLE_VERSION = "1"
 
-# The JSON Schema is generated from the VEM Zod source and is the semantic
-# authority. These strict Pydantic models give Vision typed boundary values;
-# parse_message first applies that exact generated schema to avoid a hand-kept
-# Python validation mirror drifting from the wire contract.
+# This module has no hand-maintained message or field map. The adjacent JSON
+# Schema is generated from VEM Shared Zod and constructs each strict Pydantic
+# payload and envelope model at import time.
 _SCHEMA_PATH = Path(__file__).resolve().parents[1] / "vision-v2.schema.json"
 _SCHEMA = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
 _SCHEMA_VALIDATOR = Draft202012Validator(_SCHEMA, format_checker=FormatChecker())
@@ -23,11 +23,77 @@ _SCHEMA_VALIDATOR = Draft202012Validator(_SCHEMA, format_checker=FormatChecker()
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-class TokenizedLoopbackReferenceModel(StrictModel):
-    @field_validator("reference", check_fields=False)
-    @classmethod
-    def validate_tokenized_loopback_reference(cls, value: StrictStr) -> StrictStr:
-        parsed = urlparse(value)
+def _model_name(value: str) -> str:
+    return "".join(part.capitalize() for part in value.replace(".", "_").split("_"))
+
+def _schema_type(schema: dict[str, Any], name: str) -> Any:
+    if "const" in schema:
+        return Literal[schema["const"]]
+    if "enum" in schema:
+        return Literal[tuple(schema["enum"])]
+    kind = schema.get("type")
+    if kind == "string":
+        return StrictStr
+    if kind == "integer":
+        return StrictInt
+    if kind == "boolean":
+        return StrictBool
+    if kind == "array":
+        return list[_schema_type(schema["items"], f"{name}Item")]
+    if kind == "object":
+        required = set(schema.get("required", []))
+        fields = {
+            field_name: (
+                _schema_type(field_schema, f"{name}{_model_name(field_name)}"),
+                ... if field_name in required else None,
+            )
+            for field_name, field_schema in schema.get("properties", {}).items()
+        }
+        model = create_model(name, __base__=StrictModel, **fields)
+        globals()[name] = model
+        return model
+    raise ValueError(f"unsupported generated schema type for {name}: {kind}")
+
+def _normalize_json_integers(value: Any, schema: dict[str, Any]) -> Any:
+    if "oneOf" in schema and isinstance(value, dict):
+        message_type = value.get("type")
+        for branch in schema["oneOf"]:
+            if branch.get("properties", {}).get("type", {}).get("const") == message_type:
+                return _normalize_json_integers(value, branch)
+        return value
+    if schema.get("type") == "integer":
+        if isinstance(value, bool):
+            raise ValueError("JSON integer fields reject booleans")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+            return int(value)
+        raise ValueError("JSON integer fields require a finite integer")
+    if schema.get("type") == "array" and isinstance(value, list):
+        return [_normalize_json_integers(item, schema["items"]) for item in value]
+    if schema.get("type") == "object" and isinstance(value, dict):
+        return {
+            key: _normalize_json_integers(item, schema["properties"][key])
+            if key in schema.get("properties", {})
+            else item
+            for key, item in value.items()
+        }
+    return value
+
+def _validate_extensions(value: Any, schema: dict[str, Any]) -> None:
+    if "oneOf" in schema and isinstance(value, dict):
+        message_type = value.get("type")
+        for branch in schema["oneOf"]:
+            if branch.get("properties", {}).get("type", {}).get("const") == message_type:
+                _validate_extensions(value, branch)
+                return
+        return
+    if schema.get("description") == "vem.tokenized-loopback-url":
+        try:
+            parsed = urlparse(value)
+            port = parsed.port
+        except (TypeError, ValueError) as error:
+            raise ValueError("reference must be a valid loopback URL") from error
         first_token = next(
             (token for key, token in parse_qsl(parsed.query, keep_blank_values=True) if key == "token"),
             None,
@@ -37,82 +103,32 @@ class TokenizedLoopbackReferenceModel(StrictModel):
             or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
             or parsed.username is not None
             or parsed.password is not None
+            or (port is not None and not 1 <= port <= 65535)
             or not first_token
         ):
             raise ValueError("reference must be a tokenized loopback URL")
-        return value
+        return
+    if schema.get("type") == "array" and isinstance(value, list):
+        for item in value:
+            _validate_extensions(item, schema["items"])
+    if schema.get("type") == "object" and isinstance(value, dict):
+        for key, item in value.items():
+            if key in schema.get("properties", {}):
+                _validate_extensions(item, schema["properties"][key])
 
-class GarmentSource(TokenizedLoopbackReferenceModel):
-    assetId: StrictStr
-    reference: StrictStr
-    digest: StrictStr
-    contentType: Literal["image/png"]
-    byteSize: StrictInt
-    template: Literal["tshirt_short_sleeve", "tshirt_long_sleeve"]
-
-class ResultReference(TokenizedLoopbackReferenceModel):
-    reference: StrictStr
-    digest: StrictStr
-    contentType: Literal["image/png"]
-    byteSize: StrictInt
-    width: StrictInt
-    height: StrictInt
-
-class HelloPayload(StrictModel):
-    clientRole: Literal["machine"]
-    machineCode: StrictStr | None = None
-    contractDigest: StrictStr
-    capabilities: list[StrictStr]
-
-class ReadyPayload(StrictModel):
-    serverName: StrictStr
-    serverVersion: StrictStr
-    contractDigest: StrictStr
-    cameraReady: StrictBool
-    fastReady: StrictBool
-    visionBusinessReady: StrictBool
-    capabilities: list[StrictStr]
-
-class FastAttemptStartPayload(StrictModel):
-    attemptId: StrictStr
-    mode: Literal["fast"]
-    variantId: StrictStr
-    garment: GarmentSource
-
-class AttemptAcceptedPayload(StrictModel):
-    attemptId: StrictStr
-    mode: Literal["fast"]
-
-class AttemptProgressPayload(StrictModel):
-    attemptId: StrictStr
-    stage: Literal["generating"]
-
-class AttemptCompletedPayload(StrictModel):
-    attemptId: StrictStr
-    result: ResultReference
-
-class VisionV2Envelope(StrictModel):
-    protocol: Literal["vem.vision.v2"]
-    type: Literal["vision.hello", "vision.ready", "vision.try_on.attempt.start", "vision.try_on.attempt.accepted", "vision.try_on.attempt.progress", "vision.try_on.attempt.completed"]
-    messageId: StrictStr
-    timestamp: StrictStr
-    payload: dict[str, Any]
-
-Payload = Union[HelloPayload, ReadyPayload, FastAttemptStartPayload, AttemptAcceptedPayload, AttemptProgressPayload, AttemptCompletedPayload]
-
-_PAYLOADS = {
-    "vision.hello": HelloPayload,
-    "vision.ready": ReadyPayload,
-    "vision.try_on.attempt.start": FastAttemptStartPayload,
-    "vision.try_on.attempt.accepted": AttemptAcceptedPayload,
-    "vision.try_on.attempt.progress": AttemptProgressPayload,
-    "vision.try_on.attempt.completed": AttemptCompletedPayload,
-}
+_MESSAGE_MODELS = tuple(
+    _schema_type(branch, _model_name(branch["properties"]["type"]["const"]) + "Envelope")
+    for branch in _SCHEMA["oneOf"]
+)
+for _message_model in _MESSAGE_MODELS:
+    globals()[_message_model.__name__] = _message_model
+VisionV2Envelope = Annotated[Union[tuple(_MESSAGE_MODELS)], Field(discriminator="type")]
+_MESSAGE_ADAPTER = TypeAdapter(VisionV2Envelope)
 
 def parse_message(value: Any) -> VisionV2Envelope:
-    error = next(iter(_SCHEMA_VALIDATOR.iter_errors(value)), None)
+    normalized = _normalize_json_integers(value, _SCHEMA)
+    error = next(iter(_SCHEMA_VALIDATOR.iter_errors(normalized)), None)
     if error is not None:
         raise ValueError(f"invalid {PROTOCOL} message: {error.message}")
-    envelope = VisionV2Envelope.model_validate(value)
-    _PAYLOADS[envelope.type].model_validate(envelope.payload)
-    return envelope
+    _validate_extensions(normalized, _SCHEMA)
+    return _MESSAGE_ADAPTER.validate_python(normalized)

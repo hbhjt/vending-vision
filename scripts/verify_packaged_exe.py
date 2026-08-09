@@ -127,6 +127,11 @@ def assert_bundled_resources(exe_path):
         internal / "config" / "vending-vision-camera-maintenance-v2.schema.json",
         internal / "config" / "vending-vision-camera-maintenance-v2.requests.schema.json",
         internal / "config" / "vending-vision-camera-maintenance-v2.responses.schema.json",
+        internal / "contracts" / "vem_vision_v2" / "manifest.json",
+        internal / "contracts" / "vem_vision_v2" / "vision-v2.schema.json",
+        internal / "contracts" / "vem_vision_v2" / "fixtures" / "valid.json",
+        internal / "contracts" / "vem_vision_v2" / "fixtures" / "invalid.json",
+        internal / "contracts" / "vem_vision_v2" / "python" / "vision_v2_models.py",
         internal / "models" / "person_detection" / "person_yolov8n.onnx",
         internal / "models" / "face_detection" / "face_detection_yunet_2023mar.onnx",
         internal / "models" / "age_gender" / "age_net.caffemodel",
@@ -297,6 +302,19 @@ def main():
         raise FileNotFoundError(exe_path)
 
     assert_bundled_resources(exe_path)
+    probe = subprocess.run(
+        [str(exe_path), "--verify-v2-contract-bundle"],
+        cwd=str(exe_path.parent),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if probe.returncode != 0 or "V2 contract bundle probe passed" not in probe.stdout:
+        raise AssertionError(
+            f"packaged V2 contract probe failed: {probe.stdout}{probe.stderr}",
+        )
     ensure_port_available(args.port)
     managed_port = args.port + 1
     ensure_port_available(managed_port)
