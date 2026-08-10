@@ -1788,7 +1788,10 @@ def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeyp
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
-def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restarts(monkeypatch):
+@pytest.mark.parametrize("stability_round", [1, 2])
+def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restarts(
+    monkeypatch, stability_round
+):
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
     broker = DirectShowCameraBroker(
@@ -1858,7 +1861,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
         assert broker.assert_dead()
         assert broker.active_request_count == 0
 
-        for generation in (2, 3):
+        for generation in range(2, 12):
             registry.cancel_event = asyncio.Event()
             receipt = vision_app.AttemptReceipt(
                 str(uuid4()), f"owner-{generation}", generation
@@ -1869,11 +1872,12 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
             assert frame.shape == (80, 60, 3)
             assert source["brokerPid"] is not None
             assert broker.active_request_count == 0
+        assert stability_round in {1, 2}
 
     try:
         asyncio.run(scenario())
     finally:
-        broker.release()
+        assert asyncio.run(broker.abort_async(reason="test_cleanup"))
         with camera_manager._streams_lock:
             camera_manager._dshow_brokers.pop("front", None)
     assert broker.assert_dead()

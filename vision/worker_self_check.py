@@ -1,153 +1,99 @@
-"""Packaged spawn/shared-memory self-check for V2 try-on worker boundaries."""
+"""Packaged production-worker probe for V2 try-on boundaries."""
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import multiprocessing
 import time
-from multiprocessing import shared_memory
-from uuid import uuid4
 
-from vision.acquisition_observer import acquisition_observer_entry
-from vision.render_worker_target import render_worker_entry
-from vision.shared_ipc_slot import SharedIpcSlot, run_shared_ipc_child
+import cv2
+import numpy as np
+
+from vision.acquisition_observer import AcquisitionObservationWorker
+from vision.attempt_worker import FastRenderBroker
+from vision.fast_tryon import PoseUnavailableError
 
 
-def _shared_slot_self_check_entry(connection) -> None:
-    """Spawn-safe child entry used by the packaged verifier."""
-    # Keep these real production entries import-reachable inside the frozen
-    # child.  The self-check avoids loading camera/model dependencies, but it
-    # catches missing hidden imports and spawn bootstrap regressions at the same
-    # multiprocessing boundary used by acquisition/render workers.
-    if render_worker_entry is None or acquisition_observer_entry is None:
-        raise RuntimeError("try-on worker entries were not importable")
-    connection.send(("ready", {"pid": multiprocessing.current_process().pid}))
-    while True:
-        command, payload = connection.recv()
-        if command == "shutdown":
-            connection.send(("ok", {"stopped": True}))
-            return
-        if command != "self_check":
-            raise RuntimeError(f"unknown worker self-check command: {command}")
-        name = payload.get("frameSharedName")
-        nbytes = payload.get("frameSharedBytes")
-        if not isinstance(name, str) or type(nbytes) is not int or nbytes <= 0:
-            raise RuntimeError("invalid self-check shared frame metadata")
-        shm = shared_memory.SharedMemory(name=name)
-        try:
-            observed = bytes(shm.buf[:nbytes])
-        finally:
-            shm.close()
-        if observed != b"vem-v2-worker-self-check":
-            raise RuntimeError("self-check shared memory payload mismatch")
-        connection.send(
-            (
-                "ok",
-                {
-                    "pngMagic": list(b"\x89PNG\r\n\x1a\n"),
-                    "entries": ["render", "acquisition"],
-                },
-            )
+def _probe_garment_png() -> bytes:
+    garment = np.zeros((128, 128, 4), dtype=np.uint8)
+    points = np.array(
+        [[34, 20], [12, 44], [28, 62], [36, 54], [36, 116], [92, 116],
+         [92, 54], [100, 62], [116, 44], [94, 20]],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(garment, [points], (40, 120, 220, 255))
+    ok, encoded = cv2.imencode(".png", garment)
+    if not ok:
+        raise RuntimeError("production worker probe garment encoding failed")
+    return encoded.tobytes()
+
+
+async def _verify_production_workers() -> None:
+    context = multiprocessing.get_context("spawn")
+    baseline = {child.pid for child in multiprocessing.active_children()}
+    observer = AcquisitionObservationWorker(context=context)
+    renderer = FastRenderBroker(context=context)
+    observation_status = None
+    render_status = None
+    try:
+        observation = await observer.observe(
+            np.zeros((96, 128, 3), dtype=np.uint8), timeout=15.0
         )
+        if observation.occupancy != "none" or observation.aligned:
+            raise RuntimeError(
+                f"production acquisition probe returned invalid observation: {observation}"
+            )
+        if not observation.jpeg.startswith(b"\xff\xd8"):
+            raise RuntimeError("production acquisition probe returned invalid JPEG")
+        observation_status = observation.occupancy
+
+        await renderer.start()
+        garment_png = _probe_garment_png()
+        try:
+            result = await renderer.render(
+                {
+                    "frame": np.zeros((192, 256, 3), dtype=np.uint8),
+                    "garmentPng": garment_png,
+                    "garmentDigest": "sha256:" + hashlib.sha256(garment_png).hexdigest(),
+                    "template": "tshirt_short_sleeve",
+                },
+                deadline=time.monotonic() + 15.0,
+            )
+        except PoseUnavailableError:
+            render_status = "pose_unavailable"
+        else:
+            decoded = cv2.imdecode(np.frombuffer(result, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if decoded is None:
+                raise RuntimeError("production render probe returned an invalid image")
+            render_status = "png"
+    finally:
+        observer_error = renderer_error = None
+        try:
+            await observer.shutdown()
+        except BaseException as exc:
+            observer_error = exc
+        try:
+            await renderer.shutdown()
+        except BaseException as exc:
+            renderer_error = exc
+        if observer_error is not None or renderer_error is not None:
+            raise RuntimeError(
+                f"production worker probe cleanup failed: observer={observer_error}; "
+                f"render={renderer_error}"
+            )
+
+    remaining = {
+        child.pid for child in multiprocessing.active_children()
+        if child.pid not in baseline
+    }
+    if remaining:
+        raise RuntimeError(f"production worker probe leaked children: {sorted(remaining)}")
+    print(f"production acquisition observation: {observation_status}")
+    print(f"production render response: {render_status}")
 
 
 def verify_v2_try_on_workers() -> None:
-    """Exercise the frozen spawn/shared-memory worker boundary without cameras."""
+    """Execute real frozen production entries through their shared IPC slots."""
     multiprocessing.freeze_support()
-    context = multiprocessing.get_context("spawn")
-    slot = SharedIpcSlot(
-        context=context,
-        name_prefix="vem_worker_probe",
-        request_bytes=0,
-        response_bytes=64 * 1024,
-    )
-    frame_shm = shared_memory.SharedMemory(
-        create=True,
-        size=len(b"vem-v2-worker-self-check"),
-        name=f"vem_worker_probe_{uuid4().hex}",
-    )
-    process = None
-    try:
-        frame_shm.buf[: len(b"vem-v2-worker-self-check")] = b"vem-v2-worker-self-check"
-        slot_config = dict(slot.config)
-        slot_config["expectedProcessGeneration"] = 1
-        process = context.Process(
-            target=run_shared_ipc_child,
-            args=(_shared_slot_self_check_entry, slot_config, ()),
-            daemon=True,
-        )
-        process.start()
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and not slot.poll_response():
-            if not process.is_alive():
-                raise RuntimeError(f"try-on worker self-check exited early: {process.exitcode}")
-            time.sleep(0.01)
-        if not slot.poll_response():
-            raise TimeoutError("try-on worker self-check readiness timed out")
-        kind, payload, process_generation, request_generation = slot.recv_response()
-        if (
-            kind != "ready"
-            or not isinstance(payload, dict)
-            or payload.get("pid") != process.pid
-            or process_generation != 0
-            or request_generation != 0
-        ):
-            raise RuntimeError(f"invalid try-on worker self-check readiness: {kind} {payload}")
-        slot.submit(
-            "self_check",
-            {
-                "frameSharedName": frame_shm.name,
-                "frameSharedBytes": len(b"vem-v2-worker-self-check"),
-            },
-            process_generation=1,
-            request_generation=1,
-        )
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and not slot.poll_response():
-            if not process.is_alive():
-                raise RuntimeError(f"try-on worker self-check exited during request: {process.exitcode}")
-            time.sleep(0.01)
-        if not slot.poll_response():
-            raise TimeoutError("try-on worker self-check request timed out")
-        kind, payload, process_generation, request_generation = slot.recv_response(
-            expected_process_generation=1,
-            expected_request_generation=1,
-        )
-        if kind != "ok" or payload.get("pngMagic") != list(b"\x89PNG\r\n\x1a\n"):
-            raise RuntimeError(f"invalid try-on worker self-check result: {kind} {payload}")
-        if set(payload.get("entries", [])) != {"render", "acquisition"}:
-            raise RuntimeError(f"try-on worker entry imports were incomplete: {payload}")
-        slot.submit(
-            "shutdown",
-            None,
-            process_generation=1,
-            request_generation=2,
-        )
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and not slot.poll_response():
-            if not process.is_alive():
-                break
-            time.sleep(0.01)
-        if slot.poll_response():
-            slot.recv_response(expected_process_generation=1, expected_request_generation=2)
-        process.join(timeout=5.0)
-        if process.is_alive():
-            raise RuntimeError("try-on worker self-check did not stop")
-        if process.exitcode not in {0, None}:
-            raise RuntimeError(f"try-on worker self-check failed with {process.exitcode}")
-    finally:
-        try:
-            frame_shm.close()
-        finally:
-            try:
-                frame_shm.unlink()
-            except FileNotFoundError:
-                pass
-        slot.close(unlink=True)
-        if process is not None:
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=5.0)
-            try:
-                process.close()
-            except Exception:
-                pass
+    asyncio.run(_verify_production_workers())

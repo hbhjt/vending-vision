@@ -29,8 +29,7 @@ from vision.shared_ipc_slot import SharedIpcError, SharedIpcSlot, run_shared_ipc
 MAX_FRAME_WIDTH = 1920
 MAX_FRAME_HEIGHT = 1080
 MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
-STOP_CONFIRM_TIMEOUT_SECONDS = 0.05
-ABORT_CONTROL_TIMEOUT_SECONDS = 1.0
+STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
 _ACQ_SHARED_NAME = re.compile(r"^vem_acq_[0-9a-f]{32}$")
 
 
@@ -289,7 +288,14 @@ def acquisition_observer_entry(connection: Connection) -> None:
 class AcquisitionObservationWorker:
     """One prewarmed child and one non-queued request slot."""
 
-    def __init__(self, *, context=None, target=acquisition_observer_entry, target_args=()):
+    def __init__(
+        self,
+        *,
+        context=None,
+        target=acquisition_observer_entry,
+        target_args=(),
+        stop_timeout_seconds: float = STOP_CONFIRM_TIMEOUT_SECONDS,
+    ):
         self._context = context
         self._target = target
         self._target_args = tuple(target_args)
@@ -304,6 +310,8 @@ class AcquisitionObservationWorker:
         self._generation = 0
         self._request_generation = 0
         self._start_lock = asyncio.Lock()
+        self._stop_lock = asyncio.Lock()
+        self._stop_timeout_seconds = max(float(stop_timeout_seconds), 0.001)
 
     def _mp_context(self):
         multiprocessing.freeze_support()
@@ -394,9 +402,16 @@ class AcquisitionObservationWorker:
                     continue
             start_task.result()
             if cancelled:
-                await asyncio.to_thread(
-                    self.abort, reason="acquisition_observer_start_cancelled"
+                cleanup = asyncio.create_task(
+                    self.abort_async(reason="acquisition_observer_start_cancelled"),
+                    name="acquisition-observer-start-cancel-cleanup",
                 )
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                cleanup.result()
                 raise asyncio.CancelledError
             deadline = time.monotonic() + 15.0
             while time.monotonic() < deadline:
@@ -484,8 +499,18 @@ class AcquisitionObservationWorker:
                 await asyncio.sleep(0.002)
             raise TimeoutError("acquisition observation deadline exceeded")
         except asyncio.CancelledError:
-            await asyncio.shield(self.abort_async(reason="observation_cancelled"))
-            raise
+            cancelled = asyncio.CancelledError()
+            cleanup = asyncio.create_task(
+                self.abort_async(reason="observation_cancelled"),
+                name="acquisition-observer-cancel-cleanup",
+            )
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
+            raise cancelled
         except BaseException:
             await self.abort_async(reason="observation_failed")
             raise
@@ -550,26 +575,9 @@ class AcquisitionObservationWorker:
                         process.terminate()
                     except (AttributeError, NotImplementedError, OSError, PermissionError) as exc:
                         errors.append(f"terminate {type(exc).__name__}: {exc}")
-                _wait_process_dead(process, STOP_CONFIRM_TIMEOUT_SECONDS)
             if process.is_alive():
-                try:
-                    process.terminate()
-                except (AttributeError, NotImplementedError, OSError, PermissionError) as exc:
-                    errors.append(f"terminate {type(exc).__name__}: {exc}")
-                _wait_process_dead(process, STOP_CONFIRM_TIMEOUT_SECONDS)
+                _wait_process_dead(process, self._stop_timeout_seconds)
             if process.is_alive():
-                if _wait_process_dead(process, 0.05):
-                    _close_dead_process(process)
-                    if slot is not None:
-                        slot.close(unlink=True)
-                    with self._state_lock:
-                        if self._process is process:
-                            self._parent = None
-                            self._process = None
-                            self._slot = None
-                            self._generation += 1
-                            self._fatal_error = None
-                    return True
                 with self._state_lock:
                     self._parent = parent
                     self._process = process
@@ -588,22 +596,87 @@ class AcquisitionObservationWorker:
         return True
 
     async def abort_async(self, *, reason: str) -> bool:
+        async with self._stop_lock:
+            return await self._abort_async_once(reason=reason)
+
+    async def _abort_async_once(self, *, reason: str) -> bool:
+        """Stop physically, preserving the live handle until death is observed."""
+        with self._state_lock:
+            parent, process, slot = self._parent, self._process, self._slot
+            self._ready = False
+            self._request_generation = 0
+        if parent is not None:
+            try:
+                parent.close()
+            except Exception:
+                pass
+        if process is None:
+            if slot is not None:
+                slot.close(unlink=True)
+            with self._state_lock:
+                if self._process is None:
+                    self._parent = None
+                    self._slot = None
+                    self._generation += 1
+                    self._fatal_error = None
+            return True
+
+        errors: list[str] = []
+
+        def signal_stop() -> None:
+            if not process.is_alive():
+                return
+            if _should_call_kill(process):
+                try:
+                    process.kill()
+                    return
+                except (AttributeError, NotImplementedError):
+                    pass
+                except (OSError, PermissionError) as exc:
+                    errors.append(f"kill {type(exc).__name__}: {exc}")
+            try:
+                process.terminate()
+            except (AttributeError, NotImplementedError, OSError, PermissionError) as exc:
+                errors.append(f"terminate {type(exc).__name__}: {exc}")
+
+        control = asyncio.create_task(
+            asyncio.to_thread(signal_stop),
+            name="acquisition-observer-stop-signal",
+        )
+        while not control.done():
+            try:
+                await asyncio.shield(control)
+            except asyncio.CancelledError:
+                continue
         try:
-            dead = await asyncio.to_thread(self.abort, reason=reason)
+            control.result()
         except BaseException as exc:
+            errors.append(f"control {type(exc).__name__}: {exc}")
+
+        deadline = asyncio.get_running_loop().time() + self._stop_timeout_seconds
+        while process.is_alive() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        if process.is_alive():
             with self._state_lock:
-                self._ready = False
-                self._fatal_error = (
-                    f"{reason}: {type(exc).__name__}: {exc}"
-                )
-            dead = False
-        idle = await self.wait_idle(timeout=0.02)
-        if not idle:
-            with self._state_lock:
-                self._fatal_error = reason
-                self._active_request = False
+                if self._process is process:
+                    self._parent = parent
+                    self._process = process
+                    self._slot = slot
+                    detail = "; ".join(errors)
+                    self._fatal_error = f"{reason}: {detail}" if detail else reason
             return False
-        return bool(dead)
+
+        _close_dead_process(process)
+        if slot is not None:
+            slot.close(unlink=True)
+        with self._state_lock:
+            if self._process is process:
+                self._parent = None
+                self._process = None
+                self._slot = None
+                self._generation += 1
+                self._fatal_error = None
+        return True
 
     async def shutdown(self) -> None:
         with self._state_lock:

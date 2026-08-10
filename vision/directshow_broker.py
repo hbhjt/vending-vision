@@ -25,9 +25,15 @@ MAX_FRAME_BYTES = 32 * 1024 * 1024
 MAX_FRAME_WIDTH = 4096
 MAX_FRAME_HEIGHT = 4096
 DEFAULT_READ_TIMEOUT_SECONDS = 10.0
-STOP_CONFIRM_TIMEOUT_SECONDS = 1.0
+STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
 GRACEFUL_STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
-ABORT_CONTROL_TIMEOUT_SECONDS = 1.0
+
+
+def _is_process_alive(process: Any) -> bool:
+    try:
+        return bool(process.is_alive())
+    except (OSError, PermissionError, ValueError):
+        return False
 
 
 def _wait_process_dead(process: Any, timeout: float) -> bool:
@@ -60,7 +66,11 @@ def _wait_process_dead(process: Any, timeout: float) -> bool:
 
 
 def _close_dead_process(process: Any) -> None:
-    if getattr(process, "sentinel", None) is None:
+    try:
+        sentinel = getattr(process, "sentinel", None)
+    except ValueError:
+        return
+    if sentinel is None:
         return
     close = getattr(process, "close", None)
     if close is not None:
@@ -228,6 +238,7 @@ class DirectShowCameraBroker:
         *,
         context=None,
         target=directshow_broker_entry,
+        stop_timeout_seconds: float = STOP_CONFIRM_TIMEOUT_SECONDS,
     ):
         self.role = role
         self.config = dict(config)
@@ -249,6 +260,8 @@ class DirectShowCameraBroker:
         self.frame_count = 0
         self.restart_count = 0
         self.last_pid: int | None = None
+        self._stop_timeout_seconds = max(float(stop_timeout_seconds), 0.001)
+        self._async_stop_lock = asyncio.Lock()
 
     @property
     def pid(self) -> int | None:
@@ -352,18 +365,9 @@ class DirectShowCameraBroker:
                         terminate_process("terminate-after-kill-error")
                 else:
                     terminate_process("terminate-fallback")
-                _wait_process_dead(process, STOP_CONFIRM_TIMEOUT_SECONDS)
             if process.is_alive():
-                terminate_process("terminate")
-                _wait_process_dead(process, STOP_CONFIRM_TIMEOUT_SECONDS)
+                _wait_process_dead(process, self._stop_timeout_seconds)
             if process.is_alive():
-                if _wait_process_dead(process, 0.05):
-                    _close_dead_process(process)
-                    self._parent = None
-                    self._process = None
-                    self.opened_at = None
-                    self._fatal_error = None
-                    return True
                 # Fail closed.  The live process handle is the only truthful
                 # proof that the physical-camera owner may still exist.
                 self._parent = parent
@@ -387,9 +391,6 @@ class DirectShowCameraBroker:
         timeout: float | None = None,
         _slot_owned: bool = False,
     ):
-        deadline = time.monotonic() + (
-            DEFAULT_READ_TIMEOUT_SECONDS if timeout is None else max(float(timeout), 0.001)
-        )
         if not _slot_owned and not self._request_slot.acquire(blocking=False):
             raise RuntimeError("directshow broker already has an active request")
         try:
@@ -399,6 +400,11 @@ class DirectShowCameraBroker:
                 parent = self._parent
                 process = self._process
                 self._parent.send((command, payload))
+            deadline = time.monotonic() + (
+                DEFAULT_READ_TIMEOUT_SECONDS
+                if timeout is None
+                else max(float(timeout), 0.001)
+            )
             while time.monotonic() < deadline:
                 if parent.poll(0.005):
                     kind, response = parent.recv()
@@ -415,7 +421,8 @@ class DirectShowCameraBroker:
             self._stop_process(graceful=False, reason="request_abort_failed")
             raise
         finally:
-            self._request_slot.release()
+            if not _slot_owned:
+                self._request_slot.release()
 
     async def _request_async(
         self, command: str, payload=None, *, timeout: float | None = None
@@ -454,12 +461,16 @@ class DirectShowCameraBroker:
             while not done.is_set():
                 await asyncio.sleep(0.002)
         except asyncio.CancelledError:
-            while True:
+            cleanup = asyncio.create_task(
+                self.abort_async(reason="request_cancelled"),
+                name=f"directshow-{self.role}-cancel-cleanup",
+            )
+            while not cleanup.done():
                 try:
-                    await asyncio.shield(self.abort_async(reason="request_cancelled"))
-                    break
+                    await asyncio.shield(cleanup)
                 except asyncio.CancelledError:
                     continue
+            cleanup.result()
             while not done.is_set():
                 try:
                     await asyncio.shield(asyncio.sleep(0.002))
@@ -468,32 +479,97 @@ class DirectShowCameraBroker:
             thread.join()
             with self._state_lock:
                 self._request_threads.discard(thread)
+            self._request_slot.release()
             raise
         thread.join()
         with self._state_lock:
             self._request_threads.discard(thread)
+        self._request_slot.release()
         if "error" in outcome:
             raise outcome["error"]
         return outcome["value"]
 
     async def abort_async(self, *, reason: str = "request_aborted") -> bool:
-        """Abort with bounded process control, then await request thread exit."""
-        try:
-            dead = await asyncio.to_thread(
-                self._stop_process, graceful=False, reason=reason
+        """Confirm physical death and request-thread join before admitting a restart."""
+        async with self._async_stop_lock:
+            with self._state_lock:
+                parent = self._parent
+                process = self._process
+                threads = list(self._request_threads)
+            if parent is not None:
+                try:
+                    parent.close()
+                except Exception:
+                    pass
+            errors: list[str] = []
+
+            def signal_stop() -> None:
+                if process is None or not process.is_alive():
+                    return
+                if _should_call_kill(process):
+                    try:
+                        process.kill()
+                        return
+                    except (AttributeError, NotImplementedError):
+                        pass
+                    except (OSError, PermissionError) as exc:
+                        errors.append(f"kill {type(exc).__name__}: {exc}")
+                try:
+                    process.terminate()
+                except (AttributeError, NotImplementedError, OSError, PermissionError) as exc:
+                    errors.append(f"terminate {type(exc).__name__}: {exc}")
+
+            control = asyncio.create_task(
+                asyncio.to_thread(signal_stop),
+                name=f"directshow-{self.role}-stop-signal",
             )
-        except BaseException as exc:
+            while not control.done():
+                try:
+                    await asyncio.shield(control)
+                except asyncio.CancelledError:
+                    continue
+            try:
+                control.result()
+            except BaseException as exc:
+                errors.append(f"control {type(exc).__name__}: {exc}")
+
+            deadline = asyncio.get_running_loop().time() + self._stop_timeout_seconds
+            while (
+                process is not None
+                and _is_process_alive(process)
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.01)
+            while (
+                any(thread.is_alive() for thread in threads)
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.01)
+            for thread in threads:
+                if not thread.is_alive() and thread is not threading.current_thread():
+                    thread.join(timeout=0)
+
+            process_alive = process is not None and _is_process_alive(process)
+            threads_alive = any(thread.is_alive() for thread in threads)
+            if process_alive or threads_alive:
+                detail = "; ".join(errors)
+                suffix = "request thread remained alive" if threads_alive else "process remained alive"
+                with self._state_lock:
+                    self._fatal_error = f"{reason}: {detail}; {suffix}" if detail else f"{reason}: {suffix}"
+                return False
+
+            if process is not None:
+                _close_dead_process(process)
             with self._state_lock:
-                self._fatal_error = f"{reason}: control {type(exc).__name__}: {exc}"
-            dead = False
-        deadline = time.monotonic() + ABORT_CONTROL_TIMEOUT_SECONDS
-        while self.active_request_count and time.monotonic() < deadline:
-            await asyncio.sleep(0.01)
-        if self.active_request_count and not dead:
-            with self._state_lock:
-                self._fatal_error = f"{reason}: request thread remained alive"
-            return False
-        return bool(dead)
+                if self._process is process:
+                    self._parent = None
+                    self._process = None
+                    self.opened_at = None
+                self._request_threads = {
+                    thread for thread in self._request_threads if thread.is_alive()
+                }
+                self._fatal_error = None
+            return True
 
     def abort(self, *, reason: str = "request_aborted") -> bool:
         dead = self._stop_process(graceful=False, reason=reason)

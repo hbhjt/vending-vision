@@ -191,10 +191,13 @@ class FastRenderBroker:
         self._ready = False
         self._pose_ready = True
         self._quiesced = False
+        self._shutdown_in_progress = False
         self._request_threads: set[threading.Thread] = set()
         self._active_request = False
         self._process_generation = 0
         self._request_generation = 0
+        self._start_lock = asyncio.Lock()
+        self._start_task: asyncio.Task | None = None
 
     def _mp_context(self):
         if self._context is not None:
@@ -396,11 +399,38 @@ class FastRenderBroker:
                 raise AttemptWorkerError(
                     f"render broker is unavailable: {self._fatal_error}"
                 )
+            if self._shutdown_in_progress:
+                raise AttemptWorkerError("render broker is shutting down")
+            # Only an explicit owner start may reopen a broker after completed
+            # shutdown. Request-side recovery calls _start_async directly and
+            # must remain barred once shutdown has quiesced the broker.
             self._quiesced = False
         await self._start_async()
 
     async def _start_async(self) -> None:
-        """Start and prewarm the broker without blocking the event loop."""
+        """Join one broker-owned start task without propagating caller cancellation."""
+        async with self._start_lock:
+            with self._state_lock:
+                self._reconcile_dead_shutdown_locked()
+                if self._fatal_error is not None:
+                    raise AttemptWorkerError(
+                        f"render broker is unavailable: {self._fatal_error}"
+                    )
+                if self._process is not None and _process_is_alive(self._process):
+                    if self._ready:
+                        return
+                if self._quiesced:
+                    raise AttemptWorkerError("render broker is shut down")
+                task = self._start_task
+                if task is None or task.done():
+                    task = asyncio.create_task(
+                        self._start_once(), name="fast-render-shared-start"
+                    )
+                    self._start_task = task
+        await asyncio.shield(task)
+
+    async def _start_once(self) -> None:
+        """Start and prewarm exactly one process without holding a thread lock across await."""
         with self._state_lock:
             self._reconcile_dead_shutdown_locked()
             if self._fatal_error is not None:
@@ -433,40 +463,31 @@ class FastRenderBroker:
                 args=(self._target, slot_config, self._target_args),
                 daemon=True,
             )
-            cancelled = False
-            start_task = asyncio.create_task(
-                asyncio.to_thread(process.start),
-                name="fast-render-start",
-            )
-            while not start_task.done():
-                try:
-                    await asyncio.shield(start_task)
-                except asyncio.CancelledError:
-                    cancelled = True
-                    continue
+        start_task = asyncio.create_task(
+            asyncio.to_thread(process.start),
+            name="fast-render-process-start",
+        )
+        while not start_task.done():
             try:
-                start_task.result()
-            except BaseException as exc:
-                slot.close(unlink=True)
-                try:
-                    process.close()
-                except Exception:
-                    pass
+                await asyncio.shield(start_task)
+            except asyncio.CancelledError:
+                continue
+        try:
+            start_task.result()
+        except BaseException as exc:
+            slot.close(unlink=True)
+            try:
+                process.close()
+            except Exception:
+                pass
+            with self._state_lock:
                 self._fatal_error = (
                     f"render_broker_start_failed: {type(exc).__name__}: {exc}"
                 )
-                raise AttemptWorkerError(
-                    f"render broker is unavailable: {self._fatal_error}"
-                ) from exc
-            if cancelled:
-                self._parent = None
-                self._process = process
-                self._slot = slot
-                self._ready = False
-                self._process_generation = next_process_generation
-                self._request_generation = 0
-                self._stop_sync(graceful=False, reason="render_broker_start_cancelled")
-                raise asyncio.CancelledError
+            raise AttemptWorkerError(
+                f"render broker is unavailable: {self._fatal_error}"
+            ) from exc
+        with self._state_lock:
             self._parent = None
             self._process = process
             self._slot = slot
@@ -638,7 +659,24 @@ class FastRenderBroker:
             return True
 
     async def shutdown(self) -> None:
-        self.quiesce()
+        with self._state_lock:
+            self._quiesced = True
+            self._shutdown_in_progress = True
+        async with self._start_lock:
+            start_task = self._start_task
+        if start_task is not None:
+            while not start_task.done():
+                try:
+                    await asyncio.shield(start_task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if start_task.done():
+                try:
+                    start_task.result()
+                except BaseException:
+                    pass
 
         def stop_and_join_requests() -> bool:
             dead = self._stop_sync(
@@ -695,7 +733,11 @@ class FastRenderBroker:
                     and not self._active_request
                 )
         if not dead:
+            with self._state_lock:
+                self._shutdown_in_progress = False
             raise AttemptWorkerError("render broker shutdown incomplete")
+        with self._state_lock:
+            self._shutdown_in_progress = False
 
     def _request_sync(self, payload: dict, deadline: float):
         shm = None

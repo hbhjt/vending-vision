@@ -1,5 +1,7 @@
 from pathlib import Path
 import re
+import subprocess
+import sys
 
 
 ROOT = Path(__file__).parents[1]
@@ -64,6 +66,25 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     assert "retired modules remain in packaged archive" in verifier
     assert "retired_try_on_route" in verifier
     assert "assert_no_worker_resource_leak_output" in verifier
+
+
+def test_worker_probe_executes_production_observation_and_render_ipc():
+    probe = subprocess.run(
+        [sys.executable, str(ROOT / "run_vision_server.py"), "--verify-v2-try-on-workers"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+    )
+    combined = f"{probe.stdout}{probe.stderr}"
+    assert probe.returncode == 0, combined
+    assert "production acquisition observation: none" in probe.stdout
+    assert "production render response:" in probe.stdout
+    assert "resource_tracker" not in combined
+    assert "leaked shared_memory" not in combined
 
 
 def test_frozen_runtime_keeps_the_spawn_safe_render_worker_entry():

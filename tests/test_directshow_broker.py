@@ -176,10 +176,10 @@ def test_stubborn_process_is_retained_and_broker_fails_closed_without_restart():
             return True
 
         def kill(self):
-            return None
+            raise OSError("kill denied")
 
         def terminate(self):
-            return None
+            raise PermissionError("terminate denied")
 
         def join(self, timeout=None):
             return None
@@ -281,14 +281,11 @@ def test_abort_async_control_error_returns_failure_by_deadline_without_thread_le
         def join(self, timeout=None):
             return None
 
-    broker = DirectShowCameraBroker("front", _broker_config())
+    broker = DirectShowCameraBroker(
+        "front", _broker_config(), stop_timeout_seconds=0.05
+    )
     live = LiveProcess()
     broker._process = live
-
-    def abort_raises(*, reason):
-        raise OSError(f"{reason}: windows control denied")
-
-    broker.abort = abort_raises
 
     async def scenario():
         result = await asyncio.wait_for(
@@ -330,7 +327,9 @@ def test_abort_async_does_not_call_stubborn_blocking_join_before_dead():
                 while True:
                     time.sleep(1)
 
-    broker = DirectShowCameraBroker("front", _broker_config())
+    broker = DirectShowCameraBroker(
+        "front", _broker_config(), stop_timeout_seconds=0.05
+    )
     live = LiveProcess()
     broker._process = live
 

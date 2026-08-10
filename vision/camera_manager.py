@@ -364,13 +364,40 @@ class DirectShowFrameSource:
             if candidate_id in _maintenance_candidates:
                 raise RuntimeError("camera runtime is quiesced for maintenance")
             broker = _dshow_brokers.get(self.role)
-            if broker is None or broker.config != {**self.config, "logicalRole": self.role}:
+            expected = {**self.config, "logicalRole": self.role}
+            if broker is None or any(
+                broker.config.get(key) != value for key, value in expected.items()
+            ):
                 if broker is not None:
                     if not broker.release():
                         raise RuntimeError("previous directshow broker is still alive")
                 broker = DirectShowCameraBroker(self.role, self.config)
                 _dshow_brokers[self.role] = broker
             return broker
+
+    async def _broker_async(self) -> DirectShowCameraBroker:
+        """Resolve a generation without blocking the event loop on prior-owner stop."""
+        expected = {**self.config, "logicalRole": self.role}
+        while True:
+            with _streams_lock:
+                candidate_id = self.config.get("stableId")
+                if candidate_id in _maintenance_candidates:
+                    raise RuntimeError("camera runtime is quiesced for maintenance")
+                broker = _dshow_brokers.get(self.role)
+                if broker is None:
+                    broker = DirectShowCameraBroker(self.role, self.config)
+                    _dshow_brokers[self.role] = broker
+                    return broker
+                matches = all(
+                    broker.config.get(key) == value for key, value in expected.items()
+                )
+                if matches:
+                    return broker
+            if not await broker.abort_async(reason="camera_configuration_changed"):
+                raise RuntimeError("previous directshow broker is still alive")
+            with _streams_lock:
+                if _dshow_brokers.get(self.role) is broker:
+                    _dshow_brokers.pop(self.role, None)
 
     def read(self, warmup_frames: int | None = None, *, timeout: float | None = None):
         attempts = max(1, int(settings.CAMERA_READ_RETRY_COUNT) + 1)
@@ -437,7 +464,8 @@ class DirectShowFrameSource:
                 remaining = timeout
                 if deadline is not None:
                     remaining = max(deadline - loop.time(), 0.001)
-                image = await self._broker().read_async(
+                broker = await self._broker_async()
+                image = await broker.read_async(
                     warmup_frames=warmup_frames, timeout=remaining
                 )
                 metrics.increment("camera_read_success_total", role=self.role)

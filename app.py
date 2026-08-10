@@ -318,10 +318,12 @@ async def _read_attempt_front_frame(
                 abort_camera_request("front", reason="try_on_attempt_cancelled")
             )
             read_task.cancel()
-            dead = await asyncio.shield(abort_task)
-            await asyncio.shield(asyncio.gather(read_task, return_exceptions=True))
+            dead = await _await_cleanup_uncancelled(abort_task)
+            await _await_cleanup_uncancelled(
+                asyncio.gather(read_task, return_exceptions=True)
+            )
             if not dead:
-                dead = await asyncio.shield(
+                dead = await _await_cleanup_uncancelled(
                     abort_camera_request("front", reason="try_on_attempt_cancelled_confirm")
                 )
             if not dead:

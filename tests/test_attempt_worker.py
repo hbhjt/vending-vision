@@ -108,6 +108,21 @@ def _block_first_render_target(connection, counter):
         connection.close()
 
 
+def _delayed_ready_render_target(connection, starts, ready_gate):
+    with starts.get_lock():
+        starts.value += 1
+    ready_gate.wait(timeout=5.0)
+    connection.send(("ready", {"pid": os.getpid(), "poseReady": True}))
+    try:
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+    finally:
+        connection.close()
+
+
 def _corrupt_ready_render_target(connection):
     message = {
         "kind": "ready",
@@ -1051,68 +1066,42 @@ def test_render_pid_probe_never_touches_unowned_multiprocessing_children():
         unrelated.close()
 
 
-def test_async_render_start_ticks_and_cancel_stops_new_child_before_barrier_release():
-    real_context = multiprocessing.get_context("spawn")
-
-    class SlowStartProcess:
-        pid = 7071
-        exitcode = None
-
-        def __init__(self, **_kwargs):
-            self._alive = False
-            self.kill_attempted = False
-
-        def start(self):
-            time.sleep(0.2)
-            self._alive = True
-
-        def is_alive(self):
-            return self._alive
-
-        def kill(self):
-            self.kill_attempted = True
-            self._alive = False
-
-        def terminate(self):
-            self._alive = False
-
-        def close(self):
-            return None
-
-    class Context:
-        def __init__(self):
-            self.process = SlowStartProcess()
-
-        def Event(self):
-            return real_context.Event()
-
-        def Lock(self):
-            return real_context.Lock()
-
-        def Process(self, **_kwargs):
-            return self.process
+def test_cancelled_render_start_caller_does_not_cancel_shared_worker_start():
+    context = multiprocessing.get_context("spawn")
+    starts = context.Value("i", 0)
+    ready_gate = context.Event()
 
     async def scenario():
-        context = Context()
-        broker = FastRenderBroker(context=context)
-        task = asyncio.create_task(broker.start())
-        await asyncio.sleep(0.05)
+        broker = FastRenderBroker(
+            context=context,
+            target=_delayed_ready_render_target,
+            target_args=(starts, ready_gate),
+        )
+        cancelled_caller = asyncio.create_task(broker.start())
+        surviving_caller = asyncio.create_task(broker.start())
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while starts.value < 1 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
         ticks = 0
         deadline = asyncio.get_running_loop().time() + 0.05
         while asyncio.get_running_loop().time() < deadline:
             ticks += 1
-            task.cancel()
+            cancelled_caller.cancel()
             await asyncio.sleep(0.005)
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=1.0)
-        return context.process, broker, ticks
+            await cancelled_caller
+        assert not surviving_caller.done()
+        ready_gate.set()
+        await asyncio.wait_for(surviving_caller, timeout=2.0)
+        pid = broker.pid
+        await broker.shutdown()
+        return pid, ticks
 
-    process, broker, ticks = asyncio.run(scenario())
+    pid, ticks = asyncio.run(scenario())
 
     assert ticks >= 5
-    assert process.kill_attempted is True
-    assert process.is_alive() is False
-    assert broker.ready is False
+    assert starts.value == 1
+    assert pid is not None
 
 
 def test_concurrent_render_start_is_rejected_without_worker_or_queue_growth():
@@ -1167,6 +1156,117 @@ def test_concurrent_render_start_is_rejected_without_worker_or_queue_growth():
         await broker.shutdown()
 
     asyncio.run(scenario())
+
+
+def test_concurrent_render_starts_join_one_shared_worker():
+    context = multiprocessing.get_context("spawn")
+    starts = context.Value("i", 0)
+    ready_gate = context.Event()
+    baseline = {child.pid for child in multiprocessing.active_children()}
+
+    async def scenario():
+        broker = FastRenderBroker(
+            context=context,
+            target=_delayed_ready_render_target,
+            target_args=(starts, ready_gate),
+        )
+        callers = [asyncio.create_task(broker.start()) for _ in range(3)]
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while starts.value < 1 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        ready_gate.set()
+        outcomes = await asyncio.gather(*callers, return_exceptions=True)
+        pid = broker.pid
+        try:
+            assert outcomes == [None, None, None]
+            assert starts.value == 1
+            assert pid is not None
+            assert {
+                child.pid for child in multiprocessing.active_children()
+                if child.pid not in baseline
+            } == {pid}
+        finally:
+            await broker.shutdown()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        ready_gate.set()
+        for child in multiprocessing.active_children():
+            if child.pid in baseline:
+                continue
+            if child.is_alive():
+                child.kill()
+            child.join(timeout=2.0)
+
+
+def test_render_shutdown_waits_for_shared_start_then_stops_the_worker():
+    context = multiprocessing.get_context("spawn")
+    starts = context.Value("i", 0)
+    ready_gate = context.Event()
+
+    async def scenario():
+        broker = FastRenderBroker(
+            context=context,
+            target=_delayed_ready_render_target,
+            target_args=(starts, ready_gate),
+        )
+        starting = asyncio.create_task(broker.start())
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while starts.value < 1 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        stopping = asyncio.create_task(broker.shutdown())
+        await asyncio.sleep(0.05)
+        assert not stopping.done()
+        ready_gate.set()
+        await asyncio.wait_for(starting, timeout=2.0)
+        await asyncio.wait_for(stopping, timeout=2.0)
+        assert broker.pid is None
+        assert broker.active_request_count == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        ready_gate.set()
+        for child in multiprocessing.active_children():
+            if child.is_alive():
+                child.kill()
+            child.join(timeout=2.0)
+
+
+def test_render_broker_can_start_a_new_generation_after_completed_shutdown():
+    context = multiprocessing.get_context("spawn")
+    starts = context.Value("i", 0)
+    ready_gate = context.Event()
+    ready_gate.set()
+
+    async def scenario():
+        broker = FastRenderBroker(
+            context=context,
+            target=_delayed_ready_render_target,
+            target_args=(starts, ready_gate),
+        )
+        await broker.start()
+        first_pid = broker.pid
+        await broker.shutdown()
+
+        await broker.start()
+        try:
+            assert starts.value == 2
+            assert broker.pid is not None
+            assert broker.pid != first_pid
+        finally:
+            await broker.shutdown()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        ready_gate.set()
+        for child in multiprocessing.active_children():
+            if child.is_alive():
+                child.kill()
+            child.join(timeout=2.0)
 
 
 def test_shutdown_joins_a_blocked_render_without_starting_a_replacement():

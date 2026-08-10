@@ -395,6 +395,89 @@ def test_observer_abort_async_runs_process_control_off_the_event_loop():
     asyncio.run(scenario())
 
 
+def test_repeated_cancel_waits_for_delayed_observer_death_without_starving_loop():
+    class DelayedDeathProcess:
+        pid = 7484
+        exitcode = None
+        sentinel = 7485
+
+        def __init__(self):
+            self.killed_at = None
+            self.closed = False
+
+        def is_alive(self):
+            return self.killed_at is None or time.monotonic() - self.killed_at < 0.30
+
+        def kill(self):
+            if self.killed_at is None:
+                self.killed_at = time.monotonic()
+
+        def terminate(self):
+            self.kill()
+
+        def close(self):
+            self.closed = True
+
+    class Slot:
+        def __init__(self):
+            self.closed = False
+
+        def submit(self, *_args, **_kwargs):
+            return None
+
+        def poll_response(self):
+            return False
+
+        def close(self, *, unlink):
+            assert unlink is True
+            self.closed = True
+
+    async def scenario():
+        worker = AcquisitionObservationWorker(stop_timeout_seconds=0.5)
+        process = DelayedDeathProcess()
+        slot = Slot()
+        worker._process = process
+        worker._slot = slot
+        worker._ready = True
+        worker._generation = 1
+
+        async def already_started():
+            return None
+
+        worker.start = already_started
+        request = asyncio.create_task(
+            worker.observe(np.zeros((8, 8, 3), dtype=np.uint8), timeout=2.0)
+        )
+        deadline = asyncio.get_running_loop().time() + 0.2
+        while worker.active_request_count == 0 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.002)
+        assert worker.active_request_count == 1
+
+        request.cancel()
+        await asyncio.sleep(0.04)
+        request.cancel()
+        await asyncio.sleep(0.04)
+        request.cancel()
+
+        ticks = 0
+        while not request.done():
+            assert worker.active_request_count == 1
+            assert worker._process is process
+            ticks += 1
+            await asyncio.sleep(0.01)
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+        assert ticks >= 10
+        assert process.closed is True
+        assert slot.closed is True
+        assert worker.assert_dead
+        assert worker.active_request_count == 0
+        assert worker.fatal_error is None
+
+    asyncio.run(scenario())
+
+
 def test_public_start_revalidates_stale_ready_and_preserves_fatal_handle():
     """The public start gate must use ready/process/fatal, not the raw _ready flag."""
     async def scenario():
@@ -466,7 +549,7 @@ def test_observer_abort_async_does_not_call_stubborn_blocking_join_before_dead()
                     time.sleep(1)
 
     async def scenario():
-        worker = AcquisitionObservationWorker()
+        worker = AcquisitionObservationWorker(stop_timeout_seconds=0.05)
         live = LiveProcess()
         worker._process = live
         worker._ready = True
