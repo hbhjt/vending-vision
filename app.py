@@ -76,7 +76,7 @@ from vision.try_on_session import (
 )
 from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
 from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
-from vision.attempt_worker import render_attempt_frame
+from vision.attempt_worker import FastRenderBroker, render_attempt_frame
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
@@ -100,13 +100,14 @@ _fast_attempt_registry = FastAttemptRegistry(
     terminal_ttl_seconds=_FAST_RESULT_TTL_SECONDS,
 )
 _fast_attempt_task_slots = asyncio.Semaphore(_FAST_ATTEMPT_MAX_TASKS)
+_fast_render_broker = FastRenderBroker()
 
 # 启动时的自检结果缓存
 startup_check = None
 # 调试仪表盘 HTML 文件路径
 DASHBOARD_FILE = Path(runtime_path("dashboard/profile_dashboard.html"))
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
     """服务启动事件：运行自检并记录结果。"""
     global startup_check
 
@@ -124,6 +125,12 @@ def on_startup():
         logger.info("Vision module self check passed")
     else:
         logger.warning(f"Vision module self check failed: {startup_check}")
+    try:
+        await _fast_render_broker.start()
+    except Exception:
+        # Fast is an enhancement capability.  A failed broker readiness probe
+        # keeps the service alive but is reflected truthfully in V2 readiness.
+        logger.exception("Fast render broker failed startup readiness")
 
 
 @app.on_event("shutdown")
@@ -134,11 +141,21 @@ async def on_shutdown():
             task.cancel()
 
     await _fast_attempt_registry.shutdown()
+    render_shutdown_error = None
+    try:
+        await _fast_render_broker.shutdown()
+    except Exception as exc:
+        render_shutdown_error = exc
     aborted = await abort_all_camera_requests(reason="vision_shutdown")
     released = release_all_cameras()
-    if not all(aborted.values()) or not all(released.values()):
+    if (
+        render_shutdown_error is not None
+        or not all(aborted.values())
+        or not all(released.values())
+    ):
         raise RuntimeError(
-            f"camera broker shutdown incomplete: aborted={aborted}, released={released}"
+            "runtime broker shutdown incomplete: "
+            f"render={render_shutdown_error}, aborted={aborted}, released={released}"
         )
     logger.info("Camera streams released")
 
@@ -406,6 +423,7 @@ def get_runtime_status():
         "modelReady": model_ready,
         "ageGenderReady": age_gender_ready,
         "ageGenderMode": age_gender_mode,
+        "fastRenderReady": _fast_render_broker.ready,
     }
 
 
@@ -447,6 +465,14 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
         bundle_version = identity.bundle_version
         contract_digest = identity.contract_digest
     elif not status["cameraReady"]:
+        diagnostic = "camera_unavailable"
+        schema_version = identity.schema_version
+        bundle_version = identity.bundle_version
+        contract_digest = identity.contract_digest
+    elif not status.get("fastRenderReady", True):
+        # The frozen V2 diagnostic vocabulary has one local Vision capability
+        # unavailable value.  Do not extend that cross-repository contract in
+        # this worker-only slice.
         diagnostic = "camera_unavailable"
         schema_version = identity.schema_version
         bundle_version = identity.bundle_version
@@ -1451,7 +1477,7 @@ async def run_v2_fast_attempt(
     try:
         for replay_message in admission.replay:
             await _send_json_bounded(websocket, send_lock, replay_message)
-        prepared = await asyncio.wait_for(
+        garment_source = await asyncio.wait_for(
             _fast_runtime.fetch_garment(
                 payload["garment"], await _fast_attempt_registry.cancel_event_for(receipt)
             ),
@@ -1465,7 +1491,14 @@ async def run_v2_fast_attempt(
         )
         result_image = await _run_owned_attempt_step(
             receipt,
-            render_attempt_frame(frame, prepared, timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS),
+            render_attempt_frame(
+                frame,
+                garment_source.png_bytes,
+                digest=garment_source.digest,
+                template=garment_source.template,
+                timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
+                broker=_fast_render_broker,
+            ),
             timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
         )
         stored_result, result = _prepare_fast_result(attempt_id, result_image)

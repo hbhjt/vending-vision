@@ -19,6 +19,7 @@ import app as vision_app
 from vision import camera_manager
 from vision.config import settings
 from vision.directshow_broker import DirectShowCameraBroker
+from vision.attempt_worker import FastRenderBroker
 
 
 def _fast_block_first_broker_target(connection, config):
@@ -40,6 +41,25 @@ def _fast_block_first_broker_target(connection, config):
                     "pid": os.getpid(),
                     "image": np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8),
                 }))
+    finally:
+        connection.close()
+
+
+def _fast_block_first_render_target(connection, counter):
+    connection.send(("ready", {"pid": os.getpid()}))
+    try:
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+            with counter.get_lock():
+                counter.value += 1
+                request_number = counter.value
+            if request_number == 1:
+                while True:
+                    threading.Event().wait(1.0)
+            connection.send(("ok", _png_bytes()))
     finally:
         connection.close()
 
@@ -163,6 +183,9 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
     start = _start(attempt_id, garment_reference)
 
     with TestClient(vision_app.app) as client:
+        assert vision_app._fast_render_broker.ready
+        render_pid = vision_app._fast_render_broker.pid
+        assert render_pid is not None
         with client.websocket_connect("/ws") as socket:
             socket.send_json(hello)
             assert socket.receive_json()["type"] == "vision.ready"
@@ -170,6 +193,7 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
             assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
             completed = socket.receive_json()
+        assert vision_app._fast_render_broker.pid == render_pid
 
         assert completed["type"] == "vision.try_on.attempt.completed"
         result = completed["payload"]["result"]
@@ -182,6 +206,8 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
         extra_grant = client.get(f"{grant_path}&extra=true")
         duplicate_grant = client.get(f"{grant_path}&token=second")
         wrong_method = client.post(grant_path)
+
+    assert vision_app._fast_render_broker.pid is None
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/png"
@@ -427,6 +453,118 @@ def test_v2_fast_attempt_replacement_joins_old_worker_before_new_admission(
     assert completed["payload"]["attemptId"] == second_id
 
 
+def test_v2_replacement_joins_blocked_render_then_completes_on_prestarted_recovery(
+    monkeypatch, garment_reference
+):
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {"cameraReady": True, "modelReady": True},
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    context = multiprocessing.get_context("spawn")
+    counter = context.Value("i", 0)
+    broker = FastRenderBroker(
+        context=context,
+        target=_fast_block_first_render_target,
+        target_args=(counter,),
+    )
+    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    first_id, second_id = str(uuid4()), str(uuid4())
+
+    with TestClient(vision_app.app) as client:
+        first_pid = broker.pid
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(first_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            deadline = threading.Event()
+            for _ in range(200):
+                if counter.value == 1:
+                    break
+                deadline.wait(0.01)
+            assert counter.value == 1
+
+            socket.send_json(_start(second_id, garment_reference))
+            replaced = socket.receive_json()
+            assert replaced["payload"] == {
+                "attemptId": first_id,
+                "reason": "attempt_replaced",
+            }
+            assert broker.pid is not None and broker.pid != first_pid
+            assert broker.active_request_count == 0
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            completed = socket.receive_json()
+
+        assert completed["type"] == "vision.try_on.attempt.completed"
+        assert completed["payload"]["attemptId"] == second_id
+        assert counter.value == 2
+        assert broker.active_request_count == 0
+
+    assert broker.pid is None
+
+
+def test_v2_disconnect_joins_blocked_render_before_session_cleanup_returns(
+    monkeypatch, garment_reference
+):
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {"cameraReady": True, "modelReady": True},
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    context = multiprocessing.get_context("spawn")
+    counter = context.Value("i", 0)
+    broker = FastRenderBroker(
+        context=context,
+        target=_fast_block_first_render_target,
+        target_args=(counter,),
+    )
+    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+
+    with TestClient(vision_app.app) as client:
+        first_pid = broker.pid
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(str(uuid4()), garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            waiter = threading.Event()
+            for _ in range(200):
+                if counter.value == 1:
+                    break
+                waiter.wait(0.01)
+            assert counter.value == 1
+            socket.close()
+
+        waiter = threading.Event()
+        for _ in range(200):
+            if broker.ready and broker.active_request_count == 0:
+                break
+            waiter.wait(0.01)
+        assert broker.ready
+        assert broker.pid is not None and broker.pid != first_pid
+        assert broker.active_request_count == 0
+
+    assert broker.pid is None
+
+
 def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garment_reference):
     """Fast must not spawn a child that opens the front camera device."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
@@ -440,8 +578,12 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
         read_pids.append((os.getpid(), role, warmup_frames))
         return np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8), {"source": "dshow"}
 
-    async def render(frame, prepared, *, timeout):
+    async def render(frame, garment_png, *, digest, template, timeout, broker):
         assert os.getpid() == parent_pid
+        assert garment_png == _GarmentHandler.payload
+        assert digest.startswith("sha256:")
+        assert template == "tshirt_short_sleeve"
+        assert broker is vision_app._fast_render_broker
         return _png_bytes()
 
     monkeypatch.setattr(vision_app, "read_camera_with_source", read_front)

@@ -30,3 +30,18 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     assert '"python/vision_v2_models.py"' in verifier
     assert "must not contain Python bytecode" in verifier
     assert "assert_v2_contract_resources(contract_root)" in verifier
+
+
+def test_frozen_runtime_keeps_the_spawn_safe_render_worker_entry():
+    spec = (ROOT / "vending_vision.spec").read_text("utf-8")
+    launcher = (ROOT / "run_vision_server.py").read_text("utf-8")
+    target = (ROOT / "vision" / "render_worker_target.py").read_text("utf-8")
+
+    assert '"vision.render_worker_target"' in spec
+    assert "multiprocessing.freeze_support()" in launcher
+    assert launcher.index("multiprocessing.freeze_support()") < launcher.index(
+        "from app import app as fastapi_app"
+    )
+    assert "import app" not in target
+    assert "vision.pose_estimator" not in target
+    assert "vision.model" not in target

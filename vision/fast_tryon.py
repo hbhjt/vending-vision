@@ -31,11 +31,20 @@ class PreparedGarment:
     opaque_bounds: tuple[int, int, int, int]
 
 
+@dataclass(frozen=True)
+class ValidatedGarmentSource:
+    png_bytes: bytes
+    digest: str
+    template: str
+
+
 class FastTryOnRuntime:
     def __init__(self, max_garment_bytes: int = 8 * 1024 * 1024):
         self.max_garment_bytes = max_garment_bytes
 
-    async def fetch_garment(self, descriptor: dict, cancel_event=None) -> PreparedGarment:
+    async def fetch_garment(
+        self, descriptor: dict, cancel_event=None
+    ) -> ValidatedGarmentSource:
         reference = descriptor.get("reference")
         if not isinstance(reference, str):
             raise GarmentFetchError("reference")
@@ -98,10 +107,29 @@ class FastTryOnRuntime:
         if digest != descriptor.get("digest"):
             raise GarmentFetchError("digest")
         self._predecode_png(payload)
-        rgba = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if descriptor.get("contentType") != "image/png" or descriptor.get(
+            "template"
+        ) not in {"tshirt_short_sleeve", "tshirt_long_sleeve"}:
+            raise GarmentFetchError("descriptor")
+        return ValidatedGarmentSource(
+            png_bytes=payload,
+            digest=digest,
+            template=descriptor["template"],
+        )
+
+    def prepare_garment(self, source: ValidatedGarmentSource) -> PreparedGarment:
+        if len(source.png_bytes) > self.max_garment_bytes:
+            raise GarmentFetchError("byte_size")
+        digest = "sha256:" + hashlib.sha256(source.png_bytes).hexdigest()
+        if digest != source.digest:
+            raise GarmentFetchError("digest")
+        self._predecode_png(source.png_bytes)
+        rgba = cv2.imdecode(
+            np.frombuffer(source.png_bytes, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+        )
         if rgba is None or rgba.ndim != 3 or rgba.shape[2] != 4:
             raise GarmentFetchError("png_decode")
-        if descriptor.get("contentType") != "image/png" or descriptor.get("template") not in {"tshirt_short_sleeve", "tshirt_long_sleeve"}:
+        if source.template not in {"tshirt_short_sleeve", "tshirt_long_sleeve"}:
             raise GarmentFetchError("descriptor")
         alpha_mask = np.where(rgba[:, :, 3] >= 12, 255, 0).astype(np.uint8)
         points = cv2.findNonZero(alpha_mask)
@@ -114,7 +142,7 @@ class FastTryOnRuntime:
         return PreparedGarment(
             rgba=rgba,
             digest=digest,
-            template=descriptor["template"],
+            template=source.template,
             alpha_mask=alpha_mask,
             opaque_bounds=(x, y, width, height),
         )
@@ -177,7 +205,11 @@ class FastTryOnRuntime:
         if not seen_iend or offset != len(payload):
             raise GarmentFetchError("png_malformed")
 
-    def render(self, frame: np.ndarray, garment: PreparedGarment) -> bytes:
+    def render(
+        self, frame: np.ndarray, garment: PreparedGarment | ValidatedGarmentSource
+    ) -> bytes:
+        if isinstance(garment, ValidatedGarmentSource):
+            garment = self.prepare_garment(garment)
         height, width = frame.shape[:2]
         x0, y0, source_width, source_height = garment.opaque_bounds
         source = garment.rgba[y0 : y0 + source_height, x0 : x0 + source_width]

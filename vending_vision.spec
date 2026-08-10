@@ -38,6 +38,7 @@ binaries += collect_dynamic_libs("cv2_enumerate_cameras")
 
 hiddenimports = [
     "vision.v2_contract_bundle",
+    "vision.render_worker_target",
     "contracts.vem_vision_v2.python.vision_v2_models",
     "uvicorn.lifespan.on",
     "uvicorn.loops.auto",
