@@ -19,7 +19,12 @@ from uuid import uuid4
 import numpy as np
 
 from vision.render_worker_target import render_worker_entry
-from vision.shared_ipc_slot import SharedIpcSlot, run_shared_ipc_child, wait_for_event
+from vision.shared_ipc_slot import (
+    SharedIpcError,
+    SharedIpcSlot,
+    run_shared_ipc_child,
+    wait_for_event,
+)
 
 
 class AttemptWorkerError(RuntimeError):
@@ -33,6 +38,7 @@ _MAX_FRAME_RAW_BYTES = _MAX_FRAME_WIDTH * _MAX_FRAME_HEIGHT * 3
 _CONSERVATIVE_PREPARE_BYTES_PER_SECOND = 64 * 1024 * 1024
 _CONSERVATIVE_PREPARE_FIXED_SECONDS = 0.020
 _START_TIMEOUT_SECONDS = 5.0
+_STOP_CONFIRM_TIMEOUT_SECONDS = 0.05
 
 
 def _write_shared_render_frame(
@@ -315,6 +321,14 @@ class FastRenderBroker:
                     record("join", exc)
                     return False
 
+            def wait_until_dead(timeout: float) -> bool:
+                deadline = time.monotonic() + max(timeout, 0.0)
+                while time.monotonic() < deadline:
+                    if not process.is_alive():
+                        return True
+                    time.sleep(0.002)
+                return not process.is_alive()
+
             if (
                 graceful
                 and not has_active_request
@@ -351,10 +365,10 @@ class FastRenderBroker:
                 except (OSError, PermissionError) as exc:
                     record("kill", exc)
                     terminate("terminate-after-kill-error")
-                join(0.5)
+                wait_until_dead(_STOP_CONFIRM_TIMEOUT_SECONDS)
             if process.is_alive():
                 terminate("terminate")
-                join(0.5)
+                wait_until_dead(_STOP_CONFIRM_TIMEOUT_SECONDS)
             if process.is_alive():
                 self._parent = parent
                 self._process = process
@@ -400,7 +414,9 @@ class FastRenderBroker:
                 slot = self._slot
             if not dead and requests_done and process is not None:
                 try:
-                    process.join(timeout=0.5)
+                    deadline = time.monotonic() + _STOP_CONFIRM_TIMEOUT_SECONDS
+                    while process.is_alive() and time.monotonic() < deadline:
+                        time.sleep(0.002)
                     delayed_dead = not process.is_alive()
                     if delayed_dead:
                         process.join(timeout=0)
@@ -518,12 +534,9 @@ class FastRenderBroker:
                     process = self._process
                     slot = self._slot
                 if process is not None:
-                    try:
-                        process.join(timeout=0.5)
-                    except (OSError, PermissionError) as exc:
-                        raise AttemptWorkerError(
-                            f"render broker recovery incomplete: join {type(exc).__name__}: {exc}"
-                        ) from exc
+                    deadline = time.monotonic() + _STOP_CONFIRM_TIMEOUT_SECONDS
+                    while process.is_alive() and time.monotonic() < deadline:
+                        time.sleep(0.002)
                 if process is None or process.is_alive():
                     raise AttemptWorkerError("render broker recovery incomplete")
                 try:
@@ -543,6 +556,8 @@ class FastRenderBroker:
                         self._fatal_error = None
             with self._state_lock:
                 if self._quiesced or not restart:
+                    if not restart and self._fatal_error is None:
+                        self._fatal_error = reason
                     return
             self._start_sync()
 
@@ -569,12 +584,9 @@ class FastRenderBroker:
                 if self._fatal_error != reason:
                     return
             if process is not None:
-                try:
-                    process.join(timeout=0.2)
-                except (OSError, PermissionError) as exc:
-                    raise AttemptWorkerError(
-                        f"render broker recovery incomplete: join {type(exc).__name__}: {exc}"
-                    ) from exc
+                deadline = time.monotonic() + _STOP_CONFIRM_TIMEOUT_SECONDS
+                while process.is_alive() and time.monotonic() < deadline:
+                    time.sleep(0.002)
                 if process.is_alive():
                     return
                 try:
@@ -677,6 +689,9 @@ class FastRenderBroker:
 
             if isinstance(error, (GarmentFetchError, PoseUnavailableError)):
                 raise error
+            if isinstance(error, SharedIpcError):
+                await self._recover("render_ipc_corrupt", restart=False)
+                raise AttemptWorkerError(f"render broker IPC corrupt: {error}") from error
             await self._recover("render_job_failed")
             raise error
         return outcome["value"]

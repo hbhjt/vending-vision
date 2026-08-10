@@ -45,7 +45,12 @@ def _initialize_runtime():
     return _FAST_RUNTIME
 
 
-def _render(payload: dict, *, expected_process_generation: int | None = 1) -> bytes:
+def _render(
+    payload: dict,
+    *,
+    expected_process_generation: int | None = 1,
+    expected_request_generation: int | None = None,
+) -> bytes:
     """Decode, prepare and render entirely inside the bounded child."""
     import numpy as np
 
@@ -92,6 +97,10 @@ def _render(payload: dict, *, expected_process_generation: int | None = 1) -> by
         or (
             expected_process_generation is not None
             and frame_shared.get("processGeneration") != expected_process_generation
+        )
+        or (
+            expected_request_generation is not None
+            and frame_shared.get("generation") != expected_request_generation
         )
         or frame_nbytes != height * width * channels
         or frame_nbytes > MAX_FRAME_RAW_BYTES
@@ -146,6 +155,7 @@ def render_worker_entry(connection: Connection) -> None:
                         _render(
                             payload,
                             expected_process_generation=connection.expected_process_generation,
+                            expected_request_generation=connection.current_request_generation,
                         ),
                     )
                 )

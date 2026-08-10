@@ -214,7 +214,10 @@ class SharedIpcChildConnection:
         expected_keys = {"command", "payload", "processGeneration", "requestGeneration", "requestBytes"}
         if set(message) != expected_keys:
             raise SharedIpcError("invalid request metadata keys")
-        if message["requestBytes"] != request_bytes_len:
+        request_bytes = _strict_int(message["requestBytes"], "requestBytes")
+        if request_bytes < 0 or request_bytes > self._request_bytes_cap:
+            raise SharedIpcError("invalid request bytes length")
+        if request_bytes != request_bytes_len:
             raise SharedIpcError("request byte length mismatch")
         command = message["command"]
         payload = message["payload"]
@@ -229,7 +232,10 @@ class SharedIpcChildConnection:
             raise SharedIpcError("request process generation mismatch")
         request_blob = bytes(self._shm.buf[request_bytes_offset: request_bytes_offset + request_bytes_len])
         if "garmentBytes" in payload:
-            if payload["garmentBytes"] != request_bytes_len:
+            garment_bytes = _strict_int(payload["garmentBytes"], "garmentBytes")
+            if garment_bytes < 0 or garment_bytes > self._request_bytes_cap:
+                raise SharedIpcError("invalid garment bytes length")
+            if garment_bytes != request_bytes_len:
                 raise SharedIpcError("garment byte length mismatch")
             payload = dict(payload)
             payload["garmentPng"] = request_blob
@@ -272,6 +278,14 @@ class SharedIpcChildConnection:
             return
         self._closed = True
         self._shm.close()
+
+    @property
+    def current_process_generation(self) -> int:
+        return self._last_process_generation
+
+    @property
+    def current_request_generation(self) -> int:
+        return self._last_request_generation
 
 
 def run_shared_ipc_child(

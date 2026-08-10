@@ -1,12 +1,18 @@
+import json
 import multiprocessing
 
 import pytest
 
-from vision.shared_ipc_slot import _HEADER, SharedIpcError, SharedIpcSlot
+from vision.shared_ipc_slot import (
+    _HEADER,
+    SharedIpcChildConnection,
+    SharedIpcError,
+    SharedIpcSlot,
+)
 
 
 def _write_raw_response(slot: SharedIpcSlot, message: dict, response_blob: bytes = b"") -> None:
-    encoded = __import__("json").dumps(
+    encoded = json.dumps(
         message, ensure_ascii=False, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
     _request_json, response_json, _request_bytes, response_bytes = slot._offsets()
@@ -15,6 +21,18 @@ def _write_raw_response(slot: SharedIpcSlot, message: dict, response_blob: bytes
     if response_blob:
         slot._shm.buf[response_bytes : response_bytes + len(response_blob)] = response_blob
     slot._response_event.set()
+
+
+def _write_raw_request(slot: SharedIpcSlot, message: dict, request_blob: bytes = b"") -> None:
+    encoded = json.dumps(
+        message, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    request_json, _response_json, request_bytes, _response_bytes = slot._offsets()
+    _HEADER.pack_into(slot._shm.buf, 0, len(encoded), 0, len(request_blob), 0)
+    slot._shm.buf[request_json : request_json + len(encoded)] = encoded
+    if request_blob:
+        slot._shm.buf[request_bytes : request_bytes + len(request_blob)] = request_blob
+    slot._request_event.set()
 
 
 @pytest.mark.parametrize(
@@ -89,4 +107,47 @@ def test_shared_ipc_response_rejects_status_generation_and_key_drift(mutation):
                 expected_request_generation=7,
             )
     finally:
+        slot.close(unlink=True)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda message: {**message, "requestBytes": True},
+        lambda message: {**message, "requestBytes": 1.0},
+        lambda message: {**message, "requestBytes": "1"},
+        lambda message: {**message, "requestBytes": -1},
+        lambda message: {**message, "requestBytes": 2},
+        lambda message: {**message, "payload": {**message["payload"], "garmentBytes": True}},
+        lambda message: {**message, "payload": {**message["payload"], "garmentBytes": 1.0}},
+        lambda message: {**message, "payload": {**message["payload"], "garmentBytes": "1"}},
+        lambda message: {**message, "payload": {**message["payload"], "garmentBytes": -1}},
+        lambda message: {**message, "payload": {**message["payload"], "garmentBytes": 2}},
+    ],
+)
+def test_shared_ipc_child_request_rejects_non_exact_byte_metadata_before_payload_decode(
+    mutation,
+):
+    slot = SharedIpcSlot(
+        context=multiprocessing.get_context("spawn"),
+        name_prefix="vem_test",
+        request_bytes=1,
+    )
+    child = SharedIpcChildConnection(slot.config)
+    try:
+        message = mutation(
+            {
+                "command": "render",
+                "payload": {"garmentBytes": 1},
+                "processGeneration": 3,
+                "requestGeneration": 7,
+                "requestBytes": 1,
+            }
+        )
+        _write_raw_request(slot, message, b"x")
+
+        with pytest.raises(SharedIpcError):
+            child.recv()
+    finally:
+        child.close()
         slot.close(unlink=True)

@@ -24,6 +24,8 @@ MAX_FRAME_BYTES = 32 * 1024 * 1024
 MAX_FRAME_WIDTH = 4096
 MAX_FRAME_HEIGHT = 4096
 DEFAULT_READ_TIMEOUT_SECONDS = 10.0
+STOP_CONFIRM_TIMEOUT_SECONDS = 0.05
+ABORT_CONTROL_TIMEOUT_SECONDS = 0.2
 
 
 def _keep_open(config: dict) -> bool:
@@ -271,6 +273,14 @@ class DirectShowCameraBroker:
                 except (OSError, PermissionError) as exc:
                     record_stop_error("join", exc)
 
+            def wait_until_dead(timeout: float) -> bool:
+                deadline = time.monotonic() + max(timeout, 0.0)
+                while time.monotonic() < deadline:
+                    if not process.is_alive():
+                        return True
+                    time.sleep(0.002)
+                return not process.is_alive()
+
             if graceful and parent is not None and process is not None and process.is_alive():
                 try:
                     parent.send(("shutdown", None))
@@ -294,10 +304,10 @@ class DirectShowCameraBroker:
                 except (OSError, PermissionError) as exc:
                     record_stop_error("kill", exc)
                     terminate_process("terminate-after-kill-error")
-                join_process(0.5)
+                wait_until_dead(STOP_CONFIRM_TIMEOUT_SECONDS)
             if process.is_alive():
                 terminate_process("terminate")
-                join_process(0.5)
+                wait_until_dead(STOP_CONFIRM_TIMEOUT_SECONDS)
             if process.is_alive():
                 # Fail closed.  The live process handle is the only truthful
                 # proof that the physical-camera owner may still exist.
@@ -422,12 +432,18 @@ class DirectShowCameraBroker:
         control_thread = threading.Thread(
             target=control,
             name=f"directshow-{self.role}-abort",
-            daemon=False,
+            daemon=True,
         )
         control_thread.start()
-        while not done.is_set():
+        deadline = time.monotonic() + ABORT_CONTROL_TIMEOUT_SECONDS
+        while not done.is_set() and time.monotonic() < deadline:
             await asyncio.sleep(0.002)
-        control_thread.join()
+        if done.is_set():
+            control_thread.join(timeout=0)
+        else:
+            with self._state_lock:
+                self._fatal_error = f"{reason}: abort control deadline exceeded"
+            outcome["dead"] = False
         while self.active_request_count:
             await asyncio.sleep(0.002)
         return bool(outcome.get("dead"))

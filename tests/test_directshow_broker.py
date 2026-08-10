@@ -305,3 +305,49 @@ def test_abort_async_control_error_returns_failure_by_deadline_without_thread_le
         thread.name == "directshow-front-abort" and thread.is_alive()
         for thread in threading.enumerate()
     )
+
+
+def test_abort_async_does_not_call_stubborn_blocking_join_before_dead():
+    class LiveProcess:
+        pid = 9494
+        exitcode = None
+
+        def __init__(self):
+            self.join_calls = []
+
+        def is_alive(self):
+            return True
+
+        def kill(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def join(self, timeout=None):
+            self.join_calls.append(timeout)
+            if timeout and timeout > 0:
+                while True:
+                    time.sleep(1)
+
+    broker = DirectShowCameraBroker("front", _broker_config())
+    live = LiveProcess()
+    broker._process = live
+
+    async def scenario():
+        started = time.monotonic()
+        result = await asyncio.wait_for(
+            broker.abort_async(reason="replacement"), timeout=0.2
+        )
+        return result, time.monotonic() - started
+
+    result, elapsed = asyncio.run(scenario())
+
+    assert result is False
+    assert elapsed < 0.2
+    assert live.join_calls == []
+    assert broker.assert_dead() is False
+    assert not any(
+        thread.name == "directshow-front-abort" and thread.is_alive()
+        for thread in threading.enumerate()
+    )

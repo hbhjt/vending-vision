@@ -29,6 +29,8 @@ from vision.shared_ipc_slot import SharedIpcSlot, run_shared_ipc_child
 MAX_FRAME_WIDTH = 1920
 MAX_FRAME_HEIGHT = 1080
 MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
+STOP_CONFIRM_TIMEOUT_SECONDS = 0.05
+ABORT_CONTROL_TIMEOUT_SECONDS = 0.2
 _ACQ_SHARED_NAME = re.compile(r"^vem_acq_[0-9a-f]{32}$")
 
 
@@ -430,6 +432,14 @@ class AcquisitionObservationWorker:
             except Exception:
                 pass
         if process is not None:
+            def wait_until_dead(timeout: float) -> bool:
+                deadline = time.monotonic() + max(timeout, 0.0)
+                while time.monotonic() < deadline:
+                    if not process.is_alive():
+                        return True
+                    time.sleep(0.002)
+                return not process.is_alive()
+
             if process.is_alive():
                 try:
                     process.kill()
@@ -446,10 +456,13 @@ class AcquisitionObservationWorker:
                         errors.append(
                             f"terminate {type(terminate_exc).__name__}: {terminate_exc}"
                         )
+                wait_until_dead(STOP_CONFIRM_TIMEOUT_SECONDS)
+            if process.is_alive():
                 try:
-                    process.join(timeout=0.5)
-                except (OSError, PermissionError) as exc:
-                    errors.append(f"join {type(exc).__name__}: {exc}")
+                    process.terminate()
+                except (AttributeError, NotImplementedError, OSError, PermissionError) as exc:
+                    errors.append(f"terminate {type(exc).__name__}: {exc}")
+                wait_until_dead(STOP_CONFIRM_TIMEOUT_SECONDS)
             if process.is_alive():
                 with self._state_lock:
                     self._parent = parent
@@ -488,12 +501,19 @@ class AcquisitionObservationWorker:
         thread = threading.Thread(
             target=run_abort,
             name="acquisition-observer-abort",
-            daemon=False,
+            daemon=True,
         )
         thread.start()
-        while thread.is_alive():
+        deadline = time.monotonic() + ABORT_CONTROL_TIMEOUT_SECONDS
+        while thread.is_alive() and time.monotonic() < deadline:
             await asyncio.sleep(0.002)
-        thread.join(timeout=0)
+        if thread.is_alive():
+            with self._state_lock:
+                self._ready = False
+                self._fatal_error = f"{reason}: abort control deadline exceeded"
+            result["dead"] = False
+        else:
+            thread.join(timeout=0)
         if "error" in result:
             with self._state_lock:
                 self._ready = False

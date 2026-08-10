@@ -176,6 +176,44 @@ def _slow_worker_encode_target(connection, entered, delay_seconds, test_pose_fix
     _test_fixture_render_worker_target(connection, test_pose_fixture)
 
 
+def _stale_response_render_target(connection):
+    import json
+    import os
+    import time
+
+    from vision.shared_ipc_slot import _HEADER
+
+    connection.send(("ready", {"pid": os.getpid(), "poseReady": True}))
+    command, _payload = connection.recv()
+    if command != "render":
+        connection.send(("error", "unexpected command"))
+        return
+    response = {
+        "kind": "ok",
+        "payload": {"payloadType": "bytes", "byteSize": 0},
+        "processGeneration": connection.current_process_generation,
+        "requestGeneration": connection.current_request_generation + 1,
+        "responseBytes": 0,
+    }
+    encoded = json.dumps(
+        response, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    _request_json, response_json, _request_bytes, _response_bytes = connection._offsets()
+    with connection._lock:
+        _HEADER.pack_into(
+            connection._shm.buf,
+            0,
+            _HEADER.unpack_from(connection._shm.buf, 0)[0],
+            len(encoded),
+            _HEADER.unpack_from(connection._shm.buf, 0)[2],
+            0,
+        )
+        connection._shm.buf[response_json : response_json + len(encoded)] = encoded
+        connection._response_event.set()
+    while True:
+        time.sleep(1)
+
+
 def test_production_render_target_rejects_test_arguments():
     with pytest.raises(ValueError, match="does not accept test arguments"):
         FastRenderBroker(
@@ -492,6 +530,37 @@ def test_render_worker_rejects_strict_frame_metadata_before_arbitrary_shm_attach
     assert not attached.is_set()
 
 
+def test_render_worker_rejects_wrong_request_generation_before_shm_attach(monkeypatch):
+    attached = threading.Event()
+
+    def forbidden_attach(*_args, **_kwargs):
+        attached.set()
+        raise AssertionError("wrong generation must be rejected before shm attach")
+
+    monkeypatch.setattr("vision.render_worker_target.shared_memory.SharedMemory", forbidden_attach)
+
+    with pytest.raises(ValueError):
+        _render(
+            {
+                "frameShared": {
+                    "kind": "shared_frame",
+                    "name": "vem_render_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "shape": [8, 8, 3],
+                    "dtype": "uint8",
+                    "nbytes": 8 * 8 * 3,
+                    "generation": 2,
+                    "processGeneration": 1,
+                },
+                "garmentPng": b"not-attached-before-digest",
+                "garmentDigest": "sha256:unused",
+                "template": "tshirt_short_sleeve",
+            },
+            expected_process_generation=1,
+            expected_request_generation=1,
+        )
+    assert not attached.is_set()
+
+
 def test_parent_cv2_encode_block_cannot_enter_the_prestarted_render_path(monkeypatch):
     garment = np.zeros((256, 192, 4), dtype=np.uint8)
     garment[8:248, 12:180] = (20, 120, 220, 220)
@@ -797,6 +866,38 @@ def test_pose_failures_are_typed_attempt_outcomes_and_keep_the_worker_pid():
     assert cv2.imdecode(np.frombuffer(asyncio.run(scenario()), dtype=np.uint8), cv2.IMREAD_COLOR) is not None
 
 
+def test_stale_render_ipc_response_aborts_slot_and_fails_closed_without_restart():
+    context = multiprocessing.get_context("spawn")
+    garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
+    ok, encoded = cv2.imencode(".png", garment)
+    assert ok
+    garment_png = encoded.tobytes()
+    frame = np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
+
+    async def scenario():
+        broker = FastRenderBroker(context=context, target=_stale_response_render_target)
+        await broker.start()
+        first_pid = broker.pid
+        assert first_pid is not None
+        with pytest.raises(AttemptWorkerError):
+            await render_attempt_frame(
+                frame,
+                garment_png,
+                digest="sha256:" + hashlib.sha256(garment_png).hexdigest(),
+                template="tshirt_short_sleeve",
+                timeout=5.0,
+                broker=broker,
+            )
+        assert not broker.ready
+        assert broker.pid is None
+        assert broker.active_request_count == 0
+        assert {child.pid for child in multiprocessing.active_children()} == set()
+        with pytest.raises(AttemptWorkerError, match="unavailable"):
+            await broker.start()
+
+    asyncio.run(scenario())
+
+
 def test_stubborn_kill_oserror_retains_handle_and_fails_closed_without_restart():
     class KillDeniedProcess:
         pid = 9292
@@ -830,6 +931,54 @@ def test_stubborn_kill_oserror_retains_handle_and_fails_closed_without_restart()
             await broker.start()
 
     asyncio.run(scenario())
+
+
+def test_render_shutdown_does_not_call_stubborn_blocking_join_before_dead():
+    class LiveProcess:
+        pid = 9394
+        exitcode = None
+
+        def __init__(self):
+            self.join_calls = []
+
+        def is_alive(self):
+            return True
+
+        def kill(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def join(self, timeout=None):
+            self.join_calls.append(timeout)
+            if timeout and timeout > 0:
+                while True:
+                    time.sleep(1)
+
+    async def scenario():
+        broker = FastRenderBroker()
+        live = LiveProcess()
+        broker._process = live
+        broker._ready = True
+        broker._process_generation = 1
+        started = time.monotonic()
+        with pytest.raises(AttemptWorkerError, match="shutdown incomplete"):
+            await asyncio.wait_for(broker.shutdown(), timeout=0.2)
+        return broker, live, time.monotonic() - started
+
+    broker, live, elapsed = asyncio.run(scenario())
+
+    assert elapsed < 0.2
+    assert live.join_calls == []
+    assert not broker.ready
+    assert broker.pid == live.pid
+    with pytest.raises(AttemptWorkerError, match="unavailable"):
+        asyncio.run(broker.start())
+    assert not any(
+        thread.name == "fast-render-shutdown" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
 
 
 def test_concurrent_render_start_is_rejected_without_worker_or_queue_growth():
