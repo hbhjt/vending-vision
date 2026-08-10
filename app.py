@@ -140,6 +140,7 @@ async def on_shutdown():
         if task is not None and not task.done():
             task.cancel()
 
+    _fast_render_broker.quiesce()
     await _fast_attempt_registry.shutdown()
     render_shutdown_error = None
     try:
@@ -1421,6 +1422,10 @@ async def run_v2_fast_attempt(
             )
         return
 
+    # Handshake readiness is a negotiation fact, not a lifetime lease on the
+    # render process.  Every attempt must also observe the live broker before
+    # constructing admission replay.
+    fast_ready = bool(fast_ready and _fast_render_broker.ready)
     attempt_id = payload["attemptId"]
     unavailable_terminal = _generated_v2_envelope(
         "vision.try_on.attempt.failed",
@@ -1462,6 +1467,10 @@ async def run_v2_fast_attempt(
         return
     receipt = admission.receipt
     assert receipt is not None
+    # A different-ID admission may have canceled, joined and restarted the
+    # previous render owner while admit() was awaiting it.  Recheck after that
+    # barrier and before publishing accepted/progress.
+    fast_ready = bool(fast_ready and _fast_render_broker.ready)
     if connection_closed.is_set():
         await _publish_fast_transition(
             await _fast_attempt_registry.cancel_owner_and_join(receipt)

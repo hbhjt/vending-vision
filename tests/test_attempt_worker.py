@@ -263,7 +263,7 @@ def test_parent_cv2_encode_block_cannot_enter_the_prestarted_render_path(monkeyp
     )
 
 
-def test_cancel_kills_worker_blocked_in_native_encode_within_fifty_ms():
+def test_cancel_joins_blocked_native_encode_then_readies_one_replacement():
     context = multiprocessing.get_context("spawn")
     entered = context.Event()
     garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
@@ -279,6 +279,7 @@ def test_cancel_kills_worker_blocked_in_native_encode_within_fifty_ms():
             target_args=(entered,),
         )
         await broker.start()
+        first_pid = broker.pid
         task = asyncio.create_task(
             render_attempt_frame(
                 frame,
@@ -296,6 +297,8 @@ def test_cancel_kills_worker_blocked_in_native_encode_within_fifty_ms():
             await task
         elapsed = time.monotonic() - started
         state = (
+            first_pid,
+            broker.ready,
             broker.pid,
             broker.active_request_count,
             {child.pid for child in multiprocessing.active_children()},
@@ -303,19 +306,22 @@ def test_cancel_kills_worker_blocked_in_native_encode_within_fifty_ms():
         await broker.shutdown()
         return elapsed, state
 
-    elapsed, (pid, active_requests, child_pids) = asyncio.run(scenario())
+    elapsed, (first_pid, ready, pid, active_requests, child_pids) = asyncio.run(
+        scenario()
+    )
 
-    assert elapsed < 0.05
-    assert pid is None
+    assert elapsed < 1.0
+    assert ready
+    assert pid is not None and pid != first_pid
     assert active_requests == 0
-    assert child_pids == set()
+    assert child_pids == {pid}
     assert not any(
         thread.name == "fast-render-encode" and thread.is_alive()
         for thread in threading.enumerate()
     )
 
 
-def test_worker_slow_encode_times_out_near_deadline_and_leaves_no_child():
+def test_worker_slow_encode_times_out_then_readies_one_replacement():
     context = multiprocessing.get_context("spawn")
     entered = context.Event()
     garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
@@ -331,6 +337,7 @@ def test_worker_slow_encode_times_out_near_deadline_and_leaves_no_child():
             target_args=(entered, 0.2),
         )
         await broker.start()
+        first_pid = broker.pid
         started = time.monotonic()
         with pytest.raises(TimeoutError):
             await render_attempt_frame(
@@ -344,6 +351,8 @@ def test_worker_slow_encode_times_out_near_deadline_and_leaves_no_child():
         elapsed = time.monotonic() - started
         state = (
             entered.is_set(),
+            first_pid,
+            broker.ready,
             broker.pid,
             broker.active_request_count,
             {child.pid for child in multiprocessing.active_children()},
@@ -351,18 +360,24 @@ def test_worker_slow_encode_times_out_near_deadline_and_leaves_no_child():
         await broker.shutdown()
         return elapsed, state
 
-    elapsed, (encode_entered, pid, active_requests, child_pids) = asyncio.run(
-        scenario()
-    )
+    elapsed, (
+        encode_entered,
+        first_pid,
+        ready,
+        pid,
+        active_requests,
+        child_pids,
+    ) = asyncio.run(scenario())
 
     assert encode_entered
-    assert 0.08 <= elapsed < 0.16
-    assert pid is None
+    assert 0.08 <= elapsed < 1.0
+    assert ready
+    assert pid is not None and pid != first_pid
     assert active_requests == 0
-    assert child_pids == set()
+    assert child_pids == {pid}
 
 
-def test_cancelled_blocked_render_is_joined_and_stays_unavailable():
+def test_cancelled_blocked_render_is_joined_before_controlled_recovery():
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
     garment = np.zeros((64, 48, 4), dtype=np.uint8)
@@ -379,6 +394,7 @@ def test_cancelled_blocked_render_is_joined_and_stays_unavailable():
             target_args=(counter,),
         )
         await broker.start()
+        first_pid = broker.pid
         task = asyncio.create_task(
             render_attempt_frame(
                 frame,
@@ -397,10 +413,12 @@ def test_cancelled_blocked_render_is_joined_and_stays_unavailable():
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        assert not broker.ready
-        assert broker.pid is None
+        assert broker.ready
+        assert broker.pid is not None and broker.pid != first_pid
         assert broker.active_request_count == 0
-        assert multiprocessing.active_children() == []
+        assert {child.pid for child in multiprocessing.active_children()} == {
+            broker.pid
+        }
         await broker.shutdown()
 
     asyncio.run(scenario())
@@ -614,7 +632,7 @@ def test_shutdown_joins_a_blocked_render_without_starting_a_replacement():
     asyncio.run(scenario())
 
 
-def test_blocked_render_timeout_joins_before_return_and_stays_unavailable():
+def test_blocked_render_timeout_joins_before_controlled_recovery():
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
     garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
@@ -630,6 +648,7 @@ def test_blocked_render_timeout_joins_before_return_and_stays_unavailable():
             target_args=(counter,),
         )
         await broker.start()
+        first_pid = broker.pid
         with pytest.raises(TimeoutError):
             await render_attempt_frame(
                 frame,
@@ -639,10 +658,12 @@ def test_blocked_render_timeout_joins_before_return_and_stays_unavailable():
                 timeout=0.1,
                 broker=broker,
             )
-        assert not broker.ready
-        assert broker.pid is None
+        assert broker.ready
+        assert broker.pid is not None and broker.pid != first_pid
         assert broker.active_request_count == 0
-        assert multiprocessing.active_children() == []
+        assert {child.pid for child in multiprocessing.active_children()} == {
+            broker.pid
+        }
         await broker.shutdown()
 
     asyncio.run(scenario())

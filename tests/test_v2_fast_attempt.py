@@ -64,6 +64,28 @@ def _fast_block_first_render_target(connection, counter):
         connection.close()
 
 
+def _fast_block_then_fail_restart_target(connection, starts, requests):
+    with starts.get_lock():
+        starts.value += 1
+        start_number = starts.value
+    if start_number > 1:
+        connection.close()
+        return
+    connection.send(("ready", {"pid": os.getpid()}))
+    try:
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+            with requests.get_lock():
+                requests.value += 1
+            while True:
+                threading.Event().wait(1.0)
+    finally:
+        connection.close()
+
+
 def _png_bytes():
     image = np.full((48, 36, 4), (20, 120, 220, 255), dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", image)
@@ -478,7 +500,7 @@ def test_v2_fast_attempt_replacement_joins_old_worker_before_new_admission(
     assert completed["payload"]["attemptId"] == second_id
 
 
-def test_v2_replacement_joins_blocked_render_then_stays_stably_unavailable(
+def test_v2_replacement_restarts_render_then_next_attempts_complete(
     monkeypatch, garment_reference
 ):
     manifest = json.loads(
@@ -501,9 +523,11 @@ def test_v2_replacement_joins_blocked_render_then_stays_stably_unavailable(
         target_args=(counter,),
     )
     monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
-    first_id, second_id = str(uuid4()), str(uuid4())
+    first_id, second_id, third_id = str(uuid4()), str(uuid4()), str(uuid4())
 
     with TestClient(vision_app.app) as client:
+        first_pid = broker.pid
+        assert first_pid is not None
         with client.websocket_connect("/ws") as socket:
             socket.send_json(_hello(manifest))
             assert socket.receive_json()["type"] == "vision.ready"
@@ -523,22 +547,133 @@ def test_v2_replacement_joins_blocked_render_then_stays_stably_unavailable(
                 "attemptId": first_id,
                 "reason": "attempt_replaced",
             }
-            assert broker.pid is None
-            assert not broker.ready
+            replacement_pid = broker.pid
+            assert broker.ready
+            assert replacement_pid is not None and replacement_pid != first_pid
             assert broker.active_request_count == 0
+            assert {child.pid for child in multiprocessing.active_children()} == {
+                replacement_pid
+            }
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
             assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
-            failed = socket.receive_json()
+            completed = socket.receive_json()
 
-        assert failed["type"] == "vision.try_on.attempt.failed"
-        assert failed["payload"] == {"attemptId": second_id, "reason": "fast_failed"}
-        assert counter.value == 1
+            assert completed["type"] == "vision.try_on.attempt.completed"
+            assert completed["payload"]["attemptId"] == second_id
+
+            socket.send_json(_start(third_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            completed = socket.receive_json()
+
+        assert completed["type"] == "vision.try_on.attempt.completed"
+        assert completed["payload"]["attemptId"] == third_id
+        assert broker.pid == replacement_pid
+        assert counter.value == 3
         assert broker.active_request_count == 0
 
     assert broker.pid is None
 
 
-def test_v2_disconnect_joins_blocked_render_before_session_cleanup_returns(
+def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
+    monkeypatch, garment_reference
+):
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    context = multiprocessing.get_context("spawn")
+    starts = context.Value("i", 0)
+    requests = context.Value("i", 0)
+    broker = FastRenderBroker(
+        context=context,
+        target=_fast_block_then_fail_restart_target,
+        target_args=(starts, requests),
+    )
+    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "fastRenderReady": broker.ready,
+        },
+    )
+    first_id, second_id, third_id, fourth_id = (
+        str(uuid4()),
+        str(uuid4()),
+        str(uuid4()),
+        str(uuid4()),
+    )
+
+    with TestClient(vision_app.app) as client:
+        first_pid = broker.pid
+        assert first_pid is not None
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["payload"]["fastReady"] is True
+            socket.send_json(_start(first_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            waiter = threading.Event()
+            for _ in range(200):
+                if requests.value == 1:
+                    break
+                waiter.wait(0.01)
+            assert requests.value == 1
+
+            socket.send_json(_start(second_id, garment_reference))
+            replaced = socket.receive_json()
+            assert replaced["payload"] == {
+                "attemptId": first_id,
+                "reason": "attempt_replaced",
+            }
+            unavailable = socket.receive_json()
+            assert unavailable["type"] == "vision.try_on.attempt.failed"
+            assert unavailable["payload"] == {
+                "attemptId": second_id,
+                "reason": "fast_unavailable",
+            }
+
+            assert not broker.ready
+            assert broker.pid is None
+            assert broker.active_request_count == 0
+            assert multiprocessing.active_children() == []
+            assert starts.value == 2
+
+            socket.send_json(_start(third_id, garment_reference))
+            unavailable = socket.receive_json()
+            assert unavailable["payload"] == {
+                "attemptId": third_id,
+                "reason": "fast_unavailable",
+            }
+            assert starts.value == 2
+
+        with client.websocket_connect("/ws") as fresh:
+            fresh.send_json(_hello(manifest))
+            ready = fresh.receive_json()
+            assert ready["payload"]["fastReady"] is False
+            assert ready["payload"]["businessReadinessDiagnostic"] == (
+                "camera_unavailable"
+            )
+            fresh.send_json(_start(fourth_id, garment_reference))
+            unavailable = fresh.receive_json()
+            assert unavailable["payload"] == {
+                "attemptId": fourth_id,
+                "reason": "fast_unavailable",
+            }
+
+        assert starts.value == 2
+        assert multiprocessing.active_children() == []
+
+    assert broker.pid is None
+
+
+def test_v2_disconnect_restarts_render_and_new_connection_completes(
     monkeypatch, garment_reference
 ):
     manifest = json.loads(
@@ -561,8 +696,11 @@ def test_v2_disconnect_joins_blocked_render_before_session_cleanup_returns(
         target_args=(counter,),
     )
     monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    retry_id = str(uuid4())
 
     with TestClient(vision_app.app) as client:
+        first_pid = broker.pid
+        assert first_pid is not None
         with client.websocket_connect("/ws") as socket:
             socket.send_json(_hello(manifest))
             assert socket.receive_json()["type"] == "vision.ready"
@@ -577,9 +715,101 @@ def test_v2_disconnect_joins_blocked_render_before_session_cleanup_returns(
             assert counter.value == 1
             socket.close()
 
-        assert not broker.ready
-        assert broker.pid is None
+        waiter = threading.Event()
+        for _ in range(300):
+            if broker.ready and broker.active_request_count == 0:
+                break
+            waiter.wait(0.01)
+        replacement_pid = broker.pid
+        assert broker.ready
+        assert replacement_pid is not None and replacement_pid != first_pid
         assert broker.active_request_count == 0
+
+        with client.websocket_connect("/ws") as retry:
+            retry.send_json(_hello(manifest))
+            ready = retry.receive_json()
+            assert ready["type"] == "vision.ready"
+            assert ready["payload"]["fastReady"] is True
+            retry.send_json(_start(retry_id, garment_reference))
+            assert retry.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert retry.receive_json()["type"] == "vision.try_on.attempt.progress"
+            completed = retry.receive_json()
+
+        assert completed["type"] == "vision.try_on.attempt.completed"
+        assert completed["payload"]["attemptId"] == retry_id
+        assert broker.pid == replacement_pid
+        assert counter.value == 2
+
+    assert broker.pid is None
+
+
+def test_v2_timeout_restarts_render_and_new_connection_completes(
+    monkeypatch, garment_reference
+):
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "fastRenderReady": vision_app._fast_render_broker.ready,
+        },
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 0.1)
+    _configure_recorded_front(monkeypatch)
+    context = multiprocessing.get_context("spawn")
+    counter = context.Value("i", 0)
+    broker = FastRenderBroker(
+        context=context,
+        target=_fast_block_first_render_target,
+        target_args=(counter,),
+    )
+    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    timed_out_id, retry_id = str(uuid4()), str(uuid4())
+
+    with TestClient(vision_app.app) as client:
+        first_pid = broker.pid
+        assert first_pid is not None
+        with client.websocket_connect("/ws") as first:
+            first.send_json(_hello(manifest))
+            assert first.receive_json()["payload"]["fastReady"] is True
+            first.send_json(_start(timed_out_id, garment_reference))
+            assert first.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert first.receive_json()["type"] == "vision.try_on.attempt.progress"
+            failed = first.receive_json()
+
+        assert failed["type"] == "vision.try_on.attempt.failed"
+        assert failed["payload"] == {
+            "attemptId": timed_out_id,
+            "reason": "fast_failed",
+        }
+        replacement_pid = broker.pid
+        assert broker.ready
+        assert replacement_pid is not None and replacement_pid != first_pid
+        assert broker.active_request_count == 0
+        assert {child.pid for child in multiprocessing.active_children()} == {
+            replacement_pid
+        }
+
+        with client.websocket_connect("/ws") as retry:
+            retry.send_json(_hello(manifest))
+            ready = retry.receive_json()
+            assert ready["payload"]["fastReady"] is True
+            retry.send_json(_start(retry_id, garment_reference))
+            assert retry.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert retry.receive_json()["type"] == "vision.try_on.attempt.progress"
+            completed = retry.receive_json()
+
+        assert completed["type"] == "vision.try_on.attempt.completed"
+        assert completed["payload"]["attemptId"] == retry_id
+        assert broker.pid == replacement_pid
+        assert counter.value == 2
 
     assert broker.pid is None
 

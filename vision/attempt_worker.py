@@ -61,6 +61,17 @@ async def _run_broker_control(name: str, operation):
     return outcome.get("value")
 
 
+async def _finish_cancelled_control(operation) -> Any:
+    """Finish one shielded control coroutine despite repeated cancellation."""
+    task = asyncio.create_task(operation)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
 class FastRenderBroker:
     """Parent-side owner of the single Fast render process and job slot."""
 
@@ -156,11 +167,19 @@ class FastRenderBroker:
 
         if not parent.poll(_START_TIMEOUT_SECONDS):
             self._stop_sync(graceful=False, reason="render_broker_readiness_timeout")
+            with self._state_lock:
+                if self._fatal_error is None:
+                    self._fatal_error = "render_broker_readiness_timeout"
             raise AttemptWorkerError("render broker readiness timeout")
         try:
             kind, payload = parent.recv()
         except (EOFError, OSError) as exc:
             self._stop_sync(graceful=False, reason="render_broker_readiness_failed")
+            with self._state_lock:
+                if self._fatal_error is None:
+                    self._fatal_error = (
+                        f"render_broker_readiness_failed: {type(exc).__name__}: {exc}"
+                    )
             raise AttemptWorkerError(f"render broker readiness failed: {exc}") from exc
         if (
             kind != "ready"
@@ -168,6 +187,9 @@ class FastRenderBroker:
             or payload.get("pid") != process.pid
         ):
             self._stop_sync(graceful=False, reason="render_broker_readiness_invalid")
+            with self._state_lock:
+                if self._fatal_error is None:
+                    self._fatal_error = "render_broker_readiness_invalid"
             raise AttemptWorkerError("render broker returned invalid readiness")
         with self._state_lock:
             self._ready = True
@@ -180,6 +202,11 @@ class FastRenderBroker:
                 )
             self._quiesced = False
         await _run_broker_control("fast-render-start", self._start_sync)
+
+    def quiesce(self) -> None:
+        """Prevent recovery from spawning during application shutdown."""
+        with self._state_lock:
+            self._quiesced = True
 
     def _stop_sync(self, *, graceful: bool, reason: str) -> bool:
         """Stop and join truthfully; retain a live handle on any failed stop."""
@@ -258,8 +285,7 @@ class FastRenderBroker:
             return True
 
     async def shutdown(self) -> None:
-        with self._state_lock:
-            self._quiesced = True
+        self.quiesce()
 
         def stop_and_join_requests() -> bool:
             dead = self._stop_sync(
@@ -338,6 +364,7 @@ class FastRenderBroker:
 
     async def _recover(self, reason: str, *, restart: bool = True) -> None:
         """Terminate/join the failed job owner and optionally prestart recovery."""
+
         def recover() -> None:
             dead = self._stop_sync(graceful=False, reason=reason)
             if not dead:
@@ -348,6 +375,17 @@ class FastRenderBroker:
             self._start_sync()
 
         await _run_broker_control("fast-render-recover", recover)
+
+    async def _restart_after_recovery(self) -> None:
+        """Prestart one replacement only after the prior request was joined."""
+
+        def restart() -> None:
+            with self._state_lock:
+                if self._quiesced:
+                    return
+            self._start_sync()
+
+        await _run_broker_control("fast-render-restart", restart)
 
     async def render(self, payload: dict, *, deadline: float) -> bytes:
         """Submit exactly one non-queued job and keep pipe waits off the loop."""
@@ -374,6 +412,7 @@ class FastRenderBroker:
         )
         with self._state_lock:
             self._request_threads.add(thread)
+        request_released = False
         try:
             thread.start()
         except BaseException:
@@ -385,30 +424,42 @@ class FastRenderBroker:
             while not done.is_set():
                 await asyncio.sleep(0.002)
         except asyncio.CancelledError:
-            recovery_error: BaseException | None = None
             try:
-                await asyncio.shield(
+                await _finish_cancelled_control(
                     self._recover("render_job_cancelled", restart=False)
                 )
-            except BaseException as exc:
-                recovery_error = exc
+            except BaseException:
+                # _stop_sync retains the live handle and fatal state when it
+                # cannot prove the prior worker dead.  Replacement must still
+                # finish registry cleanup instead of escaping admission.
+                pass
             while not done.is_set():
-                await asyncio.shield(asyncio.sleep(0.002))
+                try:
+                    await asyncio.shield(asyncio.sleep(0.002))
+                except asyncio.CancelledError:
+                    continue
             thread.join()
-            if recovery_error is not None:
-                raise recovery_error
+            with self._state_lock:
+                self._request_threads.discard(thread)
+            self._job_slot.release()
+            request_released = True
+            try:
+                await _finish_cancelled_control(self._restart_after_recovery())
+            except BaseException:
+                # Readiness failures are persisted by _start_sync.  The old
+                # attempt remains canonically canceled and the replacement
+                # observes the broker's live unavailable state.
+                pass
             raise
         finally:
-            if done.is_set():
+            if done.is_set() and not request_released:
                 thread.join()
                 with self._state_lock:
                     self._request_threads.discard(thread)
                 self._job_slot.release()
         if "error" in outcome:
             error = outcome["error"]
-            await self._recover(
-                "render_job_failed", restart=not isinstance(error, TimeoutError)
-            )
+            await self._recover("render_job_failed")
             raise error
         return outcome["value"]
 
