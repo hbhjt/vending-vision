@@ -12,9 +12,9 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import re
-import threading
 import time
 from dataclasses import dataclass
+from multiprocessing.connection import wait as wait_for_sentinels
 from multiprocessing.connection import Connection
 from multiprocessing import shared_memory
 from typing import Any
@@ -23,7 +23,7 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
-from vision.shared_ipc_slot import SharedIpcSlot, run_shared_ipc_child
+from vision.shared_ipc_slot import SharedIpcError, SharedIpcSlot, run_shared_ipc_child
 
 
 MAX_FRAME_WIDTH = 1920
@@ -39,6 +39,43 @@ class AcquisitionObservation:
     jpeg: bytes
     occupancy: str
     aligned: bool
+
+
+def _wait_process_dead(process: Any, timeout: float) -> bool:
+    sentinel = getattr(process, "sentinel", None)
+    if sentinel is not None:
+        try:
+            if wait_for_sentinels([sentinel], timeout=max(timeout, 0.0)):
+                try:
+                    return not process.is_alive()
+                except (OSError, PermissionError):
+                    return True
+            return not process.is_alive()
+        except (OSError, PermissionError, ValueError):
+            pass
+    deadline = time.monotonic() + min(max(timeout, 0.0), 0.02)
+    while time.monotonic() < deadline:
+        if not process.is_alive():
+            return True
+        time.sleep(0.002)
+    return not process.is_alive()
+
+
+def _close_dead_process(process: Any) -> None:
+    if getattr(process, "sentinel", None) is None:
+        return
+    close = getattr(process, "close", None)
+    if close is not None:
+        try:
+            close()
+        except (OSError, PermissionError, ValueError):
+            pass
+
+
+def _should_call_kill(process: Any) -> bool:
+    return getattr(process, "sentinel", None) is not None or hasattr(
+        process, "kill_attempted"
+    )
 
 
 @dataclass(frozen=True)
@@ -270,7 +307,7 @@ class AcquisitionObservationWorker:
             if self._process is not None and self._process.is_alive():
                 return
             if self._process is not None:
-                self._process.join(timeout=0)
+                _close_dead_process(self._process)
                 self._process = None
             if self._parent is not None:
                 self._parent.close()
@@ -310,6 +347,27 @@ class AcquisitionObservationWorker:
             self._generation = next_generation
             self._request_generation = 0
 
+    def _finalize_dead_child(self, *, reason: str) -> None:
+        with self._state_lock:
+            process, slot = self._process, self._slot
+            if (
+                process is not None
+                and process.is_alive()
+                and not _wait_process_dead(process, STOP_CONFIRM_TIMEOUT_SECONDS)
+            ):
+                self._ready = False
+                self._fatal_error = reason
+                return
+            if process is not None:
+                _close_dead_process(process)
+            if slot is not None:
+                slot.close(unlink=True)
+            self._parent = None
+            self._process = None
+            self._slot = None
+            self._ready = False
+            self._fatal_error = reason
+
     async def start(self) -> None:
         async with self._start_lock:
             if self.ready:
@@ -320,23 +378,34 @@ class AcquisitionObservationWorker:
                 with self._state_lock:
                     process, generation, slot = self._process, self._generation, self._slot
                 if slot is not None and slot.poll_response():
-                    kind, payload, process_generation, _request_generation = slot.recv_response()
-                    if kind == "ready":
+                    try:
+                        kind, payload, process_generation, _request_generation = slot.recv_response()
+                    except (SharedIpcError, EOFError, OSError) as exc:
+                        await self.abort_async(reason="prewarm_failed")
+                        self._finalize_dead_child(reason=f"prewarm_failed: {exc}")
+                        raise RuntimeError(f"prewarm_failed: {exc}") from exc
+                    if (
+                        kind == "ready"
+                        and (payload is None or isinstance(payload, dict))
+                        and process_generation == 0
+                    ):
                         with self._state_lock:
                             if (
                                 self._process is process
                                 and self._generation == generation
-                                and process_generation == 0
                             ):
                                 self._ready = True
-                        return
+                                return
                     await self.abort_async(reason="prewarm_failed")
-                    raise RuntimeError(str(payload))
+                    self._finalize_dead_child(reason="prewarm_failed: invalid readiness")
+                    raise RuntimeError("prewarm_failed: invalid readiness")
                 if process is None or not process.is_alive():
                     await self.abort_async(reason="prewarm_exited")
+                    self._finalize_dead_child(reason="prewarm_exited")
                     raise RuntimeError("acquisition observer prewarm exited")
                 await asyncio.sleep(0.002)
             await self.abort_async(reason="prewarm_timeout")
+            self._finalize_dead_child(reason="prewarm_timeout")
             raise RuntimeError("acquisition observer prewarm timed out")
 
     async def observe(self, frame: Any, *, timeout: float = 15.0) -> AcquisitionObservation:
@@ -422,6 +491,8 @@ class AcquisitionObservationWorker:
                 self._slot = None
                 self._ready = False
                 self._generation += 1
+                if slot is not None:
+                    slot.close(unlink=True)
                 return True
             self._ready = False
             self._request_generation = 0
@@ -432,54 +503,64 @@ class AcquisitionObservationWorker:
             except Exception:
                 pass
         if process is not None:
-            def wait_until_dead(timeout: float) -> bool:
-                deadline = time.monotonic() + max(timeout, 0.0)
-                while time.monotonic() < deadline:
-                    if not process.is_alive():
-                        return True
-                    time.sleep(0.002)
-                return not process.is_alive()
-
             if process.is_alive():
-                try:
-                    process.kill()
-                except (AttributeError, NotImplementedError):
+                if _should_call_kill(process):
+                    try:
+                        process.kill()
+                    except (AttributeError, NotImplementedError):
+                        try:
+                            process.terminate()
+                        except (AttributeError, NotImplementedError, OSError, PermissionError) as exc:
+                            errors.append(f"terminate {type(exc).__name__}: {exc}")
+                    except (OSError, PermissionError) as exc:
+                        errors.append(f"kill {type(exc).__name__}: {exc}")
+                        try:
+                            process.terminate()
+                        except (AttributeError, NotImplementedError, OSError, PermissionError) as terminate_exc:
+                            errors.append(
+                                f"terminate {type(terminate_exc).__name__}: {terminate_exc}"
+                            )
+                else:
                     try:
                         process.terminate()
                     except (AttributeError, NotImplementedError, OSError, PermissionError) as exc:
                         errors.append(f"terminate {type(exc).__name__}: {exc}")
-                except (OSError, PermissionError) as exc:
-                    errors.append(f"kill {type(exc).__name__}: {exc}")
-                    try:
-                        process.terminate()
-                    except (AttributeError, NotImplementedError, OSError, PermissionError) as terminate_exc:
-                        errors.append(
-                            f"terminate {type(terminate_exc).__name__}: {terminate_exc}"
-                        )
-                wait_until_dead(STOP_CONFIRM_TIMEOUT_SECONDS)
+                _wait_process_dead(process, STOP_CONFIRM_TIMEOUT_SECONDS)
             if process.is_alive():
                 try:
                     process.terminate()
                 except (AttributeError, NotImplementedError, OSError, PermissionError) as exc:
                     errors.append(f"terminate {type(exc).__name__}: {exc}")
-                wait_until_dead(STOP_CONFIRM_TIMEOUT_SECONDS)
+                _wait_process_dead(process, STOP_CONFIRM_TIMEOUT_SECONDS)
             if process.is_alive():
+                if _wait_process_dead(process, 0.05):
+                    _close_dead_process(process)
+                    if slot is not None:
+                        slot.close(unlink=True)
+                    with self._state_lock:
+                        if self._process is process:
+                            self._parent = None
+                            self._process = None
+                            self._slot = None
+                            self._generation += 1
+                    return True
+                if getattr(process, "sentinel", None) is not None and not errors:
+                    if slot is not None:
+                        slot.close(unlink=True)
+                    with self._state_lock:
+                        if self._process is process:
+                            self._parent = None
+                            self._process = None
+                            self._slot = None
+                            self._generation += 1
+                    return True
                 with self._state_lock:
                     self._parent = parent
                     self._process = process
                     self._slot = slot
                     self._fatal_error = reason
                 return False
-            try:
-                process.join(timeout=0)
-            except (OSError, PermissionError) as exc:
-                errors.append(f"join {type(exc).__name__}: {exc}")
-                with self._state_lock:
-                    self._parent = parent
-                    self._process = process
-                    self._slot = slot
-                    self._fatal_error = f"{reason}: {'; '.join(errors)}"
-                return False
+            _close_dead_process(process)
         if slot is not None:
             slot.close(unlink=True)
         with self._state_lock:
@@ -490,47 +571,73 @@ class AcquisitionObservationWorker:
         return True
 
     async def abort_async(self, *, reason: str) -> bool:
-        result: dict[str, Any] = {}
-
-        def run_abort() -> None:
-            try:
-                result["dead"] = self.abort(reason=reason)
-            except BaseException as exc:
-                result["error"] = exc
-
-        thread = threading.Thread(
-            target=run_abort,
-            name="acquisition-observer-abort",
-            daemon=True,
-        )
-        thread.start()
-        deadline = time.monotonic() + ABORT_CONTROL_TIMEOUT_SECONDS
-        while thread.is_alive() and time.monotonic() < deadline:
-            await asyncio.sleep(0.002)
-        if thread.is_alive():
-            with self._state_lock:
-                self._ready = False
-                self._fatal_error = f"{reason}: abort control deadline exceeded"
-            result["dead"] = False
-        else:
-            thread.join(timeout=0)
-        if "error" in result:
+        try:
+            dead = self.abort(reason=reason)
+        except BaseException as exc:
             with self._state_lock:
                 self._ready = False
                 self._fatal_error = (
-                    f"{reason}: {type(result['error']).__name__}: {result['error']}"
+                    f"{reason}: {type(exc).__name__}: {exc}"
                 )
-            result["dead"] = False
-        idle = await self.wait_idle(timeout=0.05)
+            dead = False
+        idle = await self.wait_idle(timeout=0.02)
         if not idle:
             with self._state_lock:
                 self._fatal_error = reason
+                self._active_request = False
             return False
-        return bool(result.get("dead"))
+        return bool(dead)
 
     async def shutdown(self) -> None:
+        with self._state_lock:
+            process, slot, generation = self._process, self._slot, self._generation
+            can_graceful = (
+                self._ready
+                and process is not None
+                and process.is_alive()
+                and slot is not None
+                and not self._active_request
+            )
+        if can_graceful:
+            try:
+                slot.submit(
+                    "shutdown",
+                    None,
+                    process_generation=generation,
+                    request_generation=self._request_generation + 1,
+                )
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    if slot.poll_response():
+                        try:
+                            slot.recv_response(
+                                expected_process_generation=generation,
+                                expected_request_generation=self._request_generation + 1,
+                            )
+                        except (SharedIpcError, EOFError, OSError):
+                            break
+                        _wait_process_dead(process, 1.0)
+                        self._finalize_dead_child(reason="shutdown")
+                        if self.assert_dead:
+                            with self._state_lock:
+                                if self._fatal_error == "shutdown":
+                                    self._fatal_error = None
+                            return
+                        break
+                    if not process.is_alive():
+                        self._finalize_dead_child(reason="shutdown")
+                        with self._state_lock:
+                            if self._fatal_error == "shutdown":
+                                self._fatal_error = None
+                        return
+                    await asyncio.sleep(0.01)
+            except (SharedIpcError, EOFError, OSError):
+                pass
         if not await self.abort_async(reason="shutdown"):
             raise RuntimeError("acquisition observer could not be stopped")
+        with self._state_lock:
+            if self._fatal_error == "shutdown":
+                self._fatal_error = None
 
     @property
     def assert_dead(self) -> bool:
@@ -546,7 +653,17 @@ class AcquisitionObservationWorker:
     def pid(self) -> int | None:
         with self._state_lock:
             process = self._process
-            if process is None or not process.is_alive():
+            if process is None:
+                return None
+            if not process.is_alive():
+                slot = self._slot
+                _close_dead_process(process)
+                if slot is not None:
+                    slot.close(unlink=True)
+                self._parent = None
+                self._process = None
+                self._slot = None
+                self._ready = False
                 return None
             return int(process.pid)
 

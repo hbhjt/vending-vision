@@ -17,6 +17,9 @@ from uuid import uuid4
 
 from vision.fast_result_store import FastResultStore, ResultAdmissionError
 
+_PENDING_READINESS_WAIT_SECONDS = 0.25
+_PENDING_READINESS_POLL_SECONDS = 0.01
+
 
 @dataclass(frozen=True)
 class AttemptReceipt:
@@ -341,12 +344,32 @@ class FastAttemptRegistry:
                 await asyncio.wait_for(asyncio.shield(preparation.join_task), timeout=0.05)
             except asyncio.TimeoutError:
                 preparation.join_task.cancel()
-                try:
-                    await asyncio.shield(preparation.join_task)
-                except asyncio.CancelledError:
+                cleanup = None
+                async with self._gate:
+                    pending = self._pending
+                    if pending is not None and pending.token == preparation.token:
+                        cleanup = self._reserve_cleanup_unlocked(
+                            preparation.join_task
+                        )
+                    elif self._cleanup is not None:
+                        cleanup = self._cleanup
+                if cleanup is not None:
+                    await self._finish_cleanup_uncancelled(cleanup)
+                else:
+                    while not preparation.join_task.done():
+                        try:
+                            await asyncio.shield(preparation.join_task)
+                        except asyncio.CancelledError:
+                            continue
                     self._consume_finished_task(preparation.join_task)
-                except Exception:
-                    self._consume_finished_task(preparation.join_task)
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling() > 0:
+                    async with self._gate:
+                        pending = self._pending
+                        if pending is not None and pending.token == preparation.token:
+                            self._pending = None
+                            pending.done.set()
+                    raise asyncio.CancelledError
             except asyncio.CancelledError:
                 current_task = asyncio.current_task()
                 if current_task is None or current_task.cancelling() == 0:
@@ -376,6 +399,21 @@ class FastAttemptRegistry:
                     raise
             except Exception:
                 self._consume_finished_task(preparation.join_task)
+
+        if (
+            not preparation.resolved
+            and preparation.wait_event is None
+            and preparation.join_task is not None
+            and accepted is not None
+        ):
+            readiness_deadline = (
+                asyncio.get_running_loop().time() + _PENDING_READINESS_WAIT_SECONDS
+            )
+            while (
+                not readiness()
+                and asyncio.get_running_loop().time() < readiness_deadline
+            ):
+                await asyncio.sleep(_PENDING_READINESS_POLL_SECONDS)
 
         async with self._gate:
             self._prune_unlocked()
@@ -715,23 +753,25 @@ class FastAttemptRegistry:
     @staticmethod
     def _consume_finished_task(task: asyncio.Task) -> None:
         """Retrieve a finished prior task's outcome without reclassifying it."""
+        if not task.done():
+            return
         try:
             task.exception()
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, asyncio.InvalidStateError):
             pass
 
     async def _finish_cleanup_uncancelled(
         self, cleanup: CleanupReservation
     ) -> None:
         async def finalize() -> None:
-            try:
-                await asyncio.shield(cleanup.prior_task)
-            except asyncio.CancelledError:
-                self._consume_finished_task(cleanup.prior_task)
-            except Exception:
-                self._consume_finished_task(cleanup.prior_task)
-                # The prior owner's outcome is already represented by its
-                # canonical terminal.  Admission only needs resource closure.
+            while not cleanup.prior_task.done():
+                try:
+                    await asyncio.shield(cleanup.prior_task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            self._consume_finished_task(cleanup.prior_task)
             async with self._gate:
                 if self._cleanup is cleanup:
                     self._cleanup = None

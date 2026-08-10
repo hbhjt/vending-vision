@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import multiprocessing
 import os
 import threading
@@ -12,6 +13,7 @@ import pytest
 
 from vision.attempt_worker import AttemptWorkerError, FastRenderBroker, render_attempt_frame
 from vision.render_worker_target import _render, render_worker_entry
+from vision.shared_ipc_slot import _HEADER
 
 
 _TEST_POSE_FIXTURE = {
@@ -104,6 +106,34 @@ def _block_first_render_target(connection, counter):
             connection.send(("ok", encoded.tobytes()))
     finally:
         connection.close()
+
+
+def _corrupt_ready_render_target(connection):
+    message = {
+        "kind": "ready",
+        "payload": {"pid": os.getpid()},
+        "processGeneration": 999,
+        "requestGeneration": 0,
+        "responseBytes": 0,
+    }
+    encoded = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    _request_json, response_json, _request_bytes, _response_bytes = connection._offsets()
+    with connection._lock:
+        request_json_len, _old_response, request_bytes_len, _old_bytes = _HEADER.unpack_from(
+            connection._shm.buf, 0
+        )
+        _HEADER.pack_into(
+            connection._shm.buf,
+            0,
+            request_json_len,
+            len(encoded),
+            request_bytes_len,
+            0,
+        )
+        connection._shm.buf[response_json : response_json + len(encoded)] = encoded
+        connection._response_event.set()
+    while True:
+        time.sleep(1)
 
 
 def _crash_first_render_target(connection, counter):
@@ -260,6 +290,26 @@ def test_render_spawn_failure_unlinks_slot_and_closes_process_handle():
     assert broker.pid is None
     assert broker.ready is False
     with pytest.raises(AttemptWorkerError, match="render_broker_start_failed"):
+        broker._start_sync()
+
+
+def test_live_render_prewarm_corrupt_ready_stops_child_and_fails_closed():
+    broker = FastRenderBroker(
+        context=multiprocessing.get_context("spawn"),
+        target=_corrupt_ready_render_target,
+    )
+
+    with pytest.raises(AttemptWorkerError, match="readiness"):
+        broker._start_sync()
+
+    assert broker.ready is False
+    assert broker.pid is None
+    assert broker.active_request_count == 0
+    assert broker._slot is None
+    assert broker._fatal_error is not None
+    assert "readiness" in broker._fatal_error
+    assert {child.pid for child in multiprocessing.active_children()} == set()
+    with pytest.raises(AttemptWorkerError, match="unavailable"):
         broker._start_sync()
 
 

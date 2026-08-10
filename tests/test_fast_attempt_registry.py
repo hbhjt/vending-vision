@@ -742,6 +742,82 @@ def test_shutdown_during_pending_cancel_waits_for_prior_cleanup_barrier():
     asyncio.run(scenario())
 
 
+def test_repeated_outer_cancel_keeps_cleanup_barrier_until_old_owner_stops():
+    async def scenario():
+        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        old_id = str(uuid4())
+        new_id = str(uuid4())
+        old_stop_released = asyncio.Event()
+        old_cleanup_reached = asyncio.Event()
+
+        async def old_owner():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                old_cleanup_reached.set()
+                await old_stop_released.wait()
+
+        old_task = asyncio.create_task(old_owner())
+        old = await registry.admit(
+            attempt_id=old_id,
+            websocket=object(),
+            send_lock=asyncio.Lock(),
+            task=old_task,
+            accepted=_message("vision.try_on.attempt.accepted", old_id, "old-accepted"),
+            generating=_message("vision.try_on.attempt.generating", old_id, "old-generating"),
+        )
+        assert old.is_owner
+
+        async def replacement():
+            prep = await registry.prepare_admission(
+                attempt_id=new_id,
+                websocket=object(),
+                send_lock=asyncio.Lock(),
+                task=asyncio.current_task(),
+            )
+            assert prep.join_task is old_task
+            return await registry.commit_prepared_admission(
+                prep,
+                accepted=_message("vision.try_on.attempt.accepted", new_id, "new-accepted"),
+                generating=_message("vision.try_on.attempt.generating", new_id, "new-generating"),
+                unavailable_terminal=_message(
+                    "vision.try_on.attempt.failed", new_id, "new-unavailable"
+                ),
+                readiness=lambda: True,
+            )
+
+        replacement_task = asyncio.create_task(replacement())
+        await asyncio.sleep(0.08)
+        assert old_cleanup_reached.is_set()
+        replacement_task.cancel()
+        await asyncio.sleep(0)
+        replacement_task.cancel()
+        await asyncio.sleep(0.05)
+        assert not replacement_task.done()
+
+        blocked = asyncio.create_task(
+            registry.admit(
+                attempt_id=str(uuid4()),
+                websocket=object(),
+                send_lock=asyncio.Lock(),
+                task=asyncio.current_task(),
+                accepted=None,
+                generating=None,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not blocked.done(), "new attempt crossed cleanup before old child stopped"
+
+        old_stop_released.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(replacement_task, timeout=1.0)
+        admitted = await asyncio.wait_for(blocked, timeout=1.0)
+        assert admitted.is_owner
+        await registry.cancel_owner_and_join(admitted.receipt)
+
+    asyncio.run(scenario())
+
+
 def test_terminal_ttl_prunes_all_expired_records_not_only_lru_head():
     """Replaying one terminal must not hide older expired records behind it."""
     async def scenario():

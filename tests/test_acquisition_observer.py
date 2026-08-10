@@ -1,5 +1,7 @@
 import asyncio
+import json
 import multiprocessing
+import os
 import threading
 import time
 
@@ -11,6 +13,7 @@ from vision.acquisition_observer import (
     AcquisitionObservationWorker,
     _read_shared_frame,
 )
+from vision.shared_ipc_slot import _HEADER
 
 
 def _blocking_observer_target(connection):
@@ -39,6 +42,34 @@ def _counting_observer_target(connection, starts):
                 return
     finally:
         connection.close()
+
+
+def _corrupt_ready_observer_target(connection):
+    message = {
+        "kind": "ready",
+        "payload": {"pid": os.getpid()},
+        "processGeneration": 999,
+        "requestGeneration": 0,
+        "responseBytes": 0,
+    }
+    encoded = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    _request_json, response_json, _request_bytes, _response_bytes = connection._offsets()
+    with connection._lock:
+        request_json_len, _old_response, request_bytes_len, _old_bytes = _HEADER.unpack_from(
+            connection._shm.buf, 0
+        )
+        _HEADER.pack_into(
+            connection._shm.buf,
+            0,
+            request_json_len,
+            len(encoded),
+            request_bytes_len,
+            0,
+        )
+        connection._shm.buf[response_json : response_json + len(encoded)] = encoded
+        connection._response_event.set()
+    while True:
+        time.sleep(1)
 
 
 def test_single_slot_observation_keeps_the_event_loop_responsive_until_cancel_cleanup():
@@ -131,6 +162,29 @@ def test_acquisition_spawn_failure_unlinks_slot_and_closes_process_handle():
     assert worker.ready is False
     with pytest.raises(RuntimeError, match="acquisition_observer_start_failed"):
         worker._start()
+
+
+def test_live_acquisition_prewarm_corrupt_ready_stops_child_and_fails_closed():
+    async def scenario():
+        worker = AcquisitionObservationWorker(
+            context=multiprocessing.get_context("spawn"),
+            target=_corrupt_ready_observer_target,
+        )
+        with pytest.raises(RuntimeError, match="prewarm"):
+            await worker.start()
+        assert worker.ready is False
+        assert worker.pid is None
+        assert worker.active_request_count == 0
+        assert worker._slot is None
+        assert worker.fatal_error is not None
+        assert "prewarm" in worker.fatal_error
+        assert {
+            child.pid for child in multiprocessing.active_children()
+        } == set()
+        with pytest.raises(RuntimeError, match="unavailable"):
+            await worker.start()
+
+    asyncio.run(scenario())
 
 
 def test_production_observation_request_does_not_call_parent_connection_send(monkeypatch):

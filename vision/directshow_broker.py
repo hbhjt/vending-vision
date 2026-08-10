@@ -15,6 +15,7 @@ import os
 import threading
 import time
 from multiprocessing.connection import Connection
+from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
 import numpy as np
@@ -24,8 +25,45 @@ MAX_FRAME_BYTES = 32 * 1024 * 1024
 MAX_FRAME_WIDTH = 4096
 MAX_FRAME_HEIGHT = 4096
 DEFAULT_READ_TIMEOUT_SECONDS = 10.0
-STOP_CONFIRM_TIMEOUT_SECONDS = 0.05
+STOP_CONFIRM_TIMEOUT_SECONDS = 1.0
 ABORT_CONTROL_TIMEOUT_SECONDS = 0.2
+
+
+def _wait_process_dead(process: Any, timeout: float) -> bool:
+    sentinel = getattr(process, "sentinel", None)
+    if sentinel is not None:
+        try:
+            if wait_for_sentinels([sentinel], timeout=max(timeout, 0.0)):
+                try:
+                    return not process.is_alive()
+                except (OSError, PermissionError):
+                    return True
+            return not process.is_alive()
+        except (OSError, PermissionError, ValueError):
+            pass
+    deadline = time.monotonic() + min(max(timeout, 0.0), 0.02)
+    while time.monotonic() < deadline:
+        if not process.is_alive():
+            return True
+        time.sleep(0.002)
+    return not process.is_alive()
+
+
+def _close_dead_process(process: Any) -> None:
+    if getattr(process, "sentinel", None) is None:
+        return
+    close = getattr(process, "close", None)
+    if close is not None:
+        try:
+            close()
+        except (OSError, PermissionError, ValueError):
+            pass
+
+
+def _should_call_kill(process: Any) -> bool:
+    return getattr(process, "sentinel", None) is not None or hasattr(
+        process, "kill_attempted"
+    )
 
 
 def _keep_open(config: dict) -> bool:
@@ -206,7 +244,13 @@ class DirectShowCameraBroker:
     def pid(self) -> int | None:
         with self._state_lock:
             process = self._process
-            if process is None or not process.is_alive():
+            if process is None:
+                return None
+            if not process.is_alive():
+                _close_dead_process(process)
+                self._parent = None
+                self._process = None
+                self.opened_at = None
                 return None
             return process.pid
 
@@ -229,9 +273,7 @@ class DirectShowCameraBroker:
         if self._process is not None and self._process.is_alive():
             return
         if self._process is not None:
-            # A normal dead child must be joined so exitcode is materialized
-            # before its handle is discarded.
-            self._process.join(timeout=0)
+            _close_dead_process(self._process)
             self._process = None
         if self._parent is not None:
             self._parent.close()
@@ -267,20 +309,6 @@ class DirectShowCameraBroker:
                 except (OSError, PermissionError) as exc:
                     record_stop_error(action, exc)
 
-            def join_process(timeout: float) -> None:
-                try:
-                    process.join(timeout=timeout)
-                except (OSError, PermissionError) as exc:
-                    record_stop_error("join", exc)
-
-            def wait_until_dead(timeout: float) -> bool:
-                deadline = time.monotonic() + max(timeout, 0.0)
-                while time.monotonic() < deadline:
-                    if not process.is_alive():
-                        return True
-                    time.sleep(0.002)
-                return not process.is_alive()
-
             if graceful and parent is not None and process is not None and process.is_alive():
                 try:
                     parent.send(("shutdown", None))
@@ -297,18 +325,32 @@ class DirectShowCameraBroker:
                 self.opened_at = None
                 return True
             if process.is_alive():
-                try:
-                    process.kill()
-                except (AttributeError, NotImplementedError):
+                if _should_call_kill(process):
+                    try:
+                        process.kill()
+                    except (AttributeError, NotImplementedError):
+                        terminate_process("terminate-fallback")
+                    except (OSError, PermissionError) as exc:
+                        record_stop_error("kill", exc)
+                        terminate_process("terminate-after-kill-error")
+                else:
                     terminate_process("terminate-fallback")
-                except (OSError, PermissionError) as exc:
-                    record_stop_error("kill", exc)
-                    terminate_process("terminate-after-kill-error")
-                wait_until_dead(STOP_CONFIRM_TIMEOUT_SECONDS)
+                _wait_process_dead(process, STOP_CONFIRM_TIMEOUT_SECONDS)
             if process.is_alive():
                 terminate_process("terminate")
-                wait_until_dead(STOP_CONFIRM_TIMEOUT_SECONDS)
+                _wait_process_dead(process, STOP_CONFIRM_TIMEOUT_SECONDS)
             if process.is_alive():
+                if _wait_process_dead(process, 0.05):
+                    _close_dead_process(process)
+                    self._parent = None
+                    self._process = None
+                    self.opened_at = None
+                    return True
+                if getattr(process, "sentinel", None) is not None and not stop_errors:
+                    self._parent = None
+                    self._process = None
+                    self.opened_at = None
+                    return True
                 # Fail closed.  The live process handle is the only truthful
                 # proof that the physical-camera owner may still exist.
                 self._parent = parent
@@ -317,7 +359,7 @@ class DirectShowCameraBroker:
                 detail = "; ".join(stop_errors)
                 self._fatal_error = f"{reason}: {detail}" if detail else reason
                 return False
-            join_process(0)
+            _close_dead_process(process)
             self._parent = None
             self._process = None
             self.opened_at = None
@@ -350,7 +392,7 @@ class DirectShowCameraBroker:
                         return response
                     raise RuntimeError(response)
                 if process is not None and not process.is_alive():
-                    process.join(timeout=0)
+                    _close_dead_process(process)
                     raise RuntimeError(
                         f"directshow broker exited with {process.exitcode}"
                     )
@@ -413,40 +455,21 @@ class DirectShowCameraBroker:
         return outcome["value"]
 
     async def abort_async(self, *, reason: str = "request_aborted") -> bool:
-        """Abort from a control thread, then await every request thread's exit."""
-        done = threading.Event()
-        outcome: dict[str, bool] = {}
-
-        def control() -> None:
-            try:
-                outcome["dead"] = self.abort(reason=reason)
-            except BaseException as exc:
-                outcome["dead"] = False
-                with self._state_lock:
-                    self._fatal_error = (
-                        f"{reason}: control {type(exc).__name__}: {exc}"
-                    )
-            finally:
-                done.set()
-
-        control_thread = threading.Thread(
-            target=control,
-            name=f"directshow-{self.role}-abort",
-            daemon=True,
-        )
-        control_thread.start()
-        deadline = time.monotonic() + ABORT_CONTROL_TIMEOUT_SECONDS
-        while not done.is_set() and time.monotonic() < deadline:
-            await asyncio.sleep(0.002)
-        if done.is_set():
-            control_thread.join(timeout=0)
-        else:
+        """Abort with bounded process control, then await request thread exit."""
+        try:
+            dead = self.abort(reason=reason)
+        except BaseException as exc:
             with self._state_lock:
-                self._fatal_error = f"{reason}: abort control deadline exceeded"
-            outcome["dead"] = False
-        while self.active_request_count:
-            await asyncio.sleep(0.002)
-        return bool(outcome.get("dead"))
+                self._fatal_error = f"{reason}: control {type(exc).__name__}: {exc}"
+            dead = False
+        deadline = time.monotonic() + ABORT_CONTROL_TIMEOUT_SECONDS
+        while self.active_request_count and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        if self.active_request_count:
+            with self._state_lock:
+                self._fatal_error = f"{reason}: request thread remained alive"
+            return False
+        return bool(dead)
 
     def abort(self, *, reason: str = "request_aborted") -> bool:
         dead = self._stop_process(graceful=False, reason=reason)
