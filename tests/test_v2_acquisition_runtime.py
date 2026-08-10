@@ -147,7 +147,10 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
     """Production top presence cancels a public WS attempt; the stream keeps reporting Vision facts."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", True)
-    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 10)
+    # Replay the six-FPS fixture on its production timeline.  Consuming all
+    # 24 frames at a synthetic 10ms poll rate would invalidate the top-camera
+    # candidate before the real front sampler's one-second minimum can finish.
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 167)
     monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 10)
     monkeypatch.setattr(vision_app, "_ACQUISITION_POLL_SECONDS", 0.01)
     monkeypatch.setattr(vision_app, "_ACQUISITION_STABLE_FRAMES", 1)

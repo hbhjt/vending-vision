@@ -7,6 +7,7 @@ import time
 import numpy as np
 import pytest
 
+import vision.directshow_broker as directshow_broker
 from vision.directshow_broker import (
     DirectShowCameraUnavailable,
     DirectShowCameraBroker,
@@ -155,6 +156,40 @@ def test_async_blocked_request_keeps_loop_responsive_and_cancel_joins_before_res
     assert broker.assert_dead()
 
 
+def test_async_read_timeout_kills_real_blocked_child_and_keeps_loop_responsive():
+    context = multiprocessing.get_context("spawn")
+    broker = DirectShowCameraBroker(
+        "front",
+        _broker_config(),
+        context=context,
+        target=_blocking_broker_target,
+        stop_timeout_seconds=2.0,
+    )
+
+    async def scenario():
+        started = time.monotonic()
+        read_task = asyncio.create_task(
+            broker.read_async(warmup_frames=1, timeout=0.05)
+        )
+        ticks = 0
+        while not read_task.done():
+            ticks += 1
+            await asyncio.sleep(0.002)
+        with pytest.raises(TimeoutError, match="read deadline exceeded"):
+            await read_task
+        return time.monotonic() - started, ticks
+
+    try:
+        elapsed, ticks = asyncio.run(scenario())
+    finally:
+        broker.release()
+
+    assert elapsed < 2.5
+    assert ticks >= 5
+    assert broker.assert_dead()
+    assert broker.active_request_count == 0
+
+
 def test_stubborn_process_is_retained_and_broker_fails_closed_without_restart():
     class Connection:
         def send(self, _message):
@@ -208,6 +243,64 @@ def test_stubborn_process_is_retained_and_broker_fails_closed_without_restart():
     with pytest.raises(RuntimeError, match="unavailable"):
         broker.read(warmup_frames=1, timeout=0.01)
     assert context.processes == [stubborn]
+
+
+@pytest.mark.parametrize("liveness_error", [PermissionError, OSError, ValueError])
+def test_unknown_process_liveness_is_retained_and_broker_fails_closed(
+    liveness_error,
+):
+    class Connection:
+        def close(self):
+            return None
+
+    class UnknownProcess:
+        pid = 9211
+        exitcode = None
+
+        def __init__(self):
+            self.kill_attempted = False
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            raise liveness_error("liveness unavailable")
+
+        def kill(self):
+            self.kill_attempted = True
+
+        def terminate(self):
+            self.kill_attempted = True
+
+    class Context:
+        def __init__(self):
+            self.processes = []
+
+        def Pipe(self, duplex=True):
+            return Connection(), Connection()
+
+        def Process(self, **_kwargs):
+            process = UnknownProcess()
+            self.processes.append(process)
+            return process
+
+    context = Context()
+    broker = DirectShowCameraBroker(
+        "front",
+        _broker_config(),
+        context=context,
+        stop_timeout_seconds=0.01,
+    )
+    broker._start_locked()
+    unknown = context.processes[0]
+
+    assert broker.release() is False
+    assert unknown.kill_attempted
+    assert broker.assert_dead() is False
+    assert broker._process is unknown
+    with pytest.raises(RuntimeError, match="unavailable"):
+        broker.read(warmup_frames=1, timeout=0.01)
+    assert context.processes == [unknown]
 
 
 def test_async_read_timeout_reports_fatal_unavailable_when_physical_stop_fails():
@@ -493,3 +586,270 @@ def test_abort_async_does_not_call_stubborn_blocking_join_before_dead():
         thread.name == "directshow-front-abort" and thread.is_alive()
         for thread in threading.enumerate()
     )
+
+
+def test_abort_async_waits_for_process_sentinel_without_blocking_event_loop(
+    monkeypatch,
+):
+    class SentinelProcess:
+        pid = 9595
+        sentinel = 77
+
+        def __init__(self):
+            self.exitcode = None
+            self.join_calls = []
+
+        def is_alive(self):
+            return self.exitcode is None
+
+        def kill(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def join(self, timeout=None):
+            self.join_calls.append(timeout)
+            while True:
+                time.sleep(1)
+
+    process = SentinelProcess()
+
+    def wait_for_exit(sentinels, timeout):
+        assert sentinels == [process.sentinel]
+        assert timeout > 0
+        time.sleep(0.08)
+        process.exitcode = 9
+        return [process.sentinel]
+
+    monkeypatch.setattr(directshow_broker, "wait_for_sentinels", wait_for_exit)
+    broker = DirectShowCameraBroker(
+        "front", _broker_config(), stop_timeout_seconds=0.2
+    )
+    broker._process = process
+
+    async def scenario():
+        stop_task = asyncio.create_task(broker.abort_async(reason="replacement"))
+        ticks = 0
+        while not stop_task.done():
+            ticks += 1
+            await asyncio.sleep(0.005)
+        return await stop_task, ticks
+
+    stopped, ticks = asyncio.run(scenario())
+
+    assert stopped is True
+    assert ticks >= 8
+    assert process.join_calls == []
+    assert broker.assert_dead()
+
+
+def test_release_confirms_liveness_after_sentinel_becomes_ready(monkeypatch):
+    class SentinelRaceProcess:
+        pid = 9646
+        sentinel = 79
+        exitcode = None
+
+        def __init__(self):
+            self.dead_at = None
+            self.join_calls = []
+
+        def is_alive(self):
+            if self.dead_at is None or time.monotonic() < self.dead_at:
+                return True
+            self.exitcode = 9
+            return False
+
+        def kill(self):
+            self.dead_at = time.monotonic() + 0.03
+
+        def terminate(self):
+            self.kill()
+
+        def join(self, timeout=None):
+            self.join_calls.append(timeout)
+            while True:
+                time.sleep(1)
+
+    process = SentinelRaceProcess()
+    monkeypatch.setattr(
+        directshow_broker,
+        "wait_for_sentinels",
+        lambda _sentinels, timeout: [process.sentinel],
+    )
+    broker = DirectShowCameraBroker(
+        "front", _broker_config(), stop_timeout_seconds=0.1
+    )
+    broker._process = process
+
+    assert broker.release() is True
+    assert process.join_calls == []
+    assert broker.assert_dead()
+
+
+def test_abort_async_finishes_sentinel_wait_after_cancellation(monkeypatch):
+    class SentinelProcess:
+        pid = 9696
+        sentinel = 88
+
+        def __init__(self):
+            self.exitcode = None
+
+        def is_alive(self):
+            return self.exitcode is None
+
+        def kill(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    process = SentinelProcess()
+    wait_entered = threading.Event()
+    wait_finished = threading.Event()
+
+    def wait_for_exit(_sentinels, timeout):
+        assert timeout > 0
+        wait_entered.set()
+        time.sleep(0.08)
+        process.exitcode = 9
+        wait_finished.set()
+        return [process.sentinel]
+
+    monkeypatch.setattr(directshow_broker, "wait_for_sentinels", wait_for_exit)
+    broker = DirectShowCameraBroker(
+        "front", _broker_config(), stop_timeout_seconds=0.2
+    )
+    broker._process = process
+
+    async def scenario():
+        stop_task = asyncio.create_task(broker.abort_async(reason="replacement"))
+        while not wait_entered.is_set() and not stop_task.done():
+            await asyncio.sleep(0.002)
+        assert wait_entered.is_set(), f"stop completed early: {stop_task.result()}"
+        stop_task.cancel()
+        return await stop_task
+
+    assert asyncio.run(scenario()) is True
+    assert wait_finished.is_set()
+    assert broker.assert_dead()
+
+
+def test_abort_async_invalid_sentinel_falls_back_to_async_liveness_poll():
+    class InvalidSentinelProcess:
+        pid = 9797
+        exitcode = None
+
+        def __init__(self):
+            self.dead_at = None
+
+        @property
+        def sentinel(self):
+            raise ValueError("invalid sentinel")
+
+        def is_alive(self):
+            if self.dead_at is None or time.monotonic() < self.dead_at:
+                return True
+            self.exitcode = 9
+            return False
+
+        def kill(self):
+            self.dead_at = time.monotonic() + 0.05
+
+        def terminate(self):
+            self.kill()
+
+    process = InvalidSentinelProcess()
+    broker = DirectShowCameraBroker(
+        "front", _broker_config(), stop_timeout_seconds=0.2
+    )
+    broker._process = process
+
+    async def scenario():
+        stop_task = asyncio.create_task(broker.abort_async(reason="replacement"))
+        ticks = 0
+        while not stop_task.done():
+            ticks += 1
+            await asyncio.sleep(0.005)
+        return await stop_task, ticks
+
+    stopped, ticks = asyncio.run(scenario())
+
+    assert stopped is True
+    assert ticks >= 5
+    assert broker.assert_dead()
+
+
+def test_async_request_cancel_waits_for_error_cleanup_blocked_on_stop_lock():
+    request_polled = threading.Event()
+
+    class Connection:
+        def send(self, _message):
+            return None
+
+        def poll(self, _timeout):
+            request_polled.set()
+            return False
+
+        def close(self):
+            return None
+
+    class Process:
+        pid = 9898
+        sentinel = None
+        exitcode = None
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return self.exitcode is None
+
+        def kill(self):
+            self.exitcode = 9
+
+        def terminate(self):
+            self.exitcode = 9
+
+    class Context:
+        def Pipe(self, duplex=True):
+            return Connection(), Connection()
+
+        def Process(self, **_kwargs):
+            return Process()
+
+    broker = DirectShowCameraBroker(
+        "front",
+        _broker_config(),
+        context=Context(),
+        stop_timeout_seconds=0.2,
+    )
+
+    async def scenario():
+        await broker._async_stop_lock.acquire()
+        read_task = asyncio.create_task(
+            broker.read_async(warmup_frames=1, timeout=0.01)
+        )
+        while not request_polled.is_set():
+            await asyncio.sleep(0.002)
+        await asyncio.sleep(0.02)
+        read_task.cancel()
+        await asyncio.sleep(0)
+        read_task.cancel()
+        await asyncio.sleep(0)
+        canceled_before_cleanup = read_task.done()
+        broker._async_stop_lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(read_task, timeout=0.5)
+        slot_reacquired = broker._request_slot.acquire(blocking=False)
+        if slot_reacquired:
+            broker._request_slot.release()
+        return canceled_before_cleanup, slot_reacquired
+
+    canceled_before_cleanup, slot_reacquired = asyncio.run(scenario())
+
+    assert canceled_before_cleanup is False
+    assert slot_reacquired is True
+    assert broker.active_request_count == 0
+    assert broker._request_threads == set()
+    assert broker.assert_dead()
