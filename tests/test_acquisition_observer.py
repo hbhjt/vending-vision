@@ -4,6 +4,7 @@ import threading
 import time
 
 import pytest
+import numpy as np
 
 from vision.acquisition_observer import AcquisitionObservation, AcquisitionObservationWorker
 
@@ -42,7 +43,7 @@ def test_single_slot_observation_keeps_the_event_loop_responsive_until_cancel_cl
         worker = AcquisitionObservationWorker(
             context=multiprocessing.get_context("spawn"), target=_blocking_observer_target
         )
-        request = asyncio.create_task(worker.observe(object()))
+        request = asyncio.create_task(worker.observe(np.zeros((8, 8, 3), dtype=np.uint8)))
         await asyncio.sleep(0.05)
         ticks = 0
         deadline = asyncio.get_running_loop().time() + 0.04
@@ -72,9 +73,9 @@ def test_normal_acquisition_observer_reuses_one_prewarmed_child_for_multiple_obs
             target=_counting_observer_target,
             target_args=(starts,),
         )
-        first = await worker.observe(b"frame-1")
+        first = await worker.observe(np.zeros((8, 8, 3), dtype=np.uint8))
         first_pid = worker.pid
-        second = await worker.observe(b"frame-2")
+        second = await worker.observe(np.ones((8, 8, 3), dtype=np.uint8))
         assert first == AcquisitionObservation(b"jpeg", "single", True)
         assert second == first
         assert starts.value == 1
@@ -112,13 +113,18 @@ class _PermissionDeniedProcess:
 class _AliveProcess:
     pid = 100001
 
+    def __init__(self):
+        self._alive = True
+
     def is_alive(self):
-        return True
+        return self._alive
 
     def kill(self):
+        self._alive = False
         return None
 
     def terminate(self):
+        self._alive = False
         return None
 
     def join(self, timeout=None):
@@ -140,10 +146,13 @@ class _BlockingSendConnection:
         self.send_entered = threading.Event()
         self.release_send = threading.Event()
         self.closed = False
+        self.large_payload_send_count = 0
 
-    def send(self, _payload):
+    def send(self, payload):
         self.send_entered.set()
-        assert self.release_send.wait(timeout=2.0)
+        if _payload_contains_large_frame(payload):
+            self.large_payload_send_count += 1
+            assert self.release_send.wait(timeout=2.0)
 
     def poll(self, _timeout=0):
         return False
@@ -153,19 +162,38 @@ class _BlockingSendConnection:
 
     def close(self):
         self.closed = True
-        self.release_send.set()
+
+
+def _payload_contains_large_frame(payload):
+    try:
+        import numpy as np
+
+        if isinstance(payload, np.ndarray):
+            return payload.nbytes > 1024
+    except Exception:
+        pass
+    if isinstance(payload, bytes):
+        return len(payload) > 1024
+    if isinstance(payload, dict):
+        return any(_payload_contains_large_frame(value) for value in payload.values())
+    if isinstance(payload, (tuple, list)):
+        return any(_payload_contains_large_frame(value) for value in payload)
+    return False
 
 
 def test_observation_abort_is_bounded_when_connection_send_blocks():
-    """Cancel/replacement must not need the request thread's state lock."""
+    """Production observation must not pipe large frames or retain stubborn send threads."""
     async def scenario():
+        import numpy as np
+
         worker = AcquisitionObservationWorker()
         parent = _BlockingSendConnection()
         worker._parent = parent
         worker._process = _AliveProcess()
         worker._ready = True
 
-        request = asyncio.create_task(worker.observe(b"large-frame"))
+        frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        request = asyncio.create_task(worker.observe(frame))
         deadline = time.monotonic() + 1.0
         while not parent.send_entered.is_set() and time.monotonic() < deadline:
             await asyncio.sleep(0.002)
@@ -175,6 +203,8 @@ def test_observation_abort_is_bounded_when_connection_send_blocks():
         done, _ = await asyncio.wait({abort}, timeout=0.2)
         try:
             assert abort in done, "abort waited behind a request thread blocked in Connection.send"
+            assert parent.large_payload_send_count == 0
+            assert worker.active_request_count == 0
         finally:
             parent.release_send.set()
             with pytest.raises(Exception):

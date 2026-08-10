@@ -15,9 +15,18 @@ import threading
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
+from multiprocessing import shared_memory
 from typing import Any
+from uuid import uuid4
 
 import cv2
+import numpy as np
+
+
+MAX_FRAME_WIDTH = 1920
+MAX_FRAME_HEIGHT = 1080
+MAX_FRAME_EDGE = 1920
+MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
 
 
 @dataclass(frozen=True)
@@ -25,6 +34,116 @@ class AcquisitionObservation:
     jpeg: bytes
     occupancy: str
     aligned: bool
+
+
+@dataclass(frozen=True)
+class _SharedFrame:
+    name: str
+    shape: tuple[int, int, int]
+    dtype: str
+    nbytes: int
+    generation: int
+
+
+def _coerce_frame_for_shared_memory(frame: Any) -> np.ndarray:
+    if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError("acquisition frame must be a BGR image")
+    height, width, channels = frame.shape
+    if (
+        height <= 0
+        or width <= 0
+        or height > MAX_FRAME_EDGE
+        or width > MAX_FRAME_EDGE
+        or channels != 3
+        or frame.dtype != np.uint8
+        or frame.nbytes > MAX_FRAME_RAW_BYTES
+    ):
+        raise ValueError("acquisition frame metadata exceeds cap")
+    if frame.flags.c_contiguous:
+        return frame
+    return np.ascontiguousarray(frame)
+
+
+def _write_shared_frame(frame: Any, *, generation: int) -> tuple[_SharedFrame, shared_memory.SharedMemory]:
+    contiguous = _coerce_frame_for_shared_memory(frame)
+    shm = shared_memory.SharedMemory(
+        create=True,
+        size=int(contiguous.nbytes),
+        name=f"vem_acq_{uuid4().hex}",
+    )
+    try:
+        shm.buf[: contiguous.nbytes] = contiguous.reshape(-1).view(np.uint8)
+    except BaseException:
+        try:
+            shm.close()
+        finally:
+            shm.unlink()
+        raise
+    return (
+        _SharedFrame(
+            name=shm.name,
+            shape=tuple(int(value) for value in contiguous.shape),
+            dtype=str(contiguous.dtype),
+            nbytes=int(contiguous.nbytes),
+            generation=int(generation),
+        ),
+        shm,
+    )
+
+
+def _read_shared_frame(metadata: Any, *, generation: int) -> np.ndarray:
+    if not isinstance(metadata, dict) or metadata.get("kind") != "shared_frame":
+        raise ValueError("invalid acquisition frame metadata")
+    shape = metadata.get("shape")
+    if (
+        not isinstance(shape, (tuple, list))
+        or len(shape) != 3
+        or any(type(value) is not int for value in shape)
+    ):
+        raise ValueError("invalid acquisition frame shape")
+    height, width, channels = tuple(int(value) for value in shape)
+    nbytes = metadata.get("nbytes")
+    dtype = metadata.get("dtype")
+    if (
+        metadata.get("generation") != generation
+        or dtype != "uint8"
+        or channels != 3
+        or height <= 0
+        or width <= 0
+        or height > MAX_FRAME_EDGE
+        or width > MAX_FRAME_EDGE
+        or type(nbytes) is not int
+        or nbytes != height * width * channels
+        or nbytes > MAX_FRAME_RAW_BYTES
+    ):
+        raise ValueError("acquisition frame metadata exceeds cap")
+    shm = shared_memory.SharedMemory(name=str(metadata.get("name")))
+    try:
+        return np.ndarray((height, width, channels), dtype=np.uint8, buffer=shm.buf).copy()
+    finally:
+        name = shm._name  # pyright: ignore[reportPrivateUsage]
+        shm.close()
+        # The parent owns unlink exactly once.  A spawned child only attaches
+        # transiently; unregister its attach handle so Python's resource
+        # tracker does not emit a false leak warning or race the parent unlink.
+        try:
+            from multiprocessing import resource_tracker
+
+            resource_tracker.unregister(name, "shared_memory")
+        except Exception:
+            pass
+
+
+def _unlink_shared_frame(shm: shared_memory.SharedMemory | None) -> None:
+    if shm is None:
+        return
+    try:
+        shm.close()
+    finally:
+        try:
+            shm.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _pose_is_aligned(estimator, frame: Any) -> bool:
@@ -85,6 +204,7 @@ def acquisition_observer_entry(connection: Connection) -> None:
     try:
         detector, estimator = PersonDetector(), PoseEstimator()
         connection.send(("ready", None))
+        generation = 0
         while True:
             command, payload = connection.recv()
             if command == "shutdown":
@@ -92,7 +212,9 @@ def acquisition_observer_entry(connection: Connection) -> None:
                 return
             if command != "observe":
                 raise RuntimeError("unknown acquisition observer command")
-            observation = _observe_frame(detector, estimator, payload)
+            generation += 1
+            frame = _read_shared_frame(payload, generation=generation)
+            observation = _observe_frame(detector, estimator, frame)
             connection.send(("ok", observation))
     except BaseException as exc:
         try:
@@ -118,6 +240,7 @@ class AcquisitionObservationWorker:
         self._fatal_error: str | None = None
         self._ready = False
         self._generation = 0
+        self._request_generation = 0
         self._start_lock = asyncio.Lock()
 
     def _mp_context(self):
@@ -145,6 +268,7 @@ class AcquisitionObservationWorker:
             child.close()
             self._parent, self._process = parent, process
             self._generation += 1
+            self._request_generation = 0
 
     async def start(self) -> None:
         async with self._start_lock:
@@ -182,12 +306,27 @@ class AcquisitionObservationWorker:
         done, outcome = threading.Event(), {}
 
         def request() -> None:
+            shm = None
             try:
                 with self._state_lock:
                     parent, process, generation = self._parent, self._process, self._generation
                     if parent is None or process is None or not process.is_alive():
                         raise RuntimeError("acquisition observer unavailable")
-                parent.send(("observe", frame))
+                    self._request_generation += 1
+                    request_generation = self._request_generation
+                shared_frame, shm = _write_shared_frame(frame, generation=request_generation)
+                parent.send((
+                    "observe",
+                    {
+                        "kind": "shared_frame",
+                        "name": shared_frame.name,
+                        "shape": shared_frame.shape,
+                        "dtype": shared_frame.dtype,
+                        "nbytes": shared_frame.nbytes,
+                        "generation": shared_frame.generation,
+                        "processGeneration": generation,
+                    },
+                ))
                 deadline = time.monotonic() + max(timeout, 0.001)
                 while time.monotonic() < deadline:
                     if parent.poll(0.005):
@@ -209,6 +348,7 @@ class AcquisitionObservationWorker:
             except BaseException as exc:
                 outcome["error"] = exc
             finally:
+                _unlink_shared_frame(shm)
                 self._request_slot.release()
                 done.set()
 
@@ -255,6 +395,7 @@ class AcquisitionObservationWorker:
             self._process = None
             self._ready = False
             self._generation += 1
+            self._request_generation = 0
         if parent is not None:
             try:
                 parent.close()

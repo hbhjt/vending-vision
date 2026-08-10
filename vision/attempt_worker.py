@@ -12,7 +12,9 @@ import multiprocessing
 import threading
 import time
 from multiprocessing.connection import Connection
+from multiprocessing import shared_memory
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
@@ -30,6 +32,44 @@ _MAX_FRAME_RAW_BYTES = _MAX_FRAME_WIDTH * _MAX_FRAME_HEIGHT * 3
 _CONSERVATIVE_PREPARE_BYTES_PER_SECOND = 64 * 1024 * 1024
 _CONSERVATIVE_PREPARE_FIXED_SECONDS = 0.020
 _START_TIMEOUT_SECONDS = 5.0
+
+
+def _write_shared_render_frame(frame: np.ndarray) -> tuple[dict[str, Any], shared_memory.SharedMemory]:
+    shm = shared_memory.SharedMemory(
+        create=True,
+        size=int(frame.nbytes),
+        name=f"vem_render_{uuid4().hex}",
+    )
+    try:
+        shm.buf[: frame.nbytes] = frame.reshape(-1).view(np.uint8)
+    except BaseException:
+        try:
+            shm.close()
+        finally:
+            shm.unlink()
+        raise
+    return (
+        {
+            "kind": "shared_frame",
+            "name": shm.name,
+            "shape": tuple(int(value) for value in frame.shape),
+            "dtype": str(frame.dtype),
+            "nbytes": int(frame.nbytes),
+        },
+        shm,
+    )
+
+
+def _unlink_shared_render_frame(shm: shared_memory.SharedMemory | None) -> None:
+    if shm is None:
+        return
+    try:
+        shm.close()
+    finally:
+        try:
+            shm.unlink()
+        except FileNotFoundError:
+            pass
 
 
 async def _run_broker_control(name: str, operation):
@@ -325,6 +365,7 @@ class FastRenderBroker:
             raise AttemptWorkerError("render broker shutdown incomplete")
 
     def _request_sync(self, payload: dict, deadline: float):
+        shm = None
         with self._state_lock:
             if self._fatal_error is not None:
                 raise AttemptWorkerError(
@@ -343,47 +384,45 @@ class FastRenderBroker:
         wire_payload = {
             key: value for key, value in payload.items() if key != "frame"
         }
-        # The only parent-side frame copy is explicitly capped above and runs
-        # on this same abortable broker request lane.  It cannot create an
-        # independent native encode thread that outlives cancellation.
-        wire_payload["frameBytes"] = frame.tobytes(order="C")
-        wire_payload["frameShape"] = tuple(int(value) for value in frame.shape)
-        wire_payload["frameDtype"] = str(frame.dtype)
-        if time.monotonic() >= deadline:
-            raise TimeoutError("render broker deadline exceeded during frame copy")
-        parent.send(("render", wire_payload))
-        while time.monotonic() < deadline:
-            if parent.poll(0.005):
-                try:
-                    kind, response = parent.recv()
-                except (EOFError, OSError) as exc:
-                    raise AttemptWorkerError(
-                        f"render broker connection closed: {exc}"
-                    ) from exc
-                if kind == "ok":
-                    if not isinstance(response, bytes):
+        try:
+            wire_payload["frameShared"], shm = _write_shared_render_frame(frame)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("render broker deadline exceeded during frame copy")
+            parent.send(("render", wire_payload))
+            while time.monotonic() < deadline:
+                if parent.poll(0.005):
+                    try:
+                        kind, response = parent.recv()
+                    except (EOFError, OSError) as exc:
                         raise AttemptWorkerError(
-                            "render broker returned corrupt response"
-                        )
-                    return response
-                if kind == "garment_error":
-                    from vision.fast_tryon import GarmentFetchError
+                            f"render broker connection closed: {exc}"
+                        ) from exc
+                    if kind == "ok":
+                        if not isinstance(response, bytes):
+                            raise AttemptWorkerError(
+                                "render broker returned corrupt response"
+                            )
+                        return response
+                    if kind == "garment_error":
+                        from vision.fast_tryon import GarmentFetchError
 
-                    raise GarmentFetchError(response)
-                if kind == "pose_error":
-                    from vision.fast_tryon import PoseUnavailableError
+                        raise GarmentFetchError(response)
+                    if kind == "pose_error":
+                        from vision.fast_tryon import PoseUnavailableError
 
-                    # Child diagnostics may contain model paths or native
-                    # exception detail.  Pose absence is a normal attempt
-                    # outcome, and its parent-facing contract is stable.
-                    raise PoseUnavailableError("pose_unavailable")
-                raise AttemptWorkerError(response)
-            if not process.is_alive():
-                process.join(timeout=0)
-                raise AttemptWorkerError(
-                    f"render broker exited with {process.exitcode}"
-                )
-        raise TimeoutError("render broker job deadline exceeded")
+                        # Child diagnostics may contain model paths or native
+                        # exception detail.  Pose absence is a normal attempt
+                        # outcome, and its parent-facing contract is stable.
+                        raise PoseUnavailableError("pose_unavailable")
+                    raise AttemptWorkerError(response)
+                if not process.is_alive():
+                    process.join(timeout=0)
+                    raise AttemptWorkerError(
+                        f"render broker exited with {process.exitcode}"
+                    )
+            raise TimeoutError("render broker job deadline exceeded")
+        finally:
+            _unlink_shared_render_frame(shm)
 
     async def _recover(self, reason: str, *, restart: bool = True) -> None:
         """Terminate/join the failed job owner and optionally prestart recovery."""

@@ -4,6 +4,7 @@ This is deliberately a websocket/HTTP test: it does not seed a registry or
 reach into the preview store.  The test is the first Phase-B tracer bullet.
 """
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -25,8 +26,6 @@ from vision import camera_manager
 from vision import presence_runtime
 from vision.config import settings
 from vision.acquisition_observer import AcquisitionObservationWorker
-from vision.acquisition_observer import AcquisitionObservation
-from vision.profile_messages import profile_update
 
 
 def _permanently_blocking_acquisition_observer(connection):
@@ -105,26 +104,6 @@ class _ReadyFastBroker:
         return None
 
 
-class _AcquiringOnlyObserver:
-    ready = True
-    fatal_error = None
-    pid = None
-    active_request_count = 0
-    assert_dead = True
-
-    async def start(self):
-        return None
-
-    async def observe(self, _frame, *, timeout=15.0):
-        return AcquisitionObservation(b"jpeg", "single", False)
-
-    async def wait_idle(self):
-        return None
-
-    async def shutdown(self):
-        return None
-
-
 def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkeypatch):
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
@@ -168,21 +147,25 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", True)
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 10)
-    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 8)
+    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 10)
     monkeypatch.setattr(vision_app, "_ACQUISITION_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_STABLE_FRAMES", 1)
     monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
-    monkeypatch.setattr(vision_app, "_acquisition_observer", _AcquiringOnlyObserver())
     monkeypatch.setattr(
         vision_app,
-        "collect_front_profile_update",
-        lambda event_id, *_args, **_kwargs: profile_update(
-            "vision.profile_result",
-            {
-                "eventId": event_id,
-                "profile": {"presence": True, "age": 30, "gender": "unknown"},
-                "source": "front",
-            },
-        ),
+        "_acquisition_observer",
+        AcquisitionObservationWorker(context=multiprocessing.get_context("spawn")),
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "fastRenderReady": True,
+            "fastPoseReady": True,
+            "acquisitionObserverReady": vision_app._acquisition_observer_ready(),
+        },
     )
     _configure_recorded_top(monkeypatch)
     _configure_recorded_front(monkeypatch, "man-front.mp4")
@@ -194,6 +177,15 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
     departures = []
     seen_types = []
     post_cancel_presence = False
+    generating_seen = False
+    front_idle_after_generating = False
+    profile_after_generating = False
+
+    async def unfinished_render(*_args, **_kwargs):
+        await asyncio.sleep(30)
+        return _png_bytes()
+
+    monkeypatch.setattr(vision_app, "render_attempt_frame", unfinished_render)
     try:
         with TestClient(vision_app.app) as client:
             with client.websocket_connect("/ws") as socket:
@@ -217,6 +209,13 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                 while time.monotonic() < deadline:
                     message = socket.receive_json()
                     seen_types.append(message["type"])
+                    if message["type"] == "vision.try_on.attempt.generating":
+                        generating_seen = True
+                        front_idle_after_generating = (
+                            vision_app.get_front_camera_owner()["owner"] == "idle"
+                        )
+                    if generating_seen and message["type"] == "vision.profile_result":
+                        profile_after_generating = True
                     if message["type"] == "vision.try_on.attempt.canceled":
                         canceled.append(message)
                     if message["type"] == "vision.person_departed":
@@ -229,9 +228,16 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                 assert [message["payload"] for message in canceled] == [
                     {"attemptId": attempt_id, "reason": "departure"}
                 ]
+                assert generating_seen
+                assert front_idle_after_generating
+                assert profile_after_generating
                 assert len(departures) == 1
                 assert "vision.presence_status" in seen_types
                 assert "vision.profile_result" in seen_types
+                assert any(
+                    message_type in seen_types
+                    for message_type in ["vision.presence_status", "vision.profile_result"]
+                )
                 assert post_cancel_presence
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
     finally:
@@ -239,6 +245,9 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
         thread.join()
         camera_manager.release_all_cameras()
         monkeypatch.setattr(presence_runtime, "_runtime", None)
+        if vision_app._acquisition_observer is not None:
+            asyncio.run(vision_app._acquisition_observer.shutdown())
+        vision_app._acquisition_observer = None
 
 
 def test_v2_start_exposes_attempt_scoped_tokenized_acquisition_preview(monkeypatch):

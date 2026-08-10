@@ -148,7 +148,12 @@ async def on_shutdown():
             task.cancel()
 
     _fast_render_broker.quiesce()
-    await _acquisition_previews.close()
+    preview_shutdown_error = None
+    try:
+        await _acquisition_previews.close()
+    except Exception as exc:
+        preview_shutdown_error = exc
+        logger.warning("Acquisition preview shutdown close failed: %s", exc)
     await _fast_attempt_registry.shutdown()
     observer = _acquisition_observer
     if observer is not None:
@@ -162,12 +167,14 @@ async def on_shutdown():
     released = release_all_cameras()
     if (
         render_shutdown_error is not None
+        or preview_shutdown_error is not None
         or not all(aborted.values())
         or not all(released.values())
     ):
         raise RuntimeError(
             "runtime broker shutdown incomplete: "
-            f"render={render_shutdown_error}, aborted={aborted}, released={released}"
+            f"render={render_shutdown_error}, preview={preview_shutdown_error}, "
+            f"aborted={aborted}, released={released}"
         )
     logger.info("Camera streams released")
 
@@ -1260,14 +1267,26 @@ async def _cancel_v2_attempt(*, attempt_id: str, terminal: dict) -> TerminalTran
     )
     if transition is None:
         return None
-    await _acquisition_previews.close(attempt_id)
+    cleanup_errors = []
+    try:
+        await _acquisition_previews.close(attempt_id)
+    except Exception as exc:
+        cleanup_errors.append(f"preview_close:{type(exc).__name__}:{exc}")
     owner = get_front_camera_owner()
     token = owner.get("leaseToken")
     if owner.get("owner") == "try_on_attempt" and isinstance(token, str) and token.startswith(
         f"try-on:{attempt_id}:"
     ):
-        release_front_camera(
+        release = release_front_camera(
             "try_on_attempt", reason=f"try_on_canceled:{attempt_id}", lease_token=token
+        )
+        if not release.get("ok"):
+            cleanup_errors.append(f"front_release:{release.get('error')}")
+    if cleanup_errors:
+        logger.warning(
+            "V2 attempt cancellation cleanup completed with errors attemptId=%s errors=%s",
+            attempt_id,
+            cleanup_errors,
         )
     return transition
 
@@ -1448,13 +1467,32 @@ async def send_error(
     )
 
 
-async def _release_acquisition_resources(receipt: AttemptReceipt, lease_token: str) -> None:
-    await _acquisition_previews.close(receipt.attempt_id)
-    release_front_camera(
-        "try_on_attempt",
-        reason=f"try_on_acquisition_done:{receipt.attempt_id}",
-        lease_token=lease_token,
-    )
+async def _release_acquisition_resources(
+    receipt: AttemptReceipt, lease_token: str
+) -> list[str]:
+    """Release all acquisition resources and report, never throw, cleanup errors."""
+    errors: list[str] = []
+    try:
+        await _acquisition_previews.close(receipt.attempt_id)
+    except Exception as exc:
+        errors.append(f"preview_close:{type(exc).__name__}:{exc}")
+    try:
+        released = release_front_camera(
+            "try_on_attempt",
+            reason=f"try_on_acquisition_done:{receipt.attempt_id}",
+            lease_token=lease_token,
+        )
+        if not released.get("ok"):
+            errors.append(f"front_release:{released.get('error')}")
+    except Exception as exc:
+        errors.append(f"front_release:{type(exc).__name__}:{exc}")
+    if errors:
+        logger.warning(
+            "V2 acquisition cleanup completed with errors attemptId=%s errors=%s",
+            receipt.attempt_id,
+            errors,
+        )
+    return errors
 
 
 async def run_v2_fast_attempt(
@@ -1594,8 +1632,10 @@ async def run_v2_fast_attempt(
 
         # Capture transitions are ordered: capability close + lease release,
         # then public generating.  Profile ownership can resume before render.
-        await _release_acquisition_resources(receipt, lease_token)
+        cleanup_errors = await _release_acquisition_resources(receipt, lease_token)
         lease_acquired = False
+        if cleanup_errors:
+            raise RuntimeError("acquisition_cleanup_failed")
         generating = _generated_v2_envelope(
             "vision.try_on.attempt.generating", {"attemptId": attempt_id, "stage": "preparing"}
         )

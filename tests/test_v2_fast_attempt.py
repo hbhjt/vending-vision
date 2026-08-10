@@ -260,6 +260,27 @@ class _ReadyFastBroker:
         return None
 
 
+class _SingleAlignedObserver:
+    ready = True
+    pose_ready = True
+    fatal_error = None
+    pid = None
+    active_request_count = 0
+    assert_dead = True
+
+    async def start(self):
+        return None
+
+    async def observe(self, _frame, *, timeout=15.0):
+        return AcquisitionObservation(b"jpeg", "single", True)
+
+    async def wait_idle(self, *, timeout=None):
+        return True
+
+    async def shutdown(self):
+        return None
+
+
 class _FatalAcquisitionObserver:
     ready = False
     fatal_error = "spawn_failed"
@@ -1594,6 +1615,98 @@ def test_v2_fast_attempt_respects_attempt_owner_lease(monkeypatch):
             reason="test_cleanup",
             lease_token="try-on:existing",
         )
+
+
+def test_v2_capture_preview_close_failure_releases_lease_and_commits_one_failed_terminal(
+    monkeypatch, garment_reference
+):
+    """Public WS capture cleanup cannot let preview close failure skip lease release/terminal."""
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
+    monkeypatch.setattr(vision_app, "_acquisition_observer", _SingleAlignedObserver())
+    monkeypatch.setattr(vision_app, "_ACQUISITION_STABLE_FRAMES", 1)
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "fastRenderReady": True,
+            "fastPoseReady": True,
+        },
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "read_camera_with_source",
+        lambda *_args, **_kwargs: (
+            np.zeros((80, 60, 3), dtype=np.uint8),
+            {"source": "recorded_video"},
+        ),
+    )
+
+    close_calls = []
+
+    async def stubborn_close(attempt_id=None, *, timeout=1.0):
+        close_calls.append((attempt_id, timeout))
+        if attempt_id is not None:
+            raise RuntimeError("acquisition_preview_stubborn_readers")
+
+    async def render_should_not_run(*_args, **_kwargs):
+        raise AssertionError("render must wait for successful acquisition cleanup")
+
+    monkeypatch.setattr(vision_app._acquisition_previews, "close", stubborn_close)
+    monkeypatch.setattr(vision_app, "render_attempt_frame", render_should_not_run)
+    attempt_id = str(uuid4())
+    received = []
+    done = threading.Event()
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(attempt_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+
+            def receive_until_terminal():
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    message = socket.receive_json()
+                    received.append(message)
+                    if message["type"] in {
+                        "vision.try_on.attempt.completed",
+                        "vision.try_on.attempt.failed",
+                        "vision.try_on.attempt.canceled",
+                    }:
+                        break
+                done.set()
+
+            reader = threading.Thread(target=receive_until_terminal, daemon=True)
+            reader.start()
+            assert done.wait(timeout=3.0)
+            reader.join(timeout=1.0)
+
+    terminals = [
+        message for message in received
+        if message["type"] in {
+            "vision.try_on.attempt.completed",
+            "vision.try_on.attempt.failed",
+            "vision.try_on.attempt.canceled",
+        }
+    ]
+    assert terminals == [
+        {
+            **terminals[0],
+            "type": "vision.try_on.attempt.failed",
+            "payload": {"attemptId": attempt_id, "reason": "fast_failed"},
+        }
+    ]
+    assert len(close_calls) >= 1
+    assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
 def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeypatch):

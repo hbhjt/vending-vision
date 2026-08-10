@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from multiprocessing import shared_memory
 from multiprocessing.connection import Connection
 
 
@@ -49,19 +50,17 @@ def _render(payload: dict) -> bytes:
     from vision.fast_tryon import GarmentFetchError, ValidatedGarmentSource
 
     if not isinstance(payload, dict) or set(payload) != {
-        "frameBytes",
-        "frameShape",
-        "frameDtype",
+        "frameShared",
         "garmentPng",
         "garmentDigest",
         "template",
     }:
         raise ValueError("invalid render payload")
-    frame_bytes = payload["frameBytes"]
-    frame_shape = payload["frameShape"]
+    frame_shared = payload["frameShared"]
     garment_png = payload["garmentPng"]
-    if not isinstance(frame_bytes, bytes) or len(frame_bytes) > MAX_FRAME_RAW_BYTES:
-        raise ValueError("raw frame exceeds render cap")
+    if not isinstance(frame_shared, dict):
+        raise ValueError("raw frame metadata is invalid")
+    frame_shape = frame_shared.get("shape")
     if (
         not isinstance(frame_shape, (tuple, list))
         or len(frame_shape) != 3
@@ -69,14 +68,17 @@ def _render(payload: dict) -> bytes:
     ):
         raise ValueError("raw frame shape is invalid")
     height, width, channels = frame_shape
+    frame_nbytes = frame_shared.get("nbytes")
     if (
         height <= 0
         or width <= 0
         or height > MAX_FRAME_HEIGHT
         or width > MAX_FRAME_WIDTH
         or channels != 3
-        or payload["frameDtype"] != "uint8"
-        or len(frame_bytes) != height * width * channels
+        or frame_shared.get("dtype") != "uint8"
+        or type(frame_nbytes) is not int
+        or frame_nbytes != height * width * channels
+        or frame_nbytes > MAX_FRAME_RAW_BYTES
     ):
         raise ValueError("raw frame metadata exceeds render cap")
     if not isinstance(garment_png, bytes) or len(garment_png) > MAX_GARMENT_BYTES:
@@ -84,9 +86,18 @@ def _render(payload: dict) -> bytes:
     digest = "sha256:" + hashlib.sha256(garment_png).hexdigest()
     if digest != payload["garmentDigest"]:
         raise GarmentFetchError("digest")
-    frame = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(
-        (height, width, channels)
-    )
+    shm = shared_memory.SharedMemory(name=str(frame_shared.get("name")))
+    try:
+        frame = np.ndarray((height, width, channels), dtype=np.uint8, buffer=shm.buf).copy()
+    finally:
+        name = shm._name  # pyright: ignore[reportPrivateUsage]
+        shm.close()
+        try:
+            from multiprocessing import resource_tracker
+
+            resource_tracker.unregister(name, "shared_memory")
+        except Exception:
+            pass
     source = ValidatedGarmentSource(
         png_bytes=garment_png,
         digest=digest,

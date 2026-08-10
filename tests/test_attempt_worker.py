@@ -27,6 +27,8 @@ _TEST_POSE_FIXTURE = {
 
 def _test_fixture_render_worker_target(connection, test_pose_fixture):
     """Spawn-safe test worker; it is intentionally outside packaged Vision code."""
+    from multiprocessing import shared_memory
+
     from vision.fast_tryon import (
         FastTryOnRuntime,
         GarmentFetchError,
@@ -51,9 +53,23 @@ def _test_fixture_render_worker_target(connection, test_pose_fixture):
                 connection.send(("ok", None))
                 return
             try:
-                frame = np.frombuffer(payload["frameBytes"], dtype=np.uint8).reshape(
-                    payload["frameShape"]
-                )
+                frame_shared = payload["frameShared"]
+                shm = shared_memory.SharedMemory(name=frame_shared["name"])
+                try:
+                    frame = np.ndarray(
+                        tuple(frame_shared["shape"]),
+                        dtype=np.uint8,
+                        buffer=shm.buf,
+                    ).copy()
+                finally:
+                    name = shm._name
+                    shm.close()
+                    try:
+                        from multiprocessing import resource_tracker
+
+                        resource_tracker.unregister(name, "shared_memory")
+                    except Exception:
+                        pass
                 garment = payload["garmentPng"]
                 digest = "sha256:" + hashlib.sha256(garment).hexdigest()
                 source = ValidatedGarmentSource(
