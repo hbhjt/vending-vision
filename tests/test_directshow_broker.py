@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from vision.directshow_broker import (
+    DirectShowCameraUnavailable,
     DirectShowCameraBroker,
     directshow_broker_entry,
 )
@@ -207,6 +208,148 @@ def test_stubborn_process_is_retained_and_broker_fails_closed_without_restart():
     with pytest.raises(RuntimeError, match="unavailable"):
         broker.read(warmup_frames=1, timeout=0.01)
     assert context.processes == [stubborn]
+
+
+def test_async_read_timeout_reports_fatal_unavailable_when_physical_stop_fails():
+    class Connection:
+        def send(self, _message):
+            return None
+
+        def poll(self, _timeout):
+            return False
+
+        def close(self):
+            return None
+
+    class StubbornProcess:
+        pid = 9242
+        exitcode = None
+        kill_attempted = True
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+        def kill(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    class Context:
+        def __init__(self):
+            self.processes = []
+
+        def Pipe(self, duplex=True):
+            return Connection(), Connection()
+
+        def Process(self, **_kwargs):
+            process = StubbornProcess()
+            self.processes.append(process)
+            return process
+
+    context = Context()
+    broker = DirectShowCameraBroker(
+        "front",
+        _broker_config(),
+        context=context,
+        stop_timeout_seconds=0.05,
+    )
+
+    async def scenario():
+        with pytest.raises(
+            DirectShowCameraUnavailable,
+            match="directshow broker is unavailable: request_abort_failed",
+        ):
+            await asyncio.wait_for(
+                broker.read_async(warmup_frames=1, timeout=0.01),
+                timeout=0.2,
+            )
+        assert broker.active_request_count == 0
+
+    asyncio.run(scenario())
+
+    stubborn = context.processes[0]
+    assert broker._process is stubborn
+    assert broker.assert_dead() is False
+    with pytest.raises(DirectShowCameraUnavailable, match="unavailable"):
+        broker.read(warmup_frames=1, timeout=0.01)
+    assert context.processes == [stubborn]
+
+
+def test_async_read_timeout_waits_for_delayed_physical_death_and_thread_exit():
+    class Connection:
+        def send(self, _message):
+            return None
+
+        def poll(self, _timeout):
+            return False
+
+        def close(self):
+            return None
+
+    class DelayedDeathProcess:
+        pid = 9252
+        exitcode = None
+        kill_attempted = True
+
+        def __init__(self):
+            self.dead_at = None
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return self.dead_at is None or time.monotonic() < self.dead_at
+
+        def kill(self):
+            self.dead_at = time.monotonic() + 0.3
+
+        def terminate(self):
+            self.kill()
+
+    class Context:
+        def __init__(self):
+            self.processes = []
+
+        def Pipe(self, duplex=True):
+            return Connection(), Connection()
+
+        def Process(self, **_kwargs):
+            process = DelayedDeathProcess()
+            self.processes.append(process)
+            return process
+
+    context = Context()
+    broker = DirectShowCameraBroker(
+        "front",
+        _broker_config(),
+        context=context,
+        stop_timeout_seconds=0.6,
+    )
+
+    async def scenario():
+        started = time.monotonic()
+        read_task = asyncio.create_task(
+            broker.read_async(warmup_frames=1, timeout=0.01)
+        )
+        ticks = 0
+        while not read_task.done():
+            ticks += 1
+            await asyncio.sleep(0.005)
+        with pytest.raises(TimeoutError, match="read deadline exceeded"):
+            await read_task
+        return time.monotonic() - started, ticks
+
+    elapsed, ticks = asyncio.run(scenario())
+
+    assert elapsed >= 0.25
+    assert elapsed < 0.8
+    assert ticks >= 30
+    assert broker.assert_dead()
+    assert broker.active_request_count == 0
 
 
 def test_live_process_kill_oserror_is_reported_and_retained_fail_closed():

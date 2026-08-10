@@ -183,6 +183,24 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
     profile_after_generating = False
     ambient_payloads = []
 
+    def missing_facts():
+        missing = []
+        if not canceled:
+            missing.append("departure cancellation")
+        if not departures:
+            missing.append("person departure")
+        if not post_cancel_presence:
+            missing.append("post-cancel presence")
+        if not generating_seen:
+            missing.append("generating")
+        if not front_idle_after_generating:
+            missing.append("front camera release before generation")
+        if not profile_after_generating:
+            missing.append("profile after generation started")
+        if not ambient_payloads:
+            missing.append("ambient observation")
+        return missing
+
     async def unfinished_render(*_args, **_kwargs):
         await asyncio.sleep(30)
         return _png_bytes()
@@ -229,9 +247,13 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                         "vision.person_departed",
                     } and "ambientLight" in message["payload"]:
                         ambient_payloads.append(message["payload"]["ambientLight"])
-                    if canceled and departures and post_cancel_presence:
+                    if not missing_facts():
                         break
 
+                assert not missing_facts(), (
+                    f"missing facts before deadline: {missing_facts()}; "
+                    f"seen types: {seen_types}"
+                )
                 assert [message["payload"] for message in canceled] == [
                     {"attemptId": attempt_id, "reason": "departure"}
                 ]

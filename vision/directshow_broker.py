@@ -29,8 +29,14 @@ STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
 GRACEFUL_STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
 
 
+class DirectShowCameraUnavailable(RuntimeError):
+    """The physical DirectShow owner could not be stopped truthfully."""
+
+
 def _is_process_alive(process: Any) -> bool:
     try:
+        if getattr(process, "exitcode", None) is not None:
+            return False
         return bool(process.is_alive())
     except (OSError, PermissionError, ValueError):
         return False
@@ -51,18 +57,18 @@ def _wait_process_dead(process: Any, timeout: float) -> bool:
                     except (AssertionError, OSError, PermissionError, ValueError):
                         pass
                 try:
-                    return not process.is_alive()
+                    return not _is_process_alive(process)
                 except (OSError, PermissionError):
                     return True
-            return not process.is_alive()
+            return not _is_process_alive(process)
         except (OSError, PermissionError, ValueError):
             pass
     deadline = time.monotonic() + max(timeout, 0.0)
     while time.monotonic() < deadline:
-        if not process.is_alive():
+        if not _is_process_alive(process):
             return True
         time.sleep(0.002)
-    return not process.is_alive()
+    return not _is_process_alive(process)
 
 
 def _close_dead_process(process: Any) -> None:
@@ -269,7 +275,7 @@ class DirectShowCameraBroker:
             process = self._process
             if process is None:
                 return None
-            if not process.is_alive():
+            if not _is_process_alive(process):
                 _close_dead_process(process)
                 self._parent = None
                 self._process = None
@@ -293,7 +299,7 @@ class DirectShowCameraBroker:
             raise RuntimeError(f"directshow broker is unavailable: {self._fatal_error}")
         if self._quiesced:
             raise RuntimeError("directshow broker is quiesced for maintenance")
-        if self._process is not None and self._process.is_alive():
+        if self._process is not None and _is_process_alive(self._process):
             return
         if self._process is not None:
             _close_dead_process(self._process)
@@ -332,7 +338,12 @@ class DirectShowCameraBroker:
                 except (OSError, PermissionError) as exc:
                     record_stop_error(action, exc)
 
-            if graceful and parent is not None and process is not None and process.is_alive():
+            if (
+                graceful
+                and parent is not None
+                and process is not None
+                and _is_process_alive(process)
+            ):
                 try:
                     parent.send(("shutdown", None))
                     parent.poll(0.25)
@@ -354,7 +365,7 @@ class DirectShowCameraBroker:
                 self._parent = None
                 self.opened_at = None
                 return True
-            if process.is_alive():
+            if _is_process_alive(process):
                 if _should_call_kill(process):
                     try:
                         process.kill()
@@ -365,9 +376,9 @@ class DirectShowCameraBroker:
                         terminate_process("terminate-after-kill-error")
                 else:
                     terminate_process("terminate-fallback")
-            if process.is_alive():
+            if _is_process_alive(process):
                 _wait_process_dead(process, self._stop_timeout_seconds)
-            if process.is_alive():
+            if _is_process_alive(process):
                 # Fail closed.  The live process handle is the only truthful
                 # proof that the physical-camera owner may still exist.
                 self._parent = parent
@@ -411,14 +422,23 @@ class DirectShowCameraBroker:
                     if kind == "ok":
                         return response
                     raise RuntimeError(response)
-                if process is not None and not process.is_alive():
+                if process is not None and not _is_process_alive(process):
                     _close_dead_process(process)
                     raise RuntimeError(
                         f"directshow broker exited with {process.exitcode}"
                     )
             raise TimeoutError("directshow broker read deadline exceeded")
-        except Exception:
-            self._stop_process(graceful=False, reason="request_abort_failed")
+        except Exception as exc:
+            stopped = self._stop_process(
+                graceful=False,
+                reason="request_abort_failed",
+            )
+            if not stopped:
+                with self._state_lock:
+                    fatal_error = self._fatal_error or "request_abort_failed"
+                raise DirectShowCameraUnavailable(
+                    f"directshow broker is unavailable: {fatal_error}"
+                ) from exc
             raise
         finally:
             if not _slot_owned:
@@ -504,7 +524,7 @@ class DirectShowCameraBroker:
             errors: list[str] = []
 
             def signal_stop() -> None:
-                if process is None or not process.is_alive():
+                if process is None or not _is_process_alive(process):
                     return
                 if _should_call_kill(process):
                     try:
@@ -637,7 +657,7 @@ class DirectShowCameraBroker:
     def assert_dead(self) -> bool:
         with self._state_lock:
             process = self._process
-            return process is None or not process.is_alive()
+            return process is None or not _is_process_alive(process)
 
     def begin_maintenance(self) -> None:
         with self._state_lock:
