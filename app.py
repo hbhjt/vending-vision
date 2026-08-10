@@ -2,9 +2,8 @@
 FastAPI 应用入口模块
 
 提供售货机视觉服务的 HTTP 和 WebSocket API：
-- HTTP: 健康检查、版本信息、摄像头状态/快照、指标、调试仪表盘
-- WebSocket: 画像推送协议（presence_status / profile_result / person_departed）
-- 试衣 MJPEG 流: HTTP multipart 流式传输
+- HTTP: 健康检查、版本信息、摄像头状态/快照、指标、调试仪表盘、V2 试衣结果读取
+- WebSocket: 画像推送协议（presence_status / profile_result / person_departed）与 V2 试衣尝试事件
 
 核心工作循环：
 presence_broadcast_loop() 独立轮询顶部摄像头并推送轻量状态；

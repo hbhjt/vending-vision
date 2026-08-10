@@ -1,7 +1,0 @@
-vem.vision.v1
-vision.try_on.start
-vision.try_on.stop
-vision.try_on.started
-vision.try_on.stopped
-tryon_frontend
-/try-on/{session}.mjpeg

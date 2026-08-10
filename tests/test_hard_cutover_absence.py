@@ -1,12 +1,26 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
 THIS_TEST = Path(__file__).resolve()
-NEGATIVE_FIXTURE = ROOT / "tests" / "fixtures" / "hard-cutover-forbidden.txt"
+
+FORBIDDEN_PATTERNS = (
+    ("protocol-v1", re.compile(r"\bvem[.]vision[.]v1\b")),
+    (
+        "legacy-try-on-wire-message",
+        re.compile(r"\bvision[.]try_on[.](?:start|stop|started|stopped)\b"),
+    ),
+    ("legacy-try-on-client", re.compile(r"\btryon_frontend\b")),
+    (
+        "legacy-preview-route",
+        re.compile(r"/try-on/\{[^}]+}[.]mjpeg\b|try-on-preview", re.I),
+    ),
+    ("transport-specific-preview", re.compile(r"\bmjpeg\b", re.I)),
+)
 
 
-def find_violations(paths, forbidden, *, include_negative_fixture=False):
+def find_violations(paths):
     source_files = [
         path
         for root in paths
@@ -14,26 +28,16 @@ def find_violations(paths, forbidden, *, include_negative_fixture=False):
         if path.is_file()
         and path.suffix not in {".pyc", ".mp4", ".png", ".jpg", ".jpeg", ".log"}
         and path != THIS_TEST
-        and (include_negative_fixture or path != NEGATIVE_FIXTURE)
     ]
     return [
-        f"{path}: {token}"
+        f"{path}: {category}"
         for path in source_files
-        for token in forbidden
-        if token in path.read_text(encoding="utf-8", errors="ignore")
+        for category, pattern in FORBIDDEN_PATTERNS
+        if pattern.search(path.read_text(encoding="utf-8", errors="ignore"))
     ]
 
 
 def test_retired_vision_session_and_v1_surface_is_absent():
-    forbidden = (
-        "vem.vision.v1",
-        "vision.try_on.start",
-        "vision.try_on.stop",
-        "vision.try_on.started",
-        "vision.try_on.stopped",
-        "tryon_frontend",
-        "/try-on/{session}.mjpeg",
-    )
     paths = [
         ROOT / "app.py",
         ROOT / "vision",
@@ -46,16 +50,26 @@ def test_retired_vision_session_and_v1_surface_is_absent():
         ROOT / "vending_vision.spec",
     ]
     assert not (ROOT / "vision" / "try_on_session.py").exists()
-    assert find_violations(paths, forbidden) == []
+    assert find_violations(paths) == []
 
 
-def test_hard_cutover_guard_detects_every_forbidden_category():
-    forbidden = tuple(
-        line for line in NEGATIVE_FIXTURE.read_text(encoding="utf-8").splitlines() if line
-    )
+def test_hard_cutover_guard_detects_every_forbidden_category(tmp_path):
+    def dot(*parts: str) -> str:
+        return ".".join(parts)
 
-    violations = find_violations(
-        [NEGATIVE_FIXTURE], forbidden, include_negative_fixture=True
-    )
+    def compact(*parts: str) -> str:
+        return "".join(parts)
 
-    assert violations == [f"{NEGATIVE_FIXTURE}: {token}" for token in forbidden]
+    fixtures = {
+        "protocol.txt": dot("vem", "vision", "v1"),
+        "wire.txt": dot("vision", "try_on", "start"),
+        "client.txt": compact("tryon", "_", "frontend"),
+        "route.txt": f"/{'/'.join(('try-on', '{session}'))}.{compact('m', 'jpeg')}",
+        "transport.txt": compact("M", "JPEG"),
+    }
+    for name, body in fixtures.items():
+        (tmp_path / name).write_text(f"{body}\n", encoding="utf-8")
+
+    categories = sorted({entry.rsplit(": ", 1)[1] for entry in find_violations([tmp_path])})
+
+    assert categories == sorted(category for category, _pattern in FORBIDDEN_PATTERNS)
