@@ -43,6 +43,7 @@ hiddenimports = [
     "vision.v2_contract_bundle",
     "vision.render_worker_target",
     "vision.acquisition_observer",
+    "vision.worker_self_check",
     "contracts.vem_vision_v2.python.vision_v2_models",
     "uvicorn.lifespan.on",
     "uvicorn.loops.auto",

@@ -30,7 +30,7 @@ MAX_FRAME_WIDTH = 1920
 MAX_FRAME_HEIGHT = 1080
 MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
 STOP_CONFIRM_TIMEOUT_SECONDS = 0.05
-ABORT_CONTROL_TIMEOUT_SECONDS = 0.2
+ABORT_CONTROL_TIMEOUT_SECONDS = 1.0
 _ACQ_SHARED_NAME = re.compile(r"^vem_acq_[0-9a-f]{32}$")
 
 
@@ -42,10 +42,19 @@ class AcquisitionObservation:
 
 
 def _wait_process_dead(process: Any, timeout: float) -> bool:
-    sentinel = getattr(process, "sentinel", None)
+    try:
+        sentinel = getattr(process, "sentinel", None)
+    except ValueError:
+        return True
     if sentinel is not None:
         try:
             if wait_for_sentinels([sentinel], timeout=max(timeout, 0.0)):
+                join = getattr(process, "join", None)
+                if join is not None:
+                    try:
+                        join(timeout=0)
+                    except (AssertionError, OSError, PermissionError, ValueError):
+                        pass
                 try:
                     return not process.is_alive()
                 except (OSError, PermissionError):
@@ -53,7 +62,7 @@ def _wait_process_dead(process: Any, timeout: float) -> bool:
             return not process.is_alive()
         except (OSError, PermissionError, ValueError):
             pass
-    deadline = time.monotonic() + min(max(timeout, 0.0), 0.02)
+    deadline = time.monotonic() + max(timeout, 0.0)
     while time.monotonic() < deadline:
         if not process.is_alive():
             return True
@@ -372,7 +381,23 @@ class AcquisitionObservationWorker:
         async with self._start_lock:
             if self.ready:
                 return
-            self._start()
+            cancelled = False
+            start_task = asyncio.create_task(
+                asyncio.to_thread(self._start),
+                name="acquisition-observer-start",
+            )
+            while not start_task.done():
+                try:
+                    await asyncio.shield(start_task)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    continue
+            start_task.result()
+            if cancelled:
+                await asyncio.to_thread(
+                    self.abort, reason="acquisition_observer_start_cancelled"
+                )
+                raise asyncio.CancelledError
             deadline = time.monotonic() + 15.0
             while time.monotonic() < deadline:
                 with self._state_lock:
@@ -543,16 +568,7 @@ class AcquisitionObservationWorker:
                             self._process = None
                             self._slot = None
                             self._generation += 1
-                    return True
-                if getattr(process, "sentinel", None) is not None and not errors:
-                    if slot is not None:
-                        slot.close(unlink=True)
-                    with self._state_lock:
-                        if self._process is process:
-                            self._parent = None
-                            self._process = None
-                            self._slot = None
-                            self._generation += 1
+                            self._fatal_error = None
                     return True
                 with self._state_lock:
                     self._parent = parent
@@ -568,11 +584,12 @@ class AcquisitionObservationWorker:
             self._process = None
             self._slot = None
             self._generation += 1
+            self._fatal_error = None
         return True
 
     async def abort_async(self, *, reason: str) -> bool:
         try:
-            dead = self.abort(reason=reason)
+            dead = await asyncio.to_thread(self.abort, reason=reason)
         except BaseException as exc:
             with self._state_lock:
                 self._ready = False
@@ -642,7 +659,12 @@ class AcquisitionObservationWorker:
     @property
     def assert_dead(self) -> bool:
         with self._state_lock:
-            return self._process is None or not self._process.is_alive()
+            if self._process is None:
+                return True
+            try:
+                return not self._process.is_alive()
+            except ValueError:
+                return True
 
     @property
     def active_request_count(self) -> int:
@@ -674,7 +696,7 @@ class AcquisitionObservationWorker:
                 self._ready
                 and self._fatal_error is None
                 and self._process is not None
-                and self._process.is_alive()
+                and self.pid is not None
             )
 
     @property

@@ -38,6 +38,7 @@ def test_frozen_spec_keeps_the_generated_v2_bundle_and_static_boundary_import():
     assert '(CONTRACT_ROOT / "vision-v2.server.schema.json", "contracts/vem_vision_v2")' in spec
     assert '(str(ROOT / "contracts"), "contracts")' not in spec
     assert '"vision.v2_contract_bundle"' in spec
+    assert '"vision.worker_self_check"' in spec
     assert '"contracts.vem_vision_v2.python.vision_v2_models"' in spec
 
 
@@ -45,7 +46,9 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     verifier = (ROOT / "scripts" / "verify_packaged_exe.py").read_text("utf-8")
 
     assert '"--verify-v2-contract-bundle"' in verifier
+    assert '"--verify-v2-try-on-workers"' in verifier
     assert '"V2 contract bundle probe passed"' in verifier
+    assert '"V2 try-on worker probe passed"' in verifier
     assert '"contracts" / "vem_vision_v2"' in verifier
     assert "expected_contract_resources" in verifier
     assert '"__init__.py"' in verifier
@@ -60,6 +63,7 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     assert "assert_hard_cutover_archive_absence(exe_path)" in verifier
     assert "retired modules remain in packaged archive" in verifier
     assert "retired_try_on_route" in verifier
+    assert "assert_no_worker_resource_leak_output" in verifier
 
 
 def test_frozen_runtime_keeps_the_spawn_safe_render_worker_entry():
@@ -70,6 +74,7 @@ def test_frozen_runtime_keeps_the_spawn_safe_render_worker_entry():
 
     assert '"vision.render_worker_target"' in spec
     assert '"vision.acquisition_observer"' in spec
+    assert '"vision.worker_self_check"' in spec
     assert "multiprocessing.freeze_support()" in launcher
     assert launcher.index("multiprocessing.freeze_support()") < launcher.index(
         "from app import app as fastapi_app"

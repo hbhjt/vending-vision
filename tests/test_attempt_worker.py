@@ -1019,7 +1019,7 @@ def test_render_shutdown_does_not_call_stubborn_blocking_join_before_dead():
 
     broker, live, elapsed = asyncio.run(scenario())
 
-    assert elapsed < 0.2
+    assert elapsed < 3.5
     assert live.join_calls == []
     assert not broker.ready
     assert broker.pid == live.pid
@@ -1029,6 +1029,90 @@ def test_render_shutdown_does_not_call_stubborn_blocking_join_before_dead():
         thread.name == "fast-render-shutdown" and thread.is_alive()
         for thread in threading.enumerate()
     )
+
+
+def test_render_pid_probe_never_touches_unowned_multiprocessing_children():
+    context = multiprocessing.get_context("spawn")
+    unrelated = context.Process(target=time.sleep, args=(5,))
+    unrelated.start()
+    try:
+        broker = FastRenderBroker()
+        broker._fatal_error = "render_broker_readiness_timeout"
+
+        assert broker.pid is None
+        assert unrelated.is_alive()
+    finally:
+        if unrelated.is_alive():
+            unrelated.terminate()
+        unrelated.join(timeout=2.0)
+        if unrelated.is_alive():
+            unrelated.kill()
+            unrelated.join(timeout=2.0)
+        unrelated.close()
+
+
+def test_async_render_start_ticks_and_cancel_stops_new_child_before_barrier_release():
+    real_context = multiprocessing.get_context("spawn")
+
+    class SlowStartProcess:
+        pid = 7071
+        exitcode = None
+
+        def __init__(self, **_kwargs):
+            self._alive = False
+            self.kill_attempted = False
+
+        def start(self):
+            time.sleep(0.2)
+            self._alive = True
+
+        def is_alive(self):
+            return self._alive
+
+        def kill(self):
+            self.kill_attempted = True
+            self._alive = False
+
+        def terminate(self):
+            self._alive = False
+
+        def close(self):
+            return None
+
+    class Context:
+        def __init__(self):
+            self.process = SlowStartProcess()
+
+        def Event(self):
+            return real_context.Event()
+
+        def Lock(self):
+            return real_context.Lock()
+
+        def Process(self, **_kwargs):
+            return self.process
+
+    async def scenario():
+        context = Context()
+        broker = FastRenderBroker(context=context)
+        task = asyncio.create_task(broker.start())
+        await asyncio.sleep(0.05)
+        ticks = 0
+        deadline = asyncio.get_running_loop().time() + 0.05
+        while asyncio.get_running_loop().time() < deadline:
+            ticks += 1
+            task.cancel()
+            await asyncio.sleep(0.005)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        return context.process, broker, ticks
+
+    process, broker, ticks = asyncio.run(scenario())
+
+    assert ticks >= 5
+    assert process.kill_attempted is True
+    assert process.is_alive() is False
+    assert broker.ready is False
 
 
 def test_concurrent_render_start_is_rejected_without_worker_or_queue_growth():

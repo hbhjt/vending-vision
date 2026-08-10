@@ -40,6 +40,7 @@ _CONSERVATIVE_PREPARE_BYTES_PER_SECOND = 64 * 1024 * 1024
 _CONSERVATIVE_PREPARE_FIXED_SECONDS = 0.020
 _START_TIMEOUT_SECONDS = 5.0
 _STOP_CONFIRM_TIMEOUT_SECONDS = 1.0
+_GRACEFUL_STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
 
 
 def _write_shared_render_frame(
@@ -85,10 +86,14 @@ def _unlink_shared_render_frame(shm: shared_memory.SharedMemory | None) -> None:
 
 
 async def _run_broker_control(name: str, operation):
-    """Run one bounded process-control operation without a control thread."""
-    del name
-    await asyncio.sleep(0)
-    return operation()
+    """Run one bounded process-control operation off the event loop."""
+    task = asyncio.create_task(asyncio.to_thread(operation), name=name)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
 
 
 async def _finish_cancelled_control(operation) -> Any:
@@ -103,10 +108,19 @@ async def _finish_cancelled_control(operation) -> Any:
 
 
 def _wait_process_dead(process: Any, timeout: float) -> bool:
-    sentinel = getattr(process, "sentinel", None)
+    try:
+        sentinel = getattr(process, "sentinel", None)
+    except ValueError:
+        return True
     if sentinel is not None:
         try:
             if wait_for_sentinels([sentinel], timeout=max(timeout, 0.0)):
+                join = getattr(process, "join", None)
+                if join is not None:
+                    try:
+                        join(timeout=0)
+                    except (AssertionError, OSError, PermissionError, ValueError):
+                        pass
                 try:
                     return not _process_is_alive(process)
                 except (OSError, PermissionError):
@@ -114,7 +128,7 @@ def _wait_process_dead(process: Any, timeout: float) -> bool:
             return not _process_is_alive(process)
         except (AttributeError, OSError, PermissionError, ValueError):
             pass
-    deadline = time.monotonic() + min(max(timeout, 0.0), 0.02)
+    deadline = time.monotonic() + max(timeout, 0.0)
     while time.monotonic() < deadline:
         if not _process_is_alive(process):
             return True
@@ -181,7 +195,6 @@ class FastRenderBroker:
         self._active_request = False
         self._process_generation = 0
         self._request_generation = 0
-        self._detached_processes: list[Any] = []
 
     def _mp_context(self):
         if self._context is not None:
@@ -189,9 +202,32 @@ class FastRenderBroker:
         multiprocessing.freeze_support()
         return multiprocessing.get_context("spawn")
 
+    def _reconcile_dead_shutdown_locked(self) -> None:
+        self._request_threads = {
+            thread for thread in self._request_threads if thread.is_alive()
+        }
+        if self._fatal_error != "render_broker_shutdown_failed":
+            return
+        if self._active_request or self._request_threads:
+            return
+        process = self._process
+        if process is not None and _process_is_alive(process):
+            return
+        slot = self._slot
+        if process is not None:
+            _close_dead_process(process)
+        if slot is not None:
+            slot.close(unlink=True)
+        self._parent = None
+        self._process = None
+        self._slot = None
+        self._ready = False
+        self._fatal_error = None
+
     @property
     def ready(self) -> bool:
         with self._state_lock:
+            self._reconcile_dead_shutdown_locked()
             process = self._process
             return bool(
                 self._ready
@@ -203,52 +239,13 @@ class FastRenderBroker:
     @property
     def pose_ready(self) -> bool:
         with self._state_lock:
+            self._reconcile_dead_shutdown_locked()
             return bool(self._pose_ready and self.ready)
 
     @property
     def pid(self) -> int | None:
         with self._state_lock:
-            for detached in list(self._detached_processes):
-                try:
-                    detached_alive = _process_is_alive(detached)
-                except ValueError:
-                    self._detached_processes.remove(detached)
-                    continue
-                if detached_alive:
-                    try:
-                        detached.kill()
-                    except (AttributeError, NotImplementedError):
-                        try:
-                            detached.terminate()
-                        except (AttributeError, NotImplementedError, OSError, PermissionError):
-                            pass
-                    except (AttributeError, NotImplementedError, OSError, PermissionError):
-                        pass
-                    _wait_process_dead(detached, 1.0)
-                try:
-                    detached_alive = _process_is_alive(detached)
-                except ValueError:
-                    detached_alive = False
-                if not detached_alive:
-                    _close_dead_process(detached)
-                    self._detached_processes.remove(detached)
-            if self._fatal_error is not None:
-                current_process = self._process
-                for child in multiprocessing.active_children():
-                    if current_process is not None and child.pid == current_process.pid:
-                        continue
-                    try:
-                        child.kill()
-                    except (AttributeError, NotImplementedError):
-                        try:
-                            child.terminate()
-                        except (AttributeError, NotImplementedError, OSError, PermissionError):
-                            pass
-                    except (OSError, PermissionError):
-                        pass
-                    _wait_process_dead(child, 1.0)
-                    if not _process_is_alive(child):
-                        _close_dead_process(child)
+            self._reconcile_dead_shutdown_locked()
             process = self._process
             if process is None:
                 return None
@@ -362,12 +359,11 @@ class FastRenderBroker:
             with self._state_lock:
                 self._ready = False
                 self._fatal_error = "render_broker_readiness_timeout"
-                if self._process is process:
+                if self._process is process and not _process_is_alive(process):
                     self._parent = None
                     self._process = None
                     self._slot = None
-                    self._detached_processes.append(process)
-                slot.close(unlink=True)
+                    slot.close(unlink=True)
             raise AttemptWorkerError("render broker readiness timeout")
         try:
             kind, payload, response_process_generation, _response_request_generation = slot.recv_response()
@@ -395,6 +391,7 @@ class FastRenderBroker:
 
     async def start(self) -> None:
         with self._state_lock:
+            self._reconcile_dead_shutdown_locked()
             if self._fatal_error is not None:
                 raise AttemptWorkerError(
                     f"render broker is unavailable: {self._fatal_error}"
@@ -405,6 +402,7 @@ class FastRenderBroker:
     async def _start_async(self) -> None:
         """Start and prewarm the broker without blocking the event loop."""
         with self._state_lock:
+            self._reconcile_dead_shutdown_locked()
             if self._fatal_error is not None:
                 raise AttemptWorkerError(
                     f"render broker is unavailable: {self._fatal_error}"
@@ -435,8 +433,19 @@ class FastRenderBroker:
                 args=(self._target, slot_config, self._target_args),
                 daemon=True,
             )
+            cancelled = False
+            start_task = asyncio.create_task(
+                asyncio.to_thread(process.start),
+                name="fast-render-start",
+            )
+            while not start_task.done():
+                try:
+                    await asyncio.shield(start_task)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    continue
             try:
-                process.start()
+                start_task.result()
             except BaseException as exc:
                 slot.close(unlink=True)
                 try:
@@ -449,6 +458,15 @@ class FastRenderBroker:
                 raise AttemptWorkerError(
                     f"render broker is unavailable: {self._fatal_error}"
                 ) from exc
+            if cancelled:
+                self._parent = None
+                self._process = process
+                self._slot = slot
+                self._ready = False
+                self._process_generation = next_process_generation
+                self._request_generation = 0
+                self._stop_sync(graceful=False, reason="render_broker_start_cancelled")
+                raise asyncio.CancelledError
             self._parent = None
             self._process = process
             self._slot = slot
@@ -467,12 +485,11 @@ class FastRenderBroker:
             with self._state_lock:
                 self._ready = False
                 self._fatal_error = "render_broker_readiness_timeout"
-                if self._process is process:
+                if self._process is process and not _process_is_alive(process):
                     self._parent = None
                     self._process = None
                     self._slot = None
-                    self._detached_processes.append(process)
-                slot.close(unlink=True)
+                    slot.close(unlink=True)
             raise AttemptWorkerError("render broker readiness timeout")
 
         def finalize_dead_child(reason: str) -> None:
@@ -560,6 +577,15 @@ class FastRenderBroker:
                     wait_for_event(slot.config["responseEvent"], 0.25, process=process)
                 except Exception:
                     pass
+                if _wait_process_dead(process, _GRACEFUL_STOP_CONFIRM_TIMEOUT_SECONDS):
+                    _close_dead_process(process)
+                    self._parent = None
+                    self._process = None
+                    self._slot = None
+                    self._fatal_error = None
+                    if slot is not None:
+                        slot.close(unlink=True)
+                    return True
             if parent is not None:
                 try:
                     parent.close()
@@ -592,14 +618,7 @@ class FastRenderBroker:
                     self._parent = None
                     self._process = None
                     self._slot = None
-                    if slot is not None:
-                        slot.close(unlink=True)
-                    return True
-                if getattr(process, "sentinel", None) is not None and not errors:
-                    self._parent = None
-                    self._process = None
-                    self._slot = None
-                    self._detached_processes.append(process)
+                    self._fatal_error = None
                     if slot is not None:
                         slot.close(unlink=True)
                     return True
@@ -613,6 +632,7 @@ class FastRenderBroker:
             self._parent = None
             self._process = None
             self._slot = None
+            self._fatal_error = None
             if slot is not None:
                 slot.close(unlink=True)
             return True
@@ -665,6 +685,15 @@ class FastRenderBroker:
         dead = await _run_broker_control(
             "fast-render-shutdown", stop_and_join_requests
         )
+        if not dead:
+            with self._state_lock:
+                self._reconcile_dead_shutdown_locked()
+                dead = (
+                    self._fatal_error is None
+                    and self._process is None
+                    and not self._request_threads
+                    and not self._active_request
+                )
         if not dead:
             raise AttemptWorkerError("render broker shutdown incomplete")
 

@@ -344,7 +344,7 @@ def test_abort_async_does_not_call_stubborn_blocking_join_before_dead():
     result, elapsed = asyncio.run(scenario())
 
     assert result is False
-    assert elapsed < 0.2
+    assert elapsed < 3.5
     assert live.join_calls == []
     assert broker.assert_dead() is False
     assert not any(

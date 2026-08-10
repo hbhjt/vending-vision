@@ -305,6 +305,10 @@ async def _read_attempt_front_frame(
             dead = await abort_task
             await asyncio.gather(read_task, return_exceptions=True)
             if not dead:
+                dead = await abort_camera_request(
+                    "front", reason=f"{abort_reason}_confirm"
+                )
+            if not dead:
                 raise RuntimeError("front camera broker remained alive after abort")
             if cancel_waiter in done:
                 raise GarmentFetchError("attempt_canceled")
@@ -316,6 +320,10 @@ async def _read_attempt_front_frame(
             read_task.cancel()
             dead = await asyncio.shield(abort_task)
             await asyncio.shield(asyncio.gather(read_task, return_exceptions=True))
+            if not dead:
+                dead = await asyncio.shield(
+                    abort_camera_request("front", reason="try_on_attempt_cancelled_confirm")
+                )
             if not dead:
                 raise RuntimeError("front camera broker remained alive after cancel")
             raise

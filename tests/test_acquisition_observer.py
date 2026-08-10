@@ -490,6 +490,70 @@ def test_observer_abort_async_does_not_call_stubborn_blocking_join_before_dead()
     )
 
 
+def test_async_acquisition_start_ticks_and_cancel_stops_new_child_before_ready():
+    real_context = multiprocessing.get_context("spawn")
+
+    class SlowStartProcess:
+        pid = 7676
+        exitcode = None
+
+        def __init__(self, **_kwargs):
+            self._alive = False
+            self.kill_attempted = False
+
+        def start(self):
+            time.sleep(0.2)
+            self._alive = True
+
+        def is_alive(self):
+            return self._alive
+
+        def kill(self):
+            self.kill_attempted = True
+            self._alive = False
+
+        def terminate(self):
+            self._alive = False
+
+        def close(self):
+            return None
+
+    class Context:
+        def __init__(self):
+            self.process = SlowStartProcess()
+
+        def Event(self):
+            return real_context.Event()
+
+        def Lock(self):
+            return real_context.Lock()
+
+        def Process(self, **_kwargs):
+            return self.process
+
+    async def scenario():
+        context = Context()
+        worker = AcquisitionObservationWorker(context=context)
+        task = asyncio.create_task(worker.start())
+        await asyncio.sleep(0.05)
+        ticks = 0
+        deadline = asyncio.get_running_loop().time() + 0.05
+        while asyncio.get_running_loop().time() < deadline:
+            ticks += 1
+            task.cancel()
+            await asyncio.sleep(0.005)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        return context.process, worker, ticks
+
+    process, worker, ticks = asyncio.run(scenario())
+
+    assert ticks >= 5
+    assert process.kill_attempted is True
+    assert process.is_alive() is False
+    assert worker.ready is False
+
+
 @pytest.mark.parametrize(
     "metadata",
     [

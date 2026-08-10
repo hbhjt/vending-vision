@@ -68,6 +68,11 @@ def parse_args(argv=None):
         action="store_true",
         help="verify the frozen V2 bundle accepts and rejects its committed fixtures",
     )
+    parser.add_argument(
+        "--verify-v2-try-on-workers",
+        action="store_true",
+        help="verify frozen V2 try-on worker spawn and shared IPC boundaries",
+    )
     return parser.parse_args(argv)
 
 
@@ -100,6 +105,12 @@ def main():
     args = parse_args()
     if args.verify_v2_contract_bundle:
         verify_v2_contract_bundle()
+        return
+    if args.verify_v2_try_on_workers:
+        from vision.worker_self_check import verify_v2_try_on_workers
+
+        verify_v2_try_on_workers()
+        print("V2 try-on worker probe passed")
         return
     configure_workdir()
     # 抑制 TensorFlow/MediaPipe 的冗余日志输出

@@ -353,6 +353,30 @@ def terminate_packaged_process(process, process_log, *, verification_failed=Fals
     return output
 
 
+def assert_no_worker_resource_leak_output(output):
+    lowered = output.lower()
+    if "resource_tracker" in lowered or "shared_memory" in lowered:
+        raise AssertionError(f"packaged worker probe leaked resource diagnostics: {output}")
+
+
+def run_packaged_probe(exe_path, argument, expected_stdout):
+    probe = subprocess.run(
+        [str(exe_path), argument],
+        cwd=str(exe_path.parent),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    combined = f"{probe.stdout}{probe.stderr}"
+    assert_no_worker_resource_leak_output(combined)
+    if probe.returncode != 0 or expected_stdout not in probe.stdout:
+        raise AssertionError(
+            f"packaged probe {argument} failed: {combined}",
+        )
+
+
 def verify_plain_camera_maintenance_contract(base_url):
     """Exercise the real packaged adapter through plain loopback v2 routes."""
     read_status, contract = http_status_json(f"{base_url}/maintenance/cameras")
@@ -442,19 +466,16 @@ def main():
         raise FileNotFoundError(exe_path)
 
     assert_bundled_resources(exe_path)
-    probe = subprocess.run(
-        [str(exe_path), "--verify-v2-contract-bundle"],
-        cwd=str(exe_path.parent),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
+    run_packaged_probe(
+        exe_path,
+        "--verify-v2-contract-bundle",
+        "V2 contract bundle probe passed",
     )
-    if probe.returncode != 0 or "V2 contract bundle probe passed" not in probe.stdout:
-        raise AssertionError(
-            f"packaged V2 contract probe failed: {probe.stdout}{probe.stderr}",
-        )
+    run_packaged_probe(
+        exe_path,
+        "--verify-v2-try-on-workers",
+        "V2 try-on worker probe passed",
+    )
     ensure_port_available(args.port)
     managed_port = args.port + 1
     ensure_port_available(managed_port)
