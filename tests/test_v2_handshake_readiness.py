@@ -85,7 +85,7 @@ def test_v2_digest_mismatch_withholds_fast_readiness_without_rejecting_core_conn
 ):
     """A contract mismatch is an enhancement diagnostic, not a core Vision outage."""
     manifest = json.loads((BUNDLE_ROOT / "manifest.json").read_text("utf-8"))
-    hello = json.loads((BUNDLE_ROOT / "fixtures" / "valid.json").read_text("utf-8"))[0]
+    hello = json.loads((BUNDLE_ROOT / "fixtures" / "client-valid.json").read_text("utf-8"))[0]
     hello["payload"]["bundleVersion"] = manifest["bundleVersion"]
     hello["payload"]["schemaVersion"] = manifest["schemaVersion"]
     hello["payload"]["contractDigest"] = "b" * 64
@@ -113,7 +113,7 @@ def test_v2_digest_mismatch_withholds_fast_readiness_without_rejecting_core_conn
 def test_v2_handshake_rejects_unknown_envelope_properties_through_generated_boundary(
     monkeypatch,
 ):
-    hello = json.loads((BUNDLE_ROOT / "fixtures" / "valid.json").read_text("utf-8"))[0]
+    hello = json.loads((BUNDLE_ROOT / "fixtures" / "client-valid.json").read_text("utf-8"))[0]
     hello["unexpected"] = True
     monkeypatch.setattr(
         vision_app,
@@ -135,7 +135,7 @@ def test_v2_handshake_rejects_unknown_envelope_properties_through_generated_boun
 def test_missing_identity_returns_a_strict_degraded_ready_after_valid_hello(
     monkeypatch,
 ):
-    hello = json.loads((BUNDLE_ROOT / "fixtures" / "valid.json").read_text("utf-8"))[0]
+    hello = json.loads((BUNDLE_ROOT / "fixtures" / "client-valid.json").read_text("utf-8"))[0]
     monkeypatch.setattr(
         vision_app,
         "load_v2_contract_identity",
@@ -158,7 +158,7 @@ def test_missing_identity_returns_a_strict_degraded_ready_after_valid_hello(
 
 
 def test_missing_generated_parser_never_falls_back_to_hello_capabilities(monkeypatch):
-    hello = json.loads((BUNDLE_ROOT / "fixtures" / "valid.json").read_text("utf-8"))[0]
+    hello = json.loads((BUNDLE_ROOT / "fixtures" / "client-valid.json").read_text("utf-8"))[0]
     monkeypatch.setattr(
         vision_app,
         "parse_v2_client_message",

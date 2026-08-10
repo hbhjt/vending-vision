@@ -136,7 +136,10 @@ _CLIENT_ADAPTER = TypeAdapter(VisionV2ClientEnvelope)
 _SERVER_ADAPTER = TypeAdapter(VisionV2ServerEnvelope)
 
 def _parse(value: Any, schema: dict[str, Any], validator: Draft202012Validator, adapter: TypeAdapter) -> Any:
-    normalized = _normalize_json_integers(value, schema)
+    try:
+        normalized = _normalize_json_integers(value, schema)
+    except ValueError as error:
+        raise ValueError(f"invalid {PROTOCOL} message: {error}") from error
     error = next(iter(validator.iter_errors(normalized)), None)
     if error is not None:
         raise ValueError(f"invalid {PROTOCOL} message: {error.message}")

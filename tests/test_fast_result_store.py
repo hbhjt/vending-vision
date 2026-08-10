@@ -101,7 +101,7 @@ def test_terminal_commit_failure_has_one_failed_terminal_and_no_orphan_grant():
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted=accepted,
-            progress=None,
+            generating=None,
         )
         transition = await registry.commit_terminal_transition(
             admission.receipt,
@@ -136,7 +136,7 @@ def test_registry_never_admits_a_result_for_a_noncompleted_terminal(terminal_typ
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted={"type": "vision.try_on.attempt.accepted", "payload": {"attemptId": attempt_id}},
-            progress=None,
+            generating=None,
         )
 
         transition = await registry.commit_terminal_transition(
@@ -157,7 +157,7 @@ def test_registry_never_admits_a_result_for_a_noncompleted_terminal(terminal_typ
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted=None,
-            progress=None,
+            generating=None,
         )
         assert replay.replay == [transition.message]
 
@@ -178,7 +178,7 @@ def test_capacity_eviction_removes_dead_completed_replay_before_new_is_visible()
                 send_lock=asyncio.Lock(),
                 task=asyncio.current_task(),
                 accepted={"type": "vision.try_on.attempt.accepted", "payload": {"attemptId": attempt_id}},
-                progress=None,
+                generating=None,
             )
             assert admission.is_owner
             result = _result(token, size)
@@ -197,11 +197,11 @@ def test_capacity_eviction_removes_dead_completed_replay_before_new_is_visible()
         assert await registry.get_result("new", "new-token") is not None
         assert (await registry.admit(
             attempt_id="new", websocket=object(), send_lock=asyncio.Lock(),
-            task=asyncio.current_task(), accepted=None, progress=None,
+            task=asyncio.current_task(), accepted=None, generating=None,
         )).replay == [new]
         old_readmission = await registry.admit(
             attempt_id="old", websocket=object(), send_lock=asyncio.Lock(),
-            task=asyncio.current_task(), accepted=None, progress=None,
+            task=asyncio.current_task(), accepted=None, generating=None,
         )
         assert old_readmission.is_owner
         assert old_readmission.replay == []
@@ -225,7 +225,7 @@ def test_result_expiry_removes_its_completed_terminal_before_same_id_replay():
             attempt_id=attempt_id,
             websocket=object(), send_lock=asyncio.Lock(), task=asyncio.current_task(),
             accepted={"type": "vision.try_on.attempt.accepted", "payload": {"attemptId": attempt_id}},
-            progress=None,
+            generating=None,
         )
         result = _result("expired-token", 4)
         await registry.commit_terminal_transition(
@@ -238,7 +238,7 @@ def test_result_expiry_removes_its_completed_terminal_before_same_id_replay():
         readmission = await registry.admit(
             attempt_id=attempt_id,
             websocket=object(), send_lock=asyncio.Lock(), task=asyncio.current_task(),
-            accepted=None, progress=None,
+            accepted=None, generating=None,
         )
         assert readmission.is_owner
         assert readmission.replay == []
@@ -255,7 +255,7 @@ def test_failed_new_result_admission_keeps_existing_terminal_and_grant_intact():
 
         old_admission = await registry.admit(
             attempt_id="old", websocket=object(), send_lock=asyncio.Lock(),
-            task=asyncio.current_task(), accepted=None, progress=None,
+            task=asyncio.current_task(), accepted=None, generating=None,
         )
         old_result = _result("old-token", 4)
         old_completed = {
@@ -268,7 +268,7 @@ def test_failed_new_result_admission_keeps_existing_terminal_and_grant_intact():
 
         new_admission = await registry.admit(
             attempt_id="new", websocket=object(), send_lock=asyncio.Lock(),
-            task=asyncio.current_task(), accepted=None, progress=None,
+            task=asyncio.current_task(), accepted=None, generating=None,
         )
         transition = await registry.commit_terminal_transition(
             new_admission.receipt,
@@ -281,7 +281,7 @@ def test_failed_new_result_admission_keeps_existing_terminal_and_grant_intact():
         assert await registry.get_result("old", "old-token") is not None
         old_replay = await registry.admit(
             attempt_id="old", websocket=object(), send_lock=asyncio.Lock(),
-            task=asyncio.current_task(), accepted=None, progress=None,
+            task=asyncio.current_task(), accepted=None, generating=None,
         )
         assert old_replay.replay == [old_completed]
         assert await registry.get_result("new", "new-token") is None
@@ -299,7 +299,7 @@ def test_evicted_attempt_duplicate_race_has_one_new_owner_and_no_stale_replay():
         async def complete(attempt_id, token):
             admission = await registry.admit(
                 attempt_id=attempt_id, websocket=object(), send_lock=asyncio.Lock(),
-                task=asyncio.current_task(), accepted=None, progress=None,
+                task=asyncio.current_task(), accepted=None, generating=None,
             )
             await registry.commit_terminal_transition(
                 admission.receipt,
@@ -312,7 +312,7 @@ def test_evicted_attempt_duplicate_race_has_one_new_owner_and_no_stale_replay():
         duplicates = await asyncio.gather(*(
             registry.admit(
                 attempt_id="old", websocket=object(), send_lock=asyncio.Lock(),
-                task=asyncio.current_task(), accepted=None, progress=None,
+                task=asyncio.current_task(), accepted=None, generating=None,
             )
             for _ in range(8)
         ))
