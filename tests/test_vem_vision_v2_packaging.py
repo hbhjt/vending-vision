@@ -34,7 +34,8 @@ def test_frozen_spec_keeps_the_generated_v2_bundle_and_static_boundary_import():
     assert '(CONTRACT_ROOT / "__init__.py", "contracts/vem_vision_v2")' in spec
     assert '(CONTRACT_ROOT / "python" / "__init__.py", "contracts/vem_vision_v2/python")' in spec
     assert '(CONTRACT_ROOT / "python" / "vision_v2_models.py", "contracts/vem_vision_v2/python")' in spec
-    assert '(CONTRACT_ROOT / "vision-v2.schema.json", "contracts/vem_vision_v2")' in spec
+    assert '(CONTRACT_ROOT / "vision-v2.client.schema.json", "contracts/vem_vision_v2")' in spec
+    assert '(CONTRACT_ROOT / "vision-v2.server.schema.json", "contracts/vem_vision_v2")' in spec
     assert '(str(ROOT / "contracts"), "contracts")' not in spec
     assert '"vision.v2_contract_bundle"' in spec
     assert '"contracts.vem_vision_v2.python.vision_v2_models"' in spec

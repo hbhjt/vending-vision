@@ -29,7 +29,7 @@ def test_debug_contract_bundle_exposes_the_generated_manifest_identity_only():
 
 def test_debug_websocket_accepts_the_same_strict_manifest_bound_v2_hello(monkeypatch):
     manifest = json.loads((BUNDLE_ROOT / "manifest.json").read_text("utf-8"))
-    hello = json.loads((BUNDLE_ROOT / "fixtures" / "valid.json").read_text("utf-8"))[0]
+    hello = json.loads((BUNDLE_ROOT / "fixtures" / "client-valid.json").read_text("utf-8"))[0]
     hello["payload"]["schemaVersion"] = manifest["schemaVersion"]
     hello["payload"]["bundleVersion"] = manifest["bundleVersion"]
     hello["payload"]["contractDigest"] = manifest["bundleDigest"]
@@ -72,7 +72,7 @@ def test_v2_identity_rejects_noncanonical_duplicate_and_digest_tampering(
         )
     else:
         manifest = json.loads(raw)
-        manifest["files"]["vision-v2.schema.json"] = "f" * 64
+        manifest["files"]["vision-v2.client.schema.json"] = "f" * 64
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     monkeypatch.setattr(v2_contract_bundle, "_BUNDLE_ROOT", bundle)
 
@@ -161,7 +161,7 @@ def test_missing_generated_parser_never_falls_back_to_hello_capabilities(monkeyp
     hello = json.loads((BUNDLE_ROOT / "fixtures" / "valid.json").read_text("utf-8"))[0]
     monkeypatch.setattr(
         vision_app,
-        "parse_v2_boundary_message",
+        "parse_v2_client_message",
         lambda _value: (_ for _ in ()).throw(V2ContractBundleUnavailable("missing")),
     )
     monkeypatch.setattr(

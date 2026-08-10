@@ -186,7 +186,7 @@ def test_fast_runtime_cancels_a_slow_drip_and_closes_its_stream():
         )
         assert await asyncio.to_thread(SlowDripHandler.entered.wait, 1.0)
         canceled.set()
-        with pytest.raises(GarmentFetchError, match="attempt_replaced"):
+        with pytest.raises(GarmentFetchError, match="attempt_canceled"):
             await asyncio.wait_for(task, timeout=1.0)
         assert task.done()
         assert await asyncio.to_thread(SlowDripHandler.closed.wait, 1.0)

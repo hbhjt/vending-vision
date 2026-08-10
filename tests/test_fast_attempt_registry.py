@@ -11,7 +11,7 @@ def _message(message_type: str, attempt_id: str, message_id: str) -> dict:
     return {
         "type": message_type,
         "messageId": message_id,
-        "payload": {"attemptId": attempt_id, "reason": "attempt_replaced"},
+        "payload": {"attemptId": attempt_id, "reason": "replaced"},
     }
 
 
@@ -21,7 +21,7 @@ def test_cancel_wins_over_completed_with_one_canonical_terminal():
         registry = FastAttemptRegistry(terminal_ttl_seconds=60)
         attempt_id = str(uuid4())
         accepted = _message("vision.try_on.attempt.accepted", attempt_id, "accepted-1")
-        progress = _message("vision.try_on.attempt.progress", attempt_id, "progress-1")
+        generating = _message("vision.try_on.attempt.generating", attempt_id, "generating-1")
         canceled = _message("vision.try_on.attempt.failed", attempt_id, "canceled-1")
         completed = _message("vision.try_on.attempt.completed", attempt_id, "completed-1")
         receipts = set()
@@ -31,7 +31,7 @@ def test_cancel_wins_over_completed_with_one_canonical_terminal():
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted=accepted,
-            progress=progress,
+            generating=generating,
             canceled_terminal=canceled,
             owner_receipts=receipts,
         )
@@ -47,7 +47,7 @@ def test_cancel_wins_over_completed_with_one_canonical_terminal():
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted=accepted,
-            progress=progress,
+            generating=generating,
         )
 
         assert replay.replay == [canceled]
@@ -61,7 +61,7 @@ def test_completed_wins_over_later_cancel_with_one_canonical_terminal():
         registry = FastAttemptRegistry(terminal_ttl_seconds=60)
         attempt_id = str(uuid4())
         accepted = _message("vision.try_on.attempt.accepted", attempt_id, "accepted-2")
-        progress = _message("vision.try_on.attempt.progress", attempt_id, "progress-2")
+        generating = _message("vision.try_on.attempt.generating", attempt_id, "generating-2")
         completed = _message("vision.try_on.attempt.completed", attempt_id, "completed-2")
 
         admission = await registry.admit(
@@ -70,7 +70,7 @@ def test_completed_wins_over_later_cancel_with_one_canonical_terminal():
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted=accepted,
-            progress=progress,
+            generating=generating,
             canceled_terminal=_message("vision.try_on.attempt.failed", attempt_id, "canceled-2"),
         )
         assert admission.is_owner
@@ -82,7 +82,7 @@ def test_completed_wins_over_later_cancel_with_one_canonical_terminal():
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted=accepted,
-            progress=progress,
+            generating=generating,
         )
 
         assert replay.replay == [completed]
@@ -111,7 +111,7 @@ def test_waiting_replacement_rechecks_after_same_id_backpressure_terminal():
             send_lock=asyncio.Lock(),
             task=first_task_handle,
             accepted=_message("vision.try_on.attempt.accepted", first_id, "first-accepted"),
-            progress=_message("vision.try_on.attempt.progress", first_id, "first-progress"),
+            generating=_message("vision.try_on.attempt.generating", first_id, "first-generating"),
             canceled_terminal=first_canceled,
         )
         assert first_admission.is_owner
@@ -123,7 +123,7 @@ def test_waiting_replacement_rechecks_after_same_id_backpressure_terminal():
                 send_lock=asyncio.Lock(),
                 task=asyncio.current_task(),
                 accepted=_message("vision.try_on.attempt.accepted", replacement_id, "replacement-accepted"),
-                progress=_message("vision.try_on.attempt.progress", replacement_id, "replacement-progress"),
+                generating=_message("vision.try_on.attempt.generating", replacement_id, "replacement-generating"),
             )
         )
 
@@ -181,8 +181,8 @@ def test_prior_join_outcome_is_consumed_before_pending_admission_recheck(
             accepted=_message(
                 "vision.try_on.attempt.accepted", first_id, "first-accepted"
             ),
-            progress=_message(
-                "vision.try_on.attempt.progress", first_id, "first-progress"
+            generating=_message(
+                "vision.try_on.attempt.generating", first_id, "first-generating"
             ),
             canceled_terminal=_message(
                 "vision.try_on.attempt.failed", first_id, "first-canceled"
@@ -193,8 +193,8 @@ def test_prior_join_outcome_is_consumed_before_pending_admission_recheck(
         accepted = _message(
             "vision.try_on.attempt.accepted", pending_id, "pending-accepted"
         )
-        progress = _message(
-            "vision.try_on.attempt.progress", pending_id, "pending-progress"
+        generating = _message(
+            "vision.try_on.attempt.generating", pending_id, "pending-generating"
         )
         unavailable = _message(
             "vision.try_on.attempt.failed", pending_id, "pending-unavailable"
@@ -214,7 +214,7 @@ def test_prior_join_outcome_is_consumed_before_pending_admission_recheck(
             return await registry.commit_prepared_admission(
                 preparation,
                 accepted=accepted,
-                progress=progress,
+                generating=generating,
                 unavailable_terminal=unavailable,
                 readiness=lambda: ready,
             )
@@ -231,11 +231,11 @@ def test_prior_join_outcome_is_consumed_before_pending_admission_recheck(
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted=None,
-            progress=None,
+            generating=None,
         )
         if ready:
             assert pending.is_owner
-            assert replay.replay == [accepted, progress]
+            assert replay.replay == [accepted, generating]
             await registry.cancel_owner_and_join(pending.receipt)
         else:
             assert not pending.is_owner
@@ -251,8 +251,8 @@ def test_prior_join_outcome_is_consumed_before_pending_admission_recheck(
                 accepted=_message(
                     "vision.try_on.attempt.accepted", next_id, "next-accepted"
                 ),
-                progress=_message(
-                    "vision.try_on.attempt.progress", next_id, "next-progress"
+                generating=_message(
+                    "vision.try_on.attempt.generating", next_id, "next-generating"
                 ),
             ),
             timeout=1.0,
@@ -291,8 +291,8 @@ def test_cancelled_pending_owner_keeps_cleanup_barrier_until_prior_task_ends():
             accepted=_message(
                 "vision.try_on.attempt.accepted", first_id, "first-accepted"
             ),
-            progress=_message(
-                "vision.try_on.attempt.progress", first_id, "first-progress"
+            generating=_message(
+                "vision.try_on.attempt.generating", first_id, "first-generating"
             ),
             canceled_terminal=first_canceled,
         )
@@ -316,8 +316,8 @@ def test_cancelled_pending_owner_keeps_cleanup_barrier_until_prior_task_ends():
                 accepted=_message(
                     "vision.try_on.attempt.accepted", pending_id, "pending-accepted"
                 ),
-                progress=_message(
-                    "vision.try_on.attempt.progress", pending_id, "pending-progress"
+                generating=_message(
+                    "vision.try_on.attempt.generating", pending_id, "pending-generating"
                 ),
                 unavailable_terminal=_message(
                     "vision.try_on.attempt.failed", pending_id, "pending-unavailable"
@@ -338,8 +338,8 @@ def test_cancelled_pending_owner_keeps_cleanup_barrier_until_prior_task_ends():
             accepted=_message(
                 "vision.try_on.attempt.accepted", pending_id, "ignored-accepted"
             ),
-            progress=_message(
-                "vision.try_on.attempt.progress", pending_id, "ignored-progress"
+            generating=_message(
+                "vision.try_on.attempt.generating", pending_id, "ignored-generating"
             ),
         )
         assert same_id.replay == [pending_canceled]
@@ -353,8 +353,8 @@ def test_cancelled_pending_owner_keeps_cleanup_barrier_until_prior_task_ends():
                 accepted=_message(
                     "vision.try_on.attempt.accepted", next_id, "next-accepted"
                 ),
-                progress=_message(
-                    "vision.try_on.attempt.progress", next_id, "next-progress"
+                generating=_message(
+                    "vision.try_on.attempt.generating", next_id, "next-generating"
                 ),
             )
         )
@@ -376,7 +376,7 @@ def test_cancelled_pending_owner_keeps_cleanup_barrier_until_prior_task_ends():
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted=None,
-            progress=None,
+            generating=None,
         )
         assert replay.replay == [pending_canceled]
         await registry.cancel_owner_and_join(next_admission.receipt)
@@ -411,8 +411,8 @@ def test_repeated_pending_cancel_waits_for_failed_prior_and_keeps_cancelled_erro
             accepted=_message(
                 "vision.try_on.attempt.accepted", first_id, "first-accepted"
             ),
-            progress=_message(
-                "vision.try_on.attempt.progress", first_id, "first-progress"
+            generating=_message(
+                "vision.try_on.attempt.generating", first_id, "first-generating"
             ),
             canceled_terminal=_message(
                 "vision.try_on.attempt.failed", first_id, "first-canceled"
@@ -438,8 +438,8 @@ def test_repeated_pending_cancel_waits_for_failed_prior_and_keeps_cancelled_erro
                 accepted=_message(
                     "vision.try_on.attempt.accepted", pending_id, "pending-accepted"
                 ),
-                progress=_message(
-                    "vision.try_on.attempt.progress", pending_id, "pending-progress"
+                generating=_message(
+                    "vision.try_on.attempt.generating", pending_id, "pending-generating"
                 ),
                 unavailable_terminal=_message(
                     "vision.try_on.attempt.failed", pending_id, "pending-unavailable"
@@ -462,8 +462,8 @@ def test_repeated_pending_cancel_waits_for_failed_prior_and_keeps_cancelled_erro
                 accepted=_message(
                     "vision.try_on.attempt.accepted", next_id, "next-accepted"
                 ),
-                progress=_message(
-                    "vision.try_on.attempt.progress", next_id, "next-progress"
+                generating=_message(
+                    "vision.try_on.attempt.generating", next_id, "next-generating"
                 ),
             )
         )
@@ -485,7 +485,7 @@ def test_repeated_pending_cancel_waits_for_failed_prior_and_keeps_cancelled_erro
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted=None,
-            progress=None,
+            generating=None,
         )
         assert replay.replay == [pending_canceled]
         await registry.cancel_owner_and_join(next_admission.receipt)
@@ -514,8 +514,8 @@ def test_shutdown_during_pending_cancel_waits_for_prior_cleanup_barrier():
             accepted=_message(
                 "vision.try_on.attempt.accepted", first_id, "first-accepted"
             ),
-            progress=_message(
-                "vision.try_on.attempt.progress", first_id, "first-progress"
+            generating=_message(
+                "vision.try_on.attempt.generating", first_id, "first-generating"
             ),
             canceled_terminal=_message(
                 "vision.try_on.attempt.failed", first_id, "first-canceled"
@@ -540,8 +540,8 @@ def test_shutdown_during_pending_cancel_waits_for_prior_cleanup_barrier():
                 accepted=_message(
                     "vision.try_on.attempt.accepted", pending_id, "pending-accepted"
                 ),
-                progress=_message(
-                    "vision.try_on.attempt.progress", pending_id, "pending-progress"
+                generating=_message(
+                    "vision.try_on.attempt.generating", pending_id, "pending-generating"
                 ),
                 unavailable_terminal=_message(
                     "vision.try_on.attempt.failed", pending_id, "pending-unavailable"
@@ -562,8 +562,8 @@ def test_shutdown_during_pending_cancel_waits_for_prior_cleanup_barrier():
                 accepted=_message(
                     "vision.try_on.attempt.accepted", next_id, "next-accepted"
                 ),
-                progress=_message(
-                    "vision.try_on.attempt.progress", next_id, "next-progress"
+                generating=_message(
+                    "vision.try_on.attempt.generating", next_id, "next-generating"
                 ),
             )
         )
@@ -574,7 +574,7 @@ def test_shutdown_during_pending_cancel_waits_for_prior_cleanup_barrier():
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted=None,
-            progress=None,
+            generating=None,
         )
         assert same_id.replay == [pending_canceled]
         await asyncio.sleep(0.05)
@@ -629,7 +629,7 @@ def test_terminal_ttl_prunes_all_expired_records_not_only_lru_head():
             send_lock=asyncio.Lock(),
             task=asyncio.current_task(),
             accepted=_message("vision.try_on.attempt.accepted", oldest, "retry-accepted"),
-            progress=_message("vision.try_on.attempt.progress", oldest, "retry-progress"),
+            generating=_message("vision.try_on.attempt.generating", oldest, "retry-generating"),
         )
         assert retry.is_owner
         await registry.cancel_owner_and_join(retry.receipt)

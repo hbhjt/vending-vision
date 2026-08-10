@@ -288,7 +288,7 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(start)
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             completed = socket.receive_json()
         assert vision_app._fast_render_broker.pid == render_pid
 
@@ -364,7 +364,7 @@ def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(attempt_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             failed = socket.receive_json()
 
         assert failed["type"] == "vision.try_on.attempt.failed"
@@ -395,7 +395,7 @@ def test_v2_fast_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(attempt_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             assert _GarmentHandler.entered.wait(timeout=2)
             socket.send_json(_envelope("vision.ping", {}))
             assert socket.receive_json()["type"] == "vision.pong"
@@ -429,7 +429,7 @@ def test_v2_fast_pose_failures_are_stable_terminals_without_worker_recovery(
             for _ in range(3):
                 socket.send_json(_start(str(uuid4()), garment_reference))
                 assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-                assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+                assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
                 failed = socket.receive_json()
                 assert failed["type"] == "vision.try_on.attempt.failed"
                 assert failed["payload"]["reason"] == "fast_failed"
@@ -438,7 +438,7 @@ def test_v2_fast_pose_failures_are_stable_terminals_without_worker_recovery(
             attempt_id = str(uuid4())
             socket.send_json(_start(attempt_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             completed = socket.receive_json()
             assert completed["type"] == "vision.try_on.attempt.completed"
             assert completed["payload"]["attemptId"] == attempt_id
@@ -466,7 +466,7 @@ def test_v2_fast_attempt_replays_same_owner_active_attempt_without_new_terminal(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(start)
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             assert _GarmentHandler.entered.wait(timeout=2)
 
             socket.send_json(start)
@@ -474,7 +474,7 @@ def test_v2_fast_attempt_replays_same_owner_active_attempt_without_new_terminal(
 
             assert [message["type"] for message in replayed] == [
                 "vision.try_on.attempt.accepted",
-                "vision.try_on.attempt.progress",
+                "vision.try_on.attempt.generating",
             ]
             assert all(message["payload"]["attemptId"] == attempt_id for message in replayed)
 
@@ -506,14 +506,14 @@ def test_v2_fast_attempt_second_socket_joins_and_both_receive_one_terminal(
 
             owner.send_json(start)
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert owner.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.generating"
             assert _GarmentHandler.entered.wait(timeout=2)
 
             subscriber.send_json(start)
             replay = [subscriber.receive_json(), subscriber.receive_json()]
             assert [message["type"] for message in replay] == [
                 "vision.try_on.attempt.accepted",
-                "vision.try_on.attempt.progress",
+                "vision.try_on.attempt.generating",
             ]
 
             _GarmentHandler.release.set()
@@ -544,13 +544,13 @@ def test_v2_fast_attempt_second_socket_joins_without_cancelling_owner(
             assert retry.receive_json()["type"] == "vision.ready"
             owner.send_json(start)
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert owner.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.generating"
             assert _GarmentHandler.entered.wait(timeout=2)
 
             retry.send_json(start)
             assert [retry.receive_json()["type"], retry.receive_json()["type"]] == [
                 "vision.try_on.attempt.accepted",
-                "vision.try_on.attempt.progress",
+                "vision.try_on.attempt.generating",
             ]
             # Losing the subscriber must not cancel the connection that owns work.
             retry.close()
@@ -578,7 +578,7 @@ def test_v2_fast_attempt_terminal_reconnect_replays_the_identical_grant(
             assert owner.receive_json()["type"] == "vision.ready"
             owner.send_json(start)
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert owner.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.generating"
             terminal = owner.receive_json()
 
         with client.websocket_connect("/ws") as reconnect:
@@ -641,16 +641,16 @@ def test_v2_fast_attempt_replacement_joins_old_worker_before_new_admission(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(first_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             assert _GarmentHandler.entered.wait(timeout=2)
 
             socket.send_json(_start(second_id, garment_reference))
             replaced = socket.receive_json()
-            assert replaced["type"] == "vision.try_on.attempt.failed"
-            assert replaced["payload"] == {"attemptId": first_id, "reason": "attempt_replaced"}
+            assert replaced["type"] == "vision.try_on.attempt.canceled"
+            assert replaced["payload"] == {"attemptId": first_id, "reason": "replaced"}
 
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             _GarmentHandler.release.set()
             completed = socket.receive_json()
 
@@ -691,7 +691,7 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(first_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             deadline = threading.Event()
             for _ in range(200):
                 if counter.value == 1:
@@ -703,10 +703,10 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
             replaced = socket.receive_json()
             assert replaced["payload"] == {
                 "attemptId": first_id,
-                "reason": "attempt_replaced",
+                "reason": "replaced",
             }
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             replacement_pid = broker.pid
             assert broker.ready
             assert replacement_pid is not None and replacement_pid != first_pid
@@ -721,7 +721,7 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
 
             socket.send_json(_start(third_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             completed = socket.receive_json()
 
         assert completed["type"] == "vision.try_on.attempt.completed"
@@ -776,7 +776,7 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
             assert socket.receive_json()["payload"]["fastReady"] is True
             socket.send_json(_start(first_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             waiter = threading.Event()
             for _ in range(200):
                 if requests.value == 1:
@@ -788,7 +788,7 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
             replaced = socket.receive_json()
             assert replaced["payload"] == {
                 "attemptId": first_id,
-                "reason": "attempt_replaced",
+                "reason": "replaced",
             }
             unavailable = socket.receive_json()
             assert unavailable["type"] == "vision.try_on.attempt.failed"
@@ -885,7 +885,7 @@ def test_v2_duplicate_waits_for_atomic_failed_replacement_admission(
             assert duplicate.receive_json()["payload"]["fastReady"] is True
             owner.send_json(_start(first_id, garment_reference))
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert owner.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.generating"
             waiter = threading.Event()
             for _ in range(200):
                 if requests.value == 1:
@@ -928,7 +928,7 @@ def test_v2_duplicate_waits_for_atomic_failed_replacement_admission(
 
         expected_replaced = {
             "attemptId": first_id,
-            "reason": "attempt_replaced",
+            "reason": "replaced",
         }
         assert owner_messages[0]["payload"] == expected_replaced
         expected_unavailable = owner_messages[1]
@@ -1002,7 +1002,7 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
             assert duplicate.receive_json()["payload"]["fastReady"] is True
             owner.send_json(_start(first_id, garment_reference))
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert owner.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.generating"
             waiter = threading.Event()
             for _ in range(200):
                 if requests.value == 1:
@@ -1044,11 +1044,11 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
 
         assert owner_messages[0]["payload"] == {
             "attemptId": first_id,
-            "reason": "attempt_replaced",
+            "reason": "replaced",
         }
         assert [message["type"] for message in owner_messages[1:]] == [
             "vision.try_on.attempt.accepted",
-            "vision.try_on.attempt.progress",
+            "vision.try_on.attempt.generating",
             "vision.try_on.attempt.completed",
         ]
         assert duplicate_messages == owner_messages[1:]
@@ -1097,7 +1097,7 @@ def test_v2_disconnect_restarts_render_and_new_connection_completes(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(str(uuid4()), garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             waiter = threading.Event()
             for _ in range(200):
                 if counter.value == 1:
@@ -1123,7 +1123,7 @@ def test_v2_disconnect_restarts_render_and_new_connection_completes(
             assert ready["payload"]["fastReady"] is True
             retry.send_json(_start(retry_id, garment_reference))
             assert retry.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert retry.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert retry.receive_json()["type"] == "vision.try_on.attempt.generating"
             completed = retry.receive_json()
 
         assert completed["type"] == "vision.try_on.attempt.completed"
@@ -1172,7 +1172,7 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
             assert first.receive_json()["payload"]["fastReady"] is True
             first.send_json(_start(timed_out_id, garment_reference))
             assert first.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert first.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert first.receive_json()["type"] == "vision.try_on.attempt.generating"
             failed = first.receive_json()
 
         assert failed["type"] == "vision.try_on.attempt.failed"
@@ -1194,7 +1194,7 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
             assert ready["payload"]["fastReady"] is True
             retry.send_json(_start(retry_id, garment_reference))
             assert retry.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert retry.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert retry.receive_json()["type"] == "vision.try_on.attempt.generating"
             completed = retry.receive_json()
 
         assert completed["type"] == "vision.try_on.attempt.completed"
@@ -1236,7 +1236,7 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(attempt_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
             completed = socket.receive_json()
 
     assert completed["type"] == "vision.try_on.attempt.completed"
@@ -1419,7 +1419,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
             ticks += 1
             await asyncio.sleep(0.002)
         registry.cancel_event.set()
-        with pytest.raises(vision_app.GarmentFetchError, match="attempt_replaced"):
+        with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
             await asyncio.wait_for(read_task, timeout=1.0)
         assert ticks >= 10
         assert broker.assert_dead()

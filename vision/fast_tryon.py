@@ -98,7 +98,7 @@ class FastTryOnRuntime:
         ):
             raise GarmentFetchError("loopback")
         if cancel_event is not None and cancel_event.is_set():
-            raise GarmentFetchError("attempt_replaced")
+            raise GarmentFetchError("attempt_canceled")
         timeout = httpx.Timeout(connect=1.0, read=0.25, write=1.0, pool=1.0)
         try:
             async with asyncio.timeout(5.0):
@@ -125,7 +125,7 @@ class FastTryOnRuntime:
                         iterator = response.aiter_bytes(64 * 1024).__aiter__()
                         while True:
                             if cancel_event is not None and cancel_event.is_set():
-                                raise GarmentFetchError("attempt_replaced")
+                                raise GarmentFetchError("attempt_canceled")
                             try:
                                 chunk = await self._await_or_cancel(anext(iterator), cancel_event)
                             except StopAsyncIteration:
@@ -218,7 +218,7 @@ class FastTryOnRuntime:
             # exits closes a blocked connect/header/body read immediately.
             operation.cancel()
             await asyncio.gather(operation, return_exceptions=True)
-            raise GarmentFetchError("attempt_replaced")
+            raise GarmentFetchError("attempt_canceled")
         return operation.result()
 
     def _predecode_png(self, payload: bytes) -> None:

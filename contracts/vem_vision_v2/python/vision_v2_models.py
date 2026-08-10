@@ -17,9 +17,11 @@ CONTRACT_BUNDLE_VERSION = "1"
 # This module has no hand-maintained message or field map. The adjacent JSON
 # Schema is generated from VEM Shared Zod and constructs each strict Pydantic
 # payload and envelope model at import time.
-_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "vision-v2.schema.json"
-_SCHEMA = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
-_SCHEMA_VALIDATOR = Draft202012Validator(_SCHEMA, format_checker=FormatChecker())
+_BUNDLE_ROOT = Path(__file__).resolve().parents[1]
+_CLIENT_SCHEMA = json.loads((_BUNDLE_ROOT / "vision-v2.client.schema.json").read_text(encoding="utf-8"))
+_SERVER_SCHEMA = json.loads((_BUNDLE_ROOT / "vision-v2.server.schema.json").read_text(encoding="utf-8"))
+_CLIENT_VALIDATOR = Draft202012Validator(_CLIENT_SCHEMA, format_checker=FormatChecker())
+_SERVER_VALIDATOR = Draft202012Validator(_SERVER_SCHEMA, format_checker=FormatChecker())
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -28,6 +30,8 @@ def _model_name(value: str) -> str:
     return "".join(part.capitalize() for part in value.replace(".", "_").split("_"))
 
 def _schema_type(schema: dict[str, Any], name: str) -> Any:
+    if "anyOf" in schema or "oneOf" in schema:
+        return Any
     if "const" in schema:
         return Literal[schema["const"]]
     if "enum" in schema:
@@ -82,21 +86,6 @@ def _normalize_json_integers(value: Any, schema: dict[str, Any]) -> Any:
     return value
 
 def _validate_extensions(value: Any, schema: dict[str, Any]) -> None:
-    if schema.get("x-vem-semantic") == "vision-v2-acquiring-payload":
-        if not isinstance(value, dict):
-            return
-        attempt_id = value.get("attemptId")
-        preview = value.get("preview")
-        if isinstance(attempt_id, str) and isinstance(preview, dict):
-            reference = preview.get("reference")
-            try:
-                path = urlparse(reference).path if isinstance(reference, str) else ""
-            except ValueError:
-                path = ""
-            expected_suffix = f"/attempts/{attempt_id}/preview.mjpeg"
-            if not path.endswith(expected_suffix):
-                raise ValueError("preview reference must be scoped to attemptId")
-        return
     if "oneOf" in schema and isinstance(value, dict):
         message_type = value.get("type")
         for branch in schema["oneOf"]:
@@ -131,19 +120,31 @@ def _validate_extensions(value: Any, schema: dict[str, Any]) -> None:
             if key in schema.get("properties", {}):
                 _validate_extensions(item, schema["properties"][key])
 
-_MESSAGE_MODELS = tuple(
-    _schema_type(branch, _model_name(branch["properties"]["type"]["const"]) + "Envelope")
-    for branch in _SCHEMA["oneOf"]
-)
-for _message_model in _MESSAGE_MODELS:
-    globals()[_message_model.__name__] = _message_model
-VisionV2Envelope = Annotated[Union[tuple(_MESSAGE_MODELS)], Field(discriminator="type")]
-_MESSAGE_ADAPTER = TypeAdapter(VisionV2Envelope)
+def _message_models(schema: dict[str, Any]) -> tuple[type[BaseModel], ...]:
+    return tuple(
+        _schema_type(branch, _model_name(branch["properties"]["type"]["const"]) + "Envelope")
+        for branch in schema["oneOf"]
+    )
 
-def parse_message(value: Any) -> VisionV2Envelope:
-    normalized = _normalize_json_integers(value, _SCHEMA)
-    error = next(iter(_SCHEMA_VALIDATOR.iter_errors(normalized)), None)
+_CLIENT_MODELS = _message_models(_CLIENT_SCHEMA)
+_SERVER_MODELS = _message_models(_SERVER_SCHEMA)
+for _message_model in (*_CLIENT_MODELS, *_SERVER_MODELS):
+    globals()[_message_model.__name__] = _message_model
+VisionV2ClientEnvelope = Annotated[Union[tuple(_CLIENT_MODELS)], Field(discriminator="type")]
+VisionV2ServerEnvelope = Annotated[Union[tuple(_SERVER_MODELS)], Field(discriminator="type")]
+_CLIENT_ADAPTER = TypeAdapter(VisionV2ClientEnvelope)
+_SERVER_ADAPTER = TypeAdapter(VisionV2ServerEnvelope)
+
+def _parse(value: Any, schema: dict[str, Any], validator: Draft202012Validator, adapter: TypeAdapter) -> Any:
+    normalized = _normalize_json_integers(value, schema)
+    error = next(iter(validator.iter_errors(normalized)), None)
     if error is not None:
         raise ValueError(f"invalid {PROTOCOL} message: {error.message}")
-    _validate_extensions(normalized, _SCHEMA)
-    return _MESSAGE_ADAPTER.validate_python(normalized)
+    _validate_extensions(normalized, schema)
+    return adapter.validate_python(normalized)
+
+def parse_client_message(value: Any) -> VisionV2ClientEnvelope:
+    return _parse(value, _CLIENT_SCHEMA, _CLIENT_VALIDATOR, _CLIENT_ADAPTER)
+
+def parse_server_message(value: Any) -> VisionV2ServerEnvelope:
+    return _parse(value, _SERVER_SCHEMA, _SERVER_VALIDATOR, _SERVER_ADAPTER)

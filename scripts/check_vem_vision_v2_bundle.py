@@ -13,9 +13,12 @@ from typing import Any
 
 EXPECTED_FILES = {
     "__init__.py",
-    "vision-v2.schema.json",
-    "fixtures/valid.json",
-    "fixtures/invalid.json",
+    "vision-v2.client.schema.json",
+    "vision-v2.server.schema.json",
+    "fixtures/client-valid.json",
+    "fixtures/client-invalid.json",
+    "fixtures/server-valid.json",
+    "fixtures/server-invalid.json",
     "python/__init__.py",
     "python/vision_v2_models.py",
     "manifest.json",

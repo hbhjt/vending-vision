@@ -319,9 +319,12 @@ def test_packaged_resource_verifier_rejects_retired_maintenance_v1_schema(tmp_pa
         "__init__.py",
         "python/__init__.py",
         "python/vision_v2_models.py",
-        "vision-v2.schema.json",
-        "fixtures/valid.json",
-        "fixtures/invalid.json",
+        "vision-v2.client.schema.json",
+        "vision-v2.server.schema.json",
+        "fixtures/client-valid.json",
+        "fixtures/client-invalid.json",
+        "fixtures/server-valid.json",
+        "fixtures/server-invalid.json",
     ]:
         source = ROOT / "contracts" / "vem_vision_v2" / relative_path
         destination = internal / "contracts" / "vem_vision_v2" / relative_path

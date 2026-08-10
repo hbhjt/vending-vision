@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from app import validate_envelope, validate_message_payload
-from vision.v2_contract_bundle import parse_v2_boundary_message
+from vision.v2_contract_bundle import parse_v2_client_message
 
 
 def envelope(message_type="vision.ping", message_id="message-1", timestamp=None, payload=None):
@@ -40,12 +40,12 @@ def test_hello_uses_the_generated_v2_boundary_without_a_v1_payload_adapter():
             "capabilities": ["c" * 64],
         },
     }
-    assert parse_v2_boundary_message(valid).type == "vision.hello"
+    assert parse_v2_client_message(valid).type == "vision.hello"
     assert validate_message_payload("vision.hello", valid["payload"]) is not None
 
     invalid = {**valid, "payload": {**valid["payload"], "machineCode": "M" * 65}}
     try:
-        parse_v2_boundary_message(invalid)
+        parse_v2_client_message(invalid)
     except ValueError:
         pass
     else:

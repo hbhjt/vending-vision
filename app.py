@@ -68,7 +68,8 @@ from vision.attempt_worker import FastRenderBroker, render_attempt_frame
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
-    parse_v2_boundary_message,
+    parse_v2_client_message,
+    parse_v2_server_message,
 )
 
 
@@ -166,7 +167,7 @@ def _discard_completed_fast_attempt(task: asyncio.Task) -> None:
 async def _run_owned_attempt_step(receipt: AttemptReceipt, operation, *, timeout: float):
     """Race an owned process operation with cancellation and join it in all cases."""
     if not await _fast_attempt_registry.is_current(receipt):
-        raise GarmentFetchError("attempt_replaced")
+        raise GarmentFetchError("attempt_canceled")
     worker = asyncio.create_task(operation)
     cancel_waiter = asyncio.create_task(
         (await _fast_attempt_registry.cancel_event_for(receipt)).wait()
@@ -178,7 +179,7 @@ async def _run_owned_attempt_step(receipt: AttemptReceipt, operation, *, timeout
         if worker in done:
             return worker.result()
         if cancel_waiter in done:
-            raise GarmentFetchError("attempt_replaced")
+            raise GarmentFetchError("attempt_canceled")
         raise asyncio.TimeoutError()
     except (asyncio.TimeoutError, asyncio.CancelledError, GarmentFetchError):
         worker.cancel()
@@ -188,7 +189,7 @@ async def _run_owned_attempt_step(receipt: AttemptReceipt, operation, *, timeout
         cancel_waiter.cancel()
         await asyncio.gather(cancel_waiter, return_exceptions=True)
         if not await _fast_attempt_registry.is_current(receipt):
-            raise GarmentFetchError("attempt_replaced")
+            raise GarmentFetchError("attempt_canceled")
 
 
 async def _acquire_front_io_until(deadline: float) -> None:
@@ -211,7 +212,7 @@ async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
         await _acquire_front_io_until(deadline)
         io_acquired = True
         if not await _fast_attempt_registry.is_current(receipt):
-            raise GarmentFetchError("attempt_replaced")
+            raise GarmentFetchError("attempt_canceled")
         owner = acquire_front_camera(
             "fast_try_on",
             reason=f"fast_attempt:{receipt.attempt_id}",
@@ -245,7 +246,7 @@ async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
                 return read_task.result()
 
             abort_reason = (
-                "fast_attempt_replaced" if cancel_waiter in done else "fast_attempt_timeout"
+                "fast_attempt_canceled" if cancel_waiter in done else "fast_attempt_timeout"
             )
             abort_task = asyncio.create_task(
                 abort_camera_request("front", reason=abort_reason)
@@ -256,7 +257,7 @@ async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
             if not dead:
                 raise RuntimeError("front camera broker remained alive after abort")
             if cancel_waiter in done:
-                raise GarmentFetchError("attempt_replaced")
+                raise GarmentFetchError("attempt_canceled")
             raise asyncio.TimeoutError()
         except asyncio.CancelledError:
             abort_task = asyncio.create_task(
@@ -374,7 +375,7 @@ def _prepare_fast_result(attempt_id: str, image: bytes) -> tuple[dict, dict]:
 
 
 def _generated_v2_envelope(message_type: str, payload: dict) -> dict:
-    parsed = parse_v2_boundary_message(
+    parsed = parse_v2_server_message(
         envelope(message_type=message_type, message_id=str(uuid4()), payload=payload)
     )
     if parsed.type != message_type:
@@ -443,7 +444,7 @@ def get_runtime_status():
 def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
     """Return a generated-boundary V2 ready envelope without degrading core Vision."""
     try:
-        parsed_hello = parse_v2_boundary_message(hello)
+        parsed_hello = parse_v2_client_message(hello)
         if parsed_hello.type != "vision.hello":
             raise ValueError("invalid_v2_boundary_message")
         payload = parsed_hello.payload.model_dump()
@@ -521,7 +522,7 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
     # This is the server-to-machine strict generated boundary validation even
     # when the identity manifest is unavailable.  The latter is a degraded
     # business capability only if the generated parser itself remains usable.
-    parsed_ready = parse_v2_boundary_message(ready)
+    parsed_ready = parse_v2_server_message(ready)
     return parsed_ready.model_dump(), set(client_capabilities)
 
 
@@ -1287,7 +1288,7 @@ async def run_v2_fast_attempt(
 ) -> None:
     """Run one bounded Fast attempt without holding a WS or store lock on I/O."""
     try:
-        parsed = parse_v2_boundary_message(message)
+        parsed = parse_v2_client_message(message)
         if parsed.type != "vision.try_on.attempt.start":
             raise ValueError("invalid_v2_boundary_message")
         payload = parsed.payload.model_dump()
@@ -1314,8 +1315,8 @@ async def run_v2_fast_attempt(
         {"attemptId": attempt_id, "reason": "fast_unavailable"},
     )
     canceled_terminal = _generated_v2_envelope(
-        "vision.try_on.attempt.failed",
-        {"attemptId": attempt_id, "reason": "attempt_replaced"},
+        "vision.try_on.attempt.canceled",
+        {"attemptId": attempt_id, "reason": "replaced"},
     )
     accepted = (
         _generated_v2_envelope(
@@ -1324,9 +1325,9 @@ async def run_v2_fast_attempt(
         if fast_ready
         else None
     )
-    progress = (
+    generating = (
         _generated_v2_envelope(
-            "vision.try_on.attempt.progress", {"attemptId": attempt_id, "stage": "generating"}
+            "vision.try_on.attempt.generating", {"attemptId": attempt_id, "stage": "preparing"}
         )
         if fast_ready
         else None
@@ -1344,7 +1345,7 @@ async def run_v2_fast_attempt(
     admission = await _fast_attempt_registry.commit_prepared_admission(
         preparation,
         accepted=accepted,
-        progress=progress,
+        generating=generating,
         unavailable_terminal=unavailable_terminal,
         readiness=lambda: bool(
             fast_ready
@@ -1374,7 +1375,7 @@ async def run_v2_fast_attempt(
             timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
         )
         if not await _fast_attempt_registry.is_current(receipt):
-            raise GarmentFetchError("attempt_replaced")
+            raise GarmentFetchError("attempt_canceled")
         frame, source_frame = await _read_fast_front_frame(
             receipt,
             timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
@@ -1411,13 +1412,12 @@ async def run_v2_fast_attempt(
         )
     except GarmentFetchError as error:
         terminal = _generated_v2_envelope(
-            "vision.try_on.attempt.failed",
-            {
-                "attemptId": attempt_id,
-                "reason": "attempt_replaced"
-                if str(error) == "attempt_replaced"
-                else "garment_rejected",
-            },
+            "vision.try_on.attempt.canceled"
+            if str(error) == "attempt_canceled"
+            else "vision.try_on.attempt.failed",
+            {"attemptId": attempt_id, "reason": "replaced"}
+            if str(error) == "attempt_canceled"
+            else {"attemptId": attempt_id, "reason": "garment_rejected"},
         )
     except asyncio.TimeoutError:
         terminal = _generated_v2_envelope(
@@ -1432,7 +1432,7 @@ async def run_v2_fast_attempt(
         )
     except asyncio.CancelledError:
         terminal = _generated_v2_envelope(
-            "vision.try_on.attempt.failed", {"attemptId": attempt_id, "reason": "attempt_replaced"}
+            "vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "replaced"}
         )
     # Preparation is deliberately private until the completed contract is
     # encoded and validated.  Any failure above commits the one failed
@@ -1452,7 +1452,7 @@ async def reject_v2_fast_attempt_for_backpressure(
 ) -> None:
     """Reject only an overflowed *new* attempt while preserving same-ID joins."""
     try:
-        parsed = parse_v2_boundary_message(message)
+        parsed = parse_v2_client_message(message)
         if parsed.type != "vision.try_on.attempt.start":
             raise ValueError("invalid_v2_boundary_message")
         attempt_id = parsed.payload.attemptId
@@ -1468,7 +1468,7 @@ async def reject_v2_fast_attempt_for_backpressure(
         return
     terminal = _generated_v2_envelope(
         "vision.try_on.attempt.failed",
-        {"attemptId": attempt_id, "reason": "attempt_already_active"},
+        {"attemptId": attempt_id, "reason": "fast_unavailable"},
     )
     admission = await _fast_attempt_registry.join_pending_or_reject(
         attempt_id=attempt_id,
@@ -1630,6 +1630,28 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
 
                 handshake_complete = True
                 continue
+
+            if message_type in {
+                "vision.try_on.attempt.start",
+                "vision.try_on.attempt.capture",
+                "vision.try_on.attempt.cancel",
+            }:
+                try:
+                    # Every V2 frame arriving at Vision crosses only the
+                    # generated client entrypoint.  It is intentionally not a
+                    # permissive envelope parser shared with server events.
+                    message = parse_v2_client_message(message).model_dump(mode="json")
+                    payload = message["payload"]
+                except (V2ContractBundleUnavailable, ValueError):
+                    async with send_lock:
+                        await send_error(
+                            websocket,
+                            code="invalid_message",
+                            message="invalid_v2_boundary_message",
+                            retryable=False,
+                            message_id=message_id,
+                        )
+                    continue
 
             is_v2_fast_attempt = (
                 message_type == "vision.try_on.attempt.start"

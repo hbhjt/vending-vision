@@ -17,7 +17,11 @@ import threading
 import webbrowser
 from pathlib import Path
 
-from vision.v2_contract_bundle import load_v2_contract_identity, parse_v2_boundary_message
+from vision.v2_contract_bundle import (
+    load_v2_contract_identity,
+    parse_v2_client_message,
+    parse_v2_server_message,
+)
 
 
 def bool_env(name, default=True):
@@ -76,11 +80,13 @@ def verify_v2_contract_bundle():
     # loader that serves the websocket handshake.
     load_v2_contract_identity()
     bundle_root = Path(__file__).resolve().parent / "contracts" / "vem_vision_v2"
-    valid = json.loads((bundle_root / "fixtures" / "valid.json").read_text("utf-8"))
-    invalid = json.loads((bundle_root / "fixtures" / "invalid.json").read_text("utf-8"))
-    parse_v2_boundary_message(valid[0])
+    client_valid = json.loads((bundle_root / "fixtures" / "client-valid.json").read_text("utf-8"))
+    server_valid = json.loads((bundle_root / "fixtures" / "server-valid.json").read_text("utf-8"))
+    invalid = json.loads((bundle_root / "fixtures" / "server-invalid.json").read_text("utf-8"))
+    parse_v2_client_message(client_valid[0])
+    parse_v2_server_message(server_valid[0])
     try:
-        parse_v2_boundary_message(invalid[0]["message"])
+        parse_v2_server_message(invalid[0]["message"])
     except ValueError:
         print("V2 contract bundle probe passed")
         return

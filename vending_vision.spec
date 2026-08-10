@@ -17,9 +17,12 @@ CONTRACT_DATA_FILES = [
     (CONTRACT_ROOT / "__init__.py", "contracts/vem_vision_v2"),
     (CONTRACT_ROOT / "python" / "__init__.py", "contracts/vem_vision_v2/python"),
     (CONTRACT_ROOT / "python" / "vision_v2_models.py", "contracts/vem_vision_v2/python"),
-    (CONTRACT_ROOT / "vision-v2.schema.json", "contracts/vem_vision_v2"),
-    (CONTRACT_ROOT / "fixtures" / "valid.json", "contracts/vem_vision_v2/fixtures"),
-    (CONTRACT_ROOT / "fixtures" / "invalid.json", "contracts/vem_vision_v2/fixtures"),
+    (CONTRACT_ROOT / "vision-v2.client.schema.json", "contracts/vem_vision_v2"),
+    (CONTRACT_ROOT / "vision-v2.server.schema.json", "contracts/vem_vision_v2"),
+    (CONTRACT_ROOT / "fixtures" / "client-valid.json", "contracts/vem_vision_v2/fixtures"),
+    (CONTRACT_ROOT / "fixtures" / "client-invalid.json", "contracts/vem_vision_v2/fixtures"),
+    (CONTRACT_ROOT / "fixtures" / "server-valid.json", "contracts/vem_vision_v2/fixtures"),
+    (CONTRACT_ROOT / "fixtures" / "server-invalid.json", "contracts/vem_vision_v2/fixtures"),
 ]
 
 datas = [

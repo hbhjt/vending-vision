@@ -132,11 +132,12 @@ V1 hello、`protocolVersion`、`modelReady` 与所有 V1 成功条件均不受�
 
 Machine 仅可在 ready 后发起一个 `vision.try_on.attempt.start`。Fast 尝试会依次发布
 accepted 只是启动确认，不是生命周期 phase。客户试衣的公开 phase 是
-`acquiring -> generating -> completed`，并以 `failed` 或 `canceled` 作为 terminal；
-旧 `vision.try_on.attempt.progress` 仅在 Phase B 迁移完成前保留。采集阶段返回当前
-attempt 的 tokenized loopback HTTP MJPEG preview、`streamType`、真实 occupancy、guidance
+`acquiring -> generating -> completed`，并以 `failed` 或 `canceled` 作为 terminal。采集阶段返回当前
+active attempt 的 rotating-token loopback HTTP MJPEG preview（固定路径
+`/v2/try-on/acquisition/preview.mjpeg?token=...`）、`streamType`、真实 occupancy、guidance
 和 `manualCaptureAllowed`。Machine 发送 capture 或仅带 `user`/`route_leave` 的 cancel；
-manual 只绕过 stability waiting，不能绕过 no-person、multiple-person 或 alignment 保护。
+manual 只在 single/`hold_still` 时可用，只绕过 stability waiting，不能绕过 no-person、multiple-person
+或 alignment 保护；`ready` 会立即自动采集，不公开 manual 动作。
 
 Vision 直接拥有源帧，Machine 不从渲染后的 preview bytes 提取生成输入。capture 后 preview
 关闭且 front-camera lease 在 generating 前释放；generating 只发布 `preparing`/`rendering`
@@ -148,7 +149,8 @@ route 内 profile 不触发导航，也不存在 automaticFast/AI fallback。
 
 ## 验证与兼容性
 
-- 共享 valid/invalid fixtures 是 TS、Python 和 Rust 的共同证据。
+- client/server 各自有 valid/invalid fixture corpus；Machine inbound 只接受 server schema，Vision
+  inbound 只接受 client schema。
 - generated manifest 的 canonical bytes、文件集合和 digest 必须通过本地 checker 验证。
 - 当前兼容边界只接受 `vem.vision.v2`；V1 帧仅可作为拒绝性测试样本。
 - 发送方或接收方不得因未知字段、未知 discriminator 或错误 phase 而静默降级。

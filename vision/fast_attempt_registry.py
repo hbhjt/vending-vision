@@ -1,7 +1,7 @@
 """Process-wide ownership and replay state for Fast try-on attempts.
 
 Replacement uses a pending admission reservation while the old owner joins.
-No accepted/progress state becomes visible until readiness and active ownership
+No accepted/generating state becomes visible until readiness and active ownership
 are committed together under the short state gate.
 """
 
@@ -41,7 +41,7 @@ class ActiveAttempt:
     owner_subscriber_key: int | None = None
     subscribers: dict[int, AttemptSubscriber] = field(default_factory=dict)
     accepted: dict | None = None
-    latest_progress: dict | None = None
+    latest_generating: dict | None = None
     canceled_terminal: dict | None = None
 
 
@@ -219,7 +219,7 @@ class FastAttemptRegistry:
     def _replay_active(active: ActiveAttempt) -> list[dict]:
         return [
             copy.deepcopy(message)
-            for message in (active.accepted, active.latest_progress)
+            for message in (active.accepted, active.latest_generating)
             if message
         ]
 
@@ -307,7 +307,7 @@ class FastAttemptRegistry:
         preparation: AdmissionPreparation,
         *,
         accepted: dict | None,
-        progress: dict | None,
+        generating: dict | None,
         unavailable_terminal: dict,
         readiness: Callable[[], bool],
     ) -> AttemptAdmission:
@@ -413,7 +413,7 @@ class FastAttemptRegistry:
                 owner_subscriber_key=pending.owner_subscriber_key,
                 subscribers=pending.subscribers,
                 accepted=copy.deepcopy(accepted),
-                latest_progress=copy.deepcopy(progress),
+                latest_generating=copy.deepcopy(generating),
                 canceled_terminal=pending.canceled_terminal,
             )
             self._pending = None
@@ -422,7 +422,7 @@ class FastAttemptRegistry:
                 receipt,
                 [
                     copy.deepcopy(message)
-                    for message in (accepted, progress)
+                    for message in (accepted, generating)
                     if message
                 ],
             )
@@ -435,7 +435,7 @@ class FastAttemptRegistry:
         send_lock: asyncio.Lock,
         task: asyncio.Task,
         accepted: dict | None,
-        progress: dict | None,
+        generating: dict | None,
         canceled_terminal: dict | None = None,
         owner_receipts: set[AttemptReceipt] | None = None,
     ) -> AttemptAdmission:
@@ -451,7 +451,7 @@ class FastAttemptRegistry:
         admission = await self.commit_prepared_admission(
             preparation,
             accepted=accepted,
-            progress=progress,
+            generating=generating,
             unavailable_terminal={},
             readiness=lambda: True,
         )

@@ -13,9 +13,12 @@ from typing import Any
 _BUNDLE_ROOT = Path(__file__).parents[1] / "contracts" / "vem_vision_v2"
 _EXPECTED_FILES = {
     "__init__.py",
-    "vision-v2.schema.json",
-    "fixtures/valid.json",
-    "fixtures/invalid.json",
+    "vision-v2.client.schema.json",
+    "vision-v2.server.schema.json",
+    "fixtures/client-valid.json",
+    "fixtures/client-invalid.json",
+    "fixtures/server-valid.json",
+    "fixtures/server-invalid.json",
     "python/__init__.py",
     "python/vision_v2_models.py",
     "manifest.json",
@@ -151,13 +154,21 @@ def load_v2_contract_identity() -> V2ContractIdentity:
     )
 
 
-def parse_v2_boundary_message(value: Any):
-    """Parse through the generated model; never fall back to a hand-written hello."""
+def _parse_generated(direction: str, value: Any):
+    """Parse an explicitly directed V2 boundary; never use a generic envelope."""
     try:
-        from contracts.vem_vision_v2.python.vision_v2_models import parse_message
+        from contracts.vem_vision_v2.python import vision_v2_models
 
-        return parse_message(value)
+        return getattr(vision_v2_models, f"parse_{direction}_message")(value)
     except (ImportError, OSError, ModuleNotFoundError) as error:
         raise V2ContractBundleUnavailable("vision_v2_contract_bundle_unavailable") from error
     except (ValueError, TypeError) as error:
         raise ValueError("invalid_v2_boundary_message") from error
+
+
+def parse_v2_client_message(value: Any):
+    return _parse_generated("client", value)
+
+
+def parse_v2_server_message(value: Any):
+    return _parse_generated("server", value)
