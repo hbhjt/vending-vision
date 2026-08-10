@@ -1,4 +1,6 @@
 import json
+import multiprocessing
+import os
 import threading
 import time
 from pathlib import Path
@@ -11,12 +13,37 @@ from fastapi.testclient import TestClient
 from vision.camera_binding import (
     CAMERA_MAINTENANCE_CONTRACT_VERSION,
     Cv2EnumerateCamerasDirectShowAdapter,
+    CameraCandidate,
     CameraLeaseRegistry,
     CameraMaintenanceService,
     JsonBindingStore,
     OpenCvCameraAccess,
     WindowsCameraDiscovery,
 )
+from vision.directshow_broker import DirectShowCameraBroker
+
+
+def _maintenance_handoff_broker_target(connection, config):
+    active = config["activeCounter"]
+    starts = config["startCounter"]
+    with starts.get_lock():
+        starts.value += 1
+    with active.get_lock():
+        active.value += 1
+    try:
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                with active.get_lock():
+                    active.value -= 1
+                connection.send(("ok", None))
+                return
+            if command == "read":
+                connection.send(("ok", {"pid": os.getpid(), "image": np.zeros((8, 10, 3), dtype=np.uint8)}))
+    finally:
+        with active.get_lock():
+            active.value = 0
+        connection.close()
 
 
 class MutableDiscovery:
@@ -230,6 +257,53 @@ def test_runtime_camera_handoff_allows_maintenance_test_confirmation_then_resume
     assert events == ["quiesce", "capture-release", "resume"]
     resumed_runtime = leases.acquire("usb#top-001", "runtime:top")
     resumed_runtime.release()
+
+
+def test_active_directshow_broker_is_dead_before_parent_maintenance_open_and_restarts_lazily(monkeypatch):
+    from vision import camera_manager
+
+    context = multiprocessing.get_context("spawn")
+    active = context.Value("i", 0)
+    starts = context.Value("i", 0)
+    config = {
+        "role": "profile_tryon",
+        "index": 7,
+        "backend": "dshow",
+        "stableId": "usb#front-002",
+        "keep_open": True,
+        "activeCounter": active,
+        "startCounter": starts,
+    }
+    broker = DirectShowCameraBroker(
+        "front", config, context=context, target=_maintenance_handoff_broker_target
+    )
+    source = camera_manager.DirectShowFrameSource("front", config)
+    with camera_manager._streams_lock:
+        camera_manager._dshow_brokers["front"] = broker
+
+    class Capture:
+        def isOpened(self):
+            return True
+
+        def release(self):
+            assert active.value == 0
+
+    access = OpenCvCameraAccess(runtime_handoff=camera_manager.quiesce_runtime_camera)
+    monkeypatch.setattr(access, "_open", lambda _candidate: Capture() if active.value == 0 else (_ for _ in ()).throw(AssertionError("double open")))
+    monkeypatch.setattr("vision.camera.read_warmup_frame", lambda _capture, _frames: np.zeros((8, 10, 3), dtype=np.uint8))
+    candidate = MutableDiscovery().observations[1]
+    try:
+        assert source.read(timeout=1.0).shape == (8, 10, 3)
+        assert active.value == 1
+        assert access.test("front", CameraCandidate.from_observation(candidate))["ok"] is True
+        assert active.value == 0
+        assert broker.assert_dead()
+        assert source.read(timeout=1.0).shape == (8, 10, 3)
+        assert starts.value == 2
+    finally:
+        broker.release()
+        with camera_manager._streams_lock:
+            camera_manager._dshow_brokers.pop("front", None)
 
 
 def test_contract_reports_unproven_or_duplicate_identity_as_explicit_non_ready():

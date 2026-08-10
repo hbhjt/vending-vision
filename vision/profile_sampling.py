@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 
 import cv2
 
@@ -252,7 +253,15 @@ def resize_for_profile_inference(image):
     return cv2.resize(image, (width, height))
 
 
-def sample_frame(source, index, proximity=None, track=None, cancel_event=None):
+def sample_frame(
+    source,
+    index,
+    proximity=None,
+    track=None,
+    cancel_event=None,
+    *,
+    _io_lock_held=False,
+):
     """采集一帧并进行完整推理。
 
     这是画像采集的核心函数。每帧执行：
@@ -268,6 +277,17 @@ def sample_frame(source, index, proximity=None, track=None, cancel_event=None):
     if cancel_event is not None and cancel_event.is_set():
         raise ProfileSamplingCancelled("profile_sampling_cancelled")
 
+    if not _io_lock_held:
+        with front_camera_io_lock():
+            return sample_frame(
+                source,
+                index,
+                proximity=proximity,
+                track=track,
+                cancel_event=cancel_event,
+                _io_lock_held=True,
+            )
+
     started = time.time()
     # 检查前置摄像头所有权（快速失败）
     owner_status = get_front_camera_owner()
@@ -278,16 +298,15 @@ def sample_frame(source, index, proximity=None, track=None, cancel_event=None):
             reason="front_camera_owner_changed",
         )
 
-    with front_camera_io_lock():
-        # 二次确认：加锁后重新检查，防止 TOCTOU 竞态
-        owner_status = get_front_camera_owner()
-        if owner_status.get("owner") != "vision":
-            metrics.increment("profile_sample_owner_busy_total", owner=owner_status.get("owner"))
-            raise FrontCameraBusy(
-                owner_status=owner_status,
-                reason="front_camera_owner_changed_after_lock",
-            )
-        image, source_frame = read_camera_with_source("front", warmup_frames=1)
+    # 二次确认：加锁后重新检查，防止 TOCTOU 竞态
+    owner_status = get_front_camera_owner()
+    if owner_status.get("owner") != "vision":
+        metrics.increment("profile_sample_owner_busy_total", owner=owner_status.get("owner"))
+        raise FrontCameraBusy(
+            owner_status=owner_status,
+            reason="front_camera_owner_changed_after_lock",
+        )
+    image, source_frame = read_camera_with_source("front", warmup_frames=1)
 
     inference_image = resize_for_profile_inference(image)
     profile = infer_image(inference_image)
@@ -366,6 +385,8 @@ def collect_best_profile_samples(
     cancel_event=None,
     close_enough=False,
     close_validator=None,
+    *,
+    _io_lock_held=False,
 ):
     """按时间窗口采集多帧，并选择质量最高的帧。
 
@@ -396,29 +417,33 @@ def collect_best_profile_samples(
     samples = []
     index = 1
 
-    # 在时间窗口内按固定帧率采集
-    while time.monotonic() < deadline:
-        if cancel_event is not None and cancel_event.is_set():
-            raise ProfileSamplingCancelled("profile_sampling_cancelled")
-        sample = sample_frame(
-            source="candidate",
-            index=index,
-            proximity=proximity,
-            track=track,
-            cancel_event=cancel_event,
-        )
-        samples.append(sample)
-        index += 1
-        valid_count = sum(1 for item in samples if item.get("valid"))
-        latest_close = bool(close_enough)
-        if close_validator is not None:
-            latest_close = latest_close or bool(close_validator())
-        if valid_count >= min_good_frames and (
-            latest_close
-            or time.monotonic() - started_at >= early_finish_after_sec
-        ):
-            break
-        time.sleep(interval)
+    # One physical-camera sequence owns the lane across every frame and every
+    # inter-frame gap.  Fast may preempt only after this sequence releases it.
+    sequence_lock = nullcontext() if _io_lock_held else front_camera_io_lock()
+    with sequence_lock:
+        while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ProfileSamplingCancelled("profile_sampling_cancelled")
+            sample = sample_frame(
+                source="candidate",
+                index=index,
+                proximity=proximity,
+                track=track,
+                cancel_event=cancel_event,
+                _io_lock_held=True,
+            )
+            samples.append(sample)
+            index += 1
+            valid_count = sum(1 for item in samples if item.get("valid"))
+            latest_close = bool(close_enough)
+            if close_validator is not None:
+                latest_close = latest_close or bool(close_validator())
+            if valid_count >= min_good_frames and (
+                latest_close
+                or time.monotonic() - started_at >= early_finish_after_sec
+            ):
+                break
+            time.sleep(interval)
 
     # 按质量评分排序，选最优帧
     samples.sort(
@@ -454,7 +479,9 @@ def is_face_vote_candidate(sample):
     )
 
 
-def collect_face_vote_samples(samples, proximity, track, cancel_event=None):
+def collect_face_vote_samples(
+    samples, proximity, track, cancel_event=None, *, _io_lock_held=False
+):
     """补充采集更多的面部投票帧。
 
     年龄/性别识别可能需要多帧投票以提高置信度。
@@ -471,26 +498,29 @@ def collect_face_vote_samples(samples, proximity, track, cancel_event=None):
         [sample for sample in samples if is_face_vote_candidate(sample)]
     )
 
-    while qualified_count < target_count:
-        if cancel_event is not None and cancel_event.is_set():
-            raise ProfileSamplingCancelled("profile_sampling_cancelled")
-        if settings.PROFILE_FACE_VOTE_INTERVAL_MS > 0:
-            time.sleep(settings.PROFILE_FACE_VOTE_INTERVAL_MS / 1000.0)
+    sequence_lock = nullcontext() if _io_lock_held else front_camera_io_lock()
+    with sequence_lock:
+        while qualified_count < target_count:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ProfileSamplingCancelled("profile_sampling_cancelled")
+            if settings.PROFILE_FACE_VOTE_INTERVAL_MS > 0:
+                time.sleep(settings.PROFILE_FACE_VOTE_INTERVAL_MS / 1000.0)
 
-        sample = sample_frame(
-            source="face_vote",
-            index=len(samples) + 1,
-            proximity=proximity,
-            track=track,
-            cancel_event=cancel_event,
-        )
-        samples.append(sample)
+            sample = sample_frame(
+                source="face_vote",
+                index=len(samples) + 1,
+                proximity=proximity,
+                track=track,
+                cancel_event=cancel_event,
+                _io_lock_held=True,
+            )
+            samples.append(sample)
 
-        if is_face_vote_candidate(sample):
-            qualified_count += 1
+            if is_face_vote_candidate(sample):
+                qualified_count += 1
 
-        if (
-            len([item for item in samples if item.get("source") == "face_vote"])
-            >= target_count
-        ):
-            break
+            if (
+                len([item for item in samples if item.get("source") == "face_vote"])
+                >= target_count
+            ):
+                break

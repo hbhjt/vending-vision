@@ -9,6 +9,7 @@ serving the next camera request.
 
 from __future__ import annotations
 
+import asyncio
 import multiprocessing
 import os
 import threading
@@ -183,10 +184,16 @@ class DirectShowCameraBroker:
         self.config["logicalRole"] = role
         self._context = context
         self._target = target
-        self._lock = threading.RLock()
+        # Native pipe waits never hold this state lock.  Abort/maintenance can
+        # therefore close and kill the child from an independent control path.
+        self._state_lock = threading.RLock()
+        self._request_slot = threading.Lock()
         self._parent: Connection | None = None
         self._child: Connection | None = None
         self._process = None
+        self._request_threads: set[threading.Thread] = set()
+        self._fatal_error: str | None = None
+        self._quiesced = False
         self.opened_at: float | None = None
         self.last_frame_at: float | None = None
         self.frame_count = 0
@@ -195,10 +202,16 @@ class DirectShowCameraBroker:
 
     @property
     def pid(self) -> int | None:
-        process = self._process
-        if process is None or not process.is_alive():
-            return None
-        return process.pid
+        with self._state_lock:
+            process = self._process
+            if process is None or not process.is_alive():
+                return None
+            return process.pid
+
+    @property
+    def active_request_count(self) -> int:
+        with self._state_lock:
+            return sum(thread.is_alive() for thread in self._request_threads)
 
     def _mp_context(self):
         if self._context is not None:
@@ -207,9 +220,20 @@ class DirectShowCameraBroker:
         return multiprocessing.get_context("spawn")
 
     def _start_locked(self) -> None:
+        if self._fatal_error is not None:
+            raise RuntimeError(f"directshow broker is unavailable: {self._fatal_error}")
+        if self._quiesced:
+            raise RuntimeError("directshow broker is quiesced for maintenance")
         if self._process is not None and self._process.is_alive():
             return
-        self._close_locked(kill=True)
+        if self._process is not None:
+            # A normal dead child must be joined so exitcode is materialized
+            # before its handle is discarded.
+            self._process.join(timeout=0)
+            self._process = None
+        if self._parent is not None:
+            self._parent.close()
+            self._parent = None
         context = self._mp_context()
         parent, child = context.Pipe(duplex=True)
         process = context.Process(
@@ -225,55 +249,191 @@ class DirectShowCameraBroker:
         self.opened_at = time.time()
         self.restart_count += 1
 
-    def _close_locked(self, *, kill: bool = False) -> None:
-        parent = self._parent
-        process = self._process
-        if parent is not None:
-            try:
-                parent.close()
-            except Exception:
-                pass
-        if process is not None and process.is_alive():
-            if kill:
+    def _stop_process(self, *, graceful: bool, reason: str) -> bool:
+        """Stop and join the child without ever faking death or losing its handle."""
+        with self._state_lock:
+            parent = self._parent
+            process = self._process
+            if graceful and parent is not None and process is not None and process.is_alive():
+                try:
+                    parent.send(("shutdown", None))
+                    parent.poll(0.25)
+                except Exception:
+                    pass
+            if parent is not None:
+                try:
+                    parent.close()
+                except Exception:
+                    pass
+            if process is None:
+                self._parent = None
+                self.opened_at = None
+                return True
+            if process.is_alive():
                 try:
                     process.kill()
-                except AttributeError:
+                except (AttributeError, NotImplementedError):
                     process.terminate()
-            process.join(timeout=0.5)
-            if process.is_alive():
-                process.terminate()
                 process.join(timeout=0.5)
-        self._parent = None
-        self._process = None
-        self.opened_at = None
+            if process.is_alive():
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+                process.join(timeout=0.5)
+            if process.is_alive():
+                # Fail closed.  The live process handle is the only truthful
+                # proof that the physical-camera owner may still exist.
+                self._parent = parent
+                self._process = process
+                self.opened_at = None
+                self._fatal_error = reason
+                return False
+            process.join(timeout=0)
+            self._parent = None
+            self._process = None
+            self.opened_at = None
+            return True
 
-    def _request(self, command: str, payload=None, *, timeout: float | None = None):
+    def _request(
+        self,
+        command: str,
+        payload=None,
+        *,
+        timeout: float | None = None,
+        _slot_owned: bool = False,
+    ):
         deadline = time.monotonic() + (
             DEFAULT_READ_TIMEOUT_SECONDS if timeout is None else max(float(timeout), 0.001)
         )
-        with self._lock:
-            self._start_locked()
-            assert self._parent is not None
-            process = self._process
-            try:
+        if not _slot_owned and not self._request_slot.acquire(blocking=False):
+            raise RuntimeError("directshow broker already has an active request")
+        try:
+            with self._state_lock:
+                self._start_locked()
+                assert self._parent is not None
+                parent = self._parent
+                process = self._process
                 self._parent.send((command, payload))
-                while time.monotonic() < deadline:
-                    if self._parent.poll(0.005):
-                        kind, response = self._parent.recv()
-                        if kind == "ok":
-                            return response
-                        raise RuntimeError(response)
-                    if process is not None and not process.is_alive():
-                        raise RuntimeError(
-                            f"directshow broker exited with {process.exitcode}"
-                        )
-                raise TimeoutError("directshow broker read deadline exceeded")
-            except Exception:
-                self._close_locked(kill=True)
-                raise
+            while time.monotonic() < deadline:
+                if parent.poll(0.005):
+                    kind, response = parent.recv()
+                    if kind == "ok":
+                        return response
+                    raise RuntimeError(response)
+                if process is not None and not process.is_alive():
+                    process.join(timeout=0)
+                    raise RuntimeError(
+                        f"directshow broker exited with {process.exitcode}"
+                    )
+            raise TimeoutError("directshow broker read deadline exceeded")
+        except Exception:
+            self._stop_process(graceful=False, reason="request_abort_failed")
+            raise
+        finally:
+            self._request_slot.release()
+
+    async def _request_async(
+        self, command: str, payload=None, *, timeout: float | None = None
+    ):
+        """Run exactly one request on a dedicated, non-queued worker thread."""
+        if not self._request_slot.acquire(blocking=False):
+            raise RuntimeError("directshow broker already has an active request")
+        done = threading.Event()
+        outcome: dict[str, Any] = {}
+
+        def run_request() -> None:
+            try:
+                outcome["value"] = self._request(
+                    command, payload, timeout=timeout, _slot_owned=True
+                )
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        thread = threading.Thread(
+            target=run_request,
+            name=f"directshow-{self.role}-request",
+            daemon=False,
+        )
+        with self._state_lock:
+            self._request_threads.add(thread)
+        try:
+            thread.start()
+        except BaseException:
+            with self._state_lock:
+                self._request_threads.discard(thread)
+            self._request_slot.release()
+            raise
+        try:
+            while not done.is_set():
+                await asyncio.sleep(0.002)
+        except asyncio.CancelledError:
+            await asyncio.shield(self.abort_async(reason="request_cancelled"))
+            while not done.is_set():
+                await asyncio.sleep(0.002)
+            thread.join()
+            with self._state_lock:
+                self._request_threads.discard(thread)
+            raise
+        thread.join()
+        with self._state_lock:
+            self._request_threads.discard(thread)
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
+
+    async def abort_async(self, *, reason: str = "request_aborted") -> bool:
+        """Abort from a control thread, then await every request thread's exit."""
+        done = threading.Event()
+        outcome: dict[str, bool] = {}
+
+        def control() -> None:
+            outcome["dead"] = self.abort(reason=reason)
+            done.set()
+
+        control_thread = threading.Thread(
+            target=control,
+            name=f"directshow-{self.role}-abort",
+            daemon=False,
+        )
+        control_thread.start()
+        while not done.is_set():
+            await asyncio.sleep(0.002)
+        control_thread.join()
+        while self.active_request_count:
+            await asyncio.sleep(0.002)
+        return bool(outcome.get("dead"))
+
+    def abort(self, *, reason: str = "request_aborted") -> bool:
+        dead = self._stop_process(graceful=False, reason=reason)
+        with self._state_lock:
+            threads = [
+                thread for thread in self._request_threads
+                if thread is not threading.current_thread()
+            ]
+        for thread in threads:
+            thread.join(timeout=1.0)
+        with self._state_lock:
+            requests_done = not any(thread.is_alive() for thread in self._request_threads)
+            if not requests_done:
+                self._fatal_error = f"{reason}: request thread remained alive"
+        return dead and requests_done
 
     def read(self, warmup_frames: int | None = None, *, timeout: float | None = None):
         response = self._request("read", warmup_frames, timeout=timeout)
+        image = response["image"]
+        _validate_frame(image)
+        self.last_pid = int(response["pid"])
+        self.last_frame_at = time.time()
+        self.frame_count += 1
+        return image
+
+    async def read_async(
+        self, warmup_frames: int | None = None, *, timeout: float | None = None
+    ):
+        response = await self._request_async("read", warmup_frames, timeout=timeout)
         image = response["image"]
         _validate_frame(image)
         self.last_pid = int(response["pid"])
@@ -293,20 +453,36 @@ class DirectShowCameraBroker:
         )
         return status
 
-    def release(self) -> None:
-        with self._lock:
-            parent = self._parent
-            if parent is not None and self._process is not None and self._process.is_alive():
-                try:
-                    parent.send(("shutdown", None))
-                    parent.poll(0.25)
-                except Exception:
-                    pass
-            self._close_locked(kill=True)
+    def release(self) -> bool:
+        dead = self._stop_process(graceful=True, reason="broker_release_failed")
+        with self._state_lock:
+            threads = list(self._request_threads)
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=1.0)
+        with self._state_lock:
+            requests_done = not any(thread.is_alive() for thread in self._request_threads)
+            if not requests_done:
+                self._fatal_error = "broker_release_failed: request thread remained alive"
+        return dead and requests_done
 
-    def reset(self) -> None:
-        self.release()
+    def reset(self) -> bool:
+        return self.release()
 
     def assert_dead(self) -> bool:
-        process = self._process
-        return process is None or not process.is_alive()
+        with self._state_lock:
+            process = self._process
+            return process is None or not process.is_alive()
+
+    def begin_maintenance(self) -> None:
+        with self._state_lock:
+            self._quiesced = True
+        if not self.release():
+            with self._state_lock:
+                if self._fatal_error is None:
+                    self._fatal_error = "maintenance_quiesce_failed"
+            raise RuntimeError("directshow broker could not be stopped for maintenance")
+
+    def end_maintenance(self) -> None:
+        with self._state_lock:
+            self._quiesced = False

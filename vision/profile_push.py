@@ -22,7 +22,11 @@ import time
 from uuid import uuid4
 
 from vision.camera_manager import get_last_frame_source
-from vision.camera_owner import acquire_front_camera, release_front_camera
+from vision.camera_owner import (
+    acquire_front_camera,
+    front_camera_io_lock,
+    release_front_camera,
+)
 from vision.config import settings
 from vision.metrics import metrics
 from vision.profile_aggregation import aggregate_samples, build_quality
@@ -188,23 +192,29 @@ def collect_front_profile_update(
 
         # ---- 主采集流程 ----
         # 1. 采集最佳帧批次
-        best_samples = collect_best_profile_samples(
-            proximity=proximity,
-            track=track,
-            cancel_event=cancel_event,
-            close_enough=close_enough,
-            close_validator=close_validator,
-        )
-        samples.extend(best_samples)
+        with front_camera_io_lock():
+            best_samples = collect_best_profile_samples(
+                proximity=proximity,
+                track=track,
+                cancel_event=cancel_event,
+                close_enough=close_enough,
+                close_validator=close_validator,
+                _io_lock_held=True,
+            )
+            samples.extend(best_samples)
 
-        for sample in best_samples:
-            if sample["protocolProfile"]["personPresent"]:
-                track.append_body_sample(sample)
+            for sample in best_samples:
+                if sample["protocolProfile"]["personPresent"]:
+                    track.append_body_sample(sample)
 
-        # 2. 补充面部投票帧
-        collect_face_vote_samples(
-            samples, proximity, track, cancel_event=cancel_event,
-        )
+            # 2. 补充面部投票帧；其间隙仍属于同一画像采样序列。
+            collect_face_vote_samples(
+                samples,
+                proximity,
+                track,
+                cancel_event=cancel_event,
+                _io_lock_held=True,
+            )
 
         if completion_validator is not None and not completion_validator():
             return None

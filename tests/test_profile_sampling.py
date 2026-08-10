@@ -1,9 +1,17 @@
 import unittest
+import threading
+import time
 from unittest.mock import patch
 
 import numpy as np
 
 import vision.profile_sampling as profile_sampling
+from vision.camera_owner import (
+    acquire_front_camera,
+    front_camera_io_lock,
+    get_front_camera_owner,
+    release_front_camera,
+)
 from vision.schema import VisionProfile
 
 
@@ -143,6 +151,83 @@ class ProfileSamplingTest(unittest.TestCase):
             )
 
         self.assertEqual(len(samples), 2)
+
+    def test_profile_three_frame_sequence_keeps_fast_out_until_all_gaps_finish(self):
+        frame = np.full((24, 32, 3), 128, dtype=np.uint8)
+        gap_started = threading.Event()
+        allow_gap = threading.Event()
+        sequence_done = threading.Event()
+        fast_acquired = threading.Event()
+        fast_inserted_during_sequence = []
+        reads = []
+        lease_token = "profile:test-sequence"
+        acquired = acquire_front_camera(
+            "vision", reason="profile_test", lease_token=lease_token
+        )
+        self.assertTrue(acquired["ok"])
+
+        def read_frame(_role, warmup_frames=1):
+            reads.append(len(reads) + 1)
+            return frame.copy(), {"source": "recorded_video", "frameIndex": len(reads)}
+
+        real_sleep = time.sleep
+
+        def interval_barrier(_seconds):
+            gap_started.set()
+            self.assertTrue(allow_gap.wait(timeout=1.0))
+
+        def fast_reader():
+            self.assertTrue(gap_started.wait(timeout=1.0))
+            with front_camera_io_lock():
+                fast_inserted_during_sequence.append(not sequence_done.is_set())
+                fast_acquired.set()
+
+        config = {
+            "duration_sec": 1.0,
+            "early_finish_after_sec": 0.0,
+            "target_fps": 100,
+            "min_good_frames": 3,
+            "max_good_frames": 3,
+        }
+        worker_result = {}
+
+        def collect():
+            try:
+                worker_result["samples"] = profile_sampling.collect_best_profile_samples()
+            finally:
+                sequence_done.set()
+
+        with patch.object(profile_sampling.settings, "PROFILE_SAMPLING_CONFIG", config), patch.object(
+            profile_sampling.settings, "FRONT_CAMERA_PROFILE_SAMPLE_COUNT", 3
+        ), patch.object(
+            profile_sampling.settings, "FRONT_CAMERA_PROFILE_SAMPLE_INTERVAL_MS", 1
+        ), patch.object(
+            profile_sampling, "read_camera_with_source", side_effect=read_frame
+        ), patch.object(
+            profile_sampling, "infer_image", return_value=VisionProfile(age=30, gender="female", presence=True)
+        ), patch.object(
+            profile_sampling, "score_frame_quality", return_value={
+                "faceDetected": True, "qualityScore": 0.8, "brightness": 128.0, "sharpness": 10.0,
+            }
+        ), patch.object(profile_sampling.time, "sleep", side_effect=interval_barrier):
+            collector = threading.Thread(target=collect)
+            contender = threading.Thread(target=fast_reader)
+            collector.start()
+            contender.start()
+            self.assertTrue(gap_started.wait(timeout=1.0))
+            real_sleep(0.05)
+            self.assertFalse(fast_acquired.is_set())
+            allow_gap.set()
+            collector.join(timeout=2.0)
+            contender.join(timeout=2.0)
+
+        try:
+            self.assertEqual(len(worker_result["samples"]), 3)
+            self.assertEqual(reads, [1, 2, 3])
+            self.assertEqual(fast_inserted_during_sequence, [False])
+            self.assertEqual(get_front_camera_owner()["leaseToken"], lease_token)
+        finally:
+            release_front_camera("vision", reason="profile_test_done", lease_token=lease_token)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import hashlib
 import asyncio
 import json
+import multiprocessing
 import os
 import threading
 from urllib.parse import urlsplit
@@ -17,6 +18,30 @@ from fastapi.testclient import TestClient
 import app as vision_app
 from vision import camera_manager
 from vision.config import settings
+from vision.directshow_broker import DirectShowCameraBroker
+
+
+def _fast_block_first_broker_target(connection, config):
+    counter = config["requestCounter"]
+    try:
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+            if command == "read":
+                with counter.get_lock():
+                    counter.value += 1
+                    request_number = counter.value
+                if request_number == 1:
+                    while True:
+                        threading.Event().wait(1.0)
+                connection.send(("ok", {
+                    "pid": os.getpid(),
+                    "image": np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8),
+                }))
+    finally:
+        connection.close()
 
 
 def _png_bytes():
@@ -499,11 +524,18 @@ def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeyp
             events.append(("read", os.getpid(), warmup_frames, timeout))
             return np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
 
+        async def read_async(self, warmup_frames=None, *, timeout=None):
+            return self.read(warmup_frames=warmup_frames, timeout=timeout)
+
         def last_frame(self):
             return {"source": "dshow", "brokerPid": self.last_pid}
 
         def release(self):
             events.append(("release", os.getpid()))
+            return True
+
+        def assert_dead(self):
+            return True
 
     async def is_current(_receipt):
         return True
@@ -538,6 +570,92 @@ def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeyp
     assert source == {"source": "dshow", "brokerPid": 4242}
     assert events[0] == ("open", parent_pid, "front", "front-stable")
     assert events[1][0:3] == ("read", parent_pid, 1)
+    assert vision_app.get_front_camera_owner()["owner"] == "idle"
+
+
+def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restarts(monkeypatch):
+    context = multiprocessing.get_context("spawn")
+    counter = context.Value("i", 0)
+    broker = DirectShowCameraBroker(
+        "front",
+        {
+            "role": "profile_tryon",
+            "index": 9,
+            "backend": "dshow",
+            "stableId": "front-stable",
+            "keep_open": True,
+            "requestCounter": counter,
+        },
+        context=context,
+        target=_fast_block_first_broker_target,
+    )
+
+    class Candidate:
+        index = 9
+        backend = "dshow"
+        stable_id = "front-stable"
+
+    class Maintenance:
+        def resolve(self, role):
+            assert role == "front"
+            return Candidate()
+
+        def refresh_after_read_failure(self):
+            return None
+
+    class Registry:
+        def __init__(self):
+            self.cancel_event = None
+
+        async def is_current(self, _receipt):
+            return not self.cancel_event.is_set()
+
+        async def cancel_event_for(self, _receipt):
+            return self.cancel_event
+
+    registry = Registry()
+    monkeypatch.setattr(vision_app, "_fast_attempt_registry", registry)
+    monkeypatch.setattr(vision_app.settings, "FRONT_CAMERA_CONFIG", {
+        "role": "profile_tryon", "source": "dshow", "keep_open": True,
+    })
+    monkeypatch.setattr(camera_manager, "get_camera_maintenance", lambda: Maintenance())
+    monkeypatch.setattr(camera_manager, "DirectShowCameraBroker", lambda _role, _config: broker)
+    camera_manager.release_all_cameras()
+
+    async def scenario():
+        registry.cancel_event = asyncio.Event()
+        first = vision_app.AttemptReceipt(str(uuid4()), "owner-1", 1)
+        read_task = asyncio.create_task(
+            vision_app._read_fast_front_frame(first, timeout=15.0)
+        )
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while counter.value < 1 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.002)
+        ticks = 0
+        tick_deadline = asyncio.get_running_loop().time() + 0.05
+        while asyncio.get_running_loop().time() < tick_deadline:
+            ticks += 1
+            await asyncio.sleep(0.002)
+        registry.cancel_event.set()
+        with pytest.raises(vision_app.GarmentFetchError, match="attempt_replaced"):
+            await asyncio.wait_for(read_task, timeout=1.0)
+        assert ticks >= 10
+        assert broker.assert_dead()
+        assert broker.active_request_count == 0
+
+        registry.cancel_event = asyncio.Event()
+        second = vision_app.AttemptReceipt(str(uuid4()), "owner-2", 2)
+        frame, source = await vision_app._read_fast_front_frame(second, timeout=1.0)
+        assert frame.shape == (80, 60, 3)
+        assert source["brokerPid"] is not None
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        broker.release()
+        with camera_manager._streams_lock:
+            camera_manager._dshow_brokers.pop("front", None)
+    assert broker.assert_dead()
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 

@@ -379,8 +379,8 @@ def prepare_first_try_on_frame(
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
     _try_on_sessions.begin_stream(session_id, stream_token)
     try:
-        renew_front_camera("tryon_frontend", reason=f"try_on_first_frame:{session_id}")
         with front_camera_io_lock():
+            renew_front_camera("tryon_frontend", reason=f"try_on_first_frame:{session_id}")
             frame, source_frame = read_camera_with_source("front", warmup_frames=1)
 
         ok, encoded = cv2.imencode(".jpg", frame, encode_params)
@@ -431,8 +431,8 @@ def iter_try_on_mjpeg(
             )
 
         while is_try_on_session_active(session_id, stream_token=stream_token):
-            renew_front_camera("tryon_frontend", reason=f"try_on_stream:{session_id}")
             with front_camera_io_lock():
+                renew_front_camera("tryon_frontend", reason=f"try_on_stream:{session_id}")
                 frame = read_camera("front", warmup_frames=1)
 
             ok, encoded = cv2.imencode(".jpg", frame, encode_params)

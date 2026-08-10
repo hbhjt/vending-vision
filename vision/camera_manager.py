@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from datetime import datetime
@@ -345,6 +346,7 @@ _streams: dict[str, ManagedCameraStream] = {}
 _recorded_sources: dict[str, RecordedVideoFrameSource] = {}
 _dshow_brokers: dict[str, DirectShowCameraBroker] = {}
 _streams_lock = threading.RLock()
+_maintenance_candidates: set[str] = set()
 _last_frame_metadata: dict[str, dict] = {}
 _role_read_locks = {role: threading.RLock() for role in CAMERA_ROLES}
 
@@ -358,10 +360,14 @@ class DirectShowFrameSource:
 
     def _broker(self) -> DirectShowCameraBroker:
         with _streams_lock:
+            candidate_id = self.config.get("stableId")
+            if candidate_id in _maintenance_candidates:
+                raise RuntimeError("camera runtime is quiesced for maintenance")
             broker = _dshow_brokers.get(self.role)
             if broker is None or broker.config != {**self.config, "logicalRole": self.role}:
                 if broker is not None:
-                    broker.release()
+                    if not broker.release():
+                        raise RuntimeError("previous directshow broker is still alive")
                 broker = DirectShowCameraBroker(self.role, self.config)
                 _dshow_brokers[self.role] = broker
             return broker
@@ -391,9 +397,13 @@ class DirectShowFrameSource:
                 get_camera_maintenance().refresh_after_read_failure()
                 self.config = _camera_config(self.role)
                 with _streams_lock:
-                    broker = _dshow_brokers.pop(self.role, None)
+                    broker = _dshow_brokers.get(self.role)
                 if broker is not None:
-                    broker.release()
+                    dead = broker.release()
+                    if dead:
+                        with _streams_lock:
+                            if _dshow_brokers.get(self.role) is broker:
+                                _dshow_brokers.pop(self.role, None)
                 metrics.increment("camera_read_failure_total", role=self.role)
                 logger.warning(
                     f"{self.role} camera broker read failed "
@@ -407,6 +417,63 @@ class DirectShowFrameSource:
                         sleep_for = min(sleep_for, max(deadline - time.monotonic(), 0.0))
                     if sleep_for > 0:
                         time.sleep(sleep_for)
+        metrics.observe_ms(
+            "camera_read_duration_ms",
+            (time.time() - started) * 1000,
+            role=self.role,
+        )
+        raise RuntimeError(f"{self.role} camera read failed after broker restart: {last_error}")
+
+    async def read_async(
+        self, warmup_frames: int | None = None, *, timeout: float | None = None
+    ):
+        attempts = max(1, int(settings.CAMERA_READ_RETRY_COUNT) + 1)
+        last_error = None
+        started = time.time()
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + max(float(timeout), 0.001)
+        for attempt in range(1, attempts + 1):
+            try:
+                remaining = timeout
+                if deadline is not None:
+                    remaining = max(deadline - loop.time(), 0.001)
+                image = await self._broker().read_async(
+                    warmup_frames=warmup_frames, timeout=remaining
+                )
+                metrics.increment("camera_read_success_total", role=self.role)
+                metrics.observe_ms(
+                    "camera_read_duration_ms",
+                    (time.time() - started) * 1000,
+                    role=self.role,
+                )
+                return image
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                get_camera_maintenance().refresh_after_read_failure()
+                self.config = _camera_config(self.role)
+                with _streams_lock:
+                    broker = _dshow_brokers.get(self.role)
+                if broker is not None:
+                    dead = await broker.abort_async(reason="camera_read_failed")
+                    if dead:
+                        with _streams_lock:
+                            if _dshow_brokers.get(self.role) is broker:
+                                _dshow_brokers.pop(self.role, None)
+                metrics.increment("camera_read_failure_total", role=self.role)
+                logger.warning(
+                    f"{self.role} camera broker read failed "
+                    f"attempt={attempt}/{attempts}: {exc}"
+                )
+                if deadline is not None and loop.time() >= deadline:
+                    break
+                if attempt < attempts:
+                    sleep_for = settings.CAMERA_RECONNECT_DELAY_MS / 1000.0
+                    if deadline is not None:
+                        sleep_for = min(sleep_for, max(deadline - loop.time(), 0.0))
+                    if sleep_for > 0:
+                        await asyncio.sleep(sleep_for)
         metrics.observe_ms(
             "camera_read_duration_ms",
             (time.time() - started) * 1000,
@@ -490,16 +557,61 @@ def quiesce_runtime_camera(candidate_id: str):
     Runtime reads then resume lazily through the normal single owner pipeline.
     """
     with _streams_lock:
-        streams = list(_streams.values())
-    matching = [
-        stream for stream in streams
-        if stream.config.get("stableId") == candidate_id
-    ]
-    if not matching:
-        return _NoopRuntimeMaintenanceHandoff()
-    if len(matching) != 1:
-        raise RuntimeError("camera runtime ownership is ambiguous")
-    return matching[0].quiesce_for_maintenance()
+        if candidate_id in _maintenance_candidates:
+            raise RuntimeError("camera maintenance handoff is already active")
+        matching_streams = [
+            stream for stream in _streams.values()
+            if stream.config.get("stableId") == candidate_id
+        ]
+        matching_brokers = [
+            broker for broker in _dshow_brokers.values()
+            if broker.config.get("stableId") == candidate_id
+        ]
+        roles = {item.role for item in [*matching_streams, *matching_brokers]}
+        if len(roles) > 1:
+            raise RuntimeError("camera runtime ownership is ambiguous")
+        _maintenance_candidates.add(candidate_id)
+
+    stream_handoffs = []
+    broker_handoffs = []
+    try:
+        for stream in matching_streams:
+            stream_handoffs.append(stream.quiesce_for_maintenance())
+        for broker in matching_brokers:
+            broker.begin_maintenance()
+            if not broker.assert_dead():
+                raise RuntimeError("directshow broker remained alive during maintenance handoff")
+            broker_handoffs.append(broker)
+        return _RuntimeCameraMaintenanceHandoff(
+            candidate_id, stream_handoffs, broker_handoffs
+        )
+    except Exception:
+        for broker in reversed(broker_handoffs):
+            broker.end_maintenance()
+        for handoff in reversed(stream_handoffs):
+            handoff.release()
+        with _streams_lock:
+            _maintenance_candidates.discard(candidate_id)
+        raise
+
+
+class _RuntimeCameraMaintenanceHandoff:
+    def __init__(self, candidate_id: str, stream_handoffs: list, brokers: list):
+        self._candidate_id = candidate_id
+        self._stream_handoffs = stream_handoffs
+        self._brokers = brokers
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        for broker in reversed(self._brokers):
+            broker.end_maintenance()
+        for handoff in reversed(self._stream_handoffs):
+            handoff.release()
+        with _streams_lock:
+            _maintenance_candidates.discard(self._candidate_id)
 
 
 def read_camera_with_source(
@@ -526,6 +638,48 @@ def read_camera_with_source(
         else:
             _last_frame_metadata.pop(role, None)
         return image, frame
+
+
+async def read_camera_with_source_async(
+    role: str,
+    warmup_frames: int | None = None,
+    *,
+    timeout: float | None = None,
+):
+    """Async DirectShow read that never blocks the event-loop on pipe I/O."""
+    source = get_frame_source(role)
+    if not isinstance(source, DirectShowFrameSource):
+        return read_camera_with_source(role, warmup_frames=warmup_frames, timeout=timeout)
+    image = await source.read_async(warmup_frames=warmup_frames, timeout=timeout)
+    frame = source.last_frame()
+    with _role_read_locks[role]:
+        if frame is not None:
+            frame = dict(frame)
+            _last_frame_metadata[role] = frame
+        else:
+            _last_frame_metadata.pop(role, None)
+    return image, frame
+
+
+async def abort_camera_request(role: str, *, reason: str) -> bool:
+    """Abort a broker request and return only after its process/thread are gone."""
+    with _streams_lock:
+        broker = _dshow_brokers.get(role)
+    if broker is None:
+        return True
+    dead = await broker.abort_async(reason=reason)
+    if dead:
+        with _streams_lock:
+            if _dshow_brokers.get(role) is broker:
+                _dshow_brokers.pop(role, None)
+    return dead
+
+
+async def abort_all_camera_requests(*, reason: str) -> dict[str, bool]:
+    return {
+        role: await abort_camera_request(role, reason=reason)
+        for role in sorted(CAMERA_ROLES)
+    }
 
 
 def read_camera(role: str, warmup_frames: int | None = None, *, timeout: float | None = None):
@@ -577,14 +731,19 @@ def release_camera(role: str):
         with _streams_lock:
             stream = _streams.get(role)
             source = _recorded_sources.get(role)
-            broker = _dshow_brokers.pop(role, None)
+            broker = _dshow_brokers.get(role)
         if stream is not None:
             stream.release()
         if source is not None:
             source.release()
         if broker is not None:
-            broker.release()
+            dead = broker.release()
+            if dead:
+                with _streams_lock:
+                    if _dshow_brokers.get(role) is broker:
+                        _dshow_brokers.pop(role, None)
         _last_frame_metadata.pop(role, None)
+        return broker is None or broker.assert_dead()
 
 
 def reset_camera(role: str):
@@ -593,17 +752,21 @@ def reset_camera(role: str):
         with _streams_lock:
             stream = _streams.get(role)
             source = _recorded_sources.get(role)
-            broker = _dshow_brokers.pop(role, None)
+            broker = _dshow_brokers.get(role)
         if stream is not None:
             stream.reset()
         if source is not None:
             source.reset()
         if broker is not None:
-            broker.reset()
+            dead = broker.reset()
+            if dead:
+                with _streams_lock:
+                    if _dshow_brokers.get(role) is broker:
+                        _dshow_brokers.pop(role, None)
         _last_frame_metadata.pop(role, None)
+        return broker is None or broker.assert_dead()
 
 
 def release_all_cameras():
     """释放所有摄像头资源。"""
-    for role in CAMERA_ROLES:
-        release_camera(role)
+    return {role: release_camera(role) for role in sorted(CAMERA_ROLES)}

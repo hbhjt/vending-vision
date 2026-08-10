@@ -32,11 +32,14 @@ from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketD
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from vision.camera_manager import (
+    abort_all_camera_requests,
+    abort_camera_request,
     get_all_camera_statuses,
     get_camera_config,
     get_camera_status,
     read_camera,
     read_camera_with_source,
+    read_camera_with_source_async,
     release_all_cameras,
     reset_camera,
 )
@@ -131,7 +134,12 @@ async def on_shutdown():
             task.cancel()
 
     await _fast_attempt_registry.shutdown()
-    release_all_cameras()
+    aborted = await abort_all_camera_requests(reason="vision_shutdown")
+    released = release_all_cameras()
+    if not all(aborted.values()) or not all(released.values()):
+        raise RuntimeError(
+            f"camera broker shutdown incomplete: aborted={aborted}, released={released}"
+        )
     logger.info("Camera streams released")
 
 
@@ -206,13 +214,52 @@ async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
             return read_camera_with_source("front", 1)
 
         # All production consumers enter through camera_manager.  Physical
-        # DirectShow reads are served by its single broker process; recorded
-        # video remains deterministic in-process behind the same interface.
-        return read_camera_with_source(
-            "front",
-            1,
-            timeout=max(0.001, deadline - loop.time()),
+        # DirectShow pipe waits run on one dedicated request thread, while the
+        # event loop remains available to process replacement and disconnect.
+        read_task = asyncio.create_task(
+            read_camera_with_source_async(
+                "front", 1, timeout=max(0.001, deadline - loop.time())
+            )
         )
+        cancel_waiter = asyncio.create_task(
+            (await _fast_attempt_registry.cancel_event_for(receipt)).wait()
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {read_task, cancel_waiter},
+                timeout=max(0.001, deadline - loop.time()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if read_task in done:
+                return read_task.result()
+
+            abort_reason = (
+                "fast_attempt_replaced" if cancel_waiter in done else "fast_attempt_timeout"
+            )
+            abort_task = asyncio.create_task(
+                abort_camera_request("front", reason=abort_reason)
+            )
+            read_task.cancel()
+            dead = await abort_task
+            await asyncio.gather(read_task, return_exceptions=True)
+            if not dead:
+                raise RuntimeError("front camera broker remained alive after abort")
+            if cancel_waiter in done:
+                raise GarmentFetchError("attempt_replaced")
+            raise asyncio.TimeoutError()
+        except asyncio.CancelledError:
+            abort_task = asyncio.create_task(
+                abort_camera_request("front", reason="fast_attempt_cancelled")
+            )
+            read_task.cancel()
+            dead = await asyncio.shield(abort_task)
+            await asyncio.shield(asyncio.gather(read_task, return_exceptions=True))
+            if not dead:
+                raise RuntimeError("front camera broker remained alive after cancel")
+            raise
+        finally:
+            cancel_waiter.cancel()
+            await asyncio.gather(cancel_waiter, return_exceptions=True)
     finally:
         if io_acquired:
             release_front_camera_io_lock()
