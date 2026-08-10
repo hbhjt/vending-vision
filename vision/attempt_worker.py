@@ -78,6 +78,8 @@ class FastRenderBroker:
     def __init__(
         self, *, context=None, target=render_worker_entry, target_args: tuple = ()
     ):
+        if target is render_worker_entry and target_args:
+            raise ValueError("production render target does not accept test arguments")
         self._context = context
         self._target = target
         self._target_args = tuple(target_args)

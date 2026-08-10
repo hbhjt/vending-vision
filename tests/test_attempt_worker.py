@@ -4,6 +4,7 @@ import multiprocessing
 import os
 import threading
 import time
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -22,6 +23,56 @@ _TEST_POSE_FIXTURE = {
         24: (0.62, 0.68, 0.95),
     },
 }
+
+
+def _test_fixture_render_worker_target(connection, test_pose_fixture):
+    """Spawn-safe test worker; it is intentionally outside packaged Vision code."""
+    from vision.fast_tryon import (
+        FastTryOnRuntime,
+        GarmentFetchError,
+        PoseUnavailableError,
+        ValidatedGarmentSource,
+    )
+
+    class TestFixturePoseEstimator:
+        def detect(self, _frame):
+            points = [SimpleNamespace(x=0.5, y=0.5, visibility=0.0) for _ in range(33)]
+            for index, point in test_pose_fixture["landmarks"].items():
+                x, y, visibility = point
+                points[index] = SimpleNamespace(x=x, y=y, visibility=visibility)
+            return SimpleNamespace(pose_landmarks=SimpleNamespace(landmark=points))
+
+    runtime = FastTryOnRuntime(pose_estimator=TestFixturePoseEstimator())
+    connection.send(("ready", {"pid": os.getpid(), "poseReady": True}))
+    try:
+        while True:
+            command, payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+            try:
+                frame = np.frombuffer(payload["frameBytes"], dtype=np.uint8).reshape(
+                    payload["frameShape"]
+                )
+                garment = payload["garmentPng"]
+                digest = "sha256:" + hashlib.sha256(garment).hexdigest()
+                source = ValidatedGarmentSource(
+                    png_bytes=garment,
+                    digest=digest,
+                    template=payload["template"],
+                )
+                connection.send(("ok", runtime.render(frame, source)))
+            except BaseException as exc:
+                kind = (
+                    "garment_error"
+                    if isinstance(exc, GarmentFetchError)
+                    else "pose_error"
+                    if isinstance(exc, PoseUnavailableError)
+                    else "error"
+                )
+                connection.send((kind, f"{type(exc).__name__}: {exc}"))
+    finally:
+        connection.close()
 
 
 def _block_first_render_target(connection, counter):
@@ -99,7 +150,7 @@ def _blocked_worker_encode_target(connection, entered, test_pose_fixture):
             time.sleep(1)
 
     fast_tryon.cv2.imencode = blocked_encode
-    render_worker_entry(connection, test_pose_fixture)
+    _test_fixture_render_worker_target(connection, test_pose_fixture)
 
 
 def _slow_worker_encode_target(connection, entered, delay_seconds, test_pose_fixture):
@@ -113,7 +164,14 @@ def _slow_worker_encode_target(connection, entered, delay_seconds, test_pose_fix
         return real_encode(*args, **kwargs)
 
     fast_tryon.cv2.imencode = slow_encode
-    render_worker_entry(connection, test_pose_fixture)
+    _test_fixture_render_worker_target(connection, test_pose_fixture)
+
+
+def test_production_render_target_rejects_test_arguments():
+    with pytest.raises(ValueError, match="does not accept test arguments"):
+        FastRenderBroker(
+            target=render_worker_entry, target_args=(_TEST_POSE_FIXTURE,)
+        )
 
 
 @pytest.mark.parametrize("compression", ["compressible", "difficult"])
@@ -201,7 +259,8 @@ def test_prestarted_render_broker_completes_one_real_encoded_job():
         # This is a broker/resource test.  The explicit worker-only fixture
         # avoids claiming a blank frame is a real production person.
         broker = FastRenderBroker(
-            target=render_worker_entry, target_args=(_TEST_POSE_FIXTURE,)
+            target=_test_fixture_render_worker_target,
+            target_args=(_TEST_POSE_FIXTURE,),
         )
         await broker.start()
         pid = broker.pid
@@ -267,7 +326,8 @@ def test_parent_cv2_encode_block_cannot_enter_the_prestarted_render_path(monkeyp
 
     async def scenario():
         broker = FastRenderBroker(
-            target=render_worker_entry, target_args=(_TEST_POSE_FIXTURE,)
+            target=_test_fixture_render_worker_target,
+            target_args=(_TEST_POSE_FIXTURE,),
         )
         await broker.start()
         monkeypatch.setattr(cv2, "imencode", blocked_parent_encode)

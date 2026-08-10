@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import os
 from multiprocessing.connection import Connection
-from types import SimpleNamespace
 
 
 MAX_GARMENT_BYTES = 8 * 1024 * 1024
@@ -26,43 +25,11 @@ _FAST_RUNTIME = None
 _POSE_READY = False
 
 
-class _TestFixturePoseEstimator:
-    """A serializable, explicit test-only pose boundary for broker tests.
-
-    Production entrypoints never pass this fixture: they initialize the
-    official MediaPipe estimator below.  It lets IPC/resource tests exercise a
-    complete child render without pretending a blank frame contains a person.
-    """
-
-    def __init__(self, fixture: dict):
-        if not isinstance(fixture, dict) or fixture.get("testOnly") is not True:
-            raise ValueError("invalid test pose fixture")
-        landmarks = fixture.get("landmarks")
-        if not isinstance(landmarks, dict):
-            raise ValueError("invalid test pose fixture")
-        self._landmarks = landmarks
-
-    def detect(self, _frame):
-        points = [SimpleNamespace(x=0.5, y=0.5, visibility=0.0) for _ in range(33)]
-        for index, point in self._landmarks.items():
-            if type(index) is not int or not isinstance(point, (tuple, list)) or len(point) != 3:
-                raise ValueError("invalid test pose fixture")
-            x, y, visibility = point
-            points[index] = SimpleNamespace(x=float(x), y=float(y), visibility=float(visibility))
-        return SimpleNamespace(pose_landmarks=SimpleNamespace(landmark=points))
-
-
-def _initialize_runtime(test_pose_fixture: dict | None = None):
+def _initialize_runtime():
     global _FAST_RUNTIME, _POSE_READY
     from vision.fast_tryon import FastTryOnRuntime
 
     try:
-        if test_pose_fixture is not None:
-            _FAST_RUNTIME = FastTryOnRuntime(
-                pose_estimator=_TestFixturePoseEstimator(test_pose_fixture)
-            )
-            _POSE_READY = True
-            return _FAST_RUNTIME
         pose_module = __import__("vision." + "pose_estimator", fromlist=["PoseEstimator"])
         estimator = pose_module.PoseEstimator()
         _FAST_RUNTIME = FastTryOnRuntime(pose_estimator=estimator)
@@ -136,12 +103,10 @@ def _render(payload: dict) -> bytes:
     return result
 
 
-def render_worker_entry(
-    connection: Connection, test_pose_fixture: dict | None = None
-) -> None:
+def render_worker_entry(connection: Connection) -> None:
     """Own the render loop and announce readiness separately from requests."""
     try:
-        _initialize_runtime(test_pose_fixture)
+        _initialize_runtime()
         connection.send(("ready", {"pid": os.getpid(), "poseReady": _POSE_READY}))
         while True:
             command, payload = connection.recv()

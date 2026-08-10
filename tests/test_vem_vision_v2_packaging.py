@@ -45,3 +45,23 @@ def test_frozen_runtime_keeps_the_spawn_safe_render_worker_entry():
     assert "import app" not in target
     assert "vision.pose_estimator" not in target
     assert "vision.model" not in target
+
+
+def test_packaged_production_modules_cannot_select_test_pose_fixtures():
+    production_modules = [
+        ROOT / "run_vision_server.py",
+        ROOT / "vision" / "attempt_worker.py",
+        ROOT / "vision" / "render_worker_target.py",
+    ]
+    source = "\n".join(path.read_text("utf-8").lower() for path in production_modules)
+    worker_target = (ROOT / "vision" / "render_worker_target.py").read_text("utf-8").lower()
+    spec = (ROOT / "vending_vision.spec").read_text("utf-8").lower()
+
+    assert "test_pose" not in source
+    assert "fake" not in source
+    assert "fixture" not in worker_target
+    assert "test_pose" not in worker_target
+    assert "fake" not in worker_target
+    assert '"tests"' not in spec
+    assert "test_pose" not in spec
+    assert "fake" not in spec
