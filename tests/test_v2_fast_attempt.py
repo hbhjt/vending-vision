@@ -152,6 +152,8 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
         head = client.head(grant_path)
         wrong_grant = client.get(f"{parsed_result.path}?token=wrong-token")
         missing_grant = client.get(parsed_result.path)
+        extra_grant = client.get(f"{grant_path}&extra=true")
+        duplicate_grant = client.get(f"{grant_path}&token=second")
         wrong_method = client.post(grant_path)
 
     assert response.status_code == 200
@@ -159,6 +161,7 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
     assert head.status_code == 200
     assert head.headers["content-length"] == str(len(response.content))
     assert wrong_grant.status_code == missing_grant.status_code == 404
+    assert extra_grant.status_code == duplicate_grant.status_code == 404
     assert wrong_method.status_code == 405
     assert cv2.imdecode(np.frombuffer(response.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED) is not None
     assert camera_manager.get_frame_source("front").status()["source"] == "recorded_video"
@@ -185,3 +188,60 @@ def test_v2_fast_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(
             assert socket.receive_json()["type"] == "vision.pong"
             _GarmentHandler.release.set()
             assert socket.receive_json()["type"] == "vision.try_on.attempt.completed"
+
+
+def test_v2_fast_attempt_replays_same_owner_active_attempt_without_new_terminal(
+    monkeypatch, garment_reference
+):
+    """A transport retry of the same attempt joins the owner attempt instead of failing."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    _GarmentHandler.release.clear()
+    attempt_id = str(uuid4())
+    start = _start(attempt_id, garment_reference)
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(start)
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert _GarmentHandler.entered.wait(timeout=2)
+
+            socket.send_json(start)
+            replayed = [socket.receive_json(), socket.receive_json()]
+
+            assert [message["type"] for message in replayed] == [
+                "vision.try_on.attempt.accepted",
+                "vision.try_on.attempt.progress",
+            ]
+            assert all(message["payload"]["attemptId"] == attempt_id for message in replayed)
+
+            _GarmentHandler.release.set()
+            completed = socket.receive_json()
+
+    assert completed["type"] == "vision.try_on.attempt.completed"
+    assert completed["payload"]["attemptId"] == attempt_id
+
+
+def test_v2_fast_result_store_rejects_self_too_large_without_publishing(monkeypatch):
+    monkeypatch.setattr(vision_app, "_FAST_RESULT_MAX_BYTES", 8)
+    active = {
+        "attemptId": str(uuid4()),
+        "ownerId": "owner",
+        "canceled": threading.Event(),
+        "terminal": False,
+    }
+    image = _png_bytes()
+    with vision_app._fast_attempt_lock:
+        vision_app._fast_attempt_active = active
+    try:
+        with pytest.raises(RuntimeError, match="fast_result_too_large"):
+            vision_app._store_fast_result(active, image)
+        assert active["attemptId"] not in vision_app._fast_results
+    finally:
+        with vision_app._fast_attempt_lock:
+            vision_app._fast_attempt_active = None

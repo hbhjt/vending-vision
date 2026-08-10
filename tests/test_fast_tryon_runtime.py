@@ -69,6 +69,9 @@ def test_fast_runtime_downloads_only_declared_loopback_png_and_composites_a_deco
     assert decoded is not None
     assert decoded.shape[:2] == frame.shape[:2]
     assert not np.array_equal(decoded, frame)
+    assert np.array_equal(decoded[: int(frame.shape[0] * 0.20)], frame[: int(frame.shape[0] * 0.20)])
+    torso = decoded[int(frame.shape[0] * 0.34) : int(frame.shape[0] * 0.68)]
+    assert np.count_nonzero(torso[:, :, 0] != frame[int(frame.shape[0] * 0.34) : int(frame.shape[0] * 0.68), :, 0]) > 100
 
 
 def test_fast_runtime_rejects_redirect_and_digest_mismatch(garment_server):
@@ -92,3 +95,34 @@ def test_fast_runtime_rejects_redirect_and_digest_mismatch(garment_server):
     finally:
         GarmentHandler.redirect = False
 
+
+def test_fast_runtime_rejects_png_bomb_dimensions_before_decode(garment_server):
+    from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
+
+    oversized_ihdr = (
+        b"\x89PNG\r\n\x1a\n"
+        + (13).to_bytes(4, "big")
+        + b"IHDR"
+        + (4097).to_bytes(4, "big")
+        + (32).to_bytes(4, "big")
+        + bytes([8, 6, 0, 0, 0])
+        + b"\x00\x00\x00\x00"
+        + (0).to_bytes(4, "big")
+        + b"IEND"
+        + b"\x00\x00\x00\x00"
+    )
+    GarmentHandler.payload = oversized_ihdr
+    try:
+        runtime = FastTryOnRuntime(max_garment_bytes=1024 * 1024)
+        with pytest.raises(GarmentFetchError, match="png_dimensions"):
+            runtime.fetch_garment(
+                {
+                    "reference": garment_server,
+                    "digest": "sha256:" + hashlib.sha256(oversized_ihdr).hexdigest(),
+                    "contentType": "image/png",
+                    "byteSize": len(oversized_ihdr),
+                    "template": "tshirt_short_sleeve",
+                }
+            )
+    finally:
+        GarmentHandler.payload = png_bytes()
