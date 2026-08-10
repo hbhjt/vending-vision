@@ -36,7 +36,6 @@ from vision.camera_manager import (
     get_camera_config,
     get_camera_status,
     read_camera,
-    read_camera_with_source,
     release_all_cameras,
     reset_camera,
 )
@@ -66,7 +65,8 @@ from vision.try_on_session import (
     stop_try_on_session,
 )
 from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
-from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry
+from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
+from vision.attempt_worker import capture_attempt_frame, render_attempt_frame
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
@@ -83,10 +83,12 @@ app = FastAPI(
 _FAST_RESULT_TTL_SECONDS = 5 * 60
 _FAST_RESULT_MAX_BYTES = 16 * 1024 * 1024
 _FAST_ATTEMPT_TIMEOUT_SECONDS = 15
+_FAST_ATTEMPT_MAX_TASKS = 2
 _fast_runtime = FastTryOnRuntime()
 _fast_attempt_registry = FastAttemptRegistry(
     terminal_ttl_seconds=_FAST_RESULT_TTL_SECONDS,
 )
+_fast_attempt_task_slots = asyncio.Semaphore(_FAST_ATTEMPT_MAX_TASKS)
 
 # 启动时的自检结果缓存
 startup_check = None
@@ -134,29 +136,44 @@ def _discard_completed_fast_attempt(task: asyncio.Task) -> None:
         logger.exception("Fast attempt task ended with an unhandled error")
 
 
-async def _run_owned_blocking(
-    receipt: AttemptReceipt, function, *args, timeout: float, **kwargs
-):
-    """Join a Fast frame/render future before its attempt can terminate.
-
-    Python cannot forcibly stop an already running executor call.  Shielding
-    and joining it on timeout/cancellation is therefore the cancellation
-    fence: a replacement cannot enter the one-worker lane while old image or
-    frame work remains queued or running.
-    """
+async def _run_owned_attempt_step(receipt: AttemptReceipt, operation, *, timeout: float):
+    """Race an owned process operation with cancellation and join it in all cases."""
     if not await _fast_attempt_registry.is_current(receipt):
         raise GarmentFetchError("attempt_replaced")
-    future = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    worker = asyncio.create_task(operation)
+    cancel_waiter = asyncio.create_task(
+        (await _fast_attempt_registry.cancel_event_for(receipt)).wait()
+    )
     try:
-        return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        await asyncio.shield(future)
+        done, _ = await asyncio.wait(
+            {worker, cancel_waiter}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+        )
+        if worker in done:
+            return worker.result()
+        if cancel_waiter in done:
+            raise GarmentFetchError("attempt_replaced")
+        raise asyncio.TimeoutError()
+    except (asyncio.TimeoutError, asyncio.CancelledError, GarmentFetchError):
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
         raise
     finally:
-        if not future.done():
-            await asyncio.shield(future)
+        cancel_waiter.cancel()
+        await asyncio.gather(cancel_waiter, return_exceptions=True)
         if not await _fast_attempt_registry.is_current(receipt):
             raise GarmentFetchError("attempt_replaced")
+
+
+async def _publish_fast_transition(transition: TerminalTransition | None) -> None:
+    """Deliver a registry-won terminal to every still-live subscriber."""
+    if transition is None:
+        return
+    for subscriber in transition.subscribers:
+        try:
+            async with subscriber.send_lock:
+                await subscriber.websocket.send_json(transition.message)
+        except Exception:
+            await _fast_attempt_registry.detach_subscriber(subscriber.websocket)
 
 
 def get_startup_check():
@@ -1242,19 +1259,27 @@ async def run_v2_fast_attempt(
         return
 
     attempt_id = payload["attemptId"]
-    if not fast_ready:
-        terminal = _generated_v2_envelope(
-            "vision.try_on.attempt.failed",
-            {"attemptId": attempt_id, "reason": "fast_unavailable"},
-        )
-        async with send_lock:
-            await websocket.send_json(terminal)
-        return
-    accepted = _generated_v2_envelope(
-        "vision.try_on.attempt.accepted", {"attemptId": attempt_id, "mode": "fast"}
+    unavailable_terminal = _generated_v2_envelope(
+        "vision.try_on.attempt.failed",
+        {"attemptId": attempt_id, "reason": "fast_unavailable"},
     )
-    progress = _generated_v2_envelope(
-        "vision.try_on.attempt.progress", {"attemptId": attempt_id, "stage": "generating"}
+    canceled_terminal = _generated_v2_envelope(
+        "vision.try_on.attempt.failed",
+        {"attemptId": attempt_id, "reason": "attempt_replaced"},
+    )
+    accepted = (
+        _generated_v2_envelope(
+            "vision.try_on.attempt.accepted", {"attemptId": attempt_id, "mode": "fast"}
+        )
+        if fast_ready
+        else None
+    )
+    progress = (
+        _generated_v2_envelope(
+            "vision.try_on.attempt.progress", {"attemptId": attempt_id, "stage": "generating"}
+        )
+        if fast_ready
+        else None
     )
     admission = await _fast_attempt_registry.admit(
         attempt_id=attempt_id,
@@ -1263,7 +1288,11 @@ async def run_v2_fast_attempt(
         task=asyncio.current_task(),
         accepted=accepted,
         progress=progress,
+        canceled_terminal=canceled_terminal,
+        owner_receipts=owned_fast_attempt_receipts,
     )
+    for transition in admission.transitions:
+        await _publish_fast_transition(transition)
     if not admission.is_owner:
         async with send_lock:
             for replay_message in admission.replay:
@@ -1271,10 +1300,17 @@ async def run_v2_fast_attempt(
         return
     receipt = admission.receipt
     assert receipt is not None
-    # The receipt is only recorded after the registry accepted ownership.
-    owned_fast_attempt_receipts.add(receipt)
     if connection_closed.is_set():
-        await _fast_attempt_registry.cancel_owner_and_join(receipt)
+        await _publish_fast_transition(
+            await _fast_attempt_registry.cancel_owner_and_join(receipt)
+        )
+        return
+    if not fast_ready:
+        subscribers = await _fast_attempt_registry.commit_terminal(receipt, unavailable_terminal)
+        await _publish_fast_transition(
+            TerminalTransition(message=unavailable_terminal, subscribers=subscribers)
+        )
+        return
     stored_result = None
     try:
         async with send_lock:
@@ -1288,18 +1324,19 @@ async def run_v2_fast_attempt(
         )
         if not await _fast_attempt_registry.is_current(receipt):
             raise GarmentFetchError("attempt_replaced")
-        frame, source_frame = await _run_owned_blocking(
+        frame, source_frame = await _run_owned_attempt_step(
             receipt,
-            read_camera_with_source,
-            "front",
-            warmup_frames=1,
+            capture_attempt_frame(
+                "front",
+                get_camera_config("front"),
+                warmup_frames=1,
+                timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
+            ),
             timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
         )
-        result_image = await _run_owned_blocking(
+        result_image = await _run_owned_attempt_step(
             receipt,
-            _fast_runtime.render,
-            frame,
-            prepared,
+            render_attempt_frame(frame, prepared, timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS),
             timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
         )
         stored_result, result = _prepare_fast_result(attempt_id, result_image)
@@ -1337,12 +1374,41 @@ async def run_v2_fast_attempt(
             "vision.try_on.attempt.failed", {"attemptId": attempt_id, "reason": "attempt_replaced"}
         )
     subscribers = await _fast_attempt_registry.commit_terminal(receipt, terminal, stored_result)
-    for subscriber in subscribers:
-        try:
-            async with subscriber.send_lock:
-                await subscriber.websocket.send_json(terminal)
-        except Exception:
-            await _fast_attempt_registry.detach_subscriber(subscriber.websocket)
+    await _publish_fast_transition(TerminalTransition(message=terminal, subscribers=subscribers))
+
+
+async def reject_v2_fast_attempt_for_backpressure(
+    websocket: WebSocket, send_lock: asyncio.Lock, message: dict
+) -> None:
+    """Reject only an overflowed *new* attempt while preserving same-ID joins."""
+    try:
+        parsed = parse_v2_boundary_message(message)
+        if parsed.type != "vision.try_on.attempt.start":
+            raise ValueError("invalid_v2_boundary_message")
+        attempt_id = parsed.payload.attemptId
+    except (V2ContractBundleUnavailable, ValueError):
+        async with send_lock:
+            await send_error(
+                websocket,
+                code="invalid_message",
+                message="invalid_v2_boundary_message",
+                retryable=False,
+                message_id=message.get("messageId"),
+            )
+        return
+    terminal = _generated_v2_envelope(
+        "vision.try_on.attempt.failed",
+        {"attemptId": attempt_id, "reason": "attempt_already_active"},
+    )
+    admission = await _fast_attempt_registry.reject_or_replay(
+        attempt_id=attempt_id,
+        websocket=websocket,
+        send_lock=send_lock,
+        terminal=terminal,
+    )
+    async with send_lock:
+        for replay in admission.replay:
+            await websocket.send_json(replay)
 
 
 def websocket_origin_allowed(websocket: WebSocket) -> bool:
@@ -1534,6 +1600,10 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 continue
 
             if is_v2_fast_attempt:
+                if _fast_attempt_task_slots.locked():
+                    await reject_v2_fast_attempt_for_backpressure(websocket, send_lock, message)
+                    continue
+                await _fast_attempt_task_slots.acquire()
                 task = asyncio.create_task(
                     run_v2_fast_attempt(
                         websocket,
@@ -1544,6 +1614,7 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                         connection_closed,
                     )
                 )
+                task.add_done_callback(lambda _: _fast_attempt_task_slots.release())
                 fast_attempt_tasks.add(task)
                 task.add_done_callback(fast_attempt_tasks.discard)
                 task.add_done_callback(_discard_completed_fast_attempt)
@@ -1683,8 +1754,10 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
     finally:
         connection_closed.set()
         await _fast_attempt_registry.detach_subscriber(websocket)
-        for receipt in owned_fast_attempt_receipts:
-            await _fast_attempt_registry.cancel_owner_and_join(receipt)
+        for receipt in list(owned_fast_attempt_receipts):
+            await _publish_fast_transition(
+                await _fast_attempt_registry.cancel_owner_and_join(receipt)
+            )
         if fast_attempt_tasks:
             await asyncio.gather(*list(fast_attempt_tasks), return_exceptions=True)
         await unregister_profile_client(websocket)

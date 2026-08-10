@@ -333,6 +333,39 @@ def test_v2_fast_attempt_terminal_reconnect_replays_the_identical_grant(
     assert replay == terminal
 
 
+def test_v2_fast_unavailable_is_one_canonical_terminal_across_sockets_and_readiness_recovery(
+    monkeypatch, garment_reference
+):
+    """A valid unavailable start is registered once, never rerun after recovery."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    readiness = {"cameraReady": False, "modelReady": True}
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: readiness)
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    attempt_id = str(uuid4())
+    start = _start(attempt_id, garment_reference)
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as first, client.websocket_connect("/ws") as second:
+            first.send_json(_hello(manifest))
+            second.send_json(_hello(manifest))
+            assert first.receive_json()["type"] == second.receive_json()["type"] == "vision.ready"
+            first.send_json(start)
+            terminal = first.receive_json()
+            second.send_json(start)
+            assert second.receive_json() == terminal
+
+        readiness["cameraReady"] = True
+        with client.websocket_connect("/ws") as recovered:
+            recovered.send_json(_hello(manifest))
+            assert recovered.receive_json()["type"] == "vision.ready"
+            recovered.send_json(start)
+            assert recovered.receive_json() == terminal
+
+    assert terminal["type"] == "vision.try_on.attempt.failed"
+    assert terminal["payload"] == {"attemptId": attempt_id, "reason": "fast_unavailable"}
+
+
 def test_v2_fast_attempt_replacement_joins_old_worker_before_new_admission(
     monkeypatch, garment_reference
 ):

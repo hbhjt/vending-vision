@@ -35,9 +35,12 @@ class ActiveAttempt:
     receipt: AttemptReceipt
     task: asyncio.Task
     cancel_event: asyncio.Event
+    owner_receipts: set[AttemptReceipt] | None = None
+    owner_subscriber_key: int | None = None
     subscribers: dict[int, AttemptSubscriber] = field(default_factory=dict)
     accepted: dict | None = None
     latest_progress: dict | None = None
+    canceled_terminal: dict | None = None
 
 
 @dataclass
@@ -51,16 +54,39 @@ class TerminalAttempt:
 class AttemptAdmission:
     receipt: AttemptReceipt | None
     replay: list[dict]
+    transitions: list[TerminalTransition] = field(default_factory=list)
 
     @property
     def is_owner(self) -> bool:
         return self.receipt is not None
 
 
-class FastAttemptRegistry:
-    """One active attempt plus bounded canonical terminal replay records."""
+@dataclass
+class TerminalTransition:
+    """The sole winning terminal plus the live subscribers to notify."""
 
-    def __init__(self, *, terminal_ttl_seconds: float, terminal_max_count: int = 32):
+    message: dict
+    subscribers: list[AttemptSubscriber]
+
+
+class FastAttemptRegistry:
+    """One active attempt plus bounded canonical terminal replay records.
+
+    Replays retain the newest ``terminal_max_count`` terminal records for the
+    configured TTL.  Once a record expires, the attempt ID is intentionally
+    eligible for a new attempt; retained records always replay byte-for-byte.
+    Live subscriber retention is also bounded.  An evicted idle subscriber can
+    submit the same ID again and receives that same canonical terminal once it
+    exists.
+    """
+
+    def __init__(
+        self,
+        *,
+        terminal_ttl_seconds: float,
+        terminal_max_count: int = 32,
+        subscriber_max_count: int = 32,
+    ):
         self._transition_gate = asyncio.Lock()
         self._gate = asyncio.Lock()
         self._active: ActiveAttempt | None = None
@@ -68,6 +94,22 @@ class FastAttemptRegistry:
         self._generation = 0
         self._terminal_ttl_seconds = terminal_ttl_seconds
         self._terminal_max_count = terminal_max_count
+        self._subscriber_max_count = subscriber_max_count
+
+    def _attach_subscriber_unlocked(self, active: ActiveAttempt, subscriber: AttemptSubscriber) -> None:
+        if subscriber.key in active.subscribers:
+            active.subscribers[subscriber.key] = subscriber
+            return
+        while len(active.subscribers) >= self._subscriber_max_count:
+            stale_key = next(
+                (key for key in active.subscribers if key != active.owner_subscriber_key),
+                None,
+            )
+            if stale_key is None:
+                break
+            active.subscribers.pop(stale_key, None)
+        if len(active.subscribers) < self._subscriber_max_count:
+            active.subscribers[subscriber.key] = subscriber
 
     def _prune_unlocked(self) -> None:
         cutoff = time.monotonic() - self._terminal_ttl_seconds
@@ -86,8 +128,10 @@ class FastAttemptRegistry:
         websocket: Any,
         send_lock: asyncio.Lock,
         task: asyncio.Task,
-        accepted: dict,
-        progress: dict,
+        accepted: dict | None,
+        progress: dict | None,
+        canceled_terminal: dict | None = None,
+        owner_receipts: set[AttemptReceipt] | None = None,
     ) -> AttemptAdmission:
         """Attach to a canonical attempt or admit one after replacement joins."""
         subscriber = AttemptSubscriber(id(websocket), websocket, send_lock)
@@ -101,11 +145,16 @@ class FastAttemptRegistry:
 
                 active = self._active
                 if active is not None and active.receipt.attempt_id == attempt_id:
-                    active.subscribers[subscriber.key] = subscriber
+                    self._attach_subscriber_unlocked(active, subscriber)
                     replay = [message for message in (active.accepted, active.latest_progress) if message]
                     return AttemptAdmission(None, replay)
+                transitions: list[TerminalTransition] = []
                 if active is not None:
                     active.cancel_event.set()
+                    if active.canceled_terminal is not None:
+                        transitions.append(
+                            self._commit_terminal_unlocked(active, active.canceled_terminal)
+                        )
 
             if active is not None and active.task is not task:
                 # Do not admit new work into the single worker lane until the
@@ -121,20 +170,61 @@ class FastAttemptRegistry:
                     self._active = None
                 self._generation += 1
                 receipt = AttemptReceipt(attempt_id, uuid4().hex, self._generation)
+                if owner_receipts is not None:
+                    owner_receipts.add(receipt)
                 self._active = ActiveAttempt(
                     receipt=receipt,
                     task=task,
                     cancel_event=asyncio.Event(),
+                    owner_receipts=owner_receipts,
+                    owner_subscriber_key=subscriber.key,
                     subscribers={subscriber.key: subscriber},
                     accepted=accepted,
                     latest_progress=progress,
+                    canceled_terminal=canceled_terminal,
                 )
-                return AttemptAdmission(receipt, [accepted, progress])
+                return AttemptAdmission(
+                    receipt,
+                    [message for message in (accepted, progress) if message],
+                    transitions,
+                )
 
     async def is_current(self, receipt: AttemptReceipt) -> bool:
         async with self._gate:
             active = self._active
             return active is not None and active.receipt == receipt and not active.cancel_event.is_set()
+
+    async def reject_or_replay(
+        self,
+        *,
+        attempt_id: str,
+        websocket: Any,
+        send_lock: asyncio.Lock,
+        terminal: dict,
+    ) -> AttemptAdmission:
+        """Bounded-admission fallback with stable terminal replay semantics."""
+        subscriber = AttemptSubscriber(id(websocket), websocket, send_lock)
+        async with self._gate:
+            self._prune_unlocked()
+            stored = self._terminals.get(attempt_id)
+            if stored is not None:
+                self._terminals.move_to_end(attempt_id)
+                return AttemptAdmission(None, [stored.message])
+            active = self._active
+            if active is not None and active.receipt.attempt_id == attempt_id:
+                self._attach_subscriber_unlocked(active, subscriber)
+                return AttemptAdmission(
+                    None,
+                    [message for message in (active.accepted, active.latest_progress) if message],
+                )
+            self._terminals[attempt_id] = TerminalAttempt(
+                message=terminal,
+                result=None,
+                terminal_at=time.monotonic(),
+            )
+            self._terminals.move_to_end(attempt_id)
+            self._prune_unlocked()
+            return AttemptAdmission(None, [terminal])
 
     async def cancel_event_for(self, receipt: AttemptReceipt) -> asyncio.Event:
         async with self._gate:
@@ -145,15 +235,37 @@ class FastAttemptRegistry:
         canceled.set()
         return canceled
 
-    async def cancel_owner_and_join(self, receipt: AttemptReceipt) -> None:
+    def _commit_terminal_unlocked(
+        self, active: ActiveAttempt, message: dict, result: dict | None = None
+    ) -> TerminalTransition:
+        self._terminals[active.receipt.attempt_id] = TerminalAttempt(
+            message=message,
+            result=result,
+            terminal_at=time.monotonic(),
+        )
+        self._terminals.move_to_end(active.receipt.attempt_id)
+        subscribers = list(active.subscribers.values())
+        self._active = None
+        if active.owner_receipts is not None:
+            active.owner_receipts.discard(active.receipt)
+        self._prune_unlocked()
+        return TerminalTransition(message=message, subscribers=subscribers)
+
+    async def cancel_owner_and_join(self, receipt: AttemptReceipt) -> TerminalTransition | None:
         async with self._gate:
             active = self._active
             if active is None or active.receipt != receipt:
-                return
+                return None
             active.cancel_event.set()
             task = active.task
+            transition = (
+                self._commit_terminal_unlocked(active, active.canceled_terminal)
+                if active.canceled_terminal is not None
+                else None
+            )
         if task is not asyncio.current_task():
             await asyncio.shield(task)
+        return transition
 
     async def detach_subscriber(self, websocket: Any) -> None:
         async with self._gate:
@@ -171,18 +283,7 @@ class FastAttemptRegistry:
             active = self._active
             if active is None or active.receipt != receipt:
                 return []
-            if active.cancel_event.is_set() and message.get("type") == "vision.try_on.attempt.completed":
-                return []
-            self._terminals[receipt.attempt_id] = TerminalAttempt(
-                message=message,
-                result=result,
-                terminal_at=time.monotonic(),
-            )
-            self._terminals.move_to_end(receipt.attempt_id)
-            subscribers = list(active.subscribers.values())
-            self._active = None
-            self._prune_unlocked()
-            return subscribers
+            return self._commit_terminal_unlocked(active, message, result).subscribers
 
     async def get_result(self, attempt_id: str, token: str) -> dict | None:
         async with self._gate:
@@ -195,12 +296,18 @@ class FastAttemptRegistry:
             self._terminals.move_to_end(attempt_id)
             return terminal.result
 
-    async def shutdown(self) -> None:
+    async def shutdown(self) -> TerminalTransition | None:
         async with self._gate:
             active = self._active
             if active is None:
-                return
+                return None
             active.cancel_event.set()
             task = active.task
+            transition = (
+                self._commit_terminal_unlocked(active, active.canceled_terminal)
+                if active.canceled_terminal is not None
+                else None
+            )
         if task is not asyncio.current_task():
             await asyncio.shield(task)
+        return transition
