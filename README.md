@@ -1,11 +1,11 @@
 # Vending Vision Module
 
-售货机视觉服务，运行在售货机本机。当前项目已经收敛为“双摄 + WebSocket 主动推送 + 试衣 MJPEG 预览”的生产流程。
+售货机视觉服务，运行在售货机本机。当前项目已经收敛为“双摄 + WebSocket 主动推送 + V2 Fast 生成结果”的生产流程。
 
 ## 当前能力
 
 - 顶部摄像头 `top`：常开，用于检测有人、无人、离开和多人状态。
-- 中部摄像头 `front`：按需占用，用于人物画像采集和前端试衣预览。
+- 中部摄像头 `front`：按需占用，用于人物画像采集和 V2 Fast 试衣采集。
 - 视觉端通过 WebSocket 主动推送 `vision.presence_status`、`vision.profile_result`、`vision.person_departed`。
 - Machine uses the strict V2 attempt protocol for generated try-on.
 - 多人场景只推状态，不推人物画像字段。
@@ -104,10 +104,9 @@ POST /maintenance/cameras/refresh
 GET  /maintenance/cameras/{candidateId}/preview.jpg
 POST /maintenance/cameras/{role}/test
 POST /maintenance/cameras/{role}/confirm
-GET  /session/status
 GET  /proximity/debug
 GET  /metrics
-GET  /try-on/{sessionId}.mjpeg
+GET  /v2/try-on/results/{attemptId}?token={grant}
 WS   /ws
 ```
 
@@ -155,7 +154,7 @@ powershell -ExecutionPolicy Bypass -File scripts\run_video_stability_test.ps1
 }
 ```
 
-`rotate` 表示服务读取后对画面做的校正角度，单位是顺时针度数。中部摄像头如果物理顺时针旋转 90 度安装，通常用 `270` 做逆时针校正。通过 loopback v2 维护合同的 `/maintenance/cameras/{candidateId}/preview.jpg` 预览确认人脸和身体在画面中是正的，再测年龄、性别和试衣。生产环境不存在 `/camera/{role}/snapshot.jpg`。
+`rotate` 表示服务读取后对画面做的校正角度，单位是顺时针度数。中部摄像头如果物理顺时针旋转 90 度安装，通常用 `270` 做逆时针校正。通过 loopback v2 维护合同的 `/maintenance/cameras/{candidateId}/preview.jpg` 预览确认人脸和身体在画面中是正的，再测年龄、性别和 V2 Fast 试衣。生产环境不存在 `/camera/{role}/snapshot.jpg`。
 
 顶部摄像头可以设置 ROI，只检测售货机前方交互区：
 

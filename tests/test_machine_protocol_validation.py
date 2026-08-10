@@ -52,9 +52,8 @@ def test_hello_uses_the_generated_v2_boundary_without_a_v1_payload_adapter():
         raise AssertionError("generated V2 boundary accepted an overlong machineCode")
 
 
-def test_legacy_try_on_messages_are_hard_rejected():
-    assert validate_message_payload("vision.try_on.start", {}) is not None
-    assert validate_message_payload("vision.try_on.stop", {}) is not None
+def test_unknown_client_message_types_are_hard_rejected():
+    assert validate_message_payload("unsupported.client.action", {}) is not None
 
 
 def test_unknown_client_message_type_is_rejected():

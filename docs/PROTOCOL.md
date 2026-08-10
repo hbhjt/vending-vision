@@ -4,8 +4,8 @@
 
 默认 WebSocket 地址：`ws://127.0.0.1:7892/ws`
 
-本文只描述 V2 的连接、合同身份和就绪边界。画像、presence 等业务事件必须在 V2
-就绪之后按生成的合同消费；本文不定义后续会话流程。
+本文只描述 V2 的连接、合同身份和就绪边界。画像、presence 和 Fast 试衣尝试必须在 V2
+就绪之后按生成的合同消费；本文不定义旧式会话流程。
 
 ## 唯一合同来源
 
@@ -127,6 +127,13 @@ V1 hello、`protocolVersion`、`modelReady` 与所有 V1 成功条件均不受�
 `departure-event-<uuid>`），仍不得替代信封的 `messageId`。
 
 运行时健康检查与 WebSocket 合同是不同边界；健康成功不能证明 V2 identity 已可用。
+
+## Fast 尝试与结果
+
+Machine 仅可在 ready 后发起一个 `vision.try_on.attempt.start`。Fast 尝试会依次发布
+accepted、progress 和 completed/failed/canceled 之一。完成事件含一次性 tokenized loopback
+PNG 结果引用；Machine 可解码显示、重试同一变体或返回商品详情。采集预览仅属于维护诊断，
+不是客户试衣会话接口。
 
 ## 验证与兼容性
 

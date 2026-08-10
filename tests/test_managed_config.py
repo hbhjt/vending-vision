@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import jsonschema
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,29 @@ def import_config(config_path):
             "VISION_CONFIG_FILE": str(config_path),
             "VISION_CONFIG_MODE": "managed",
         }
+    )
+
+
+def import_config_values(config_path):
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": str(ROOT),
+            "VISION_CONFIG_FILE": str(config_path),
+            "VISION_CONFIG_MODE": "managed",
+        }
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from vision.config import settings; "
+            "print(f'{settings.HOST}:{settings.PORT}:{settings.TOP_CAMERA_CONFIG[\"role\"]}:{settings.FRONT_CAMERA_CONFIG[\"role\"]}')",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
     )
     return subprocess.run(
         [sys.executable, "-c", "from vision.config import settings; print(settings.HOST)"],
@@ -39,6 +63,31 @@ def valid_config():
         },
         "allowed_origins": ["http://tauri.localhost"],
     }
+
+
+def test_frozen_site_schema_and_example_are_real_json_sources():
+    schema = json.loads(
+        (ROOT / "config" / "vending-vision-site-config-v1.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    example = json.loads(
+        (ROOT / "config" / "site.example.json").read_text(encoding="utf-8")
+    )
+
+    jsonschema.Draft202012Validator(schema).validate(example)
+
+
+def test_managed_config_values_come_from_the_frozen_site_source(tmp_path):
+    config = tmp_path / "site.json"
+    value = valid_config()
+    value["port"] = 17892
+    config.write_text(json.dumps(value), encoding="utf-8")
+
+    result = import_config_values(config)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "127.0.0.1:17892:presence:profile_fast_try_on"
 
 
 def test_managed_config_is_required_and_validated(tmp_path):
