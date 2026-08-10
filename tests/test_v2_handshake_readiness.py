@@ -1,6 +1,9 @@
 import json
 import shutil
+import asyncio
 from pathlib import Path
+from datetime import datetime, timezone
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +14,27 @@ from vision.v2_contract_bundle import V2ContractBundleUnavailable
 
 
 BUNDLE_ROOT = Path(__file__).parents[1] / "contracts" / "vem_vision_v2"
+
+
+def _envelope(message_type, payload):
+    return {
+        "protocol": "vem.vision.v2",
+        "type": message_type,
+        "messageId": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "payload": payload,
+    }
+
+
+def _hello_payload(manifest: dict) -> dict:
+    return {
+        "clientRole": "machine",
+        "machineCode": "M001",
+        "schemaVersion": manifest["schemaVersion"],
+        "bundleVersion": manifest["bundleVersion"],
+        "contractDigest": manifest["bundleDigest"],
+        "capabilities": ["try_on_fast"],
+    }
 
 
 def test_debug_contract_bundle_exposes_the_generated_manifest_identity_only():
@@ -176,3 +200,68 @@ def test_missing_generated_parser_never_falls_back_to_hello_capabilities(monkeyp
 
     assert error["type"] == "vision.error"
     assert error["payload"]["code"] == "invalid_message"
+
+
+def test_generated_hello_reports_fast_unavailable_when_acquisition_observer_is_not_ready(
+    monkeypatch,
+):
+    """Observer prewarm is a Fast capability gate, not a core camera outage."""
+    manifest = json.loads((BUNDLE_ROOT / "manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "fastRenderReady": True,
+            "fastPoseReady": True,
+            "acquisitionObserverReady": False,
+        },
+    )
+
+    with TestClient(vision_app.app).websocket_connect("/ws") as socket:
+        socket.send_json(_envelope("vision.hello", _hello_payload(manifest)))
+        ready = socket.receive_json()
+
+    assert ready["type"] == "vision.ready"
+    assert ready["payload"]["cameraReady"] is True
+    assert ready["payload"]["fastReady"] is False
+    assert ready["payload"]["visionBusinessReady"] is False
+    assert ready["payload"]["businessReadinessDiagnostic"] == "camera_unavailable"
+
+
+def test_websocket_session_repeated_cancel_still_runs_cleanup_barrier(monkeypatch):
+    """Transport cancellation must not skip registry/profile cleanup awaits."""
+    async def scenario():
+        cleanup = []
+        session_task = asyncio.current_task()
+
+        class CancelingWebSocket:
+            headers = {}
+
+            async def accept(self):
+                cleanup.append("accept")
+
+            async def receive_text(self):
+                raise asyncio.CancelledError()
+
+            async def close(self, code=None):
+                cleanup.append(f"close:{code}")
+
+        async def detach(_websocket):
+            cleanup.append("detach")
+            session_task.cancel()
+            await asyncio.sleep(0)
+
+        async def unregister(_websocket):
+            cleanup.append("unregister")
+
+        monkeypatch.setattr(vision_app._fast_attempt_registry, "detach_subscriber", detach)
+        monkeypatch.setattr(vision_app, "unregister_profile_client", unregister)
+
+        with pytest.raises(asyncio.CancelledError):
+            await vision_app.websocket_session(CancelingWebSocket(), {"machine"})
+
+        assert cleanup == ["accept", "detach", "unregister"]
+
+    asyncio.run(scenario())

@@ -84,3 +84,43 @@ def test_normal_acquisition_observer_reuses_one_prewarmed_child_for_multiple_obs
         assert worker.assert_dead
 
     asyncio.run(scenario())
+
+
+class _PermissionDeniedProcess:
+    pid = 999999
+
+    def __init__(self):
+        self.kill_attempted = False
+        self.terminate_attempted = False
+        self.join_calls = 0
+
+    def is_alive(self):
+        return True
+
+    def kill(self):
+        self.kill_attempted = True
+        raise PermissionError("access denied")
+
+    def terminate(self):
+        self.terminate_attempted = True
+        raise OSError("terminate denied")
+
+    def join(self, timeout=None):
+        self.join_calls += 1
+
+
+def test_acquisition_observer_abort_permission_errors_fail_closed_without_traceback(capsys):
+    """Kill/terminate failures retain the live handle and mark observer unavailable."""
+    worker = AcquisitionObservationWorker()
+    process = _PermissionDeniedProcess()
+    worker._process = process
+
+    assert worker.abort(reason="permission_denied") is False
+
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert process.kill_attempted is True
+    assert process.terminate_attempted is True
+    assert worker.pid == process.pid
+    with pytest.raises(RuntimeError, match="permission_denied"):
+        worker._start()

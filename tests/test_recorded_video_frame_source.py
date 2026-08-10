@@ -11,6 +11,7 @@ import pytest
 import app as vision_app
 from vision import camera_manager
 from vision.config import settings
+from vision.fast_attempt_registry import FastAttemptRegistry
 from vision.frame_source import RecordedVideoFrameSource
 from vision.presence_runtime import PresenceRuntime
 from vision.profile_state import get_occupancy_gate, reset_active_track
@@ -259,3 +260,75 @@ def test_recorded_video_drives_real_presence_profile_and_departure(monkeypatch, 
             assert result.snapshot["occupancy"]["state"] == "none"
             return
     pytest.fail("recorded top source did not produce a departure edge")
+
+
+def test_recorded_top_departure_cancels_active_public_attempt_once(monkeypatch, tmp_path):
+    """Production recorded top departure fences the active V2 attempt as departure."""
+    async def scenario():
+        manifest = fixture_manifest()
+        expected = manifest["expected"]
+        managed_config = tmp_path / "managed-site-config.json"
+        write_managed_recorded_video_config(managed_config, manifest)
+        monkeypatch.setenv("VISION_CONFIG_FILE", str(managed_config))
+        configure_recorded_sources(monkeypatch, manifest)
+        reset_presence_state()
+        runtime = PresenceRuntime()
+        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        monkeypatch.setattr(vision_app, "get_presence_runtime", lambda: runtime)
+        monkeypatch.setattr(vision_app, "_fast_attempt_registry", registry)
+        attempt_id = "550e8400-e29b-41d4-a716-446655440124"
+
+        async def active_owner():
+            await asyncio.Event().wait()
+
+        owner_task = asyncio.create_task(active_owner())
+        admission = await registry.admit(
+            attempt_id=attempt_id,
+            websocket=object(),
+            send_lock=asyncio.Lock(),
+            task=owner_task,
+            accepted={
+                "type": "vision.try_on.attempt.accepted",
+                "messageId": "accepted",
+                "payload": {"attemptId": attempt_id, "mode": "fast"},
+            },
+            generating={
+                "type": "vision.try_on.attempt.generating",
+                "messageId": "generating",
+                "payload": {"attemptId": attempt_id, "stage": "preparing"},
+            },
+        )
+        assert admission.is_owner
+
+        departure = None
+        for _ in range(expected["top"]["departureWithinPolls"]):
+            result = runtime.poll(
+                include_status=True,
+                include_ambient_light=True,
+                include_departure=True,
+            )
+            if result.update and result.update["message_type"] == "vision.person_departed":
+                departure = result.update
+                await vision_app._cancel_active_attempt("departure")
+                break
+
+        assert departure is not None
+        replay = await registry.admit(
+            attempt_id=attempt_id,
+            websocket=object(),
+            send_lock=asyncio.Lock(),
+            task=asyncio.current_task(),
+            accepted=None,
+            generating=None,
+        )
+        assert len(replay.replay) == 1
+        assert replay.replay[0]["type"] == "vision.try_on.attempt.canceled"
+        assert replay.replay[0]["payload"] == {
+            "attemptId": attempt_id,
+            "reason": "departure",
+        }
+        assert await registry.active_attempt_id() is None
+        owner_task.cancel()
+        await asyncio.gather(owner_task, return_exceptions=True)
+
+    asyncio.run(scenario())

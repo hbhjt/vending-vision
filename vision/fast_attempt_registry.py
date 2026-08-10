@@ -338,7 +338,15 @@ class FastAttemptRegistry:
             and preparation.join_task is not asyncio.current_task()
         ):
             try:
-                await asyncio.shield(preparation.join_task)
+                await asyncio.wait_for(asyncio.shield(preparation.join_task), timeout=0.05)
+            except asyncio.TimeoutError:
+                preparation.join_task.cancel()
+                try:
+                    await asyncio.shield(preparation.join_task)
+                except asyncio.CancelledError:
+                    self._consume_finished_task(preparation.join_task)
+                except Exception:
+                    self._consume_finished_task(preparation.join_task)
             except asyncio.CancelledError:
                 current_task = asyncio.current_task()
                 if current_task is None or current_task.cancelling() == 0:

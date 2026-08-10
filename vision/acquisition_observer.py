@@ -236,8 +236,11 @@ class AcquisitionObservationWorker:
             if process.is_alive():
                 try:
                     process.kill()
-                except (AttributeError, NotImplementedError):
-                    process.terminate()
+                except (AttributeError, NotImplementedError, OSError, PermissionError):
+                    try:
+                        process.terminate()
+                    except (AttributeError, NotImplementedError, OSError, PermissionError):
+                        pass
                 process.join(timeout=0.5)
             if process.is_alive():
                 self._fatal_error = reason
@@ -284,3 +287,18 @@ class AcquisitionObservationWorker:
             if process is None or not process.is_alive():
                 return None
             return int(process.pid)
+
+    @property
+    def ready(self) -> bool:
+        with self._state_lock:
+            return bool(
+                self._ready
+                and self._fatal_error is None
+                and self._process is not None
+                and self._process.is_alive()
+            )
+
+    @property
+    def fatal_error(self) -> str | None:
+        with self._state_lock:
+            return self._fatal_error

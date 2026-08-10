@@ -33,6 +33,26 @@ def test_preview_reader_leases_are_bounded_and_released_after_a_dropped_body():
     asyncio.run(scenario())
 
 
+def test_preview_close_waits_until_public_reader_leases_are_observably_zero():
+    """Close is the cleanup barrier: callers must not see live stream leases after it returns."""
+    async def scenario():
+        store = AcquisitionPreviewStore(max_readers=2)
+        token = await store.open("attempt-close", b"jpeg")
+        lease = await store.acquire(token)
+        assert lease is not None
+        assert await store.reader_count() == 1
+
+        closer = asyncio.create_task(store.close("attempt-close"))
+        await asyncio.sleep(0.02)
+        assert not closer.done(), "close returned while a public stream lease was still active"
+
+        await store.release(lease.lease_id)
+        await asyncio.wait_for(closer, timeout=0.5)
+        assert await store.reader_count() == 0
+
+    asyncio.run(scenario())
+
+
 def _unused_loopback_port():
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))

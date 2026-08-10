@@ -94,12 +94,22 @@ class AcquisitionPreviewStore:
                 return None
             return current
 
-    async def close(self, attempt_id: str | None = None) -> None:
+    async def close(self, attempt_id: str | None = None, *, timeout: float = 1.0) -> None:
         async with self._changed:
             if self._snapshot is not None and (
                 attempt_id is None or self._snapshot.attempt_id == attempt_id
             ):
                 self._snapshot = None
+                self._changed.notify_all()
+        deadline = asyncio.get_running_loop().time() + max(timeout, 0.001)
+        while asyncio.get_running_loop().time() < deadline:
+            async with self._changed:
+                if not self._readers:
+                    return
+            await asyncio.sleep(0.002)
+        async with self._changed:
+            if self._readers:
+                self._readers.clear()
                 self._changed.notify_all()
 
     async def reader_count(self) -> int:

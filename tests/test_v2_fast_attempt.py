@@ -21,6 +21,7 @@ from vision import camera_manager
 from vision.config import settings
 from vision.directshow_broker import DirectShowCameraBroker
 from vision.attempt_worker import FastRenderBroker
+from vision.acquisition_observer import AcquisitionObservation
 
 
 def _active_child_pids_except_acquisition_observer():
@@ -243,6 +244,64 @@ def _start(attempt_id, reference):
             },
         },
     )
+
+
+class _ReadyFastBroker:
+    ready = True
+    pose_ready = True
+
+    async def start(self):
+        return None
+
+    def quiesce(self):
+        return None
+
+    async def shutdown(self):
+        return None
+
+
+class _FatalAcquisitionObserver:
+    ready = False
+    fatal_error = "spawn_failed"
+    pid = None
+    active_request_count = 0
+    assert_dead = True
+
+    async def start(self):
+        return None
+
+    async def observe(self, _frame, *, timeout=15.0):
+        raise AssertionError("fatal observer must be rechecked before accepted admission")
+
+    async def wait_idle(self):
+        return None
+
+    async def shutdown(self):
+        return None
+
+
+class _DeadlineRecordingObserver:
+    ready = True
+    fatal_error = None
+    pid = None
+    active_request_count = 0
+    assert_dead = True
+
+    def __init__(self):
+        self.timeouts = []
+
+    async def start(self):
+        return None
+
+    async def observe(self, _frame, *, timeout):
+        self.timeouts.append(timeout)
+        return AcquisitionObservation(b"jpeg", "single", False)
+
+    async def wait_idle(self):
+        return None
+
+    async def shutdown(self):
+        return None
 
 
 def _envelope(message_type, payload):
@@ -1292,6 +1351,100 @@ def test_v2_disconnect_restarts_render_and_new_connection_completes(
         assert counter.value == 2
 
     assert broker.pid is None
+
+
+def test_v2_start_rechecks_acquisition_observer_after_ready_before_accepting_attempt(
+    monkeypatch, garment_reference
+):
+    """A cached hello cannot admit an attempt after the observer has gone fatal."""
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "fastRenderReady": True,
+            "fastPoseReady": True,
+            "acquisitionObserverReady": True,
+        },
+    )
+    vision_app._acquisition_observer = _FatalAcquisitionObserver()
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_hello(manifest))
+                ready = socket.receive_json()
+                assert ready["payload"]["fastReady"] is True
+
+                socket.send_json(_start(str(uuid4()), garment_reference))
+                rejected = socket.receive_json()
+
+        assert rejected["type"] == "vision.try_on.attempt.failed"
+        assert rejected["payload"]["reason"] == "fast_unavailable"
+    finally:
+        vision_app._acquisition_observer = None
+
+
+def test_v2_acquisition_observer_uses_remaining_attempt_deadline(monkeypatch, garment_reference):
+    """Observation must share the attempt deadline instead of adding its own 15s window."""
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
+    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_POLL_SECONDS", 0.005)
+    observer = _DeadlineRecordingObserver()
+    vision_app._acquisition_observer = observer
+    frame = np.zeros((64, 48, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        vision_app,
+        "read_camera_with_source",
+        lambda *_args, **_kwargs: (frame, {"source": "recorded_video"}),
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "fastRenderReady": True,
+            "fastPoseReady": True,
+            "acquisitionObserverReady": True,
+        },
+    )
+
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_hello(manifest))
+                assert socket.receive_json()["type"] == "vision.ready"
+
+                socket.send_json(_start(str(uuid4()), garment_reference))
+                assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+                while True:
+                    terminal = socket.receive_json()
+                    if terminal["type"] in {
+                        "vision.try_on.attempt.canceled",
+                        "vision.try_on.attempt.failed",
+                    }:
+                        break
+
+        assert terminal["type"] == "vision.try_on.attempt.canceled"
+        assert terminal["payload"]["reason"] == "timeout"
+        assert observer.timeouts
+        assert max(observer.timeouts) <= 0.05
+    finally:
+        vision_app._acquisition_observer = None
 
 
 def test_v2_timeout_restarts_render_and_new_connection_completes(

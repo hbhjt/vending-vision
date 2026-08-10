@@ -71,6 +71,7 @@ def test_disconnect_keeps_cleanup_barrier_before_another_socket_can_admit():
                 await release_old.wait()
 
         old_task = asyncio.create_task(old_owner())
+        await asyncio.sleep(0)
         old = await registry.admit(
             attempt_id=old_id,
             websocket=object(),
@@ -111,6 +112,57 @@ def test_disconnect_keeps_cleanup_barrier_before_another_socket_can_admit():
         transition = await asyncio.wait_for(disconnecting, timeout=1)
         assert transition is not None and transition.message == disconnect
         assert (await asyncio.wait_for(replacement, timeout=1)).is_pending_owner
+
+    asyncio.run(scenario())
+
+
+def test_replacement_cancels_blocked_owner_and_joins_cleanup_before_admission():
+    """Replacement must interrupt a blocked owner, then admit only after its cleanup."""
+    async def scenario():
+        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        old_id, new_id = str(uuid4()), str(uuid4())
+        cleanup_done = asyncio.Event()
+
+        async def old_owner():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_done.set()
+
+        old_task = asyncio.create_task(old_owner())
+        await asyncio.sleep(0)
+        old = await registry.admit(
+            attempt_id=old_id,
+            websocket=object(),
+            send_lock=asyncio.Lock(),
+            task=old_task,
+            accepted=_message("vision.try_on.attempt.accepted", old_id, "old-accepted"),
+            generating=_message("vision.try_on.attempt.acquiring", old_id, "old-acquiring"),
+            canceled_terminal=_message("vision.try_on.attempt.canceled", old_id, "old-replaced"),
+        )
+        assert old.is_owner
+
+        prepared = await registry.prepare_admission(
+            attempt_id=new_id,
+            websocket=object(),
+            send_lock=asyncio.Lock(),
+            task=asyncio.current_task(),
+        )
+        assert prepared.join_task is old_task
+        admitted = await asyncio.wait_for(
+            registry.commit_prepared_admission(
+                prepared,
+                accepted=_message("vision.try_on.attempt.accepted", new_id, "new-accepted"),
+                generating=_message("vision.try_on.attempt.acquiring", new_id, "new-acquiring"),
+                unavailable_terminal=_message("vision.try_on.attempt.failed", new_id, "new-failed"),
+                readiness=lambda: True,
+            ),
+            timeout=0.25,
+        )
+
+        assert cleanup_done.is_set()
+        assert admitted.is_owner
+        assert admitted.receipt.attempt_id == new_id
 
     asyncio.run(scenario())
 

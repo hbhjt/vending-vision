@@ -180,6 +180,28 @@ def _discard_completed_fast_attempt(task: asyncio.Task) -> None:
         logger.exception("Fast attempt task ended with an unhandled error")
 
 
+async def _await_cleanup_uncancelled(awaitable):
+    """Finish one cleanup await even when the transport scope is repeatedly cancelled."""
+    task = asyncio.ensure_future(awaitable)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
+async def _cancel_disconnect_owner_and_publish(receipt: AttemptReceipt) -> None:
+    transition = await _fast_attempt_registry.cancel_owner_and_join(
+        receipt,
+        _generated_v2_envelope(
+            "vision.try_on.attempt.canceled",
+            {"attemptId": receipt.attempt_id, "reason": "disconnect"},
+        ),
+    )
+    await _publish_fast_transition(transition)
+
+
 async def _run_owned_attempt_step(receipt: AttemptReceipt, operation, *, timeout: float):
     """Race an owned process operation with cancellation and join it in all cases."""
     if not await _fast_attempt_registry.is_current(receipt):
@@ -376,6 +398,15 @@ def _get_acquisition_observer() -> AcquisitionObservationWorker:
     return _acquisition_observer
 
 
+def _acquisition_observer_ready() -> bool:
+    observer = _acquisition_observer
+    return bool(
+        observer is not None
+        and getattr(observer, "ready", False)
+        and getattr(observer, "fatal_error", None) is None
+    )
+
+
 def _acquiring_message(attempt_id: str, token: str, occupancy: str, aligned: bool, stable: bool) -> dict:
     if occupancy == "none":
         guidance, manual = "no_person", False
@@ -533,6 +564,7 @@ def get_runtime_status():
         "ageGenderMode": age_gender_mode,
         "fastRenderReady": _fast_render_broker.ready,
         "fastPoseReady": _fast_render_broker.pose_ready,
+        "acquisitionObserverReady": _acquisition_observer_ready(),
     }
 
 
@@ -578,7 +610,11 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
         schema_version = identity.schema_version
         bundle_version = identity.bundle_version
         contract_digest = identity.contract_digest
-    elif not status.get("fastRenderReady", True) or not status.get("fastPoseReady", True):
+    elif (
+        not status.get("fastRenderReady", True)
+        or not status.get("fastPoseReady", True)
+        or not status.get("acquisitionObserverReady", True)
+    ):
         # The frozen V2 diagnostic vocabulary has one local Vision capability
         # unavailable value.  Do not extend that cross-repository contract in
         # this worker-only slice.
@@ -1448,7 +1484,10 @@ async def run_v2_fast_attempt(
     # render process.  Every attempt must also observe the live broker before
     # constructing admission replay.
     fast_ready = bool(
-        fast_ready and _fast_render_broker.ready and _fast_render_broker.pose_ready
+        fast_ready
+        and _fast_render_broker.ready
+        and _fast_render_broker.pose_ready
+        and _acquisition_observer_ready()
     )
     attempt_id = payload["attemptId"]
     unavailable_terminal = _generated_v2_envelope(
@@ -1485,6 +1524,7 @@ async def run_v2_fast_attempt(
             fast_ready
             and _fast_render_broker.ready
             and _fast_render_broker.pose_ready
+            and _acquisition_observer_ready()
         ),
     )
     if not admission.is_owner:
@@ -1526,7 +1566,7 @@ async def run_v2_fast_attempt(
             frame, source = await _read_attempt_front_frame(
                 receipt, timeout=remaining, lease_token=lease_token
             )
-            observation = await _get_acquisition_observer().observe(frame)
+            observation = await _get_acquisition_observer().observe(frame, timeout=remaining)
             jpeg = observation.jpeg
             if preview_token is None:
                 preview_token = await _acquisition_previews.open(attempt_id, jpeg)
@@ -1957,20 +1997,16 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
         logger.info("WebSocket client disconnected")
     finally:
         connection_closed.set()
-        await _fast_attempt_registry.detach_subscriber(websocket)
+        await _await_cleanup_uncancelled(_fast_attempt_registry.detach_subscriber(websocket))
         for receipt in list(owned_fast_attempt_receipts):
-            await _publish_fast_transition(
-                await _fast_attempt_registry.cancel_owner_and_join(
-                    receipt,
-                    _generated_v2_envelope(
-                        "vision.try_on.attempt.canceled",
-                        {"attemptId": receipt.attempt_id, "reason": "disconnect"},
-                    ),
-                )
+            await _await_cleanup_uncancelled(
+                _cancel_disconnect_owner_and_publish(receipt)
             )
         if fast_attempt_tasks:
-            await asyncio.gather(*list(fast_attempt_tasks), return_exceptions=True)
-        await unregister_profile_client(websocket)
+            await _await_cleanup_uncancelled(
+                asyncio.gather(*list(fast_attempt_tasks), return_exceptions=True)
+            )
+        await _await_cleanup_uncancelled(unregister_profile_client(websocket))
 
 
 @app.websocket("/ws")
