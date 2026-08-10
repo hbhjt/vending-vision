@@ -20,6 +20,7 @@ import ipaddress
 import os
 import re
 import secrets
+import threading
 from datetime import datetime
 from json import JSONDecodeError
 from pathlib import Path
@@ -516,6 +517,7 @@ async def read_acquisition_preview(request: Request, token: Optional[str] = None
 
     async def frames():
         try:
+            await _acquisition_previews.register_task(lease.lease_id, asyncio.current_task())
             current = lease.snapshot
             while current is not None:
                 yield (

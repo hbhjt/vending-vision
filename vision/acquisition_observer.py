@@ -117,6 +117,7 @@ class AcquisitionObservationWorker:
         self._request_thread: threading.Thread | None = None
         self._fatal_error: str | None = None
         self._ready = False
+        self._generation = 0
         self._start_lock = asyncio.Lock()
 
     def _mp_context(self):
@@ -143,20 +144,27 @@ class AcquisitionObservationWorker:
             process.start()
             child.close()
             self._parent, self._process = parent, process
+            self._generation += 1
 
     async def start(self) -> None:
         async with self._start_lock:
-            if self._ready:
+            if self.ready:
                 return
             self._start()
             deadline = time.monotonic() + 15.0
             while time.monotonic() < deadline:
                 with self._state_lock:
-                    parent, process = self._parent, self._process
+                    parent, process, generation = self._parent, self._process, self._generation
                 if parent is not None and parent.poll(0.002):
                     kind, payload = parent.recv()
                     if kind == "ready":
-                        self._ready = True
+                        with self._state_lock:
+                            if (
+                                self._parent is parent
+                                and self._process is process
+                                and self._generation == generation
+                            ):
+                                self._ready = True
                         return
                     await self.abort_async(reason="prewarm_failed")
                     raise RuntimeError(str(payload))
@@ -176,15 +184,22 @@ class AcquisitionObservationWorker:
         def request() -> None:
             try:
                 with self._state_lock:
-                    parent, process = self._parent, self._process
+                    parent, process, generation = self._parent, self._process, self._generation
                     if parent is None or process is None or not process.is_alive():
                         raise RuntimeError("acquisition observer unavailable")
-                    parent.send(("observe", frame))
+                parent.send(("observe", frame))
                 deadline = time.monotonic() + max(timeout, 0.001)
                 while time.monotonic() < deadline:
                     if parent.poll(0.005):
                         kind, payload = parent.recv()
                         if kind == "ok":
+                            with self._state_lock:
+                                if (
+                                    self._parent is not parent
+                                    or self._process is not process
+                                    or self._generation != generation
+                                ):
+                                    raise RuntimeError("acquisition observer response was stale")
                             outcome["value"] = payload
                             return
                         raise RuntimeError(str(payload))
@@ -214,25 +229,38 @@ class AcquisitionObservationWorker:
             raise outcome["error"]
         return outcome["value"]
         
-    async def wait_idle(self) -> None:
+    async def wait_idle(self, *, timeout: float | None = None) -> bool:
+        deadline = None
+        if timeout is not None:
+            deadline = time.monotonic() + max(timeout, 0.001)
         thread = self._request_thread
         while thread is not None and thread.is_alive():
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
             await asyncio.sleep(0.002)
         if thread is not None:
             thread.join()
         self._request_thread = None
+        return True
 
     def abort(self, *, reason: str) -> bool:
         with self._state_lock:
             parent, process = self._parent, self._process
-            if parent is not None:
-                try:
-                    parent.close()
-                except Exception:
-                    pass
             if process is None:
                 self._parent = None
+                self._ready = False
+                self._generation += 1
                 return True
+            self._parent = None
+            self._process = None
+            self._ready = False
+            self._generation += 1
+        if parent is not None:
+            try:
+                parent.close()
+            except Exception:
+                pass
+        if process is not None:
             if process.is_alive():
                 try:
                     process.kill()
@@ -243,13 +271,12 @@ class AcquisitionObservationWorker:
                         pass
                 process.join(timeout=0.5)
             if process.is_alive():
-                self._fatal_error = reason
+                with self._state_lock:
+                    self._process = process
+                    self._fatal_error = reason
                 return False
             process.join(timeout=0)
-            self._parent = None
-            self._process = None
-            self._ready = False
-            return True
+        return True
 
     async def abort_async(self, *, reason: str) -> bool:
         done, result = threading.Event(), {}
@@ -263,7 +290,11 @@ class AcquisitionObservationWorker:
         while not done.is_set():
             await asyncio.sleep(0.002)
         thread.join()
-        await self.wait_idle()
+        idle = await self.wait_idle(timeout=0.05)
+        if not idle:
+            with self._state_lock:
+                self._fatal_error = reason
+            return False
         return bool(result.get("dead"))
 
     async def shutdown(self) -> None:

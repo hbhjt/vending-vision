@@ -22,8 +22,11 @@ from fastapi.testclient import TestClient
 
 import app as vision_app
 from vision import camera_manager
+from vision import presence_runtime
 from vision.config import settings
 from vision.acquisition_observer import AcquisitionObservationWorker
+from vision.acquisition_observer import AcquisitionObservation
+from vision.profile_messages import profile_update
 
 
 def _permanently_blocking_acquisition_observer(connection):
@@ -78,6 +81,50 @@ def _configure_recorded_front(monkeypatch, filename="front.mp4"):
     camera_manager.release_all_cameras()
 
 
+def _configure_recorded_top(monkeypatch):
+    fixture_root = Path(__file__).parents[1] / "fixtures" / "recorded-video"
+    monkeypatch.setattr(settings, "TOP_CAMERA_CONFIG", {
+        "role": "presence", "source": "recorded_video",
+        "video_path": str(fixture_root / "top.mp4"), "loop": False, "rotate": 0,
+    })
+    monkeypatch.setattr(presence_runtime, "_runtime", None)
+    camera_manager.release_all_cameras()
+
+
+class _ReadyFastBroker:
+    ready = True
+    pose_ready = True
+
+    async def start(self):
+        return None
+
+    def quiesce(self):
+        return None
+
+    async def shutdown(self):
+        return None
+
+
+class _AcquiringOnlyObserver:
+    ready = True
+    fatal_error = None
+    pid = None
+    active_request_count = 0
+    assert_dead = True
+
+    async def start(self):
+        return None
+
+    async def observe(self, _frame, *, timeout=15.0):
+        return AcquisitionObservation(b"jpeg", "single", False)
+
+    async def wait_idle(self):
+        return None
+
+    async def shutdown(self):
+        return None
+
+
 def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkeypatch):
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
@@ -114,6 +161,84 @@ def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkey
         server.shutdown()
         thread.join()
         vision_app._acquisition_observer = None
+
+
+def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_events(monkeypatch):
+    """Production top presence cancels a public WS attempt; the stream keeps reporting Vision facts."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", True)
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 10)
+    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 8)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
+    monkeypatch.setattr(vision_app, "_acquisition_observer", _AcquiringOnlyObserver())
+    monkeypatch.setattr(
+        vision_app,
+        "collect_front_profile_update",
+        lambda event_id, *_args, **_kwargs: profile_update(
+            "vision.profile_result",
+            {
+                "eventId": event_id,
+                "profile": {"presence": True, "age": 30, "gender": "unknown"},
+                "source": "front",
+            },
+        ),
+    )
+    _configure_recorded_top(monkeypatch)
+    _configure_recorded_front(monkeypatch, "man-front.mp4")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _GarmentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    attempt_id = str(uuid4())
+    canceled = []
+    departures = []
+    seen_types = []
+    post_cancel_presence = False
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_envelope("vision.hello", {
+                    "clientRole": "machine", "machineCode": "M001",
+                    "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"],
+                    "contractDigest": manifest["bundleDigest"],
+                    "capabilities": [
+                        "try_on_fast", "profile_push", "presence_status",
+                        "person_departed", "ambient_light",
+                    ],
+                }))
+                assert socket.receive_json()["type"] == "vision.ready"
+                garment = _GarmentHandler.payload
+                socket.send_json(_envelope("vision.try_on.attempt.start", {
+                    "attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()),
+                    "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"},
+                }))
+
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    message = socket.receive_json()
+                    seen_types.append(message["type"])
+                    if message["type"] == "vision.try_on.attempt.canceled":
+                        canceled.append(message)
+                    if message["type"] == "vision.person_departed":
+                        departures.append(message)
+                    if canceled and message["type"] == "vision.presence_status":
+                        post_cancel_presence = True
+                    if canceled and departures and post_cancel_presence:
+                        break
+
+                assert [message["payload"] for message in canceled] == [
+                    {"attemptId": attempt_id, "reason": "departure"}
+                ]
+                assert len(departures) == 1
+                assert "vision.presence_status" in seen_types
+                assert "vision.profile_result" in seen_types
+                assert post_cancel_presence
+                assert vision_app.get_front_camera_owner()["owner"] == "idle"
+    finally:
+        server.shutdown()
+        thread.join()
+        camera_manager.release_all_cameras()
+        monkeypatch.setattr(presence_runtime, "_runtime", None)
 
 
 def test_v2_start_exposes_attempt_scoped_tokenized_acquisition_preview(monkeypatch):

@@ -25,9 +25,13 @@ def test_preview_reader_leases_are_bounded_and_released_after_a_dropped_body():
         await store.release(first.lease_id)
         third = await store.acquire(token)
         assert third is not None
-        await store.close("attempt")
+
+        closer = asyncio.create_task(store.close("attempt"))
+        await asyncio.sleep(0.02)
+        assert not closer.done()
         await store.release(second.lease_id)
         await store.release(third.lease_id)
+        await asyncio.wait_for(closer, timeout=0.5)
         assert await store.reader_count() == 0
 
     asyncio.run(scenario())
@@ -49,6 +53,65 @@ def test_preview_close_waits_until_public_reader_leases_are_observably_zero():
         await store.release(lease.lease_id)
         await asyncio.wait_for(closer, timeout=0.5)
         assert await store.reader_count() == 0
+
+    asyncio.run(scenario())
+
+
+def test_preview_close_fails_closed_when_reader_tasks_do_not_release():
+    """A stubborn ASGI body cannot be hidden by clearing the stream ledger."""
+    async def scenario():
+        store = AcquisitionPreviewStore(max_readers=2)
+        token = await store.open("attempt-stubborn", b"jpeg")
+        first = await store.acquire(token)
+        second = await store.acquire(token)
+        assert first is not None and second is not None
+        assert await store.reader_count() == 2
+
+        with pytest.raises(RuntimeError, match="acquisition_preview_stubborn_readers"):
+            await store.close("attempt-stubborn", timeout=0.02)
+
+        assert await store.reader_count() == 2
+        assert await store.get(token) is None
+        with pytest.raises(RuntimeError, match="acquisition_preview_closed_stubborn_readers"):
+            await store.open("attempt-next", b"jpeg")
+
+        await store.release(first.lease_id)
+        await store.release(second.lease_id)
+        assert await store.reader_count() == 0
+        reopened = await store.open("attempt-next", b"jpeg")
+        assert await store.get(reopened) is not None
+
+    asyncio.run(scenario())
+
+
+def test_preview_close_cancels_registered_stream_task_before_returning():
+    """Route-owned reader tasks are canceled by close before the next attempt can open."""
+    async def scenario():
+        store = AcquisitionPreviewStore(max_readers=2)
+        token = await store.open("attempt-task", b"jpeg")
+        lease = await store.acquire(token)
+        assert lease is not None
+        released = asyncio.Event()
+
+        async def stream_task():
+            try:
+                await store.register_task(lease.lease_id)
+                await asyncio.Event().wait()
+            finally:
+                await store.release(lease.lease_id)
+                released.set()
+
+        task = asyncio.create_task(stream_task())
+        await asyncio.sleep(0.02)
+        assert await store.reader_count() == 1
+        await store.close("attempt-task")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+        assert released.is_set()
+        assert await store.reader_count() == 0
+        reopened = await store.open("attempt-next", b"jpeg")
+        assert await store.get(reopened) is not None
 
     asyncio.run(scenario())
 
@@ -133,8 +196,11 @@ def test_public_preview_stream_bounds_real_http_readers_and_releases_on_close():
             assert asyncio.run(store.reader_count()) == 2
 
             asyncio.run(store.close("attempt-public"))
-            assert next(second_iter, b"") == b""
-            assert next(third_iter, b"") == b""
+            for iterator in (second_iter, third_iter):
+                try:
+                    assert next(iterator, b"") == b""
+                except httpx.RemoteProtocolError:
+                    pass
             second_cm.__exit__(None, None, None)
             third_cm.__exit__(None, None, None)
 

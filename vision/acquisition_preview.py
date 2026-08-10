@@ -36,12 +36,16 @@ class AcquisitionPreviewStore:
         self._snapshot: PreviewSnapshot | None = None
         self._max_readers = max_readers
         self._readers: set[str] = set()
+        self._reader_tasks: dict[str, asyncio.Task] = {}
+        self._stubborn_closed = False
 
     async def open(self, attempt_id: str, jpeg: bytes) -> str:
         if not jpeg:
             raise ValueError("preview requires JPEG bytes")
         token = secrets.token_urlsafe(32)
         async with self._changed:
+            if self._stubborn_closed or self._readers:
+                raise RuntimeError("acquisition_preview_closed_stubborn_readers")
             self._readers.clear()
             self._snapshot = PreviewSnapshot(attempt_id, token, bytes(jpeg))
             self._changed.notify_all()
@@ -80,7 +84,18 @@ class AcquisitionPreviewStore:
     async def release(self, lease_id: str) -> None:
         async with self._changed:
             self._readers.discard(lease_id)
+            self._reader_tasks.pop(lease_id, None)
+            if not self._readers:
+                self._stubborn_closed = False
             self._changed.notify_all()
+
+    async def register_task(self, lease_id: str, task: asyncio.Task | None = None) -> None:
+        task = task or asyncio.current_task()
+        if task is None:
+            return
+        async with self._changed:
+            if lease_id in self._readers:
+                self._reader_tasks[lease_id] = task
 
     async def wait_for_change(self, token: str, previous: bytes) -> PreviewSnapshot | None:
         async with self._changed:
@@ -101,16 +116,30 @@ class AcquisitionPreviewStore:
             ):
                 self._snapshot = None
                 self._changed.notify_all()
-        deadline = asyncio.get_running_loop().time() + max(timeout, 0.001)
-        while asyncio.get_running_loop().time() < deadline:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(timeout, 0.001)
+        natural_deadline = min(deadline, loop.time() + min(0.05, max(timeout, 0.001) / 2))
+        while loop.time() < natural_deadline:
+            async with self._changed:
+                if not self._readers:
+                    return
+            await asyncio.sleep(0.002)
+        async with self._changed:
+            reader_tasks = [
+                task for task in self._reader_tasks.values() if not task.done()
+            ]
+        for task in reader_tasks:
+            task.cancel()
+        while loop.time() < deadline:
             async with self._changed:
                 if not self._readers:
                     return
             await asyncio.sleep(0.002)
         async with self._changed:
             if self._readers:
-                self._readers.clear()
+                self._stubborn_closed = True
                 self._changed.notify_all()
+                raise RuntimeError("acquisition_preview_stubborn_readers")
 
     async def reader_count(self) -> int:
         async with self._lock:

@@ -109,6 +109,112 @@ class _PermissionDeniedProcess:
         self.join_calls += 1
 
 
+class _AliveProcess:
+    pid = 100001
+
+    def is_alive(self):
+        return True
+
+    def kill(self):
+        return None
+
+    def terminate(self):
+        return None
+
+    def join(self, timeout=None):
+        return None
+
+
+class _DeadProcess:
+    pid = 100002
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        return None
+
+
+class _BlockingSendConnection:
+    def __init__(self):
+        self.send_entered = threading.Event()
+        self.release_send = threading.Event()
+        self.closed = False
+
+    def send(self, _payload):
+        self.send_entered.set()
+        assert self.release_send.wait(timeout=2.0)
+
+    def poll(self, _timeout=0):
+        return False
+
+    def recv(self):
+        raise AssertionError("recv should not be reached by the blocking send probe")
+
+    def close(self):
+        self.closed = True
+        self.release_send.set()
+
+
+def test_observation_abort_is_bounded_when_connection_send_blocks():
+    """Cancel/replacement must not need the request thread's state lock."""
+    async def scenario():
+        worker = AcquisitionObservationWorker()
+        parent = _BlockingSendConnection()
+        worker._parent = parent
+        worker._process = _AliveProcess()
+        worker._ready = True
+
+        request = asyncio.create_task(worker.observe(b"large-frame"))
+        deadline = time.monotonic() + 1.0
+        while not parent.send_entered.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.002)
+        assert parent.send_entered.is_set()
+
+        abort = asyncio.create_task(worker.abort_async(reason="replacement"))
+        done, _ = await asyncio.wait({abort}, timeout=0.2)
+        try:
+            assert abort in done, "abort waited behind a request thread blocked in Connection.send"
+        finally:
+            parent.release_send.set()
+            with pytest.raises(Exception):
+                await asyncio.wait_for(request, timeout=1.0)
+            if not abort.done():
+                await asyncio.wait_for(abort, timeout=1.0)
+
+    asyncio.run(scenario())
+
+
+def test_public_start_revalidates_stale_ready_and_preserves_fatal_handle():
+    """The public start gate must use ready/process/fatal, not the raw _ready flag."""
+    async def scenario():
+        context = multiprocessing.get_context("spawn")
+        starts = context.Value("i", 0)
+        worker = AcquisitionObservationWorker(
+            context=context,
+            target=_counting_observer_target,
+            target_args=(starts,),
+        )
+        worker._ready = True
+        worker._process = _DeadProcess()
+
+        await worker.start()
+        assert worker.ready
+        assert starts.value == 1
+        await worker.shutdown()
+
+        fatal = AcquisitionObservationWorker()
+        live = _AliveProcess()
+        fatal._ready = True
+        fatal._process = live
+        fatal._fatal_error = "permission_denied"
+        with pytest.raises(RuntimeError, match="permission_denied"):
+            await fatal.start()
+        assert fatal._process is live
+
+    asyncio.run(scenario())
+
+
 def test_acquisition_observer_abort_permission_errors_fail_closed_without_traceback(capsys):
     """Kill/terminate failures retain the live handle and mark observer unavailable."""
     worker = AcquisitionObservationWorker()
