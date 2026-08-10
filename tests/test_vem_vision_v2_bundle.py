@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from contracts.vem_vision_v2.python.vision_v2_models import parse_message
@@ -34,6 +35,24 @@ def test_generated_v2_boundary_rejects_shared_negative_fixtures():
     for fixture in fixtures:
         with pytest.raises((ValidationError, ValueError)):
             parse_message(fixture["message"])
+
+
+def test_standalone_json_schema_rejects_control_after_token():
+    schema = json.loads((BUNDLE_ROOT / "vision-v2.schema.json").read_text("utf-8"))
+    start = next(
+        branch
+        for branch in schema["oneOf"]
+        if branch["properties"]["type"]["const"] == "vision.try_on.attempt.start"
+    )
+    reference_schema = start["properties"]["payload"]["properties"]["garment"][
+        "properties"
+    ]["reference"]
+    assert reference_schema["pattern"].endswith(r"(?![\s\S])")
+    validator = Draft202012Validator(schema)
+    fixtures = json.loads((BUNDLE_ROOT / "fixtures" / "invalid.json").read_text("utf-8"))
+    for fixture in fixtures:
+        if fixture["name"].startswith("rejects-token-url-trailing-"):
+            assert list(validator.iter_errors(fixture["message"])), fixture["name"]
 
 
 def test_json_integer_fields_normalize_integral_floats_but_reject_non_integers():
