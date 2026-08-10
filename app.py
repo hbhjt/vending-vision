@@ -62,6 +62,11 @@ from vision.try_on_session import (
     start_try_on_session,
     stop_try_on_session,
 )
+from vision.v2_contract_bundle import (
+    V2ContractBundleUnavailable,
+    load_v2_contract_identity,
+    parse_v2_boundary_message,
+)
 
 
 app = FastAPI(
@@ -149,6 +154,89 @@ def get_runtime_status():
     }
 
 
+def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
+    """Return a generated-boundary V2 ready envelope without degrading core Vision."""
+    try:
+        parsed_hello = parse_v2_boundary_message(hello)
+        if parsed_hello.type != "vision.hello":
+            raise ValueError("invalid_v2_boundary_message")
+        identity = load_v2_contract_identity()
+    except V2ContractBundleUnavailable:
+        # The core presence/profile transport is intentionally still available.
+        # A zero digest is a syntactically valid, never-equal sentinel.
+        client_payload = hello.get("payload") if isinstance(hello, dict) else None
+        if not isinstance(client_payload, dict):
+            raise ValueError("invalid_v2_boundary_message")
+        client_capabilities = client_payload.get("capabilities")
+        if not (
+            isinstance(client_capabilities, list)
+            and all(isinstance(value, str) and value for value in client_capabilities)
+        ):
+            raise ValueError("invalid_v2_boundary_message")
+        identity = None
+        payload = client_payload
+    else:
+        payload = parsed_hello.payload.model_dump()
+        client_capabilities = payload["capabilities"]
+
+    if identity is None:
+        diagnostic = "contract_bundle_unavailable"
+        schema_version = "unavailable"
+        bundle_version = "unavailable"
+        contract_digest = "0" * 64
+    elif (
+        payload["schemaVersion"] != identity.schema_version
+        or payload["bundleVersion"] != identity.bundle_version
+    ):
+        diagnostic = "contract_version_mismatch"
+        schema_version = identity.schema_version
+        bundle_version = identity.bundle_version
+        contract_digest = identity.contract_digest
+    elif payload["contractDigest"] != identity.contract_digest:
+        diagnostic = "contract_digest_mismatch"
+        schema_version = identity.schema_version
+        bundle_version = identity.bundle_version
+        contract_digest = identity.contract_digest
+    elif not status["cameraReady"]:
+        diagnostic = "camera_unavailable"
+        schema_version = identity.schema_version
+        bundle_version = identity.bundle_version
+        contract_digest = identity.contract_digest
+    else:
+        diagnostic = "ready"
+        schema_version = identity.schema_version
+        bundle_version = identity.bundle_version
+        contract_digest = identity.contract_digest
+
+    ready = envelope(
+        message_type="vision.ready",
+        message_id=f"ready-{uuid4()}",
+        payload={
+            "serverName": "vem-vision-python",
+            "serverVersion": APP_VERSION,
+            "schemaVersion": schema_version,
+            "bundleVersion": bundle_version,
+            "contractDigest": contract_digest,
+            "cameraReady": status["cameraReady"],
+            "fastReady": diagnostic == "ready",
+            "visionBusinessReady": diagnostic == "ready",
+            "businessReadinessDiagnostic": diagnostic,
+            "capabilities": [
+                "profile_push",
+                "presence_status",
+                "person_departed",
+                "ambient_light",
+                "try_on_fast",
+            ],
+        },
+    )
+    # This is the server-to-machine strict generated boundary validation.
+    if identity is not None:
+        parsed_ready = parse_v2_boundary_message(ready)
+        return parsed_ready.model_dump(), set(client_capabilities)
+    return ready, set(client_capabilities)
+
+
 def validate_envelope(message):
     """验证 WebSocket 消息的外层封包格式。
 
@@ -191,50 +279,16 @@ def validate_message_payload(message_type: str, payload: dict):
     """根据消息类型验证 payload 的字段格式。
 
     支持的验证：
-    - vision.hello: protocolVersion, capabilities, clientRole, machineCode
     - vision.try_on.start: sessionId, catalogKey, variantId
     - vision.try_on.stop: sessionId, reason
     """
     supported_types = {
-        "vision.hello",
         "vision.ping",
         "vision.try_on.start",
         "vision.try_on.stop",
     }
     if message_type not in supported_types:
         return f"unsupported client message type: {message_type}"
-
-    if message_type == "vision.hello":
-        protocol_version = payload.get("protocolVersion")
-        capabilities = payload.get("capabilities")
-        client_role = payload.get("clientRole")
-        machine_code = payload.get("machineCode")
-
-        if (
-            not isinstance(protocol_version, int)
-            or isinstance(protocol_version, bool)
-            or protocol_version != 1
-        ):
-            return "payload.protocolVersion must be 1"
-
-        if not isinstance(capabilities, list):
-            return "payload.capabilities must be an array"
-
-        if not all(
-            isinstance(item, str) and item.strip() and len(item) <= 64
-            for item in capabilities
-        ):
-            return "payload.capabilities must contain strings of 1-64 characters"
-
-        if not isinstance(client_role, str) or not client_role.strip():
-            return "payload.clientRole must be a non-empty string"
-
-        if machine_code is not None and (
-            not isinstance(machine_code, str)
-            or not machine_code
-            or len(machine_code) > 64
-        ):
-            return "payload.machineCode must contain 1-64 characters"
 
     if message_type == "vision.try_on.start":
         session_id = payload.get("sessionId")
@@ -1146,6 +1200,53 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                         message_id=message_id,
                     )
                 logger.warning(f"Unsupported protocol: {protocol}")
+                continue
+
+            if message_type == "vision.hello":
+                try:
+                    ready, client_capabilities = build_v2_ready_message(
+                        message,
+                        get_runtime_status(),
+                    )
+                except ValueError:
+                    async with send_lock:
+                        await send_error(
+                            websocket,
+                            code="invalid_message",
+                            message="invalid_v2_boundary_message",
+                            retryable=False,
+                            message_id=message_id,
+                        )
+                    continue
+
+                if message["payload"].get("clientRole") not in allowed_client_roles:
+                    async with send_lock:
+                        await send_error(
+                            websocket,
+                            code="invalid_message",
+                            message=(
+                                "payload.clientRole must be one of: "
+                                + ", ".join(sorted(allowed_client_roles))
+                            ),
+                            retryable=False,
+                            message_id=message_id,
+                        )
+                    continue
+
+                async with send_lock:
+                    await websocket.send_json(ready)
+
+                # Contract incompatibility is an enhancement-only readiness
+                # fact. Presence/profile registration remains independent.
+                if settings.PROFILE_PUSH_ENABLED:
+                    await register_profile_client(
+                        websocket,
+                        send_lock,
+                        client_capabilities,
+                        owned_try_on_session_ids,
+                    )
+
+                handshake_complete = True
                 continue
 
             payload_error = validate_message_payload(message_type, payload)

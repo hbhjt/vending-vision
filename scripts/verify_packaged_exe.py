@@ -17,7 +17,8 @@ from pathlib import Path
 import websockets
 
 
-PROTOCOL = "vem.vision.v1"
+PROTOCOL = "vem.vision.v2"
+CONTRACT_ROOT = Path(__file__).resolve().parents[1] / "contracts" / "vem_vision_v2"
 PROFILE_FIELDS = {
     "personPresent",
     "heightCm",
@@ -70,6 +71,15 @@ def message(message_type, message_id, payload=None):
         "messageId": message_id,
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "payload": payload or {},
+    }
+
+
+def v2_handshake_identity():
+    manifest = json.loads((CONTRACT_ROOT / "manifest.json").read_text("utf-8"))
+    return {
+        "schemaVersion": manifest["schemaVersion"],
+        "bundleVersion": manifest["bundleVersion"],
+        "contractDigest": manifest["bundleDigest"],
     }
 
 
@@ -191,13 +201,13 @@ async def verify_websocket(port):
                     "vision.hello",
                     "hello-packaged",
                     {
-                        "protocolVersion": 1,
+                        **v2_handshake_identity(),
                         "capabilities": [
                             "profile_push",
                             "presence_status",
                             "person_departed",
                             "ambient_light",
-                            "try_on_session",
+                            "try_on_fast",
                         ],
                         "clientRole": "machine",
                         "machineCode": "PACKAGED-TEST",
@@ -209,7 +219,7 @@ async def verify_websocket(port):
         if ready.get("type") != "vision.ready":
             raise AssertionError(f"expected vision.ready, got: {ready}")
         capabilities = set(ready.get("payload", {}).get("capabilities") or [])
-        if "try_on_session" not in capabilities or "profile_push" not in capabilities:
+        if "try_on_fast" not in capabilities or "profile_push" not in capabilities:
             raise AssertionError(f"server capabilities are incomplete: {capabilities}")
 
         await websocket.send(json.dumps(message("vision.ping", "ping-packaged")))

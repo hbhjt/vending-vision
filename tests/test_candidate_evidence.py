@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -244,6 +245,16 @@ def test_packaged_resource_verifier_rejects_retired_maintenance_v1_schema(tmp_pa
     ]:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"packaged")
+    for relative_path in [
+        "manifest.json",
+        "vision-v2.schema.json",
+        "fixtures/valid.json",
+        "fixtures/invalid.json",
+    ]:
+        source = ROOT / "contracts" / "vem_vision_v2" / relative_path
+        destination = internal / "contracts" / "vem_vision_v2" / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
     (internal / "config" / "vending-vision-camera-maintenance-v1.schema.json").write_bytes(b"retired")
 
     with pytest.raises(AssertionError, match="retired packaged resources"):

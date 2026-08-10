@@ -5,7 +5,7 @@ WebSocket 协议消息构建模块
 所有 WebSocket 消息都遵循统一的结构：
 
 {
-    "protocol": "vem.vision.v1",
+    "protocol": "vem.vision.v2",
     "type": "vision.xxx",
     "messageId": "<uuid>",
     "timestamp": "<ISO 8601 UTC>",

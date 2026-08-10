@@ -11,7 +11,17 @@ from uuid import uuid4
 import websockets
 
 
-PROTOCOL = "vem.vision.v1"
+PROTOCOL = "vem.vision.v2"
+CONTRACT_ROOT = Path(__file__).resolve().parents[1] / "contracts" / "vem_vision_v2"
+
+
+def v2_handshake_identity():
+    manifest = json.loads((CONTRACT_ROOT / "manifest.json").read_text("utf-8"))
+    return {
+        "schemaVersion": manifest["schemaVersion"],
+        "bundleVersion": manifest["bundleVersion"],
+        "contractDigest": manifest["bundleDigest"],
+    }
 
 
 def now_iso():
@@ -57,11 +67,11 @@ async def run(args):
         await socket.send(json.dumps(message("vision.hello", {
             "clientRole": "machine",
             "machineCode": args.machine_code,
-            "protocolVersion": 1,
-            "capabilities": ["profile_push", "presence_status", "person_departed", "try_on_session"],
+            **v2_handshake_identity(),
+            "capabilities": ["profile_push", "presence_status", "person_departed", "try_on_fast"],
         })))
         ready = json.loads(await asyncio.wait_for(socket.recv(), timeout=10))
-        if ready.get("type") != "vision.ready" or not ready.get("payload", {}).get("modelReady"):
+        if ready.get("type") != "vision.ready" or not ready.get("payload", {}).get("cameraReady"):
             raise AssertionError(f"machine handshake failed: {ready}")
 
         deadline = asyncio.get_running_loop().time() + args.observation_timeout

@@ -331,7 +331,7 @@ def bool_config_value(value, default=False):
 class Settings:
     APP_NAME = "Vending Vision Module"
     APP_VERSION = BUILD_APP_VERSION
-    PROTOCOL = "vem.vision.v1"
+    PROTOCOL = "vem.vision.v2"
     PERSON_DETECTOR_CONFIG = get_model_config(
         "person_detector",
         {
