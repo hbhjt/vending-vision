@@ -254,6 +254,23 @@ class DirectShowCameraBroker:
         with self._state_lock:
             parent = self._parent
             process = self._process
+            stop_errors: list[str] = []
+
+            def record_stop_error(action: str, exc: BaseException) -> None:
+                stop_errors.append(f"{action} {type(exc).__name__}: {exc}")
+
+            def terminate_process(action: str) -> None:
+                try:
+                    process.terminate()
+                except (OSError, PermissionError) as exc:
+                    record_stop_error(action, exc)
+
+            def join_process(timeout: float) -> None:
+                try:
+                    process.join(timeout=timeout)
+                except (OSError, PermissionError) as exc:
+                    record_stop_error("join", exc)
+
             if graceful and parent is not None and process is not None and process.is_alive():
                 try:
                     parent.send(("shutdown", None))
@@ -273,23 +290,24 @@ class DirectShowCameraBroker:
                 try:
                     process.kill()
                 except (AttributeError, NotImplementedError):
-                    process.terminate()
-                process.join(timeout=0.5)
+                    terminate_process("terminate-fallback")
+                except (OSError, PermissionError) as exc:
+                    record_stop_error("kill", exc)
+                    terminate_process("terminate-after-kill-error")
+                join_process(0.5)
             if process.is_alive():
-                try:
-                    process.terminate()
-                except Exception:
-                    pass
-                process.join(timeout=0.5)
+                terminate_process("terminate")
+                join_process(0.5)
             if process.is_alive():
                 # Fail closed.  The live process handle is the only truthful
                 # proof that the physical-camera owner may still exist.
                 self._parent = parent
                 self._process = process
                 self.opened_at = None
-                self._fatal_error = reason
+                detail = "; ".join(stop_errors)
+                self._fatal_error = f"{reason}: {detail}" if detail else reason
                 return False
-            process.join(timeout=0)
+            join_process(0)
             self._parent = None
             self._process = None
             self.opened_at = None
@@ -390,8 +408,16 @@ class DirectShowCameraBroker:
         outcome: dict[str, bool] = {}
 
         def control() -> None:
-            outcome["dead"] = self.abort(reason=reason)
-            done.set()
+            try:
+                outcome["dead"] = self.abort(reason=reason)
+            except BaseException as exc:
+                outcome["dead"] = False
+                with self._state_lock:
+                    self._fatal_error = (
+                        f"{reason}: control {type(exc).__name__}: {exc}"
+                    )
+            finally:
+                done.set()
 
         control_thread = threading.Thread(
             target=control,

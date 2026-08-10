@@ -1,6 +1,7 @@
 import asyncio
 import multiprocessing
 import os
+import threading
 import time
 
 import numpy as np
@@ -206,3 +207,101 @@ def test_stubborn_process_is_retained_and_broker_fails_closed_without_restart():
     with pytest.raises(RuntimeError, match="unavailable"):
         broker.read(warmup_frames=1, timeout=0.01)
     assert context.processes == [stubborn]
+
+
+def test_live_process_kill_oserror_is_reported_and_retained_fail_closed():
+    class Connection:
+        def send(self, _message):
+            return None
+
+        def poll(self, _timeout):
+            return False
+
+        def close(self):
+            return None
+
+    class KillDeniedProcess:
+        pid = 9292
+        exitcode = None
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+        def kill(self):
+            raise OSError("kill denied")
+
+        def terminate(self):
+            raise PermissionError("terminate denied")
+
+        def join(self, timeout=None):
+            raise OSError("join denied")
+
+    class Context:
+        def __init__(self):
+            self.processes = []
+
+        def Pipe(self, duplex=True):
+            return Connection(), Connection()
+
+        def Process(self, **_kwargs):
+            process = KillDeniedProcess()
+            self.processes.append(process)
+            return process
+
+    context = Context()
+    broker = DirectShowCameraBroker("front", _broker_config(), context=context)
+    broker._start_locked()
+    denied = context.processes[0]
+
+    assert broker.release() is False
+    assert broker.assert_dead() is False
+    assert broker._process is denied
+    with pytest.raises(RuntimeError, match="unavailable"):
+        broker.read(warmup_frames=1, timeout=0.01)
+    assert context.processes == [denied]
+
+
+def test_abort_async_control_error_returns_failure_by_deadline_without_thread_leak():
+    class LiveProcess:
+        pid = 9393
+        exitcode = None
+
+        def is_alive(self):
+            return True
+
+        def kill(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def join(self, timeout=None):
+            return None
+
+    broker = DirectShowCameraBroker("front", _broker_config())
+    live = LiveProcess()
+    broker._process = live
+
+    def abort_raises(*, reason):
+        raise OSError(f"{reason}: windows control denied")
+
+    broker.abort = abort_raises
+
+    async def scenario():
+        result = await asyncio.wait_for(
+            broker.abort_async(reason="replacement"), timeout=0.1
+        )
+        await asyncio.sleep(0)
+        return result
+
+    assert asyncio.run(scenario()) is False
+    assert broker.assert_dead() is False
+    with pytest.raises(RuntimeError, match="unavailable"):
+        broker.read(warmup_frames=1, timeout=0.01)
+    assert not any(
+        thread.name == "directshow-front-abort" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
