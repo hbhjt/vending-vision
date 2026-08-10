@@ -96,7 +96,7 @@ def _validate_extensions(value: Any, schema: dict[str, Any]) -> None:
         except (TypeError, ValueError) as error:
             raise ValueError("reference must be a valid loopback URL") from error
         if (
-            parsed.scheme not in {"http", "https"}
+            parsed.scheme != "http"
             or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
             or parsed.username is not None
             or parsed.password is not None

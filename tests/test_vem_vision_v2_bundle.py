@@ -27,6 +27,7 @@ def test_generated_v2_boundary_accepts_shared_fast_fixtures():
         "vision.try_on.attempt.accepted",
         "vision.try_on.attempt.progress",
         "vision.try_on.attempt.completed",
+        "vision.try_on.attempt.failed",
         "vision.ready",
     ]
 

@@ -15,10 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import ipaddress
 import os
+import secrets
 import threading
+import time
+from collections import OrderedDict
 from datetime import datetime
 from json import JSONDecodeError
 from pathlib import Path
@@ -26,6 +30,7 @@ from typing import Optional
 from uuid import uuid4
 
 import cv2
+import numpy as np
 from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
@@ -34,6 +39,7 @@ from vision.camera_manager import (
     get_camera_config,
     get_camera_status,
     read_camera,
+    read_camera_with_source,
     release_all_cameras,
     reset_camera,
 )
@@ -62,6 +68,7 @@ from vision.try_on_session import (
     start_try_on_session,
     stop_try_on_session,
 )
+from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
@@ -74,6 +81,18 @@ app = FastAPI(
     description="Smart vending machine vision API",
     version=APP_VERSION,
 )
+
+_FAST_RESULT_TTL_SECONDS = 5 * 60
+_FAST_RESULT_MAX_COUNT = 8
+_FAST_RESULT_MAX_BYTES = 16 * 1024 * 1024
+_fast_attempt_lock = threading.Lock()
+_FAST_ATTEMPT_TIMEOUT_SECONDS = 15
+_fast_attempt_active: dict | None = None
+_fast_attempt_generation = 0
+_fast_attempts_terminal: OrderedDict[str, float] = OrderedDict()
+_fast_results: OrderedDict[str, dict] = OrderedDict()
+_fast_results_bytes = 0
+_fast_runtime = FastTryOnRuntime()
 
 # 启动时的自检结果缓存
 startup_check = None
@@ -119,6 +138,157 @@ def get_startup_check():
         startup_check = run_self_check()
 
     return startup_check
+
+
+def _fast_result_reference(attempt_id: str, token: str) -> str:
+    host = str(settings.HOST)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{settings.PORT}/v2/try-on/results/{attempt_id}?token={token}"
+
+
+def _prune_fast_attempts(now: float | None = None) -> None:
+    """Bound terminal history and disposable result bytes under one short lock."""
+    global _fast_results_bytes
+    now = time.monotonic() if now is None else now
+    expired = [
+        attempt_id
+        for attempt_id, result in _fast_results.items()
+        if result["expiresAt"] <= now
+    ]
+    for attempt_id in expired:
+        _fast_results_bytes -= len(_fast_results.pop(attempt_id)["bytes"])
+    while _fast_results and (
+        len(_fast_results) > _FAST_RESULT_MAX_COUNT
+        or _fast_results_bytes > _FAST_RESULT_MAX_BYTES
+    ):
+        _, result = _fast_results.popitem(last=False)
+        _fast_results_bytes -= len(result["bytes"])
+    while _fast_attempts_terminal:
+        attempt_id, terminal_at = next(iter(_fast_attempts_terminal.items()))
+        if terminal_at + _FAST_RESULT_TTL_SECONDS > now:
+            break
+        _fast_attempts_terminal.pop(attempt_id)
+    while len(_fast_attempts_terminal) > 32:
+        _fast_attempts_terminal.popitem(last=False)
+
+
+def _begin_fast_attempt(attempt_id: str) -> tuple[dict | None, dict | None]:
+    global _fast_attempt_active, _fast_attempt_generation
+    with _fast_attempt_lock:
+        _prune_fast_attempts()
+        if attempt_id in _fast_attempts_terminal or (
+            _fast_attempt_active is not None
+            and _fast_attempt_active["attemptId"] == attempt_id
+        ):
+            return None, None
+        replaced = _fast_attempt_active
+        if replaced is not None:
+            replaced["canceled"].set()
+        _fast_attempt_generation += 1
+        active = {
+            "attemptId": attempt_id,
+            "generation": _fast_attempt_generation,
+            "canceled": threading.Event(),
+            "terminal": False,
+        }
+        _fast_attempt_active = active
+        return active, replaced
+
+
+def _finish_fast_attempt(active: dict) -> bool:
+    global _fast_attempt_active
+    with _fast_attempt_lock:
+        if active["terminal"]:
+            return False
+        active["terminal"] = True
+        _fast_attempts_terminal[active["attemptId"]] = time.monotonic()
+        _fast_attempts_terminal.move_to_end(active["attemptId"])
+        if _fast_attempt_active is active:
+            _fast_attempt_active = None
+        _prune_fast_attempts()
+        return True
+
+
+def _cancel_fast_attempt(attempt_id: str) -> None:
+    with _fast_attempt_lock:
+        if (
+            _fast_attempt_active is not None
+            and _fast_attempt_active["attemptId"] == attempt_id
+        ):
+            _fast_attempt_active["canceled"].set()
+
+
+def _store_fast_result(active: dict, image: bytes) -> dict | None:
+    global _fast_attempt_active, _fast_results_bytes
+    decoded = cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if decoded is None or decoded.ndim != 3:
+        raise RuntimeError("fast_result_invalid_png")
+    token = secrets.token_urlsafe(32)
+    result = {
+        "token": token,
+        "bytes": image,
+        "expiresAt": time.monotonic() + _FAST_RESULT_TTL_SECONDS,
+        "reference": _fast_result_reference(active["attemptId"], token),
+        "digest": f"sha256:{hashlib.sha256(image).hexdigest()}",
+        "contentType": "image/png",
+        "byteSize": len(image),
+        "width": int(decoded.shape[1]),
+        "height": int(decoded.shape[0]),
+    }
+    with _fast_attempt_lock:
+        _prune_fast_attempts()
+        if _fast_attempt_active is not active or active["canceled"].is_set():
+            return None
+        previous = _fast_results.pop(active["attemptId"], None)
+        if previous is not None:
+            _fast_results_bytes -= len(previous["bytes"])
+        if len(image) > _FAST_RESULT_MAX_BYTES:
+            return None
+        _fast_results[active["attemptId"]] = result
+        _fast_results_bytes += len(image)
+        if _fast_results_bytes > _FAST_RESULT_MAX_BYTES:
+            _fast_results.pop(active["attemptId"], None)
+            _fast_results_bytes -= len(image)
+            return None
+        # Commit result visibility and the attempt terminal state together:
+        # replacement/disconnect can only win before this point, never leave
+        # an orphaned result after it.
+        active["terminal"] = True
+        _fast_attempts_terminal[active["attemptId"]] = time.monotonic()
+        _fast_attempts_terminal.move_to_end(active["attemptId"])
+        if _fast_attempt_active is active:
+            _fast_attempt_active = None
+        _prune_fast_attempts()
+    return {key: value for key, value in result.items() if key not in {"token", "bytes", "expiresAt"}}
+
+
+def _generated_v2_envelope(message_type: str, payload: dict) -> dict:
+    parsed = parse_v2_boundary_message(
+        envelope(message_type=message_type, message_id=str(uuid4()), payload=payload)
+    )
+    if parsed.type != message_type:
+        raise ValueError("invalid_v2_boundary_message")
+    return parsed.model_dump(mode="json")
+
+
+@app.api_route("/v2/try-on/results/{attempt_id}", methods=["GET", "HEAD"])
+def read_fast_result(attempt_id: str, token: Optional[str] = None):
+    """Serve only an unguessable, disposable local PNG result read grant."""
+    with _fast_attempt_lock:
+        _prune_fast_attempts()
+        result = _fast_results.get(attempt_id)
+        if result is None or not isinstance(token, str) or not secrets.compare_digest(
+            token, result["token"]
+        ):
+            raise HTTPException(status_code=404, detail="result not found")
+        _fast_results.move_to_end(attempt_id)
+        image = result["bytes"]
+    return Response(
+        content=image,
+        media_type="image/png",
+        headers={"Content-Length": str(len(image)), "Cache-Control": "no-store"},
+    )
 
 
 def get_runtime_status():
@@ -1115,6 +1285,122 @@ async def send_error(
     )
 
 
+async def run_v2_fast_attempt(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    message: dict,
+    fast_ready: bool,
+) -> None:
+    """Run one bounded Fast attempt without holding a WS or store lock on I/O."""
+    try:
+        parsed = parse_v2_boundary_message(message)
+        if parsed.type != "vision.try_on.attempt.start":
+            raise ValueError("invalid_v2_boundary_message")
+        payload = parsed.payload.model_dump()
+    except (V2ContractBundleUnavailable, ValueError):
+        async with send_lock:
+            await send_error(
+                websocket,
+                code="invalid_message",
+                message="invalid_v2_boundary_message",
+                retryable=False,
+                message_id=message.get("messageId"),
+            )
+        return
+
+    attempt_id = payload["attemptId"]
+    if not fast_ready:
+        terminal = _generated_v2_envelope(
+            "vision.try_on.attempt.failed",
+            {"attemptId": attempt_id, "reason": "fast_unavailable"},
+        )
+        async with send_lock:
+            await websocket.send_json(terminal)
+        return
+    active, _replaced = _begin_fast_attempt(attempt_id)
+    if active is None:
+        terminal = _generated_v2_envelope(
+            "vision.try_on.attempt.failed",
+            {"attemptId": attempt_id, "reason": "attempt_already_active"},
+        )
+        async with send_lock:
+            await websocket.send_json(terminal)
+        return
+
+    try:
+        async with send_lock:
+            await websocket.send_json(
+                _generated_v2_envelope(
+                    "vision.try_on.attempt.accepted",
+                    {"attemptId": attempt_id, "mode": "fast"},
+                )
+            )
+            await websocket.send_json(
+                _generated_v2_envelope(
+                    "vision.try_on.attempt.progress",
+                    {"attemptId": attempt_id, "stage": "generating"},
+                )
+            )
+        prepared = await asyncio.wait_for(
+            asyncio.to_thread(_fast_runtime.fetch_garment, payload["garment"]),
+            timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
+        )
+        if active["canceled"].is_set():
+            raise GarmentFetchError("attempt_replaced")
+        frame, source_frame = await asyncio.wait_for(
+            asyncio.to_thread(read_camera_with_source, "front", warmup_frames=1),
+            timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
+        )
+        if active["canceled"].is_set():
+            raise GarmentFetchError("attempt_replaced")
+        result_image = await asyncio.wait_for(
+            asyncio.to_thread(_fast_runtime.render, frame, prepared),
+            timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
+        )
+        result = _store_fast_result(active, result_image)
+        if result is None:
+            terminal = _generated_v2_envelope(
+                "vision.try_on.attempt.failed",
+                {"attemptId": attempt_id, "reason": "attempt_replaced"},
+            )
+        else:
+            logger.info(
+                "Fast attempt completed attemptId=%s frameSource=%s",
+                attempt_id,
+                source_frame.get("source") if isinstance(source_frame, dict) else "unknown",
+            )
+            terminal = _generated_v2_envelope(
+                "vision.try_on.attempt.completed",
+                {"attemptId": attempt_id, "result": result},
+            )
+    except GarmentFetchError as error:
+        terminal = _generated_v2_envelope(
+            "vision.try_on.attempt.failed",
+            {
+                "attemptId": attempt_id,
+                "reason": "attempt_replaced"
+                if str(error) == "attempt_replaced"
+                else "garment_rejected",
+            },
+        )
+    except asyncio.TimeoutError:
+        terminal = _generated_v2_envelope(
+            "vision.try_on.attempt.failed",
+            {"attemptId": attempt_id, "reason": "fast_failed"},
+        )
+    except Exception:
+        logger.exception("Fast attempt failed attemptId=%s", attempt_id)
+        terminal = _generated_v2_envelope(
+            "vision.try_on.attempt.failed",
+            {"attemptId": attempt_id, "reason": "fast_failed"},
+        )
+    finally:
+        should_publish = _finish_fast_attempt(active)
+    if should_publish or terminal["type"] == "vision.try_on.attempt.completed":
+        async with send_lock:
+            await websocket.send_json(terminal)
+
+
 def websocket_origin_allowed(websocket: WebSocket) -> bool:
     """Accept native clients without Origin and allow configured local WebViews."""
     origin = websocket.headers.get("origin")
@@ -1145,7 +1431,10 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
     """
     send_lock = asyncio.Lock()
     owned_try_on_session_ids = set()
+    owned_fast_attempt_ids = set()
+    fast_attempt_tasks: set[asyncio.Task] = set()
     handshake_complete = False
+    fast_attempt_ready = False
 
     await websocket.accept()
     if not websocket_origin_allowed(websocket):
@@ -1251,6 +1540,8 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 async with send_lock:
                     await websocket.send_json(ready)
 
+                fast_attempt_ready = bool(ready["payload"]["fastReady"])
+
                 # Contract incompatibility is an enhancement-only readiness
                 # fact. Presence/profile registration remains independent.
                 if settings.PROFILE_PUSH_ENABLED:
@@ -1264,7 +1555,16 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 handshake_complete = True
                 continue
 
-            payload_error = validate_message_payload(message_type, payload)
+            is_v2_fast_attempt = (
+                message_type == "vision.try_on.attempt.start"
+                and isinstance(payload, dict)
+                and "attemptId" in payload
+            )
+            payload_error = (
+                None
+                if is_v2_fast_attempt
+                else validate_message_payload(message_type, payload)
+            )
 
             if payload_error:
                 async with send_lock:
@@ -1286,6 +1586,22 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                         retryable=False,
                         message_id=message_id,
                     )
+                continue
+
+            if is_v2_fast_attempt:
+                attempt_id = payload.get("attemptId")
+                if isinstance(attempt_id, str):
+                    owned_fast_attempt_ids.add(attempt_id)
+                task = asyncio.create_task(
+                    run_v2_fast_attempt(
+                        websocket,
+                        send_lock,
+                        message,
+                        fast_attempt_ready,
+                    )
+                )
+                fast_attempt_tasks.add(task)
+                task.add_done_callback(fast_attempt_tasks.discard)
                 continue
 
             if message_type == "vision.ping":
@@ -1420,6 +1736,8 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
     finally:
+        for attempt_id in owned_fast_attempt_ids:
+            _cancel_fast_attempt(attempt_id)
         await unregister_profile_client(websocket)
         cleanup_owned_try_on_sessions(
             owned_try_on_session_ids,
