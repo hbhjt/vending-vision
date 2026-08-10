@@ -41,8 +41,9 @@ class ActiveAttempt:
     owner_subscriber_key: int | None = None
     subscribers: dict[int, AttemptSubscriber] = field(default_factory=dict)
     accepted: dict | None = None
-    latest_generating: dict | None = None
+    latest_status: dict | None = None
     canceled_terminal: dict | None = None
+    manual_capture_requested: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass
@@ -219,7 +220,7 @@ class FastAttemptRegistry:
     def _replay_active(active: ActiveAttempt) -> list[dict]:
         return [
             copy.deepcopy(message)
-            for message in (active.accepted, active.latest_generating)
+            for message in (active.accepted, active.latest_status)
             if message
         ]
 
@@ -413,7 +414,7 @@ class FastAttemptRegistry:
                 owner_subscriber_key=pending.owner_subscriber_key,
                 subscribers=pending.subscribers,
                 accepted=copy.deepcopy(accepted),
-                latest_generating=copy.deepcopy(generating),
+                latest_status=copy.deepcopy(generating),
                 canceled_terminal=pending.canceled_terminal,
             )
             self._pending = None
@@ -553,6 +554,88 @@ class FastAttemptRegistry:
         canceled.set()
         return canceled
 
+    async def publish_nonterminal(
+        self, receipt: AttemptReceipt, message: dict
+    ) -> TerminalTransition | None:
+        """Replace the replayable lifecycle observation while this owner lives.
+
+        The attempt registry remains the single authority for both acquisition
+        and render.  Sending happens outside its short gate, just like a
+        terminal transition, so a slow socket cannot block cancel/replacement.
+        """
+        async with self._gate:
+            active = self._active
+            if active is None or active.receipt != receipt or active.cancel_event.is_set():
+                return None
+            active.latest_status = copy.deepcopy(message)
+            return TerminalTransition(
+                message=copy.deepcopy(message),
+                subscribers=list(active.subscribers.values()),
+            )
+
+    async def request_manual_capture(self, attempt_id: str) -> bool:
+        """Accept the intent only for the current acquiring attempt.
+
+        Occupancy and alignment remain Vision's frame-observation decision;
+        this method merely records one bounded client intent for that owner.
+        """
+        async with self._gate:
+            active = self._active
+            if (
+                active is None
+                or active.receipt.attempt_id != attempt_id
+                or active.cancel_event.is_set()
+                or not active.latest_status
+                or active.latest_status.get("type") != "vision.try_on.attempt.acquiring"
+            ):
+                return False
+            active.manual_capture_requested.set()
+            return True
+
+    async def take_manual_capture_request(self, receipt: AttemptReceipt) -> bool:
+        async with self._gate:
+            active = self._active
+            if active is None or active.receipt != receipt or active.cancel_event.is_set():
+                return False
+            if not active.manual_capture_requested.is_set():
+                return False
+            active.manual_capture_requested.clear()
+            return True
+
+    async def cancel_current(
+        self, *, attempt_id: str | None, terminal: dict
+    ) -> TerminalTransition | None:
+        """Fence and publish immediately; retain a barrier for later admission.
+
+        The WebSocket receive loop must remain able to answer ping and process
+        the client's following messages while a blocking camera/render worker
+        tears down.  New attempts still wait for the cleanup reservation, so
+        there is never concurrent ownership of those resources.
+        """
+        async with self._gate:
+            active = self._active
+            if active is None or (attempt_id is not None and active.receipt.attempt_id != attempt_id):
+                return None
+            active.cancel_event.set()
+            transition = self._commit_terminal_unlocked(active, terminal)
+            task = active.task
+            cleanup = (
+                self._reserve_cleanup_unlocked(task)
+                if task is not asyncio.current_task() and not task.done()
+                else None
+            )
+        if cleanup is not None:
+            # The terminal is canonical already.  Interrupt the owner so its
+            # acquisition ``finally`` executes without waiting for the next
+            # recorded-frame poll or a blocked worker deadline.
+            task.cancel()
+            asyncio.create_task(self._finish_cleanup_uncancelled(cleanup))
+        return transition
+
+    async def active_attempt_id(self) -> str | None:
+        async with self._gate:
+            return self._active.receipt.attempt_id if self._active is not None else None
+
     @staticmethod
     def _result_failure_message(message: dict) -> dict:
         """Map an unpublishable completion to the one stable Fast failure."""
@@ -655,7 +738,7 @@ class FastAttemptRegistry:
         finalizer.result()
 
     async def cancel_owner_and_join(
-        self, receipt: AttemptReceipt
+        self, receipt: AttemptReceipt, terminal: dict | None = None
     ) -> TerminalTransition | None:
         async with self._gate:
             active = self._active
@@ -663,11 +746,8 @@ class FastAttemptRegistry:
                 return None
             active.cancel_event.set()
             task = active.task
-            transition = (
-                self._commit_terminal_unlocked(active, active.canceled_terminal)
-                if active.canceled_terminal is not None
-                else None
-            )
+            chosen = terminal if terminal is not None else active.canceled_terminal
+            transition = self._commit_terminal_unlocked(active, chosen) if chosen is not None else None
         if task is not asyncio.current_task():
             await asyncio.shield(task)
         return transition

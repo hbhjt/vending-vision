@@ -65,6 +65,9 @@ from vision.session_state import get_vision_session_status
 from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError, PoseUnavailableError
 from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
 from vision.attempt_worker import FastRenderBroker, render_attempt_frame
+from vision.acquisition_preview import AcquisitionPreviewStore
+from vision.person_detector import PersonDetector
+from vision.pose_estimator import PoseEstimator
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
@@ -95,6 +98,11 @@ _fast_attempt_registry = FastAttemptRegistry(
 )
 _fast_attempt_task_slots = asyncio.Semaphore(_FAST_ATTEMPT_MAX_TASKS)
 _fast_render_broker = FastRenderBroker()
+_acquisition_previews = AcquisitionPreviewStore()
+_acquisition_person_detector: PersonDetector | None = None
+_acquisition_pose_estimator: PoseEstimator | None = None
+_ACQUISITION_STABLE_FRAMES = 3
+_ACQUISITION_POLL_SECONDS = 0.05
 
 # 启动时的自检结果缓存
 startup_check = None
@@ -135,6 +143,7 @@ async def on_shutdown():
             task.cancel()
 
     _fast_render_broker.quiesce()
+    await _acquisition_previews.close()
     await _fast_attempt_registry.shutdown()
     render_shutdown_error = None
     try:
@@ -201,26 +210,30 @@ async def _acquire_front_io_until(deadline: float) -> None:
     raise asyncio.TimeoutError()
 
 
-async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
-    """Read Fast's front frame through the production front-camera lane."""
+async def _read_attempt_front_frame(
+    receipt: AttemptReceipt, *, timeout: float, lease_token: str | None = None
+):
+    """Read one V2 acquisition frame through the production front-camera lane."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     owner_acquired = False
     io_acquired = False
-    lease_token = f"fast:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}"
+    managed_lease = lease_token is None
+    lease_token = lease_token or f"try-on:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}"
     try:
         await _acquire_front_io_until(deadline)
         io_acquired = True
         if not await _fast_attempt_registry.is_current(receipt):
             raise GarmentFetchError("attempt_canceled")
-        owner = acquire_front_camera(
-            "fast_try_on",
-            reason=f"fast_attempt:{receipt.attempt_id}",
-            lease_token=lease_token,
-        )
-        if not owner.get("ok"):
-            raise GarmentFetchError(owner.get("error") or "front_camera_busy")
-        owner_acquired = True
+        if managed_lease:
+            owner = acquire_front_camera(
+                "try_on_attempt",
+                reason=f"try_on_acquisition:{receipt.attempt_id}",
+                lease_token=lease_token,
+            )
+            if not owner.get("ok"):
+                raise GarmentFetchError(owner.get("error") or "front_camera_busy")
+            owner_acquired = True
 
         if getattr(read_camera_with_source, "__module__", "") != "vision.camera_manager":
             return read_camera_with_source("front", 1)
@@ -246,7 +259,7 @@ async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
                 return read_task.result()
 
             abort_reason = (
-                "fast_attempt_canceled" if cancel_waiter in done else "fast_attempt_timeout"
+                "try_on_attempt_canceled" if cancel_waiter in done else "try_on_attempt_timeout"
             )
             abort_task = asyncio.create_task(
                 abort_camera_request("front", reason=abort_reason)
@@ -261,7 +274,7 @@ async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
             raise asyncio.TimeoutError()
         except asyncio.CancelledError:
             abort_task = asyncio.create_task(
-                abort_camera_request("front", reason="fast_attempt_cancelled")
+                abort_camera_request("front", reason="try_on_attempt_cancelled")
             )
             read_task.cancel()
             dead = await asyncio.shield(abort_task)
@@ -277,8 +290,8 @@ async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
             release_front_camera_io_lock()
         if owner_acquired:
             release_front_camera(
-                "fast_try_on",
-                reason=f"fast_attempt_done:{receipt.attempt_id}",
+                "try_on_attempt",
+                reason=f"try_on_acquisition_done:{receipt.attempt_id}",
                 lease_token=lease_token,
             )
 
@@ -340,6 +353,101 @@ def _fast_result_reference(attempt_id: str, token: str) -> str:
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     return f"http://{host}:{settings.PORT}/v2/try-on/results/{attempt_id}?token={token}"
+
+
+def _acquisition_preview_reference(token: str) -> str:
+    host = str(settings.HOST)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{settings.PORT}/v2/try-on/acquisition/preview.mjpeg?token={token}"
+
+
+def _encode_preview_jpeg(frame) -> bytes:
+    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not ok:
+        raise RuntimeError("acquisition_preview_encode_failed")
+    return encoded.tobytes()
+
+
+def _front_pose_is_aligned(frame) -> bool:
+    """Require a centered, upright torso from the production pose boundary."""
+    global _acquisition_pose_estimator
+    if _acquisition_pose_estimator is None:
+        _acquisition_pose_estimator = PoseEstimator()
+    result = _acquisition_pose_estimator.detect(frame)
+    landmarks = getattr(getattr(result, "pose_landmarks", None), "landmark", None)
+    if landmarks is None:
+        return False
+    try:
+        left_shoulder, right_shoulder = landmarks[11], landmarks[12]
+        left_hip, right_hip = landmarks[23], landmarks[24]
+    except (IndexError, TypeError):
+        return False
+    points = (left_shoulder, right_shoulder, left_hip, right_hip)
+    if any(float(point.visibility) < 0.55 for point in points):
+        return False
+    shoulder_x = (float(left_shoulder.x) + float(right_shoulder.x)) / 2
+    shoulder_y = (float(left_shoulder.y) + float(right_shoulder.y)) / 2
+    hip_x = (float(left_hip.x) + float(right_hip.x)) / 2
+    hip_y = (float(left_hip.y) + float(right_hip.y)) / 2
+    shoulder_span = abs(float(left_shoulder.x) - float(right_shoulder.x))
+    torso_height = hip_y - shoulder_y
+    return (
+        0.30 <= shoulder_x <= 0.70
+        and 0.30 <= hip_x <= 0.70
+        and 0.10 <= shoulder_y <= 0.68
+        and 0.35 <= hip_y <= 0.95
+        and 0.14 <= shoulder_span <= 0.75
+        and 0.18 <= torso_height <= 0.62
+    )
+
+
+def _front_observation(frame) -> tuple[str, bool]:
+    """YOLO proves occupancy; production pose proves an eligible alignment."""
+    global _acquisition_person_detector
+    if _acquisition_person_detector is None:
+        _acquisition_person_detector = PersonDetector()
+    detector = _acquisition_person_detector
+    status = detector.status()
+    if not status.get("ready"):
+        return "none", False
+    detections = detector.detect(frame)
+    if len(detections) == 0:
+        return "none", False
+    if len(detections) > 1:
+        return "multiple", False
+    x, y, width, height = detections[0]["box"]
+    frame_height, frame_width = frame.shape[:2]
+    center_x = (x + width / 2) / max(frame_width, 1)
+    center_y = (y + height / 2) / max(frame_height, 1)
+    area = (width * height) / max(frame_width * frame_height, 1)
+    aligned = (
+        0.25 <= center_x <= 0.75
+        and 0.10 <= center_y <= 0.82
+        and area >= 0.08
+        and _front_pose_is_aligned(frame)
+    )
+    return "single", aligned
+
+
+def _acquiring_message(attempt_id: str, token: str, occupancy: str, aligned: bool, stable: bool) -> dict:
+    if occupancy == "none":
+        guidance, manual = "no_person", False
+    elif occupancy == "multiple":
+        guidance, manual = "multiple_people", False
+    elif not aligned:
+        guidance, manual = "align", False
+    elif stable:
+        guidance, manual = "ready", False
+    else:
+        guidance, manual = "hold_still", True
+    return _generated_v2_envelope("vision.try_on.attempt.acquiring", {
+        "attemptId": attempt_id,
+        "preview": {"reference": _acquisition_preview_reference(token), "streamType": "mjpeg"},
+        "occupancy": occupancy,
+        "guidance": guidance,
+        "manualCaptureAllowed": manual,
+    })
 
 
 def _prepare_fast_result(attempt_id: str, image: bytes) -> tuple[dict, dict]:
@@ -404,6 +512,33 @@ async def read_fast_result(request: Request, attempt_id: str, token: Optional[st
         media_type="image/png",
         headers={"Content-Length": str(len(image)), "Cache-Control": "no-store"},
     )
+
+
+@app.api_route("/v2/try-on/acquisition/preview.mjpeg", methods=["GET", "HEAD"])
+async def read_acquisition_preview(request: Request, token: Optional[str] = None):
+    """Display-only attempt preview; input frames never originate from HTTP bytes."""
+    raw_query = request.scope.get("query_string", b"")
+    if not isinstance(raw_query, bytes) or not re.fullmatch(rb"token=[A-Za-z0-9_-]{1,128}", raw_query):
+        raise HTTPException(status_code=404, detail="preview not found")
+    canonical_token = raw_query[6:].decode("ascii")
+    snapshot = await _acquisition_previews.get(canonical_token)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="preview not found")
+    media_type = "multipart/x-mixed-replace; boundary=frame"
+    if request.method == "HEAD":
+        return Response(content=b"", media_type=media_type, headers={"Cache-Control": "no-store"})
+
+    async def frames():
+        current = snapshot
+        while current is not None:
+            yield (
+                b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                + str(len(current.jpeg)).encode("ascii")
+                + b"\r\n\r\n" + current.jpeg + b"\r\n"
+            )
+            current = await _acquisition_previews.wait_for_change(canonical_token, current.jpeg)
+
+    return StreamingResponse(frames(), media_type=media_type, headers={"Cache-Control": "no-store"})
 
 
 def get_runtime_status():
@@ -1106,6 +1241,39 @@ async def broadcast_profile_update(update: dict):
         await unregister_profile_client(websocket)
 
 
+async def _cancel_active_attempt(reason: str) -> None:
+    """Top-camera departure fences the current try-on without stopping top work."""
+    attempt_id = await _fast_attempt_registry.active_attempt_id()
+    if attempt_id is None:
+        return
+    await _publish_fast_transition(await _cancel_v2_attempt(
+        attempt_id=attempt_id,
+        terminal=_generated_v2_envelope(
+            "vision.try_on.attempt.canceled",
+            {"attemptId": attempt_id, "reason": reason},
+        ),
+    ))
+
+
+async def _cancel_v2_attempt(*, attempt_id: str, terminal: dict) -> TerminalTransition | None:
+    """Make cancellation immediately relinquish acquisition-only capabilities."""
+    transition = await _fast_attempt_registry.cancel_current(
+        attempt_id=attempt_id, terminal=terminal
+    )
+    if transition is None:
+        return None
+    await _acquisition_previews.close(attempt_id)
+    owner = get_front_camera_owner()
+    token = owner.get("leaseToken")
+    if owner.get("owner") == "try_on_attempt" and isinstance(token, str) and token.startswith(
+        f"try-on:{attempt_id}:"
+    ):
+        release_front_camera(
+            "try_on_attempt", reason=f"try_on_canceled:{attempt_id}", lease_token=token
+        )
+    return transition
+
+
 async def broadcast_profile_error(code: str, message: str, retryable: bool = True):
     clients = await profile_client_snapshot()
     stale_clients = []
@@ -1188,6 +1356,8 @@ async def presence_broadcast_loop():
                     "person_departed" in capabilities,
                 )
                 if mock_update is not None:
+                    if mock_update.get("message_type") == "vision.person_departed":
+                        await _cancel_active_attempt("departure")
                     await broadcast_profile_update(mock_update)
                 await asyncio.sleep(settings.PROFILE_PUSH_INTERVAL_MS / 1000.0)
                 continue
@@ -1213,6 +1383,8 @@ async def presence_broadcast_loop():
                     "presence_worker_update_total",
                     message_type=result.update["message_type"],
                 )
+                if result.update["message_type"] == "vision.person_departed":
+                    await _cancel_active_attempt("departure")
                 await broadcast_profile_update(result.update)
 
             if (
@@ -1278,6 +1450,15 @@ async def send_error(
     )
 
 
+async def _release_acquisition_resources(receipt: AttemptReceipt, lease_token: str) -> None:
+    await _acquisition_previews.close(receipt.attempt_id)
+    release_front_camera(
+        "try_on_attempt",
+        reason=f"try_on_acquisition_done:{receipt.attempt_id}",
+        lease_token=lease_token,
+    )
+
+
 async def run_v2_fast_attempt(
     websocket: WebSocket,
     send_lock: asyncio.Lock,
@@ -1325,13 +1506,6 @@ async def run_v2_fast_attempt(
         if fast_ready
         else None
     )
-    generating = (
-        _generated_v2_envelope(
-            "vision.try_on.attempt.generating", {"attemptId": attempt_id, "stage": "preparing"}
-        )
-        if fast_ready
-        else None
-    )
     preparation = await _fast_attempt_registry.prepare_admission(
         attempt_id=attempt_id,
         websocket=websocket,
@@ -1345,7 +1519,7 @@ async def run_v2_fast_attempt(
     admission = await _fast_attempt_registry.commit_prepared_admission(
         preparation,
         accepted=accepted,
-        generating=generating,
+        generating=None,
         unavailable_terminal=unavailable_terminal,
         readiness=lambda: bool(
             fast_ready
@@ -1365,25 +1539,75 @@ async def run_v2_fast_attempt(
         )
         return
     stored_result = None
+    lease_token = f"try-on:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}"
+    lease_acquired = False
     try:
         for replay_message in admission.replay:
             await _send_json_bounded(websocket, send_lock, replay_message)
+        await _acquire_front_io_until(asyncio.get_running_loop().time() + _FAST_ATTEMPT_TIMEOUT_SECONDS)
+        try:
+            owner = acquire_front_camera(
+                "try_on_attempt", reason=f"try_on_acquisition:{attempt_id}", lease_token=lease_token
+            )
+        finally:
+            release_front_camera_io_lock()
+        if not owner.get("ok"):
+            raise GarmentFetchError(owner.get("error") or "front_camera_busy")
+        lease_acquired = True
+
+        stable_frames = 0
+        last_guidance = None
+        captured_frame = None
+        source_frame = None
+        deadline = asyncio.get_running_loop().time() + _FAST_ATTEMPT_TIMEOUT_SECONDS
+        preview_token = None
+        while asyncio.get_running_loop().time() < deadline:
+            remaining = max(0.001, deadline - asyncio.get_running_loop().time())
+            frame, source = await _read_attempt_front_frame(
+                receipt, timeout=remaining, lease_token=lease_token
+            )
+            jpeg = _encode_preview_jpeg(frame)
+            if preview_token is None:
+                preview_token = await _acquisition_previews.open(attempt_id, jpeg)
+            else:
+                await _acquisition_previews.update(attempt_id, preview_token, jpeg)
+            occupancy, aligned = _front_observation(frame)
+            stable_frames = stable_frames + 1 if occupancy == "single" and aligned else 0
+            stable = stable_frames >= _ACQUISITION_STABLE_FRAMES
+            acquiring = _acquiring_message(attempt_id, preview_token, occupancy, aligned, stable)
+            if acquiring["payload"]["guidance"] != last_guidance:
+                await _publish_fast_transition(
+                    await _fast_attempt_registry.publish_nonterminal(receipt, acquiring)
+                )
+                last_guidance = acquiring["payload"]["guidance"]
+            manual = await _fast_attempt_registry.take_manual_capture_request(receipt)
+            if occupancy == "single" and aligned and (stable or manual):
+                # The source frame remains Vision memory, never the MJPEG representation.
+                captured_frame, source_frame = frame.copy(), source
+                break
+            await asyncio.sleep(_ACQUISITION_POLL_SECONDS)
+        if captured_frame is None:
+            raise asyncio.TimeoutError()
+
+        # Capture transitions are ordered: capability close + lease release,
+        # then public generating.  Profile ownership can resume before render.
+        await _release_acquisition_resources(receipt, lease_token)
+        lease_acquired = False
+        generating = _generated_v2_envelope(
+            "vision.try_on.attempt.generating", {"attemptId": attempt_id, "stage": "preparing"}
+        )
+        await _publish_fast_transition(
+            await _fast_attempt_registry.publish_nonterminal(receipt, generating)
+        )
         garment_source = await asyncio.wait_for(
             _fast_runtime.fetch_garment(
                 payload["garment"], await _fast_attempt_registry.cancel_event_for(receipt)
-            ),
-            timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
-        )
-        if not await _fast_attempt_registry.is_current(receipt):
-            raise GarmentFetchError("attempt_canceled")
-        frame, source_frame = await _read_fast_front_frame(
-            receipt,
-            timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
+            ), timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
         )
         result_image = await _run_owned_attempt_step(
             receipt,
             render_attempt_frame(
-                frame,
+                captured_frame,
                 garment_source.png_bytes,
                 digest=garment_source.digest,
                 template=garment_source.template,
@@ -1421,8 +1645,7 @@ async def run_v2_fast_attempt(
         )
     except asyncio.TimeoutError:
         terminal = _generated_v2_envelope(
-            "vision.try_on.attempt.failed",
-            {"attemptId": attempt_id, "reason": "fast_failed"},
+            "vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "timeout"}
         )
     except Exception:
         logger.exception("Fast attempt failed attemptId=%s", attempt_id)
@@ -1434,6 +1657,9 @@ async def run_v2_fast_attempt(
         terminal = _generated_v2_envelope(
             "vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "replaced"}
         )
+    finally:
+        if lease_acquired:
+            await _release_acquisition_resources(receipt, lease_token)
     # Preparation is deliberately private until the completed contract is
     # encoded and validated.  Any failure above commits the one failed
     # terminal without passing staged token, reference, or bytes across the
@@ -1653,6 +1879,11 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                         )
                     continue
 
+            is_v2_attempt_message = message_type in {
+                "vision.try_on.attempt.start",
+                "vision.try_on.attempt.capture",
+                "vision.try_on.attempt.cancel",
+            }
             is_v2_fast_attempt = (
                 message_type == "vision.try_on.attempt.start"
                 and isinstance(payload, dict)
@@ -1660,7 +1891,7 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
             )
             payload_error = (
                 None
-                if is_v2_fast_attempt
+                if is_v2_attempt_message
                 else validate_message_payload(message_type, payload)
             )
 
@@ -1707,6 +1938,21 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 task.add_done_callback(_discard_completed_fast_attempt)
                 continue
 
+            if message_type == "vision.try_on.attempt.capture":
+                # Intent is deliberately non-terminal and accepts no frame bytes.
+                await _fast_attempt_registry.request_manual_capture(payload["attemptId"])
+                continue
+
+            if message_type == "vision.try_on.attempt.cancel":
+                terminal = _generated_v2_envelope(
+                    "vision.try_on.attempt.canceled",
+                    {"attemptId": payload["attemptId"], "reason": payload["reason"]},
+                )
+                await _publish_fast_transition(await _cancel_v2_attempt(
+                    attempt_id=payload["attemptId"], terminal=terminal
+                ))
+                continue
+
             if message_type == "vision.ping":
                 await _send_json_bounded(
                     websocket,
@@ -1750,7 +1996,13 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
         await _fast_attempt_registry.detach_subscriber(websocket)
         for receipt in list(owned_fast_attempt_receipts):
             await _publish_fast_transition(
-                await _fast_attempt_registry.cancel_owner_and_join(receipt)
+                await _fast_attempt_registry.cancel_owner_and_join(
+                    receipt,
+                    _generated_v2_envelope(
+                        "vision.try_on.attempt.canceled",
+                        {"attemptId": receipt.attempt_id, "reason": "disconnect"},
+                    ),
+                )
             )
         if fast_attempt_tasks:
             await asyncio.gather(*list(fast_attempt_tasks), return_exceptions=True)

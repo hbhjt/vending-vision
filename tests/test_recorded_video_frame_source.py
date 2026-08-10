@@ -87,7 +87,9 @@ def test_recorded_video_fixture_manifest_binds_top_and_front_recordings():
     manifest = fixture_manifest()
 
     assert manifest["schemaVersion"] == "vending-vision-recorded-video-fixture/v1"
-    assert set(manifest["recordings"]) == {"top", "front"}
+    assert set(manifest["recordings"]) == {
+        "top", "front", "manFront", "manUnalignedFront", "emptyFront"
+    }
     for role, recording in manifest["recordings"].items():
         video = FIXTURE_ROOT / recording["file"]
         assert video.is_file(), role
@@ -98,6 +100,23 @@ def test_recorded_video_fixture_manifest_binds_top_and_front_recordings():
         "vision.person_departed",
     ]
     assert manifest["expected"]["front"]["profile"]["minimumFields"]
+
+
+def test_recorded_video_man_front_fixture_is_traceable_and_decodes():
+    """The acquisition fixture is reproducible from the declared fictional input."""
+    recording = fixture_manifest()["recordings"]["manFront"]
+    video = FIXTURE_ROOT / recording["file"]
+    generator = FIXTURE_ROOT / recording["generator"]
+    assert video.is_file()
+    assert generator.is_file()
+    assert recording["sourceSha256"] == hashlib.sha256(
+        (FIXTURE_ROOT / recording["source"]).read_bytes()
+    ).hexdigest()
+    assert recording["sha256"] == hashlib.sha256(video.read_bytes()).hexdigest()
+    capture = cv2.VideoCapture(str(video))
+    ok, frame = capture.read()
+    capture.release()
+    assert ok and frame.shape == (768, 512, 3)
 
 
 def test_recorded_video_source_decodes_fixture_frames_in_order():

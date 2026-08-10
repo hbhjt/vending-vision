@@ -7,7 +7,7 @@
 优先级（从低到高）：
 - idle (0): 无人使用
 - vision (1): 视觉画像采集
-- fast_try_on (2): Fast Virtual Try-On attempt（最高优先级）
+- try_on_attempt (2): V2 Virtual Try-On acquisition（最高优先级）
 
 特性：
 - 支持超时自动过期，防止死锁
@@ -26,12 +26,12 @@ from vision.config import settings
 
 
 # 合法的前置摄像头使用者
-ALLOWED_FRONT_CAMERA_OWNERS = {"vision", "fast_try_on"}
+ALLOWED_FRONT_CAMERA_OWNERS = {"vision", "try_on_attempt"}
 # 使用者优先级映射
 FRONT_CAMERA_PRIORITY = {
     "idle": 0,
     "vision": 1,
-    "fast_try_on": 2,
+    "try_on_attempt": 2,
 }
 
 

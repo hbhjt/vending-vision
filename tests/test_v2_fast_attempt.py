@@ -186,7 +186,7 @@ def _configure_recorded_front(monkeypatch):
         {
             "role": "profile_fast_try_on",
             "source": "recorded_video",
-            "video_path": str(fixture_root / "front.mp4"),
+            "video_path": str(fixture_root / "man-front.mp4"),
             "loop": True,
             "rotate": 0,
         },
@@ -236,6 +236,15 @@ def _envelope(message_type, payload):
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "payload": payload,
     }
+
+
+def _await_generating(socket):
+    """Preserve Fast terminal assertions while crossing the V2 acquisition stage."""
+    while True:
+        message = socket.receive_json()
+        if message["type"] == "vision.try_on.attempt.generating":
+            return message
+        assert message["type"] == "vision.try_on.attempt.acquiring"
 
 
 def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
@@ -288,7 +297,7 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(start)
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             completed = socket.receive_json()
         assert vision_app._fast_render_broker.pid == render_pid
 
@@ -318,7 +327,10 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
     )
     assert result_image is not None
     assert result_image.shape == (720, 1280, 3)
-    assert recorded_dimensions == [(360, 640, 3)]
+    # Acquisition consumes three stable production source frames before the
+    # fixed captured frame enters rendering; the preview never supplies it.
+    assert len(recorded_dimensions) >= 3
+    assert set(recorded_dimensions) == {(768, 512, 3)}
     assert camera_manager.get_frame_source("front").status()["source"] == "recorded_video"
 
 
@@ -364,7 +376,7 @@ def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(attempt_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             failed = socket.receive_json()
 
         assert failed["type"] == "vision.try_on.attempt.failed"
@@ -395,7 +407,7 @@ def test_v2_fast_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(attempt_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             assert _GarmentHandler.entered.wait(timeout=2)
             socket.send_json(_envelope("vision.ping", {}))
             assert socket.receive_json()["type"] == "vision.pong"
@@ -429,7 +441,7 @@ def test_v2_fast_pose_failures_are_stable_terminals_without_worker_recovery(
             for _ in range(3):
                 socket.send_json(_start(str(uuid4()), garment_reference))
                 assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-                assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+                _await_generating(socket)
                 failed = socket.receive_json()
                 assert failed["type"] == "vision.try_on.attempt.failed"
                 assert failed["payload"]["reason"] == "fast_failed"
@@ -438,7 +450,7 @@ def test_v2_fast_pose_failures_are_stable_terminals_without_worker_recovery(
             attempt_id = str(uuid4())
             socket.send_json(_start(attempt_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             completed = socket.receive_json()
             assert completed["type"] == "vision.try_on.attempt.completed"
             assert completed["payload"]["attemptId"] == attempt_id
@@ -466,7 +478,7 @@ def test_v2_fast_attempt_replays_same_owner_active_attempt_without_new_terminal(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(start)
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             assert _GarmentHandler.entered.wait(timeout=2)
 
             socket.send_json(start)
@@ -506,7 +518,7 @@ def test_v2_fast_attempt_second_socket_joins_and_both_receive_one_terminal(
 
             owner.send_json(start)
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert owner.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(owner)
             assert _GarmentHandler.entered.wait(timeout=2)
 
             subscriber.send_json(start)
@@ -544,7 +556,7 @@ def test_v2_fast_attempt_second_socket_joins_without_cancelling_owner(
             assert retry.receive_json()["type"] == "vision.ready"
             owner.send_json(start)
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert owner.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(owner)
             assert _GarmentHandler.entered.wait(timeout=2)
 
             retry.send_json(start)
@@ -578,7 +590,7 @@ def test_v2_fast_attempt_terminal_reconnect_replays_the_identical_grant(
             assert owner.receive_json()["type"] == "vision.ready"
             owner.send_json(start)
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert owner.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(owner)
             terminal = owner.receive_json()
 
         with client.websocket_connect("/ws") as reconnect:
@@ -641,7 +653,7 @@ def test_v2_fast_attempt_replacement_joins_old_worker_before_new_admission(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(first_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             assert _GarmentHandler.entered.wait(timeout=2)
 
             socket.send_json(_start(second_id, garment_reference))
@@ -650,7 +662,7 @@ def test_v2_fast_attempt_replacement_joins_old_worker_before_new_admission(
             assert replaced["payload"] == {"attemptId": first_id, "reason": "replaced"}
 
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             _GarmentHandler.release.set()
             completed = socket.receive_json()
 
@@ -691,7 +703,7 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(first_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             deadline = threading.Event()
             for _ in range(200):
                 if counter.value == 1:
@@ -706,7 +718,7 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
                 "reason": "replaced",
             }
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             replacement_pid = broker.pid
             assert broker.ready
             assert replacement_pid is not None and replacement_pid != first_pid
@@ -721,7 +733,7 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
 
             socket.send_json(_start(third_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             completed = socket.receive_json()
 
         assert completed["type"] == "vision.try_on.attempt.completed"
@@ -776,7 +788,7 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
             assert socket.receive_json()["payload"]["fastReady"] is True
             socket.send_json(_start(first_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             waiter = threading.Event()
             for _ in range(200):
                 if requests.value == 1:
@@ -885,7 +897,7 @@ def test_v2_duplicate_waits_for_atomic_failed_replacement_admission(
             assert duplicate.receive_json()["payload"]["fastReady"] is True
             owner.send_json(_start(first_id, garment_reference))
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert owner.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(owner)
             waiter = threading.Event()
             for _ in range(200):
                 if requests.value == 1:
@@ -1002,7 +1014,7 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
             assert duplicate.receive_json()["payload"]["fastReady"] is True
             owner.send_json(_start(first_id, garment_reference))
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert owner.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(owner)
             waiter = threading.Event()
             for _ in range(200):
                 if requests.value == 1:
@@ -1011,7 +1023,7 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
             assert requests.value == 1
 
             def receive_owner():
-                for _ in range(4):
+                for _ in range(6):
                     owner_messages.append(owner.receive_json())
                     if len(owner_messages) == 1:
                         replaced_seen.set()
@@ -1025,7 +1037,7 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
             duplicate.send_json(_start(replacement_id, garment_reference))
 
             def receive_duplicate():
-                for _ in range(3):
+                for _ in range(5):
                     duplicate_messages.append(duplicate.receive_json())
                     duplicate_message_seen.set()
                 duplicate_done.set()
@@ -1046,11 +1058,14 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
             "attemptId": first_id,
             "reason": "replaced",
         }
-        assert [message["type"] for message in owner_messages[1:]] == [
-            "vision.try_on.attempt.accepted",
-            "vision.try_on.attempt.generating",
-            "vision.try_on.attempt.completed",
-        ]
+        replacement_trace = [message["type"] for message in owner_messages[1:]]
+        assert replacement_trace[0] == "vision.try_on.attempt.accepted"
+        assert replacement_trace[-1] == "vision.try_on.attempt.completed"
+        assert replacement_trace.count("vision.try_on.attempt.generating") == 1
+        assert all(
+            message_type == "vision.try_on.attempt.acquiring"
+            for message_type in replacement_trace[1:-2]
+        )
         assert duplicate_messages == owner_messages[1:]
         replacement_pid = broker.pid
         assert replacement_pid is not None and replacement_pid != first_pid
@@ -1097,7 +1112,7 @@ def test_v2_disconnect_restarts_render_and_new_connection_completes(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(str(uuid4()), garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             waiter = threading.Event()
             for _ in range(200):
                 if counter.value == 1:
@@ -1123,7 +1138,7 @@ def test_v2_disconnect_restarts_render_and_new_connection_completes(
             assert ready["payload"]["fastReady"] is True
             retry.send_json(_start(retry_id, garment_reference))
             assert retry.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert retry.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(retry)
             completed = retry.receive_json()
 
         assert completed["type"] == "vision.try_on.attempt.completed"
@@ -1152,7 +1167,9 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
         },
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
-    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 0.1)
+    # Keep real three-frame acquisition intact; the bounded timeout now
+    # expires in the deliberately blocked render worker.
+    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 1.0)
     _configure_recorded_front(monkeypatch)
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
@@ -1172,13 +1189,13 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
             assert first.receive_json()["payload"]["fastReady"] is True
             first.send_json(_start(timed_out_id, garment_reference))
             assert first.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert first.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(first)
             failed = first.receive_json()
 
-        assert failed["type"] == "vision.try_on.attempt.failed"
+        assert failed["type"] == "vision.try_on.attempt.canceled"
         assert failed["payload"] == {
             "attemptId": timed_out_id,
-            "reason": "fast_failed",
+            "reason": "timeout",
         }
         replacement_pid = broker.pid
         assert broker.ready
@@ -1194,7 +1211,7 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
             assert ready["payload"]["fastReady"] is True
             retry.send_json(_start(retry_id, garment_reference))
             assert retry.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert retry.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(retry)
             completed = retry.receive_json()
 
         assert completed["type"] == "vision.try_on.attempt.completed"
@@ -1206,7 +1223,7 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
 
 
 def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garment_reference):
-    """Fast must not spawn a child that opens the front camera device."""
+    """Acquisition must not spawn a child that opens the front camera device."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
@@ -1214,9 +1231,13 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
     read_pids = []
 
     def read_front(role, warmup_frames=None):
-        assert vision_app.get_front_camera_owner()["owner"] == "fast_try_on"
+        assert vision_app.get_front_camera_owner()["owner"] == "try_on_attempt"
         read_pids.append((os.getpid(), role, warmup_frames))
-        return np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8), {"source": "dshow"}
+        frame = cv2.imread(
+            str(Path(__file__).parents[1] / "fixtures/recorded-video/sources/person-man-front.png")
+        )
+        assert frame is not None
+        return cv2.resize(frame, (512, 768)), {"source": "dshow"}
 
     async def render(frame, garment_png, *, digest, template, timeout, broker):
         assert os.getpid() == parent_pid
@@ -1236,20 +1257,20 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(attempt_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.generating"
+            _await_generating(socket)
             completed = socket.receive_json()
 
     assert completed["type"] == "vision.try_on.attempt.completed"
-    assert read_pids == [(parent_pid, "front", 1)]
+    assert read_pids == [(parent_pid, "front", 1)] * vision_app._ACQUISITION_STABLE_FRAMES
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
-def test_v2_fast_attempt_respects_fast_owner_lease(monkeypatch):
-    """Fast cannot replace an existing generation lease."""
+def test_v2_fast_attempt_respects_attempt_owner_lease(monkeypatch):
+    """Acquisition cannot replace an existing attempt camera lease."""
     owner = vision_app.acquire_front_camera(
-        "fast_try_on",
-        reason="fast_attempt:existing",
-        lease_token="fast:existing",
+        "try_on_attempt",
+        reason="try_on_acquisition:existing",
+        lease_token="try-on:existing",
     )
     assert owner["ok"]
 
@@ -1265,15 +1286,15 @@ def test_v2_fast_attempt_respects_fast_owner_lease(monkeypatch):
 
     try:
         with pytest.raises(vision_app.GarmentFetchError, match="front_camera_busy"):
-            asyncio.run(vision_app._read_fast_front_frame(receipt, timeout=0.1))
+            asyncio.run(vision_app._read_attempt_front_frame(receipt, timeout=0.1))
 
-        assert vision_app.get_front_camera_owner()["owner"] == "fast_try_on"
-        assert vision_app.get_front_camera_owner()["leaseToken"] == "fast:existing"
+        assert vision_app.get_front_camera_owner()["owner"] == "try_on_attempt"
+        assert vision_app.get_front_camera_owner()["leaseToken"] == "try-on:existing"
     finally:
         vision_app.release_front_camera(
-            "fast_try_on",
+            "try_on_attempt",
             reason="test_cleanup",
-            lease_token="fast:existing",
+            lease_token="try-on:existing",
         )
 
 
@@ -1339,12 +1360,12 @@ def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeyp
     )
 
     try:
-        frame, source = asyncio.run(vision_app._read_fast_front_frame(receipt, timeout=1.0))
+        frame, source = asyncio.run(vision_app._read_attempt_front_frame(receipt, timeout=1.0))
     finally:
         vision_app.release_front_camera(
-            "fast_try_on",
+            "try_on_attempt",
             reason="test_cleanup",
-            lease_token=f"fast:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}",
+            lease_token=f"try-on:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}",
         )
         camera_manager.release_all_cameras()
 
@@ -1408,7 +1429,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
         registry.cancel_event = asyncio.Event()
         first = vision_app.AttemptReceipt(str(uuid4()), "owner-1", 1)
         read_task = asyncio.create_task(
-            vision_app._read_fast_front_frame(first, timeout=15.0)
+            vision_app._read_attempt_front_frame(first, timeout=15.0)
         )
         deadline = asyncio.get_running_loop().time() + 1.0
         while counter.value < 1 and asyncio.get_running_loop().time() < deadline:
@@ -1427,7 +1448,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
 
         registry.cancel_event = asyncio.Event()
         second = vision_app.AttemptReceipt(str(uuid4()), "owner-2", 2)
-        frame, source = await vision_app._read_fast_front_frame(second, timeout=1.0)
+        frame, source = await vision_app._read_attempt_front_frame(second, timeout=1.0)
         assert frame.shape == (80, 60, 3)
         assert source["brokerPid"] is not None
 

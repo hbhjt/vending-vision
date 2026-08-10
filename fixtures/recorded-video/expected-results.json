@@ -10,6 +10,28 @@
       "file": "front.mp4",
       "sha256": "6616fefc897f99c20f14b31f118459ad9e251dce71b33e262dc327dc34b74d17",
       "loop": true
+    },
+    "manFront": {
+      "file": "man-front.mp4",
+      "sha256": "f096c0c22049087bd771ef5483cbbdb63adc7a6bcb3a6ceb837486fb98634ff5",
+      "loop": true,
+      "source": "sources/person-man-front.png",
+      "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
+      "generator": "generate-man-front.py"
+    },
+    "manUnalignedFront": {
+      "file": "man-unaligned-front.mp4",
+      "sha256": "aa0be84735b96bee0a80436e01fe1ed62390c04a81e7c2920823b8414f9b1db6",
+      "loop": true,
+      "source": "sources/person-man-front.png",
+      "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
+      "generator": "generate-man-front.py"
+    },
+    "emptyFront": {
+      "file": "empty-front.mp4",
+      "sha256": "7efebb8ca8049af095c2544f81c60e3fa17bb675e9b2a281a45c16bd355c04a5",
+      "loop": true,
+      "generator": "generate-man-front.py"
     }
   },
   "expected": {

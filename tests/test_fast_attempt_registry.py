@@ -90,6 +90,39 @@ def test_completed_wins_over_later_cancel_with_one_canonical_terminal():
     asyncio.run(scenario())
 
 
+def test_explicit_cancel_publishes_before_blocked_owner_cleanup_finishes():
+    """A WebSocket cancel must not wait for a blocked renderer to receive ping."""
+    async def scenario():
+        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        attempt_id = str(uuid4())
+        release_owner = asyncio.Event()
+
+        async def owner():
+            await release_owner.wait()
+
+        owner_task = asyncio.create_task(owner())
+        admission = await registry.admit(
+            attempt_id=attempt_id,
+            websocket=object(), send_lock=asyncio.Lock(), task=owner_task,
+            accepted=_message("vision.try_on.attempt.accepted", attempt_id, "accepted"),
+            generating=_message("vision.try_on.attempt.acquiring", attempt_id, "acquiring"),
+        )
+        canceled = _message("vision.try_on.attempt.canceled", attempt_id, "canceled")
+        transition = await asyncio.wait_for(
+            registry.cancel_current(attempt_id=attempt_id, terminal=canceled), timeout=0.05
+        )
+        assert transition is not None and transition.message == canceled
+        replacement = asyncio.create_task(registry.prepare_admission(
+            attempt_id=str(uuid4()), websocket=object(), send_lock=asyncio.Lock(),
+            task=asyncio.current_task(),
+        ))
+        release_owner.set()
+        await asyncio.gather(owner_task, return_exceptions=True)
+        assert (await asyncio.wait_for(replacement, timeout=1)).is_pending_owner
+
+    asyncio.run(scenario())
+
+
 def test_waiting_replacement_rechecks_after_same_id_backpressure_terminal():
     """A waiting replacement must not overwrite a same-ID terminal won meanwhile."""
     async def scenario():
