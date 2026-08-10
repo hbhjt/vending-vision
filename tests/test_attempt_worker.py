@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from vision.attempt_worker import AttemptWorkerError, FastRenderBroker, render_attempt_frame
-from vision.render_worker_target import render_worker_entry
+from vision.render_worker_target import _render, render_worker_entry
 
 
 _TEST_POSE_FIXTURE = {
@@ -62,14 +62,7 @@ def _test_fixture_render_worker_target(connection, test_pose_fixture):
                         buffer=shm.buf,
                     ).copy()
                 finally:
-                    name = shm._name
                     shm.close()
-                    try:
-                        from multiprocessing import resource_tracker
-
-                        resource_tracker.unregister(name, "shared_memory")
-                    except Exception:
-                        pass
                 garment = payload["garmentPng"]
                 digest = "sha256:" + hashlib.sha256(garment).hexdigest()
                 source = ValidatedGarmentSource(
@@ -300,6 +293,55 @@ def test_prestarted_render_broker_completes_one_real_encoded_job():
     assert not np.array_equal(decoded, frame)
 
 
+def test_production_render_request_does_not_call_parent_connection_send(monkeypatch):
+    """Fast render request metadata must not depend on parent-side Pipe send."""
+    from multiprocessing.connection import Connection
+
+    garment = np.zeros((256, 192, 4), dtype=np.uint8)
+    garment[8:248, 12:180] = (20, 120, 220, 220)
+    ok, encoded_garment = cv2.imencode(".png", garment)
+    assert ok
+    garment_png = encoded_garment.tobytes()
+    frame = np.full((96, 72, 3), (235, 220, 205), dtype=np.uint8)
+
+    async def scenario():
+        broker = FastRenderBroker(
+            target=_test_fixture_render_worker_target,
+            target_args=(_TEST_POSE_FIXTURE,),
+        )
+        await broker.start()
+        original_send = Connection.send
+        parent_send_called = threading.Event()
+
+        def blocked_parent_send(self, _payload):
+            parent_send_called.set()
+            raise AssertionError("parent request channel must not use Connection.send")
+
+        monkeypatch.setattr(Connection, "send", blocked_parent_send)
+        try:
+            result = await asyncio.wait_for(
+                render_attempt_frame(
+                    frame,
+                    garment_png,
+                    digest="sha256:" + hashlib.sha256(garment_png).hexdigest(),
+                    template="tshirt_short_sleeve",
+                    timeout=5.0,
+                    broker=broker,
+                ),
+                timeout=6.0,
+            )
+        finally:
+            monkeypatch.setattr(Connection, "send", original_send)
+            await broker.shutdown()
+        return parent_send_called.is_set(), result, broker.active_request_count
+
+    parent_send_called, result, active_requests = asyncio.run(scenario())
+    decoded = cv2.imdecode(np.frombuffer(result, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert decoded is not None
+    assert not parent_send_called
+    assert active_requests == 0
+
+
 def test_oversized_frame_is_rejected_before_parent_copy():
     copied = threading.Event()
 
@@ -323,6 +365,71 @@ def test_oversized_frame_is_rejected_before_parent_copy():
         )
 
     assert not copied.is_set()
+
+
+@pytest.mark.parametrize(
+    "frame_shared",
+    [
+        {
+            "kind": "shared_frame",
+            "name": "arbitrary",
+            "shape": [8, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 8 * 8 * 3,
+            "generation": 1,
+            "processGeneration": 1,
+        },
+        {
+            "kind": "shared_frame",
+            "name": "vem_render_valid_name_but_extra_key",
+            "shape": [8, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 8 * 8 * 3,
+            "generation": 1,
+            "processGeneration": 1,
+            "extra": "rejected",
+        },
+        {
+            "kind": "shared_frame",
+            "name": "vem_render_too_tall",
+            "shape": [1440, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 1440 * 8 * 3,
+            "generation": 1,
+            "processGeneration": 1,
+        },
+        {
+            "kind": "shared_frame",
+            "name": "vem_render_bool_generation",
+            "shape": [8, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 8 * 8 * 3,
+            "generation": True,
+            "processGeneration": 1,
+        },
+    ],
+)
+def test_render_worker_rejects_strict_frame_metadata_before_arbitrary_shm_attach(
+    monkeypatch, frame_shared
+):
+    attached = threading.Event()
+
+    def forbidden_attach(*_args, **_kwargs):
+        attached.set()
+        raise AssertionError("invalid metadata must be rejected before shm attach")
+
+    monkeypatch.setattr("vision.render_worker_target.shared_memory.SharedMemory", forbidden_attach)
+
+    with pytest.raises(ValueError):
+        _render(
+            {
+                "frameShared": frame_shared,
+                "garmentPng": b"not-attached-before-digest",
+                "garmentDigest": "sha256:unused",
+                "template": "tshirt_short_sleeve",
+            }
+        )
+    assert not attached.is_set()
 
 
 def test_parent_cv2_encode_block_cannot_enter_the_prestarted_render_path(monkeypatch):
@@ -631,19 +738,6 @@ def test_pose_failures_are_typed_attempt_outcomes_and_keep_the_worker_pid():
 
 
 def test_stubborn_kill_oserror_retains_handle_and_fails_closed_without_restart():
-    class Connection:
-        def send(self, _message):
-            return None
-
-        def poll(self, _timeout):
-            return True
-
-        def recv(self):
-            return "ready", {"pid": 9292}
-
-        def close(self):
-            return None
-
     class KillDeniedProcess:
         pid = 9292
         exitcode = None
@@ -663,22 +757,10 @@ def test_stubborn_kill_oserror_retains_handle_and_fails_closed_without_restart()
         def join(self, timeout=None):
             raise OSError("join denied")
 
-    class Context:
-        def __init__(self):
-            self.processes = []
-
-        def Pipe(self, duplex=True):
-            return Connection(), Connection()
-
-        def Process(self, **_kwargs):
-            process = KillDeniedProcess()
-            self.processes.append(process)
-            return process
-
     async def scenario():
-        context = Context()
-        broker = FastRenderBroker(context=context)
-        await broker.start()
+        broker = FastRenderBroker()
+        broker._process = KillDeniedProcess()
+        broker._ready = True
         assert broker.ready
         with pytest.raises(AttemptWorkerError, match="shutdown incomplete"):
             await broker.shutdown()
@@ -686,7 +768,6 @@ def test_stubborn_kill_oserror_retains_handle_and_fails_closed_without_restart()
         assert broker.pid == 9292
         with pytest.raises(AttemptWorkerError, match="unavailable"):
             await broker.start()
-        assert len(context.processes) == 1
 
     asyncio.run(scenario())
 

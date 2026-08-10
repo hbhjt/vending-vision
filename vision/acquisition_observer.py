@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
-import threading
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
@@ -22,10 +21,11 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+from vision.shared_ipc_slot import SharedIpcSlot, run_shared_ipc_child
+
 
 MAX_FRAME_WIDTH = 1920
 MAX_FRAME_HEIGHT = 1080
-MAX_FRAME_EDGE = 1920
 MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
 
 
@@ -52,8 +52,8 @@ def _coerce_frame_for_shared_memory(frame: Any) -> np.ndarray:
     if (
         height <= 0
         or width <= 0
-        or height > MAX_FRAME_EDGE
-        or width > MAX_FRAME_EDGE
+        or height > MAX_FRAME_HEIGHT
+        or width > MAX_FRAME_WIDTH
         or channels != 3
         or frame.dtype != np.uint8
         or frame.nbytes > MAX_FRAME_RAW_BYTES
@@ -92,7 +92,15 @@ def _write_shared_frame(frame: Any, *, generation: int) -> tuple[_SharedFrame, s
 
 
 def _read_shared_frame(metadata: Any, *, generation: int) -> np.ndarray:
-    if not isinstance(metadata, dict) or metadata.get("kind") != "shared_frame":
+    if not isinstance(metadata, dict) or set(metadata) != {
+        "kind",
+        "name",
+        "shape",
+        "dtype",
+        "nbytes",
+        "generation",
+        "processGeneration",
+    } or metadata.get("kind") != "shared_frame":
         raise ValueError("invalid acquisition frame metadata")
     shape = metadata.get("shape")
     if (
@@ -105,33 +113,28 @@ def _read_shared_frame(metadata: Any, *, generation: int) -> np.ndarray:
     nbytes = metadata.get("nbytes")
     dtype = metadata.get("dtype")
     if (
-        metadata.get("generation") != generation
+        type(metadata.get("generation")) is not int
+        or metadata.get("generation") != generation
         or dtype != "uint8"
         or channels != 3
         or height <= 0
         or width <= 0
-        or height > MAX_FRAME_EDGE
-        or width > MAX_FRAME_EDGE
+        or height > MAX_FRAME_HEIGHT
+        or width > MAX_FRAME_WIDTH
         or type(nbytes) is not int
+        or type(metadata.get("processGeneration")) is not int
         or nbytes != height * width * channels
         or nbytes > MAX_FRAME_RAW_BYTES
     ):
         raise ValueError("acquisition frame metadata exceeds cap")
-    shm = shared_memory.SharedMemory(name=str(metadata.get("name")))
+    name = metadata.get("name")
+    if not isinstance(name, str) or not name.startswith("vem_acq_"):
+        raise ValueError("invalid acquisition frame shared memory name")
+    shm = shared_memory.SharedMemory(name=name)
     try:
         return np.ndarray((height, width, channels), dtype=np.uint8, buffer=shm.buf).copy()
     finally:
-        name = shm._name  # pyright: ignore[reportPrivateUsage]
         shm.close()
-        # The parent owns unlink exactly once.  A spawned child only attaches
-        # transiently; unregister its attach handle so Python's resource
-        # tracker does not emit a false leak warning or race the parent unlink.
-        try:
-            from multiprocessing import resource_tracker
-
-            resource_tracker.unregister(name, "shared_memory")
-        except Exception:
-            pass
 
 
 def _unlink_shared_frame(shm: shared_memory.SharedMemory | None) -> None:
@@ -232,11 +235,12 @@ class AcquisitionObservationWorker:
         self._context = context
         self._target = target
         self._target_args = tuple(target_args)
-        self._state_lock = threading.RLock()
-        self._request_slot = threading.Lock()
+        self._state_lock = multiprocessing.get_context("spawn").RLock()
+        self._request_slot = multiprocessing.get_context("spawn").Lock()
         self._parent: Connection | None = None
         self._process = None
-        self._request_thread: threading.Thread | None = None
+        self._slot: SharedIpcSlot | None = None
+        self._active_request = False
         self._fatal_error: str | None = None
         self._ready = False
         self._generation = 0
@@ -258,15 +262,21 @@ class AcquisitionObservationWorker:
                 self._process = None
             if self._parent is not None:
                 self._parent.close()
-            parent, child = self._mp_context().Pipe(duplex=True)
+            if self._slot is not None:
+                self._slot.close(unlink=True)
+            slot = SharedIpcSlot(
+                context=self._mp_context(),
+                name_prefix="vem_acq",
+                request_bytes=0,
+                response_bytes=MAX_FRAME_RAW_BYTES,
+            )
             process = self._mp_context().Process(
-                target=self._target,
-                args=(child, *self._target_args),
+                target=run_shared_ipc_child,
+                args=(self._target, slot.config, self._target_args),
                 daemon=True,
             )
             process.start()
-            child.close()
-            self._parent, self._process = parent, process
+            self._parent, self._process, self._slot = None, process, slot
             self._generation += 1
             self._request_generation = 0
 
@@ -278,15 +288,15 @@ class AcquisitionObservationWorker:
             deadline = time.monotonic() + 15.0
             while time.monotonic() < deadline:
                 with self._state_lock:
-                    parent, process, generation = self._parent, self._process, self._generation
-                if parent is not None and parent.poll(0.002):
-                    kind, payload = parent.recv()
+                    process, generation, slot = self._process, self._generation, self._slot
+                if slot is not None and slot.poll_response():
+                    kind, payload, process_generation, _request_generation = slot.recv_response()
                     if kind == "ready":
                         with self._state_lock:
                             if (
-                                self._parent is parent
-                                and self._process is process
+                                self._process is process
                                 and self._generation == generation
+                                and process_generation == 0
                             ):
                                 self._ready = True
                         return
@@ -301,98 +311,88 @@ class AcquisitionObservationWorker:
 
     async def observe(self, frame: Any, *, timeout: float = 15.0) -> AcquisitionObservation:
         await self.start()
-        if not self._request_slot.acquire(blocking=False):
+        if not self._request_slot.acquire(block=False):
             raise RuntimeError("acquisition observer is busy")
-        done, outcome = threading.Event(), {}
-
-        def request() -> None:
-            shm = None
-            try:
-                with self._state_lock:
-                    parent, process, generation = self._parent, self._process, self._generation
-                    if parent is None or process is None or not process.is_alive():
-                        raise RuntimeError("acquisition observer unavailable")
-                    self._request_generation += 1
-                    request_generation = self._request_generation
-                shared_frame, shm = _write_shared_frame(frame, generation=request_generation)
-                parent.send((
-                    "observe",
-                    {
-                        "kind": "shared_frame",
-                        "name": shared_frame.name,
-                        "shape": shared_frame.shape,
-                        "dtype": shared_frame.dtype,
-                        "nbytes": shared_frame.nbytes,
-                        "generation": shared_frame.generation,
-                        "processGeneration": generation,
-                    },
-                ))
-                deadline = time.monotonic() + max(timeout, 0.001)
-                while time.monotonic() < deadline:
-                    if parent.poll(0.005):
-                        kind, payload = parent.recv()
-                        if kind == "ok":
-                            with self._state_lock:
-                                if (
-                                    self._parent is not parent
-                                    or self._process is not process
-                                    or self._generation != generation
-                                ):
-                                    raise RuntimeError("acquisition observer response was stale")
-                            outcome["value"] = payload
-                            return
-                        raise RuntimeError(str(payload))
-                    if not process.is_alive():
-                        raise RuntimeError("acquisition observer exited")
-                raise TimeoutError("acquisition observation deadline exceeded")
-            except BaseException as exc:
-                outcome["error"] = exc
-            finally:
-                _unlink_shared_frame(shm)
-                self._request_slot.release()
-                done.set()
-
-        thread = threading.Thread(target=request, name="try-on-acquisition-request", daemon=False)
-        with self._state_lock:
-            self._request_thread = thread
-        thread.start()
+        shm = None
         try:
-            while not done.is_set():
+            with self._state_lock:
+                process, generation, slot = self._process, self._generation, self._slot
+                if slot is None or process is None or not process.is_alive():
+                    raise RuntimeError("acquisition observer unavailable")
+                self._request_generation += 1
+                request_generation = self._request_generation
+                self._active_request = True
+            shared_frame, shm = _write_shared_frame(frame, generation=request_generation)
+            slot.submit(
+                "observe",
+                {
+                    "kind": "shared_frame",
+                    "name": shared_frame.name,
+                    "shape": shared_frame.shape,
+                    "dtype": shared_frame.dtype,
+                    "nbytes": shared_frame.nbytes,
+                    "generation": shared_frame.generation,
+                    "processGeneration": generation,
+                },
+                process_generation=generation,
+                request_generation=request_generation,
+            )
+            deadline = time.monotonic() + max(timeout, 0.001)
+            while time.monotonic() < deadline:
+                if slot.poll_response():
+                    kind, payload, process_generation, response_generation = slot.recv_response()
+                    if kind == "ok":
+                        with self._state_lock:
+                            if (
+                                self._process is not process
+                                or self._generation != generation
+                                or process_generation != generation
+                                or response_generation != request_generation
+                            ):
+                                raise RuntimeError("acquisition observer response was stale")
+                        return payload
+                    raise RuntimeError(str(payload))
+                if not process.is_alive():
+                    raise RuntimeError("acquisition observer exited")
                 await asyncio.sleep(0.002)
+            raise TimeoutError("acquisition observation deadline exceeded")
         except asyncio.CancelledError:
             await asyncio.shield(self.abort_async(reason="observation_cancelled"))
-            while not done.is_set():
-                await asyncio.sleep(0.002)
             raise
-        if "error" in outcome:
+        except BaseException:
             await self.abort_async(reason="observation_failed")
-            raise outcome["error"]
-        return outcome["value"]
+            raise
+        finally:
+            _unlink_shared_frame(shm)
+            with self._state_lock:
+                self._active_request = False
+            try:
+                self._request_slot.release()
+            except ValueError:
+                pass
         
     async def wait_idle(self, *, timeout: float | None = None) -> bool:
         deadline = None
         if timeout is not None:
             deadline = time.monotonic() + max(timeout, 0.001)
-        thread = self._request_thread
-        while thread is not None and thread.is_alive():
+        while self.active_request_count:
             if deadline is not None and time.monotonic() >= deadline:
                 return False
             await asyncio.sleep(0.002)
-        if thread is not None:
-            thread.join()
-        self._request_thread = None
         return True
 
     def abort(self, *, reason: str) -> bool:
         with self._state_lock:
-            parent, process = self._parent, self._process
+            parent, process, slot = self._parent, self._process, self._slot
             if process is None:
                 self._parent = None
+                self._slot = None
                 self._ready = False
                 self._generation += 1
                 return True
             self._parent = None
             self._process = None
+            self._slot = None
             self._ready = False
             self._generation += 1
             self._request_generation = 0
@@ -401,6 +401,8 @@ class AcquisitionObservationWorker:
                 parent.close()
             except Exception:
                 pass
+        if slot is not None:
+            slot.close(unlink=True)
         if process is not None:
             if process.is_alive():
                 try:
@@ -420,17 +422,7 @@ class AcquisitionObservationWorker:
         return True
 
     async def abort_async(self, *, reason: str) -> bool:
-        done, result = threading.Event(), {}
-        def control() -> None:
-            try:
-                result["dead"] = self.abort(reason=reason)
-            finally:
-                done.set()
-        thread = threading.Thread(target=control, name="try-on-acquisition-abort", daemon=False)
-        thread.start()
-        while not done.is_set():
-            await asyncio.sleep(0.002)
-        thread.join()
+        result = {"dead": self.abort(reason=reason)}
         idle = await self.wait_idle(timeout=0.05)
         if not idle:
             with self._state_lock:
@@ -449,8 +441,8 @@ class AcquisitionObservationWorker:
 
     @property
     def active_request_count(self) -> int:
-        thread = self._request_thread
-        return int(thread is not None and thread.is_alive())
+        with self._state_lock:
+            return int(self._active_request)
 
     @property
     def pid(self) -> int | None:

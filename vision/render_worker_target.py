@@ -58,7 +58,15 @@ def _render(payload: dict) -> bytes:
         raise ValueError("invalid render payload")
     frame_shared = payload["frameShared"]
     garment_png = payload["garmentPng"]
-    if not isinstance(frame_shared, dict):
+    if not isinstance(frame_shared, dict) or set(frame_shared) != {
+        "kind",
+        "name",
+        "shape",
+        "dtype",
+        "nbytes",
+        "generation",
+        "processGeneration",
+    } or frame_shared.get("kind") != "shared_frame":
         raise ValueError("raw frame metadata is invalid")
     frame_shape = frame_shared.get("shape")
     if (
@@ -77,27 +85,25 @@ def _render(payload: dict) -> bytes:
         or channels != 3
         or frame_shared.get("dtype") != "uint8"
         or type(frame_nbytes) is not int
+        or type(frame_shared.get("generation")) is not int
+        or type(frame_shared.get("processGeneration")) is not int
         or frame_nbytes != height * width * channels
         or frame_nbytes > MAX_FRAME_RAW_BYTES
     ):
         raise ValueError("raw frame metadata exceeds render cap")
+    name = frame_shared.get("name")
+    if not isinstance(name, str) or not name.startswith("vem_render_"):
+        raise ValueError("raw frame shared memory name is invalid")
     if not isinstance(garment_png, bytes) or len(garment_png) > MAX_GARMENT_BYTES:
         raise GarmentFetchError("byte_size")
     digest = "sha256:" + hashlib.sha256(garment_png).hexdigest()
     if digest != payload["garmentDigest"]:
         raise GarmentFetchError("digest")
-    shm = shared_memory.SharedMemory(name=str(frame_shared.get("name")))
+    shm = shared_memory.SharedMemory(name=name)
     try:
         frame = np.ndarray((height, width, channels), dtype=np.uint8, buffer=shm.buf).copy()
     finally:
-        name = shm._name  # pyright: ignore[reportPrivateUsage]
         shm.close()
-        try:
-            from multiprocessing import resource_tracker
-
-            resource_tracker.unregister(name, "shared_memory")
-        except Exception:
-            pass
     source = ValidatedGarmentSource(
         png_bytes=garment_png,
         digest=digest,

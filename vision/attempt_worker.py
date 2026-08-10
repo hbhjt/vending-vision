@@ -19,6 +19,7 @@ from uuid import uuid4
 import numpy as np
 
 from vision.render_worker_target import render_worker_entry
+from vision.shared_ipc_slot import SharedIpcSlot, run_shared_ipc_child, wait_for_event
 
 
 class AttemptWorkerError(RuntimeError):
@@ -34,7 +35,9 @@ _CONSERVATIVE_PREPARE_FIXED_SECONDS = 0.020
 _START_TIMEOUT_SECONDS = 5.0
 
 
-def _write_shared_render_frame(frame: np.ndarray) -> tuple[dict[str, Any], shared_memory.SharedMemory]:
+def _write_shared_render_frame(
+    frame: np.ndarray, *, process_generation: int, request_generation: int
+) -> tuple[dict[str, Any], shared_memory.SharedMemory]:
     shm = shared_memory.SharedMemory(
         create=True,
         size=int(frame.nbytes),
@@ -55,6 +58,8 @@ def _write_shared_render_frame(frame: np.ndarray) -> tuple[dict[str, Any], share
             "shape": tuple(int(value) for value in frame.shape),
             "dtype": str(frame.dtype),
             "nbytes": int(frame.nbytes),
+            "generation": int(request_generation),
+            "processGeneration": int(process_generation),
         },
         shm,
     )
@@ -127,11 +132,15 @@ class FastRenderBroker:
         self._job_slot = threading.Lock()
         self._parent: Connection | None = None
         self._process = None
+        self._slot: SharedIpcSlot | None = None
         self._fatal_error: str | None = None
         self._ready = False
         self._pose_ready = True
         self._quiesced = False
         self._request_threads: set[threading.Thread] = set()
+        self._active_request = False
+        self._process_generation = 0
+        self._request_generation = 0
 
     def _mp_context(self):
         if self._context is not None:
@@ -192,35 +201,44 @@ class FastRenderBroker:
                 self._parent.close()
                 self._parent = None
             context = self._mp_context()
-            parent, child = context.Pipe(duplex=True)
+            if self._slot is not None:
+                self._slot.close(unlink=True)
+                self._slot = None
+            slot = SharedIpcSlot(
+                context=context,
+                name_prefix="vem_render",
+                request_bytes=_MAX_GARMENT_BYTES,
+                response_bytes=16 * 1024 * 1024,
+            )
             process = context.Process(
-                target=self._target,
-                args=(child, *self._target_args),
+                target=run_shared_ipc_child,
+                args=(self._target, slot.config, self._target_args),
                 daemon=True,
             )
             try:
                 process.start()
             except BaseException as exc:
-                parent.close()
-                child.close()
+                slot.close(unlink=True)
                 self._fatal_error = (
                     f"render_broker_start_failed: {type(exc).__name__}: {exc}"
                 )
                 raise AttemptWorkerError(
                     f"render broker is unavailable: {self._fatal_error}"
                 ) from exc
-            child.close()
-            self._parent = parent
+            self._parent = None
             self._process = process
+            self._slot = slot
+            self._process_generation += 1
+            self._request_generation = 0
 
-        if not parent.poll(_START_TIMEOUT_SECONDS):
+        if not wait_for_event(slot.config["responseEvent"], _START_TIMEOUT_SECONDS, process=process):
             self._stop_sync(graceful=False, reason="render_broker_readiness_timeout")
             with self._state_lock:
                 if self._fatal_error is None:
                     self._fatal_error = "render_broker_readiness_timeout"
             raise AttemptWorkerError("render broker readiness timeout")
         try:
-            kind, payload = parent.recv()
+            kind, payload, response_process_generation, _response_request_generation = slot.recv_response()
         except (EOFError, OSError) as exc:
             self._stop_sync(graceful=False, reason="render_broker_readiness_failed")
             with self._state_lock:
@@ -233,6 +251,7 @@ class FastRenderBroker:
             kind != "ready"
             or not isinstance(payload, dict)
             or payload.get("pid") != process.pid
+            or response_process_generation != 0
         ):
             self._stop_sync(graceful=False, reason="render_broker_readiness_invalid")
             with self._state_lock:
@@ -265,10 +284,11 @@ class FastRenderBroker:
         with self._state_lock:
             parent = self._parent
             process = self._process
+            slot = self._slot
             self._ready = False
             has_active_request = any(
                 thread.is_alive() for thread in self._request_threads
-            )
+            ) or self._active_request
             errors: list[str] = []
 
             def record(action: str, exc: BaseException) -> None:
@@ -291,13 +311,18 @@ class FastRenderBroker:
             if (
                 graceful
                 and not has_active_request
-                and parent is not None
+                and slot is not None
                 and process is not None
                 and process.is_alive()
             ):
                 try:
-                    parent.send(("shutdown", None))
-                    parent.poll(0.25)
+                    slot.submit(
+                        "shutdown",
+                        None,
+                        process_generation=self._process_generation,
+                        request_generation=self._request_generation + 1,
+                    )
+                    wait_for_event(slot.config["responseEvent"], 0.25, process=process)
                 except Exception:
                     pass
             if parent is not None:
@@ -307,6 +332,9 @@ class FastRenderBroker:
                     pass
             if process is None:
                 self._parent = None
+                self._slot = None
+                if slot is not None:
+                    slot.close(unlink=True)
                 return True
             if process.is_alive():
                 try:
@@ -323,17 +351,22 @@ class FastRenderBroker:
             if process.is_alive():
                 self._parent = parent
                 self._process = process
+                self._slot = slot
                 detail = "; ".join(errors)
                 self._fatal_error = f"{reason}: {detail}" if detail else reason
                 return False
             if not join(0):
                 self._parent = parent
                 self._process = process
+                self._slot = slot
                 detail = "; ".join(errors)
                 self._fatal_error = f"{reason}: {detail}" if detail else reason
                 return False
             self._parent = None
             self._process = None
+            self._slot = None
+            if slot is not None:
+                slot.close(unlink=True)
             return True
 
     async def shutdown(self) -> None:
@@ -356,6 +389,27 @@ class FastRenderBroker:
                     self._fatal_error = (
                         "render_broker_shutdown_failed: request thread remained alive"
                     )
+                process = self._process
+                slot = self._slot
+            if not dead and requests_done and process is not None:
+                try:
+                    process.join(timeout=0.5)
+                    delayed_dead = not process.is_alive()
+                    if delayed_dead:
+                        process.join(timeout=0)
+                except (OSError, PermissionError):
+                    delayed_dead = False
+                if delayed_dead:
+                    if slot is not None:
+                        slot.close(unlink=True)
+                    with self._state_lock:
+                        if self._process is process:
+                            self._process = None
+                            self._parent = None
+                            self._slot = None
+                        if self._fatal_error == "render_broker_shutdown_failed":
+                            self._fatal_error = None
+                    dead = True
             return dead and requests_done
 
         dead = await _run_broker_control(
@@ -371,32 +425,50 @@ class FastRenderBroker:
                 raise AttemptWorkerError(
                     f"render broker is unavailable: {self._fatal_error}"
                 )
-            parent = self._parent
             process = self._process
+            slot = self._slot
             if (
                 not self._ready
-                or parent is None
+                or slot is None
                 or process is None
                 or not process.is_alive()
             ):
                 raise AttemptWorkerError("render broker is not ready")
+            self._request_generation += 1
+            request_generation = self._request_generation
+            process_generation = self._process_generation
+            self._active_request = True
         frame = payload["frame"]
         wire_payload = {
             key: value for key, value in payload.items() if key != "frame"
         }
         try:
-            wire_payload["frameShared"], shm = _write_shared_render_frame(frame)
+            wire_payload["frameShared"], shm = _write_shared_render_frame(
+                frame,
+                process_generation=process_generation,
+                request_generation=request_generation,
+            )
             if time.monotonic() >= deadline:
                 raise TimeoutError("render broker deadline exceeded during frame copy")
-            parent.send(("render", wire_payload))
+            slot.submit(
+                "render",
+                wire_payload,
+                process_generation=process_generation,
+                request_generation=request_generation,
+            )
             while time.monotonic() < deadline:
-                if parent.poll(0.005):
+                if slot.poll_response():
                     try:
-                        kind, response = parent.recv()
+                        kind, response, response_process_generation, response_request_generation = slot.recv_response()
                     except (EOFError, OSError) as exc:
                         raise AttemptWorkerError(
                             f"render broker connection closed: {exc}"
                         ) from exc
+                    if (
+                        response_process_generation != process_generation
+                        or response_request_generation != request_generation
+                    ):
+                        raise AttemptWorkerError("render broker returned stale response")
                     if kind == "ok":
                         if not isinstance(response, bytes):
                             raise AttemptWorkerError(
@@ -423,6 +495,8 @@ class FastRenderBroker:
             raise TimeoutError("render broker job deadline exceeded")
         finally:
             _unlink_shared_render_frame(shm)
+            with self._state_lock:
+                self._active_request = False
 
     async def _recover(self, reason: str, *, restart: bool = True) -> None:
         """Terminate/join the failed job owner and optionally prestart recovery."""
@@ -430,7 +504,33 @@ class FastRenderBroker:
         def recover() -> None:
             dead = self._stop_sync(graceful=False, reason=reason)
             if not dead:
-                raise AttemptWorkerError("render broker recovery incomplete")
+                with self._state_lock:
+                    process = self._process
+                    slot = self._slot
+                if process is not None:
+                    try:
+                        process.join(timeout=0.5)
+                    except (OSError, PermissionError) as exc:
+                        raise AttemptWorkerError(
+                            f"render broker recovery incomplete: join {type(exc).__name__}: {exc}"
+                        ) from exc
+                if process is None or process.is_alive():
+                    raise AttemptWorkerError("render broker recovery incomplete")
+                try:
+                    process.join(timeout=0)
+                except (OSError, PermissionError) as exc:
+                    raise AttemptWorkerError(
+                        f"render broker recovery incomplete: join {type(exc).__name__}: {exc}"
+                    ) from exc
+                if slot is not None:
+                    slot.close(unlink=True)
+                with self._state_lock:
+                    if self._process is process:
+                        self._process = None
+                        self._parent = None
+                        self._slot = None
+                    if self._fatal_error == reason:
+                        self._fatal_error = None
             with self._state_lock:
                 if self._quiesced or not restart:
                     return
@@ -448,6 +548,45 @@ class FastRenderBroker:
             self._start_sync()
 
         await _run_broker_control("fast-render-restart", restart)
+
+    async def _restart_after_delayed_cancel_death(self, reason: str) -> None:
+        """Recover when kill is observed slightly after the control timeout."""
+
+        def restart() -> None:
+            with self._state_lock:
+                process = self._process
+                slot = self._slot
+                if self._fatal_error != reason:
+                    return
+            if process is not None:
+                try:
+                    process.join(timeout=0.2)
+                except (OSError, PermissionError) as exc:
+                    raise AttemptWorkerError(
+                        f"render broker recovery incomplete: join {type(exc).__name__}: {exc}"
+                    ) from exc
+                if process.is_alive():
+                    return
+                try:
+                    process.join(timeout=0)
+                except (OSError, PermissionError) as exc:
+                    raise AttemptWorkerError(
+                        f"render broker recovery incomplete: join {type(exc).__name__}: {exc}"
+                    ) from exc
+            if slot is not None:
+                slot.close(unlink=True)
+            with self._state_lock:
+                if self._process is process:
+                    self._process = None
+                    self._parent = None
+                    self._slot = None
+                if self._fatal_error == reason:
+                    self._fatal_error = None
+                if self._quiesced:
+                    return
+            self._start_sync()
+
+        await _run_broker_control("fast-render-delayed-cancel-restart", restart)
 
     async def render(self, payload: dict, *, deadline: float) -> bytes:
         """Submit exactly one non-queued job and keep pipe waits off the loop."""
@@ -488,7 +627,7 @@ class FastRenderBroker:
         except asyncio.CancelledError:
             try:
                 await _finish_cancelled_control(
-                    self._recover("render_job_cancelled", restart=False)
+                    self._recover("render_job_cancelled", restart=True)
                 )
             except BaseException:
                 # _stop_sync retains the live handle and fatal state when it
@@ -506,11 +645,10 @@ class FastRenderBroker:
             self._job_slot.release()
             request_released = True
             try:
-                await _finish_cancelled_control(self._restart_after_recovery())
+                await _finish_cancelled_control(
+                    self._restart_after_delayed_cancel_death("render_job_cancelled")
+                )
             except BaseException:
-                # Readiness failures are persisted by _start_sync.  The old
-                # attempt remains canonically canceled and the replacement
-                # observes the broker's live unavailable state.
                 pass
             raise
         finally:

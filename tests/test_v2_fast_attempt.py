@@ -187,6 +187,7 @@ def garment_reference():
     thread.start()
     yield f"http://127.0.0.1:{server.server_port}/garment?token=source-token"
     server.shutdown()
+    server.server_close()
     thread.join()
 
 

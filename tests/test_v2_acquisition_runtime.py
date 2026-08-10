@@ -138,6 +138,7 @@ def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkey
                 assert vision_app._acquisition_observer.assert_dead
     finally:
         server.shutdown()
+        server.server_close()
         thread.join()
         vision_app._acquisition_observer = None
 
@@ -180,6 +181,7 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
     generating_seen = False
     front_idle_after_generating = False
     profile_after_generating = False
+    ambient_payloads = []
 
     async def unfinished_render(*_args, **_kwargs):
         await asyncio.sleep(30)
@@ -222,6 +224,11 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                         departures.append(message)
                     if canceled and message["type"] == "vision.presence_status":
                         post_cancel_presence = True
+                    if message["type"] in {
+                        "vision.presence_status",
+                        "vision.person_departed",
+                    } and "ambientLight" in message["payload"]:
+                        ambient_payloads.append(message["payload"]["ambientLight"])
                     if canceled and departures and post_cancel_presence:
                         break
 
@@ -234,6 +241,13 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                 assert len(departures) == 1
                 assert "vision.presence_status" in seen_types
                 assert "vision.profile_result" in seen_types
+                assert ambient_payloads
+                assert all(
+                    "level" in payload
+                    and isinstance(payload.get("sample"), dict)
+                    and "lumaMean" in payload["sample"]
+                    for payload in ambient_payloads
+                )
                 assert any(
                     message_type in seen_types
                     for message_type in ["vision.presence_status", "vision.profile_result"]
@@ -242,6 +256,7 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
     finally:
         server.shutdown()
+        server.server_close()
         thread.join()
         camera_manager.release_all_cameras()
         monkeypatch.setattr(presence_runtime, "_runtime", None)
@@ -302,6 +317,7 @@ def test_v2_start_exposes_attempt_scoped_tokenized_acquisition_preview(monkeypat
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
     finally:
         server.shutdown()
+        server.server_close()
         thread.join()
 
 
@@ -332,6 +348,7 @@ def test_v2_manual_capture_bypasses_stability_but_not_single_person_alignment(mo
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
     finally:
         server.shutdown()
+        server.server_close()
         thread.join()
 
 
@@ -375,6 +392,7 @@ def test_v2_recorded_production_observation_truthfully_blocks_capture(
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
     finally:
         server.shutdown()
+        server.server_close()
         thread.join()
 
 
@@ -418,4 +436,5 @@ def test_v2_recorded_single_person_auto_capture_uses_production_yolo_and_pose(mo
                 assert terminal["payload"]["attemptId"] == attempt_id
     finally:
         server.shutdown()
+        server.server_close()
         thread.join()

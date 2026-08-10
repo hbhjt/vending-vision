@@ -6,7 +6,11 @@ import time
 import pytest
 import numpy as np
 
-from vision.acquisition_observer import AcquisitionObservation, AcquisitionObservationWorker
+from vision.acquisition_observer import (
+    AcquisitionObservation,
+    AcquisitionObservationWorker,
+    _read_shared_frame,
+)
 
 
 def _blocking_observer_target(connection):
@@ -83,6 +87,43 @@ def test_normal_acquisition_observer_reuses_one_prewarmed_child_for_multiple_obs
         assert worker.active_request_count == 0
         await worker.shutdown()
         assert worker.assert_dead
+
+    asyncio.run(scenario())
+
+
+def test_production_observation_request_does_not_call_parent_connection_send(monkeypatch):
+    """A normal request must complete even if parent-side Pipe send is unusable."""
+    from multiprocessing.connection import Connection
+
+    async def scenario():
+        context = multiprocessing.get_context("spawn")
+        starts = context.Value("i", 0)
+        worker = AcquisitionObservationWorker(
+            context=context,
+            target=_counting_observer_target,
+            target_args=(starts,),
+        )
+        await worker.start()
+        original_send = Connection.send
+        parent_send_called = threading.Event()
+
+        def blocked_parent_send(self, _payload):
+            parent_send_called.set()
+            raise AssertionError("parent request channel must not use Connection.send")
+
+        monkeypatch.setattr(Connection, "send", blocked_parent_send)
+        try:
+            result = await asyncio.wait_for(
+                worker.observe(np.zeros((8, 8, 3), dtype=np.uint8), timeout=2.0),
+                timeout=3.0,
+            )
+        finally:
+            monkeypatch.setattr(Connection, "send", original_send)
+            await worker.shutdown()
+
+        assert result == AcquisitionObservation(b"jpeg", "single", True)
+        assert not parent_send_called.is_set()
+        assert worker.active_request_count == 0
 
     asyncio.run(scenario())
 
@@ -181,32 +222,36 @@ def _payload_contains_large_frame(payload):
     return False
 
 
-def test_observation_abort_is_bounded_when_connection_send_blocks():
-    """Production observation must not pipe large frames or retain stubborn send threads."""
+def test_observation_abort_is_bounded_when_parent_connection_send_blocks(monkeypatch):
+    """Cancellation must not wait on any parent request Connection.send path."""
+    from multiprocessing.connection import Connection
+
     async def scenario():
         import numpy as np
 
-        worker = AcquisitionObservationWorker()
-        parent = _BlockingSendConnection()
-        worker._parent = parent
-        worker._process = _AliveProcess()
-        worker._ready = True
+        worker = AcquisitionObservationWorker(
+            context=multiprocessing.get_context("spawn"), target=_blocking_observer_target
+        )
+        await worker.start()
+
+        def blocked_parent_send(self, payload):
+            raise AssertionError("parent request channel must not use Connection.send")
+
+        monkeypatch.setattr(Connection, "send", blocked_parent_send)
 
         frame = np.zeros((64, 64, 3), dtype=np.uint8)
         request = asyncio.create_task(worker.observe(frame))
         deadline = time.monotonic() + 1.0
-        while not parent.send_entered.is_set() and time.monotonic() < deadline:
+        while worker.active_request_count == 0 and time.monotonic() < deadline:
             await asyncio.sleep(0.002)
-        assert parent.send_entered.is_set()
+        assert worker.active_request_count == 1
 
         abort = asyncio.create_task(worker.abort_async(reason="replacement"))
         done, _ = await asyncio.wait({abort}, timeout=0.2)
         try:
             assert abort in done, "abort waited behind a request thread blocked in Connection.send"
-            assert parent.large_payload_send_count == 0
             assert worker.active_request_count == 0
         finally:
-            parent.release_send.set()
             with pytest.raises(Exception):
                 await asyncio.wait_for(request, timeout=1.0)
             if not abort.done():
@@ -260,3 +305,61 @@ def test_acquisition_observer_abort_permission_errors_fail_closed_without_traceb
     assert worker.pid == process.pid
     with pytest.raises(RuntimeError, match="permission_denied"):
         worker._start()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {
+            "kind": "shared_frame",
+            "name": "arbitrary",
+            "shape": [8, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 8 * 8 * 3,
+            "generation": 1,
+            "processGeneration": 1,
+        },
+        {
+            "kind": "shared_frame",
+            "name": "vem_acq_valid_name_but_extra_key",
+            "shape": [8, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 8 * 8 * 3,
+            "generation": 1,
+            "processGeneration": 1,
+            "extra": "rejected",
+        },
+        {
+            "kind": "shared_frame",
+            "name": "vem_acq_too_tall",
+            "shape": [1440, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 1440 * 8 * 3,
+            "generation": 1,
+            "processGeneration": 1,
+        },
+        {
+            "kind": "shared_frame",
+            "name": "vem_acq_bool_generation",
+            "shape": [8, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 8 * 8 * 3,
+            "generation": True,
+            "processGeneration": 1,
+        },
+    ],
+)
+def test_acquisition_rejects_strict_frame_metadata_before_arbitrary_shm_attach(
+    monkeypatch, metadata
+):
+    attached = threading.Event()
+
+    def forbidden_attach(*_args, **_kwargs):
+        attached.set()
+        raise AssertionError("invalid metadata must be rejected before shm attach")
+
+    monkeypatch.setattr("vision.acquisition_observer.shared_memory.SharedMemory", forbidden_attach)
+
+    with pytest.raises(ValueError):
+        _read_shared_frame(metadata, generation=1)
+    assert not attached.is_set()

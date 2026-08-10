@@ -65,6 +65,7 @@ def garment_server():
     thread.start()
     yield f"http://127.0.0.1:{server.server_port}/garment?token=opaque"
     server.shutdown()
+    server.server_close()
     thread.join()
 
 
@@ -197,4 +198,5 @@ def test_fast_runtime_cancels_a_slow_drip_and_closes_its_stream():
         asyncio.run(exercise())
     finally:
         server.shutdown()
+        server.server_close()
         thread.join()
