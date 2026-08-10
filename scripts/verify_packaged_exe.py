@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import re
 from urllib.error import HTTPError
 from datetime import datetime, timezone
 from pathlib import Path
@@ -268,6 +269,29 @@ def ensure_port_available(port):
             raise RuntimeError(f"port {port} is already in use") from exc
 
 
+def _safe_process_log(output):
+    """Keep startup diagnostics useful without reproducing bearer queries."""
+    return re.sub(r"token=[^\s'\"&]+", "token=[REDACTED]", output)
+
+
+def assert_result_query_not_logged(output, *, token, raw_query):
+    if token in output or raw_query in output:
+        raise AssertionError("packaged runtime logged a result capability query")
+
+
+def verify_result_query_is_not_logged(base_url):
+    """Probe a denied disposable grant; its bearer text must not reach logs."""
+    attempt_id = "packaged-sentinel-result-attempt"
+    token = "packaged-sentinel-result-token"
+    raw_query = f"token={token}"
+    status = http_status(
+        f"{base_url}/v2/try-on/results/{attempt_id}?{raw_query}",
+    )
+    if status != 404:
+        raise AssertionError(f"unknown result grant returned {status}")
+    return token, raw_query
+
+
 def terminate_packaged_process(process, process_log, *, verification_failed=False):
     process.terminate()
     try:
@@ -278,7 +302,8 @@ def terminate_packaged_process(process, process_log, *, verification_failed=Fals
     process_log.seek(0)
     output = process_log.read()
     if output and (verification_failed or process.returncode not in {0, 1, -15}):
-        print(output, file=sys.stderr)
+        print(_safe_process_log(output), file=sys.stderr)
+    return output
 
 
 def verify_plain_camera_maintenance_contract(base_url):
@@ -323,9 +348,12 @@ def verify_managed_production_surface(exe_path, *, port, startup_timeout, temp_d
             errors="replace",
         )
         verification_failed = False
+        result_token = result_query = None
+        process_output = ""
         try:
             base_url = f"http://127.0.0.1:{port}"
             wait_for_http(base_url, process, startup_timeout)
+            result_token, result_query = verify_result_query_is_not_logged(base_url)
             verify_plain_camera_maintenance_contract(base_url)
             for legacy_url in ("/dashboard", "/camera/top/snapshot.jpg", "/camera/top/reopen"):
                 method = "POST" if legacy_url.endswith("/reopen") else "GET"
@@ -336,9 +364,13 @@ def verify_managed_production_surface(exe_path, *, port, startup_timeout, temp_d
             verification_failed = True
             raise
         finally:
-            terminate_packaged_process(
+            process_output = terminate_packaged_process(
                 process, process_log, verification_failed=verification_failed
             )
+        assert result_token is not None and result_query is not None
+        assert_result_query_not_logged(
+            process_output, token=result_token, raw_query=result_query
+        )
 
 
 def main():
@@ -405,6 +437,8 @@ def main():
                 errors="replace",
             )
             verification_failed = False
+            result_token = result_query = None
+            process_output = ""
             try:
                 base_url = f"http://127.0.0.1:{args.port}"
                 health = wait_for_http(base_url, process, args.startup_timeout)
@@ -422,15 +456,20 @@ def main():
                 metrics = http_get_json(f"{base_url}/metrics")
                 if not isinstance(metrics, dict):
                     raise AssertionError("metrics endpoint did not return an object")
+                result_token, result_query = verify_result_query_is_not_logged(base_url)
                 verify_plain_camera_maintenance_contract(base_url)
                 asyncio.run(verify_websocket(args.port))
             except BaseException:
                 verification_failed = True
                 raise
             finally:
-                terminate_packaged_process(
+                process_output = terminate_packaged_process(
                     process, process_log, verification_failed=verification_failed
                 )
+            assert result_token is not None and result_query is not None
+            assert_result_query_not_logged(
+                process_output, token=result_token, raw_query=result_query
+            )
         verify_managed_production_surface(
             exe_path,
             port=managed_port,

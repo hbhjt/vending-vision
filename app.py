@@ -1579,6 +1579,12 @@ async def run_v2_fast_attempt(
         terminal = _generated_v2_envelope(
             "vision.try_on.attempt.failed", {"attemptId": attempt_id, "reason": "attempt_replaced"}
         )
+    # Preparation is deliberately private until the completed contract is
+    # encoded and validated.  Any failure above commits the one failed
+    # terminal without passing staged token, reference, or bytes across the
+    # registry's atomic boundary.
+    if terminal.get("type") != "vision.try_on.attempt.completed":
+        stored_result = None
     transition = await _fast_attempt_registry.commit_terminal_transition(
         receipt, terminal, stored_result
     )

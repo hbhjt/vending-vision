@@ -55,6 +55,14 @@ class ResultEntry:
         return value
 
 
+@dataclass(frozen=True)
+class ResultAdmission:
+    """The immutable entry committed by one admission and every displaced ID."""
+
+    entry: ResultEntry
+    evicted_attempt_ids: tuple[str, ...]
+
+
 class FastResultStore:
     """An in-memory bounded result store with atomic admission planning."""
 
@@ -103,14 +111,17 @@ class FastResultStore:
             self._total_bytes -= entry.byte_size
         return entry
 
-    def _prune_unlocked(self, now: float | None = None) -> None:
+    def _prune_unlocked(self, now: float | None = None) -> tuple[str, ...]:
         now = self._clock() if now is None else now
+        evicted: list[str] = []
         # Iterate over every entry.  Expiry is not an LRU property and an old
         # entry may be behind a recently inserted one.
         for attempt_id, entry in list(self._entries.items()):
             if entry.expires_at <= now:
                 self._remove_unlocked(attempt_id)
+                evicted.append(attempt_id)
         self._assert_invariants()
+        return tuple(evicted)
 
     def _entry_from_result(
         self, attempt_id: str, result: Mapping[str, object], now: float
@@ -155,7 +166,7 @@ class FastResultStore:
         result: Mapping[str, object],
         *,
         now: float | None = None,
-    ) -> ResultEntry:
+    ) -> ResultAdmission:
         """Plan evictions, then commit one result atomically.
 
         The single-result limit is checked before expiry cleanup or any store
@@ -169,12 +180,31 @@ class FastResultStore:
             raise ResultAdmissionError("result_store_too_large")
 
         now = self._clock() if now is None else now
-        self._prune_unlocked(now)
         candidate = self._entry_from_result(attempt_id, result, now)
-        existing = self._entries.get(attempt_id)
+        # Validate and calculate the full transaction before changing the
+        # store.  A rejected candidate cannot silently prune or evict a live
+        # grant, which is essential when the registry has a matching terminal
+        # replay record.
+        expired_ids = tuple(
+            stored_id
+            for stored_id, entry in self._entries.items()
+            if entry.expires_at <= now
+        )
+        expired = set(expired_ids)
+        existing = (
+            self._entries.get(attempt_id)
+            if attempt_id not in expired
+            else None
+        )
         # Build the candidate totals without touching the live map.
-        candidate_count = len(self._entries) - (1 if existing is not None else 0) + 1
-        candidate_bytes = self._total_bytes - (existing.byte_size if existing else 0) + candidate.byte_size
+        retained_count = len(self._entries) - len(expired_ids)
+        retained_bytes = self._total_bytes - sum(
+            self._entries[stored_id].byte_size for stored_id in expired_ids
+        )
+        candidate_count = retained_count - (1 if existing is not None else 0) + 1
+        candidate_bytes = (
+            retained_bytes - (existing.byte_size if existing else 0) + candidate.byte_size
+        )
         if candidate_count <= self.max_count and candidate_bytes <= self.max_bytes:
             evictions: list[str] = []
         else:
@@ -182,7 +212,7 @@ class FastResultStore:
             remaining_count = candidate_count
             remaining_bytes = candidate_bytes
             for old_id, old in self._entries.items():
-                if old_id == attempt_id:
+                if old_id in expired or old_id == attempt_id:
                     continue
                 if remaining_count <= self.max_count and remaining_bytes <= self.max_bytes:
                     break
@@ -193,18 +223,24 @@ class FastResultStore:
                 raise ResultAdmissionError("result_store_capacity")
 
         # Commit exactly the plan.  No OLD entry is removed until NEW is known
-        # to fit; this also makes overwrites all-or-nothing.
-        for old_id in evictions:
+        # to fit; this also makes overwrites all-or-nothing.  The caller needs
+        # the precise eviction IDs to retire matching terminal replay records
+        # in the same registry transition.
+        for old_id in (*expired_ids, *evictions):
             self._remove_unlocked(old_id)
         self._remove_unlocked(attempt_id)
         self._entries[attempt_id] = candidate
         self._total_bytes += candidate.byte_size
         self._assert_invariants()
-        return candidate
+        return ResultAdmission(
+            entry=candidate,
+            evicted_attempt_ids=tuple((*expired_ids, *evictions)),
+        )
 
-    async def admit(self, attempt_id: str, result: Mapping[str, object]) -> ResultEntry:
+    async def admit(
+        self, attempt_id: str, result: Mapping[str, object]
+    ) -> ResultAdmission:
         async with self._lock:
-            self._prune_unlocked()
             return self._admit_unlocked(attempt_id, result)
 
     def _get_unlocked(self, attempt_id: str, token: str) -> ResultEntry | None:

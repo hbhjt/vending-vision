@@ -8,6 +8,7 @@ are committed together under the short state gate.
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -190,18 +191,37 @@ class FastAttemptRegistry:
         while len(self._terminals) > self._terminal_max_count:
             attempt_id, _terminal = self._terminals.popitem(last=False)
             self._results._remove_unlocked(attempt_id)
-        self._results._prune_unlocked(now)
+        # Result grants can have a shorter retention than terminal replay.
+        # Once a completed grant is naturally gone, its terminal must go too:
+        # otherwise a duplicate would receive a dead capability URL forever.
+        for attempt_id in self._results._prune_unlocked():
+            terminal = self._terminals.get(attempt_id)
+            if terminal is not None and terminal.result is not None:
+                self._terminals.pop(attempt_id, None)
 
     def _new_terminal(
         self, message: dict, result: dict | None = None
     ) -> TerminalAttempt:
         terminal_at = time.monotonic()
         return TerminalAttempt(
-            message=message,
-            result=result,
+            message=copy.deepcopy(message),
+            result=copy.deepcopy(result),
             terminal_at=terminal_at,
             expires_at=terminal_at + self._terminal_ttl_seconds,
         )
+
+    @staticmethod
+    def _replay_terminal(terminal: TerminalAttempt) -> dict:
+        """Return a detached response while the registry gate protects history."""
+        return copy.deepcopy(terminal.message)
+
+    @staticmethod
+    def _replay_active(active: ActiveAttempt) -> list[dict]:
+        return [
+            copy.deepcopy(message)
+            for message in (active.accepted, active.latest_progress)
+            if message
+        ]
 
     async def prepare_admission(
         self,
@@ -226,17 +246,13 @@ class FastAttemptRegistry:
                     return AdmissionPreparation(
                         attempt_id=attempt_id,
                         resolved=True,
-                        replay=[terminal.message],
+                        replay=[self._replay_terminal(terminal)],
                     )
 
                 active = self._active
                 if active is not None and active.receipt.attempt_id == attempt_id:
                     self._attach_subscriber_unlocked(active, subscriber)
-                    replay = [
-                        message
-                        for message in (active.accepted, active.latest_progress)
-                        if message
-                    ]
+                    replay = self._replay_active(active)
                     return AdmissionPreparation(
                         attempt_id=attempt_id, resolved=True, replay=replay
                     )
@@ -304,7 +320,7 @@ class FastAttemptRegistry:
                 self._prune_unlocked()
                 terminal = self._terminals.get(preparation.attempt_id)
                 if terminal is not None:
-                    return AttemptAdmission(None, [terminal.message])
+                    return AttemptAdmission(None, [self._replay_terminal(terminal)])
                 active = self._active
                 if (
                     active is not None
@@ -312,11 +328,7 @@ class FastAttemptRegistry:
                 ):
                     return AttemptAdmission(
                         None,
-                        [
-                            message
-                            for message in (active.accepted, active.latest_progress)
-                            if message
-                        ],
+                        self._replay_active(active),
                     )
                 raise RuntimeError("pending Fast admission resolved without state")
 
@@ -364,7 +376,7 @@ class FastAttemptRegistry:
                 if pending is not None and pending.token == preparation.token:
                     self._pending = None
                     pending.done.set()
-                return AttemptAdmission(None, [terminal.message])
+                return AttemptAdmission(None, [self._replay_terminal(terminal)])
             if pending is None or pending.token != preparation.token:
                 active = self._active
                 if (
@@ -373,11 +385,7 @@ class FastAttemptRegistry:
                 ):
                     return AttemptAdmission(
                         None,
-                        [
-                            message
-                            for message in (active.accepted, active.latest_progress)
-                            if message
-                        ],
+                        self._replay_active(active),
                     )
                 raise RuntimeError("Fast admission reservation was lost")
 
@@ -404,15 +412,19 @@ class FastAttemptRegistry:
                 owner_receipts=pending.owner_receipts,
                 owner_subscriber_key=pending.owner_subscriber_key,
                 subscribers=pending.subscribers,
-                accepted=accepted,
-                latest_progress=progress,
+                accepted=copy.deepcopy(accepted),
+                latest_progress=copy.deepcopy(progress),
                 canceled_terminal=pending.canceled_terminal,
             )
             self._pending = None
             pending.done.set()
             return AttemptAdmission(
                 receipt,
-                [message for message in (accepted, progress) if message],
+                [
+                    copy.deepcopy(message)
+                    for message in (accepted, progress)
+                    if message
+                ],
             )
 
     async def admit(
@@ -471,17 +483,13 @@ class FastAttemptRegistry:
                 self._prune_unlocked()
                 stored = self._terminals.get(attempt_id)
                 if stored is not None:
-                    return AttemptAdmission(None, [stored.message])
+                    return AttemptAdmission(None, [self._replay_terminal(stored)])
                 active = self._active
                 if active is not None and active.receipt.attempt_id == attempt_id:
                     self._attach_subscriber_unlocked(active, subscriber)
                     return AttemptAdmission(
                         None,
-                        [
-                            message
-                            for message in (active.accepted, active.latest_progress)
-                            if message
-                        ],
+                        self._replay_active(active),
                     )
                 pending = self._pending
                 if pending is not None and pending.attempt_id == attempt_id:
@@ -514,17 +522,13 @@ class FastAttemptRegistry:
                 self._prune_unlocked()
                 stored = self._terminals.get(attempt_id)
                 if stored is not None:
-                    return AttemptAdmission(None, [stored.message])
+                    return AttemptAdmission(None, [self._replay_terminal(stored)])
                 active = self._active
                 if active is not None and active.receipt.attempt_id == attempt_id:
                     self._attach_subscriber_unlocked(active, subscriber)
                     return AttemptAdmission(
                         None,
-                        [
-                            message
-                            for message in (active.accepted, active.latest_progress)
-                            if message
-                        ],
+                        self._replay_active(active),
                     )
                 pending = self._pending
                 if pending is not None and pending.attempt_id == attempt_id:
@@ -565,13 +569,26 @@ class FastAttemptRegistry:
     ) -> TerminalTransition:
         canonical = message
         admitted_result = None
-        if result is not None:
+        # A result grant is a capability attached exclusively to completed.
+        # Non-completed terminal callers may accidentally carry staged output;
+        # the registry deliberately ignores it rather than leaving an orphan.
+        if (
+            result is not None
+            and message.get("type") == "vision.try_on.attempt.completed"
+        ):
             try:
-                admitted_result = self._results._admit_unlocked(
+                admission = self._results._admit_unlocked(
                     active.receipt.attempt_id, result
                 )
             except ResultAdmissionError:
                 canonical = self._result_failure_message(message)
+            else:
+                admitted_result = admission.entry
+                # Store admission has already committed NEW.  Retire every
+                # displaced completed replay before publishing NEW, while the
+                # same short registry gate excludes duplicate observation.
+                for evicted_id in admission.evicted_attempt_ids:
+                    self._terminals.pop(evicted_id, None)
         self._terminals[active.receipt.attempt_id] = self._new_terminal(
             canonical, admitted_result.public() if admitted_result is not None else None
         )

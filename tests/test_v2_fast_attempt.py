@@ -322,6 +322,64 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
     assert camera_manager.get_frame_source("front").status()["source"] == "recorded_video"
 
 
+def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result_grant(
+    monkeypatch, garment_reference
+):
+    """A post-render contract failure cannot retain a staged Fast capability."""
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {"cameraReady": True, "modelReady": True},
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    sentinel_token = "sentinel-result-token"
+    original_prepare = vision_app._prepare_fast_result
+    original_envelope = vision_app._generated_v2_envelope
+
+    def prepare_with_sentinel(attempt_id, image):
+        stored, public = original_prepare(attempt_id, image)
+        reference = vision_app._fast_result_reference(attempt_id, sentinel_token)
+        stored.update(token=sentinel_token, reference=reference)
+        public.update(reference=reference)
+        return stored, public
+
+    def reject_completed(message_type, payload):
+        if message_type == "vision.try_on.attempt.completed":
+            raise ValueError("forced_completed_contract_failure")
+        return original_envelope(message_type, payload)
+
+    monkeypatch.setattr(vision_app, "_prepare_fast_result", prepare_with_sentinel)
+    monkeypatch.setattr(vision_app, "_generated_v2_envelope", reject_completed)
+    attempt_id = str(uuid4())
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(attempt_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            failed = socket.receive_json()
+
+        assert failed["type"] == "vision.try_on.attempt.failed"
+        assert failed["payload"] == {"attemptId": attempt_id, "reason": "fast_failed"}
+        assert client.get(
+            f"/v2/try-on/results/{attempt_id}?token={sentinel_token}"
+        ).status_code == 404
+
+        with client.websocket_connect("/ws") as replay_socket:
+            replay_socket.send_json(_hello(manifest))
+            assert replay_socket.receive_json()["type"] == "vision.ready"
+            replay_socket.send_json(_start(attempt_id, garment_reference))
+            assert replay_socket.receive_json()["type"] == "vision.try_on.attempt.failed"
+
+
 def test_v2_fast_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(
     monkeypatch, garment_reference
 ):

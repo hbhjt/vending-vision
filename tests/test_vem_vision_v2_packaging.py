@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).parents[1]
@@ -30,6 +31,9 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     assert '"python/vision_v2_models.py"' in verifier
     assert "must not contain Python bytecode" in verifier
     assert "assert_v2_contract_resources(contract_root)" in verifier
+    assert "verify_result_query_is_not_logged" in verifier
+    assert "assert_result_query_not_logged" in verifier
+    assert "_safe_process_log" in verifier
 
 
 def test_frozen_runtime_keeps_the_spawn_safe_render_worker_entry():
@@ -45,6 +49,29 @@ def test_frozen_runtime_keeps_the_spawn_safe_render_worker_entry():
     assert "import app" not in target
     assert "vision.pose_estimator" not in target
     assert "vision.model" not in target
+
+
+def test_every_production_uvicorn_entry_disables_access_logs():
+    """A result capability query must never become an HTTP access log line."""
+    sources = [
+        path
+        for path in ROOT.rglob("*")
+        if path.suffix in {".py", ".bat"} and "tests" not in path.parts
+    ]
+    uvicorn_entries = []
+    for path in sources:
+        source = path.read_text("utf-8")
+        if "uvicorn.run(" in source:
+            uvicorn_entries.append(path)
+            assert re.search(r"uvicorn\.run\([\s\S]*?access_log\s*=\s*False", source)
+        if "-m uvicorn" in source:
+            uvicorn_entries.append(path)
+            assert "--no-access-log" in source
+
+    assert {path.name for path in uvicorn_entries} >= {
+        "run_vision_server.py",
+        "start_server.bat",
+    }
 
 
 def test_packaged_production_modules_cannot_select_test_pose_fixtures():
