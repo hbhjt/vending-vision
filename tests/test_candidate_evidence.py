@@ -88,6 +88,15 @@ def test_candidate_sbom_covers_the_actual_win32_locked_closure(tmp_path, monkeyp
     sbom_licenses = {item["name"].lower(): item["licenseDeclared"] for item in packages}
     assert len(packages) == 62
     assert sbom_licenses == {normalized: LICENSE_OVERRIDES[normalized] for normalized in windows_lock}
+    descriptor = json.loads((tmp_path / "candidate" / "vision-release-descriptor.json").read_text(encoding="utf-8"))
+    manifest = json.loads((ROOT / "contracts" / "vem_vision_v2" / "manifest.json").read_text(encoding="utf-8"))
+    assert descriptor["protocol"] == {
+        "version": manifest["protocol"],
+        "schemaVersion": manifest["schemaVersion"],
+        "bundleVersion": manifest["bundleVersion"],
+        "contractDigest": manifest["bundleDigest"],
+        "webSocketPath": "/ws",
+    }
 
 
 def test_win32_marked_lock_selects_a_complete_offline_wheel_closure(tmp_path):

@@ -16,7 +16,7 @@ WebSocket 协议消息构建模块
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from vision.config import settings
 
@@ -43,10 +43,15 @@ def envelope(message_type: str, message_id: str | None = None, payload: dict | N
     Returns:
         标准格式的消息字典
     """
+    try:
+        canonical_message_id = str(UUID(message_id)) if message_id else str(uuid4())
+    except (TypeError, ValueError):
+        canonical_message_id = str(uuid4())
+
     return {
         "protocol": PROTOCOL,
         "type": message_type,
-        "messageId": message_id or str(uuid4()),
+        "messageId": canonical_message_id,
         "timestamp": now_iso(),
         "payload": payload or {}
     }

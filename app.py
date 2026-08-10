@@ -26,7 +26,7 @@ from typing import Optional
 from uuid import uuid4
 
 import cv2
-from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from vision.camera_manager import (
@@ -160,24 +160,18 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
         parsed_hello = parse_v2_boundary_message(hello)
         if parsed_hello.type != "vision.hello":
             raise ValueError("invalid_v2_boundary_message")
-        identity = load_v2_contract_identity()
-    except V2ContractBundleUnavailable:
-        # The core presence/profile transport is intentionally still available.
-        # A zero digest is a syntactically valid, never-equal sentinel.
-        client_payload = hello.get("payload") if isinstance(hello, dict) else None
-        if not isinstance(client_payload, dict):
-            raise ValueError("invalid_v2_boundary_message")
-        client_capabilities = client_payload.get("capabilities")
-        if not (
-            isinstance(client_capabilities, list)
-            and all(isinstance(value, str) and value for value in client_capabilities)
-        ):
-            raise ValueError("invalid_v2_boundary_message")
-        identity = None
-        payload = client_payload
-    else:
         payload = parsed_hello.payload.model_dump()
         client_capabilities = payload["capabilities"]
+    except V2ContractBundleUnavailable:
+        # Without the generated parser there is no safe hello fallback.
+        raise
+    except ValueError:
+        raise
+
+    try:
+        identity = load_v2_contract_identity()
+    except V2ContractBundleUnavailable:
+        identity = None
 
     if identity is None:
         diagnostic = "contract_bundle_unavailable"
@@ -210,7 +204,7 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
 
     ready = envelope(
         message_type="vision.ready",
-        message_id=f"ready-{uuid4()}",
+        message_id=str(uuid4()),
         payload={
             "serverName": "vem-vision-python",
             "serverVersion": APP_VERSION,
@@ -230,11 +224,11 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
             ],
         },
     )
-    # This is the server-to-machine strict generated boundary validation.
-    if identity is not None:
-        parsed_ready = parse_v2_boundary_message(ready)
-        return parsed_ready.model_dump(), set(client_capabilities)
-    return ready, set(client_capabilities)
+    # This is the server-to-machine strict generated boundary validation even
+    # when the identity manifest is unavailable.  The latter is a degraded
+    # business capability only if the generated parser itself remains usable.
+    parsed_ready = parse_v2_boundary_message(ready)
+    return parsed_ready.model_dump(), set(client_capabilities)
 
 
 def validate_envelope(message):
@@ -362,6 +356,21 @@ def dashboard():
     return HTMLResponse(
         content=DASHBOARD_FILE.read_text(encoding="utf-8"),
     )
+
+
+@app.get("/debug/contract-bundle")
+def debug_contract_bundle():
+    """Expose only the generated V2 identity needed by the diagnostic client."""
+    try:
+        identity = load_v2_contract_identity()
+    except V2ContractBundleUnavailable as exc:
+        raise HTTPException(status_code=503, detail="contract_bundle_unavailable") from exc
+    return {
+        "protocol": identity.protocol,
+        "schemaVersion": identity.schema_version,
+        "bundleVersion": identity.bundle_version,
+        "contractDigest": identity.contract_digest,
+    }
 
 
 @app.get("/health")
@@ -900,14 +909,9 @@ def queue_profile_message(client: dict, message_type: str, payload: dict):
         return
 
     event_payload = filter_payload_for_client(payload, capabilities)
-    message_prefix = {
-        "vision.profile_result": "result",
-        "vision.person_departed": "departure",
-    }.get(message_type, "status")
-
     message = envelope(
         message_type=message_type,
-        message_id=f"{message_prefix}-{event_payload['eventId']}-{uuid4()}",
+        message_id=str(uuid4()),
         payload=event_payload,
     )
     try:
@@ -1208,6 +1212,17 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                         message,
                         get_runtime_status(),
                     )
+                except V2ContractBundleUnavailable:
+                    async with send_lock:
+                        await send_error(
+                            websocket,
+                            code="invalid_message",
+                            message="contract_bundle_unavailable",
+                            retryable=False,
+                            message_id=message_id,
+                        )
+                    await websocket.close(code=1008)
+                    return
                 except ValueError:
                     async with send_lock:
                         await send_error(
@@ -1262,23 +1277,6 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                     )
                 continue
 
-            if (
-                message_type == "vision.hello"
-                and payload.get("clientRole") not in allowed_client_roles
-            ):
-                async with send_lock:
-                    await send_error(
-                        websocket,
-                        code="invalid_message",
-                        message=(
-                            "payload.clientRole must be one of: "
-                            + ", ".join(sorted(allowed_client_roles))
-                        ),
-                        retryable=False,
-                        message_id=message_id,
-                    )
-                continue
-
             if message_type != "vision.hello" and not handshake_complete:
                 async with send_lock:
                     await send_error(
@@ -1288,68 +1286,6 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                         retryable=False,
                         message_id=message_id,
                     )
-                continue
-
-            if message_type == "vision.hello":
-                status = get_runtime_status()
-                client_capabilities = set(payload.get("capabilities") or [])
-
-                server_capabilities = [
-                    "profile_push",
-                    "presence_status",
-                    "person_departed",
-                    "ambient_light",
-                    "try_on_session",
-                ]
-                async with send_lock:
-                    await websocket.send_json(
-                        envelope(
-                            message_type="vision.ready",
-                            message_id=f"ready-{uuid4()}",
-                            payload={
-                                "serverName": "vem-vision-python",
-                                "serverVersion": APP_VERSION,
-                                "cameraReady": status["cameraReady"],
-                                "modelReady": status["modelReady"],
-                                "capabilities": server_capabilities,
-                            },
-                        )
-                    )
-
-                # The VEM daemon treats vision as a non-sale-critical capability.
-                # Complete the protocol handshake even when cameras/models are
-                # degraded so the runtime can expose diagnostics and retry after
-                # the site is calibrated. Profile workers remain guarded by the
-                # runtime checks and will publish a retryable error when needed.
-                if not status["modelReady"] or not status["cameraReady"]:
-                    async with send_lock:
-                        await websocket.send_json(
-                            error_envelope(
-                                code=(
-                                    "model_not_ready"
-                                    if not status["modelReady"]
-                                    else "camera_unavailable"
-                                ),
-                                message=(
-                                    "required vision model is not ready"
-                                    if not status["modelReady"]
-                                    else "configured camera is not ready"
-                                ),
-                                retryable=True,
-                                message_id=f"error-degraded-{uuid4()}",
-                            )
-                        )
-
-                if settings.PROFILE_PUSH_ENABLED:
-                    await register_profile_client(
-                        websocket,
-                        send_lock,
-                        client_capabilities,
-                        owned_try_on_session_ids,
-                    )
-
-                handshake_complete = True
-
                 continue
 
             if message_type == "vision.ping":
@@ -1500,5 +1436,5 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.websocket("/debug/ws")
 async def dashboard_websocket_endpoint(websocket: WebSocket):
-    """Vendor diagnostic surface; isolated from the machine protocol route."""
-    await websocket_session(websocket, {"dashboard"})
+    """Vendor diagnostic surface using the generated machine-role V2 hello."""
+    await websocket_session(websocket, {"machine"})

@@ -6,6 +6,8 @@ import json
 import re
 from pathlib import Path
 
+from vision.v2_contract_bundle import load_v2_contract_identity
+
 try:  # direct ``python scripts/...`` and package import both remain supported
     from scripts.dependency_lock import verify_dependency_closure
 except ModuleNotFoundError:  # pragma: no cover - exercised by release workflow
@@ -62,6 +64,7 @@ def main():
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     model_manifest = json.loads((root / "models/model-manifest.json").read_text(encoding="utf-8"))
+    contract_identity = load_v2_contract_identity()
     requirements = verify_dependency_closure(args.requirements_lock, args.wheelhouse, args.python)
 
     sbom = {
@@ -141,7 +144,13 @@ def main():
         "lifecycle": {"requiresInteractiveSession": True, "shutdownTimeoutMs": 10000},
         "configuration": {"format": "json", "schemaVersion": "vending-vision-site-config/v1", "argument": "--config"},
         "health": {"port": 7892, "path": "/health", "expectedStatus": 200, "timeoutMs": 30000},
-        "protocol": {"version": "vem.vision.v1", "webSocketPath": "/ws"},
+        "protocol": {
+            "version": contract_identity.protocol,
+            "schemaVersion": contract_identity.schema_version,
+            "bundleVersion": contract_identity.bundle_version,
+            "contractDigest": contract_identity.contract_digest,
+            "webSocketPath": "/ws",
+        },
         "sbom": evidence_ref(sbom_path, format="spdx-json"),
         "provenance": evidence_ref(provenance_path, predicateType="https://slsa.dev/provenance/v1"),
     }

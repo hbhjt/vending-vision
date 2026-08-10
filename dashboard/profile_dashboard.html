@@ -807,7 +807,7 @@
             <div class="status-strip">
               <div class="status-cell">
                 <div class="label">协议</div>
-                <div class="value" id="protocolValue">vem.vision.v1</div>
+                <div class="value" id="protocolValue">--</div>
               </div>
               <div class="status-cell">
                 <div class="label">最后更新</div>
@@ -1014,8 +1014,6 @@
   </div>
 
   <script>
-    const PROTOCOL = "vem.vision.v1";
-
     const els = {
       wsUrl: document.getElementById("wsUrl"),
       connectBtn: document.getElementById("connectBtn"),
@@ -1079,6 +1077,7 @@
       activeTryOnSessionId: null,
       pendingTryOnSessionId: null,
       selectedRecommendation: null,
+      contractIdentity: null,
     };
 
     function defaultWsUrl() {
@@ -1105,7 +1104,7 @@
 
     function envelope(type, messageId, payload = {}) {
       return {
-        protocol: PROTOCOL,
+        protocol: state.contractIdentity?.protocol || "vem.vision.v2",
         type,
         messageId,
         timestamp: nowIso(),
@@ -1118,9 +1117,44 @@
         return null;
       }
 
-      const message = envelope(type, `${type}-${Date.now()}`, payload);
+      const message = envelope(type, crypto.randomUUID(), payload);
       state.ws.send(JSON.stringify(message));
       return message;
+    }
+
+    function contractBundleUrl(wsUrl) {
+      const url = new URL(wsUrl, window.location.href);
+      url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+      url.pathname = "/debug/contract-bundle";
+      url.search = "";
+      url.hash = "";
+      return url.toString();
+    }
+
+    async function sendV2Hello(socket, wsUrl) {
+      const response = await fetch(contractBundleUrl(wsUrl), { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`contract bundle unavailable (${response.status})`);
+      }
+      const identity = await response.json();
+      if (!identity || !identity.protocol || !identity.schemaVersion || !identity.bundleVersion || !identity.contractDigest) {
+        throw new Error("contract bundle identity is incomplete");
+      }
+      if (state.ws !== socket || socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      state.contractIdentity = identity;
+      els.protocolValue.textContent = identity.protocol;
+      send("vision.hello", {
+        clientRole: "machine",
+        machineCode: "dashboard-debug",
+        schemaVersion: identity.schemaVersion,
+        bundleVersion: identity.bundleVersion,
+        contractDigest: identity.contractDigest,
+        capabilities: ["profile_push", "presence_status", "person_departed", "ambient_light", "try_on_fast"],
+      });
+      clearInterval(state.pingTimer);
+      state.pingTimer = setInterval(() => send("vision.ping"), 3000);
     }
 
     function setStatus(status, text) {
@@ -1198,20 +1232,11 @@
 
       state.ws.addEventListener("open", () => {
         setStatus("connected", "已连接");
-        send("vision.hello", {
-          clientRole: "dashboard",
-          machineCode: "dashboard-demo",
-          protocolVersion: 1,
-          capabilities: [
-            "profile_push",
-            "presence_status",
-            "person_departed",
-            "ambient_light",
-            "try_on_session",
-          ],
+        void sendV2Hello(state.ws, url).catch((error) => {
+          setStatus("error", "V2 合同不可用");
+          renderRaw({ error: String(error) }, "local.contract_bundle_unavailable");
+          state.ws?.close();
         });
-        clearInterval(state.pingTimer);
-        state.pingTimer = setInterval(() => send("vision.ping"), 3000);
       });
 
       state.ws.addEventListener("message", (event) => {
@@ -1220,9 +1245,9 @@
           message = JSON.parse(event.data);
         } catch (error) {
           message = {
-            protocol: PROTOCOL,
+            protocol: state.contractIdentity?.protocol || "vem.vision.v2",
             type: "local.invalid_json",
-            messageId: `invalid-${Date.now()}`,
+            messageId: crypto.randomUUID(),
             timestamp: nowIso(),
             payload: { raw: event.data, error: String(error) },
           };
@@ -1274,7 +1299,7 @@
 
       if (message.type === "vision.ready") {
         const payload = message.payload || {};
-        els.subtitle.textContent = `服务 ${payload.serverVersion || "--"} | 摄像头 ${payload.cameraReady ? "就绪" : "未就绪"} | 模型 ${payload.modelReady ? "就绪" : "未就绪"}`;
+        els.subtitle.textContent = `服务 ${payload.serverVersion || "--"} | 摄像头 ${payload.cameraReady ? "就绪" : "未就绪"} | 快速试衣 ${payload.visionBusinessReady ? "就绪" : "不可用"}`;
         return;
       }
 
@@ -1802,9 +1827,9 @@
 
     function loadDemo() {
       const message = {
-        protocol: PROTOCOL,
+        protocol: state.contractIdentity?.protocol || "vem.vision.v2",
         type: "vision.profile_result",
-        messageId: `demo-${Date.now()}`,
+        messageId: crypto.randomUUID(),
         timestamp: nowIso(),
         payload: {
           eventId: "vision-event-demo",
