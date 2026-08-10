@@ -14,6 +14,9 @@ ROOT = Path(SPECPATH)
 CONTRACT_ROOT = ROOT / "contracts" / "vem_vision_v2"
 CONTRACT_DATA_FILES = [
     (CONTRACT_ROOT / "manifest.json", "contracts/vem_vision_v2"),
+    (CONTRACT_ROOT / "__init__.py", "contracts/vem_vision_v2"),
+    (CONTRACT_ROOT / "python" / "__init__.py", "contracts/vem_vision_v2/python"),
+    (CONTRACT_ROOT / "python" / "vision_v2_models.py", "contracts/vem_vision_v2/python"),
     (CONTRACT_ROOT / "vision-v2.schema.json", "contracts/vem_vision_v2"),
     (CONTRACT_ROOT / "fixtures" / "valid.json", "contracts/vem_vision_v2/fixtures"),
     (CONTRACT_ROOT / "fixtures" / "invalid.json", "contracts/vem_vision_v2/fixtures"),

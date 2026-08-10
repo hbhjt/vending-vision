@@ -17,7 +17,6 @@ from pathlib import Path
 import websockets
 
 
-PROTOCOL = "vem.vision.v2"
 CONTRACT_ROOT = Path(__file__).resolve().parents[1] / "contracts" / "vem_vision_v2"
 PROFILE_FIELDS = {
     "personPresent",
@@ -66,7 +65,7 @@ def parse_args():
 
 def message(message_type, message_id, payload=None):
     return {
-        "protocol": PROTOCOL,
+        "protocol": v2_runtime_identity()["protocol"],
         "type": message_type,
         "messageId": message_id,
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -74,12 +73,23 @@ def message(message_type, message_id, payload=None):
     }
 
 
-def v2_handshake_identity():
+def v2_runtime_identity():
     manifest = json.loads((CONTRACT_ROOT / "manifest.json").read_text("utf-8"))
     return {
+        "protocol": manifest["protocol"],
         "schemaVersion": manifest["schemaVersion"],
         "bundleVersion": manifest["bundleVersion"],
         "contractDigest": manifest["bundleDigest"],
+    }
+
+
+def v2_handshake_identity():
+    """Identity fields permitted inside the vision.hello payload."""
+    identity = v2_runtime_identity()
+    return {
+        "schemaVersion": identity["schemaVersion"],
+        "bundleVersion": identity["bundleVersion"],
+        "contractDigest": identity["contractDigest"],
     }
 
 
@@ -132,6 +142,9 @@ def wait_for_http(base_url, process, timeout):
 def assert_v2_contract_resources(contract_root):
     expected_contract_resources = {
         "manifest.json",
+        "__init__.py",
+        "python/__init__.py",
+        "python/vision_v2_models.py",
         "vision-v2.schema.json",
         "fixtures/valid.json",
         "fixtures/invalid.json",
@@ -162,6 +175,9 @@ def assert_bundled_resources(exe_path):
         internal / "config" / "vending-vision-camera-maintenance-v2.requests.schema.json",
         internal / "config" / "vending-vision-camera-maintenance-v2.responses.schema.json",
         contract_root / "manifest.json",
+        contract_root / "__init__.py",
+        contract_root / "python" / "__init__.py",
+        contract_root / "python" / "vision_v2_models.py",
         contract_root / "vision-v2.schema.json",
         contract_root / "fixtures" / "valid.json",
         contract_root / "fixtures" / "invalid.json",
@@ -181,7 +197,7 @@ def assert_bundled_resources(exe_path):
     if present_retired:
         raise AssertionError(f"retired packaged resources must not be shipped: {present_retired}")
     camera_adapter = internal / "cv2_enumerate_cameras"
-    if not any(camera_adapter.glob("_windows_backend*.pyd")):
+    if sys.platform == "win32" and not any(camera_adapter.glob("_windows_backend*.pyd")):
         raise AssertionError("missing packaged cv2-enumerate-cameras Windows DirectShow adapter")
 
 
@@ -397,7 +413,7 @@ def main():
                 if not health.get("checks", {}).get("face", {}).get("ok"):
                     raise AssertionError(f"packaged face check failed: {health}")
                 version = http_get_json(f"{base_url}/version")
-                if version.get("protocol") != PROTOCOL:
+                if version.get("protocol") != v2_runtime_identity()["protocol"]:
                     raise AssertionError(f"protocol mismatch: {version}")
                 if args.expected_version and version.get("version") != args.expected_version:
                     raise AssertionError(

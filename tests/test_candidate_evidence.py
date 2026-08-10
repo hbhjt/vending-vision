@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import importlib.metadata
 import json
 import shutil
 import subprocess
@@ -32,6 +33,65 @@ def test_release_lock_contains_hashes_for_full_runtime_and_packaging_closure():
     assert packages["anyio"]["version"]
     assert packages["cv2-enumerate-cameras"]["hashes"]
     assert all(package["hashes"] for package in packages.values())
+
+
+def test_candidate_cli_bootstraps_repo_imports_for_help_and_full_generation(tmp_path):
+    script = ROOT / "scripts" / "generate_candidate_evidence.py"
+    help_result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert help_result.returncode == 0, help_result.stderr
+    assert "--wheelhouse" in help_result.stdout
+
+    bundle = tmp_path / "vending-vision-0.2.1-rc.1-windows-x86_64.zip"
+    bundle.write_bytes(b"candidate-bundle")
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    pip_version = importlib.metadata.version("pip")
+    wheel = wheelhouse / f"pip-{pip_version}-py3-none-any.whl"
+    wheel.write_bytes(b"candidate wheel fixture")
+    wheel_hash = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    lock = tmp_path / "requirements.lock"
+    lock.write_text(
+        f"pip=={pip_version} --hash=sha256:{wheel_hash}\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "candidate"
+    generation = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--bundle",
+            str(bundle),
+            "--version",
+            "0.2.1-rc.1",
+            "--commit",
+            "b" * 40,
+            "--repository",
+            "hbhjt/vending-vision",
+            "--signer-identity",
+            SIGNER,
+            "--requirements-lock",
+            str(lock),
+            "--wheelhouse",
+            str(wheelhouse),
+            "--python",
+            sys.executable,
+            "--output",
+            str(output),
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert generation.returncode == 0, generation.stderr
+    descriptor = json.loads((output / "vision-release-descriptor.json").read_text("utf-8"))
+    assert descriptor["protocol"]["version"] == "vem.vision.v2"
 
 
 def test_release_lock_includes_the_windows_click_console_dependency_in_the_win32_closure():
@@ -256,6 +316,9 @@ def test_packaged_resource_verifier_rejects_retired_maintenance_v1_schema(tmp_pa
         path.write_bytes(b"packaged")
     for relative_path in [
         "manifest.json",
+        "__init__.py",
+        "python/__init__.py",
+        "python/vision_v2_models.py",
         "vision-v2.schema.json",
         "fixtures/valid.json",
         "fixtures/invalid.json",

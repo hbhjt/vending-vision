@@ -17,7 +17,7 @@ import threading
 import webbrowser
 from pathlib import Path
 
-from vision.v2_contract_bundle import parse_v2_boundary_message
+from vision.v2_contract_bundle import load_v2_contract_identity, parse_v2_boundary_message
 
 
 def bool_env(name, default=True):
@@ -71,6 +71,10 @@ def verify_v2_contract_bundle():
     """Probe the packaged generated contract through one accepted and rejected fixture."""
     import json
 
+    # Validate manifest metadata, exact file set, and every digest before
+    # parsing fixtures.  The frozen verifier relies on this being the same
+    # loader that serves the websocket handshake.
+    load_v2_contract_identity()
     bundle_root = Path(__file__).resolve().parent / "contracts" / "vem_vision_v2"
     valid = json.loads((bundle_root / "fixtures" / "valid.json").read_text("utf-8"))
     invalid = json.loads((bundle_root / "fixtures" / "invalid.json").read_text("utf-8"))

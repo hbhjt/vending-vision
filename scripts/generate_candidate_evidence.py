@@ -4,14 +4,24 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+# A release operator invokes this file as ``python scripts/...``.  In that
+# mode Python puts only ``scripts/`` on sys.path, so establish the repository
+# package root before importing generated contract code.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from vision.v2_contract_bundle import load_v2_contract_identity
 
-try:  # direct ``python scripts/...`` and package import both remain supported
-    from scripts.dependency_lock import verify_dependency_closure
-except ModuleNotFoundError:  # pragma: no cover - exercised by release workflow
-    from dependency_lock import verify_dependency_closure
+
+def verify_dependency_closure(*args, **kwargs):
+    """Load packaging-only dependencies after CLI parsing has succeeded."""
+    from scripts.dependency_lock import verify_dependency_closure as verify
+
+    return verify(*args, **kwargs)
 
 
 SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$")
@@ -59,11 +69,10 @@ def main():
     if not re.fullmatch(r"spki-sha256:[a-f0-9]{64}", args.signer_identity):
         raise SystemExit("signer identity must be spki-sha256:<64 lowercase hex>")
 
-    root = Path(__file__).resolve().parents[1]
     bundle = Path(args.bundle).resolve()
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    model_manifest = json.loads((root / "models/model-manifest.json").read_text(encoding="utf-8"))
+    model_manifest = json.loads((ROOT / "models/model-manifest.json").read_text(encoding="utf-8"))
     contract_identity = load_v2_contract_identity()
     requirements = verify_dependency_closure(args.requirements_lock, args.wheelhouse, args.python)
 
