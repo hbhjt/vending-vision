@@ -141,6 +141,9 @@ def main():
         host=str(settings.HOST),
         port=int(settings.PORT),
         log_level="info",
+        # Result capability URLs contain bearer material.  Uvicorn's default
+        # access formatter would echo the raw target into production logs.
+        access_log=False,
         reload=False,   # 生产模式不启用热重载
         workers=1,      # 单 worker（摄像头资源不能多进程共享）
     )

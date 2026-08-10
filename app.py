@@ -19,6 +19,7 @@ import hashlib
 import json
 import ipaddress
 import os
+import re
 import secrets
 from datetime import datetime
 from json import JSONDecodeError
@@ -92,12 +93,17 @@ app = FastAPI(
 
 _FAST_RESULT_TTL_SECONDS = 5 * 60
 _FAST_RESULT_MAX_BYTES = 16 * 1024 * 1024
+_FAST_RESULT_MAX_COUNT = 1000
+_FAST_RESULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 _FAST_ATTEMPT_TIMEOUT_SECONDS = 15
 _FAST_ATTEMPT_MAX_TASKS = 2
 _FAST_TERMINAL_SEND_TIMEOUT_SECONDS = 0.25
 _fast_runtime = FastTryOnRuntime()
 _fast_attempt_registry = FastAttemptRegistry(
     terminal_ttl_seconds=_FAST_RESULT_TTL_SECONDS,
+    result_max_count=_FAST_RESULT_MAX_COUNT,
+    result_max_bytes=_FAST_RESULT_MAX_TOTAL_BYTES,
+    result_single_max_bytes=_FAST_RESULT_MAX_BYTES,
 )
 _fast_attempt_task_slots = asyncio.Semaphore(_FAST_ATTEMPT_MAX_TASKS)
 _fast_render_broker = FastRenderBroker()
@@ -349,11 +355,22 @@ def _fast_result_reference(attempt_id: str, token: str) -> str:
 
 
 def _prepare_fast_result(attempt_id: str, image: bytes) -> tuple[dict, dict]:
+    if len(image) > _FAST_RESULT_MAX_BYTES:
+        raise RuntimeError("fast_result_too_large")
+    png_signature = b"\x89PNG\r\n\x1a\n"
+    if len(image) < 33 or image[:8] != png_signature or image[12:16] != b"IHDR":
+        raise RuntimeError("fast_result_invalid_png")
+    width = int.from_bytes(image[16:20], "big")
+    height = int.from_bytes(image[20:24], "big")
+    if not 1 <= width <= 8192 or not 1 <= height <= 8192:
+        raise RuntimeError("fast_result_dimensions_too_large")
+    if width * height > 8192 * 8192:
+        raise RuntimeError("fast_result_dimensions_too_large")
     decoded = cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if decoded is None or decoded.ndim != 3:
         raise RuntimeError("fast_result_invalid_png")
-    if len(image) > _FAST_RESULT_MAX_BYTES:
-        raise RuntimeError("fast_result_too_large")
+    if decoded.shape[1] != width or decoded.shape[0] != height:
+        raise RuntimeError("fast_result_invalid_png")
     token = secrets.token_urlsafe(32)
     stored = {
         "token": token,
@@ -381,14 +398,21 @@ def _generated_v2_envelope(message_type: str, payload: dict) -> dict:
 @app.api_route("/v2/try-on/results/{attempt_id}", methods=["GET", "HEAD"])
 async def read_fast_result(request: Request, attempt_id: str, token: Optional[str] = None):
     """Serve only an unguessable, disposable local PNG result read grant."""
-    if list(request.query_params.multi_items()) != [("token", token)]:
+    raw_query = request.scope.get("query_string", b"")
+    if not isinstance(raw_query, bytes) or not re.fullmatch(
+        rb"token=[A-Za-z0-9_-]{1,128}", raw_query
+    ):
         raise HTTPException(status_code=404, detail="result not found")
-    result = await _fast_attempt_registry.get_result(attempt_id, token or "")
+    try:
+        canonical_token = raw_query[6:].decode("ascii")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=404, detail="result not found")
+    result = await _fast_attempt_registry.get_result(attempt_id, canonical_token)
     if result is None:
         raise HTTPException(status_code=404, detail="result not found")
     image = result["bytes"]
     return Response(
-        content=image,
+        content=b"" if request.method == "HEAD" else image,
         media_type="image/png",
         headers={"Content-Length": str(len(image)), "Cache-Control": "no-store"},
     )
@@ -1555,8 +1579,11 @@ async def run_v2_fast_attempt(
         terminal = _generated_v2_envelope(
             "vision.try_on.attempt.failed", {"attemptId": attempt_id, "reason": "attempt_replaced"}
         )
-    subscribers = await _fast_attempt_registry.commit_terminal(receipt, terminal, stored_result)
-    await _publish_fast_transition(TerminalTransition(message=terminal, subscribers=subscribers))
+    transition = await _fast_attempt_registry.commit_terminal_transition(
+        receipt, terminal, stored_result
+    )
+    if transition is not None:
+        await _publish_fast_transition(transition)
 
 
 async def reject_v2_fast_attempt_for_backpressure(

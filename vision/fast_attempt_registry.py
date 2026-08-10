@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
 
+from vision.fast_result_store import FastResultStore, ResultAdmissionError
+
 
 @dataclass(frozen=True)
 class AttemptReceipt:
@@ -120,6 +122,10 @@ class FastAttemptRegistry:
         terminal_ttl_seconds: float,
         terminal_max_count: int = 32,
         subscriber_max_count: int = 32,
+        result_store: FastResultStore | None = None,
+        result_max_count: int = 1000,
+        result_max_bytes: int = 256 * 1024 * 1024,
+        result_single_max_bytes: int | None = None,
     ):
         self._gate = asyncio.Lock()
         self._active: ActiveAttempt | None = None
@@ -130,6 +136,12 @@ class FastAttemptRegistry:
         self._terminal_ttl_seconds = terminal_ttl_seconds
         self._terminal_max_count = terminal_max_count
         self._subscriber_max_count = subscriber_max_count
+        self._results = result_store or FastResultStore(
+            max_count=result_max_count,
+            max_bytes=result_max_bytes,
+            single_max_bytes=result_single_max_bytes,
+            ttl_seconds=terminal_ttl_seconds,
+        )
 
     def _attach_subscriber_unlocked(
         self, active: ActiveAttempt, subscriber: AttemptSubscriber
@@ -174,8 +186,11 @@ class FastAttemptRegistry:
         for attempt_id, terminal in list(self._terminals.items()):
             if terminal.expires_at <= now:
                 self._terminals.pop(attempt_id, None)
+                self._results._remove_unlocked(attempt_id)
         while len(self._terminals) > self._terminal_max_count:
-            self._terminals.popitem(last=False)
+            attempt_id, _terminal = self._terminals.popitem(last=False)
+            self._results._remove_unlocked(attempt_id)
+        self._results._prune_unlocked(now)
 
     def _new_terminal(
         self, message: dict, result: dict | None = None
@@ -208,7 +223,6 @@ class FastAttemptRegistry:
                 self._prune_unlocked()
                 terminal = self._terminals.get(attempt_id)
                 if terminal is not None:
-                    self._terminals.move_to_end(attempt_id)
                     return AdmissionPreparation(
                         attempt_id=attempt_id,
                         resolved=True,
@@ -290,7 +304,6 @@ class FastAttemptRegistry:
                 self._prune_unlocked()
                 terminal = self._terminals.get(preparation.attempt_id)
                 if terminal is not None:
-                    self._terminals.move_to_end(preparation.attempt_id)
                     return AttemptAdmission(None, [terminal.message])
                 active = self._active
                 if (
@@ -348,7 +361,6 @@ class FastAttemptRegistry:
             terminal = self._terminals.get(preparation.attempt_id)
             pending = self._pending
             if terminal is not None:
-                self._terminals.move_to_end(preparation.attempt_id)
                 if pending is not None and pending.token == preparation.token:
                     self._pending = None
                     pending.done.set()
@@ -459,7 +471,6 @@ class FastAttemptRegistry:
                 self._prune_unlocked()
                 stored = self._terminals.get(attempt_id)
                 if stored is not None:
-                    self._terminals.move_to_end(attempt_id)
                     return AttemptAdmission(None, [stored.message])
                 active = self._active
                 if active is not None and active.receipt.attempt_id == attempt_id:
@@ -503,7 +514,6 @@ class FastAttemptRegistry:
                 self._prune_unlocked()
                 stored = self._terminals.get(attempt_id)
                 if stored is not None:
-                    self._terminals.move_to_end(attempt_id)
                     return AttemptAdmission(None, [stored.message])
                 active = self._active
                 if active is not None and active.receipt.attempt_id == attempt_id:
@@ -539,17 +549,39 @@ class FastAttemptRegistry:
         canceled.set()
         return canceled
 
+    @staticmethod
+    def _result_failure_message(message: dict) -> dict:
+        """Map an unpublishable completion to the one stable Fast failure."""
+        failure = dict(message)
+        failure["type"] = "vision.try_on.attempt.failed"
+        failure["payload"] = {
+            "attemptId": message.get("payload", {}).get("attemptId"),
+            "reason": "fast_failed",
+        }
+        return failure
+
     def _commit_terminal_unlocked(
         self, active: ActiveAttempt, message: dict, result: dict | None = None
     ) -> TerminalTransition:
-        self._terminals[active.receipt.attempt_id] = self._new_terminal(message, result)
+        canonical = message
+        admitted_result = None
+        if result is not None:
+            try:
+                admitted_result = self._results._admit_unlocked(
+                    active.receipt.attempt_id, result
+                )
+            except ResultAdmissionError:
+                canonical = self._result_failure_message(message)
+        self._terminals[active.receipt.attempt_id] = self._new_terminal(
+            canonical, admitted_result.public() if admitted_result is not None else None
+        )
         self._terminals.move_to_end(active.receipt.attempt_id)
         subscribers = list(active.subscribers.values())
         self._active = None
         if active.owner_receipts is not None:
             active.owner_receipts.discard(active.receipt)
         self._prune_unlocked()
-        return TerminalTransition(message=message, subscribers=subscribers)
+        return TerminalTransition(message=canonical, subscribers=subscribers)
 
     def _commit_pending_terminal_unlocked(
         self, pending: PendingAdmission, message: dict
@@ -646,13 +678,21 @@ class FastAttemptRegistry:
     async def get_result(self, attempt_id: str, token: str) -> dict | None:
         async with self._gate:
             self._prune_unlocked()
-            terminal = self._terminals.get(attempt_id)
-            if terminal is None or terminal.result is None:
+            entry = self._results._get_unlocked(attempt_id, token)
+            return entry.stored() if entry is not None else None
+
+    async def commit_terminal_transition(
+        self,
+        receipt: AttemptReceipt,
+        message: dict,
+        result: dict | None = None,
+    ) -> TerminalTransition | None:
+        """Commit terminal and result together, returning the canonical winner."""
+        async with self._gate:
+            active = self._active
+            if active is None or active.receipt != receipt:
                 return None
-            if terminal.result.get("token") != token:
-                return None
-            self._terminals.move_to_end(attempt_id)
-            return terminal.result
+            return self._commit_terminal_unlocked(active, message, result)
 
     async def shutdown(self) -> TerminalTransition | None:
         async with self._gate:
