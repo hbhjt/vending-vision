@@ -7,13 +7,14 @@ verified image bounds plus the declared template rather than product anchors.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import http.client
 import struct
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
 import cv2
+import httpx
 import numpy as np
 
 
@@ -34,7 +35,7 @@ class FastTryOnRuntime:
     def __init__(self, max_garment_bytes: int = 8 * 1024 * 1024):
         self.max_garment_bytes = max_garment_bytes
 
-    def fetch_garment(self, descriptor: dict, cancel_event=None) -> PreparedGarment:
+    async def fetch_garment(self, descriptor: dict, cancel_event=None) -> PreparedGarment:
         reference = descriptor.get("reference")
         if not isinstance(reference, str):
             raise GarmentFetchError("reference")
@@ -45,39 +46,52 @@ class FastTryOnRuntime:
             or not parse_qs(url.query).get("token")
         ):
             raise GarmentFetchError("loopback")
-        deadline = cv2.getTickCount() / cv2.getTickFrequency() + 5.0
-        connection = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=1)
+        if cancel_event is not None and cancel_event.is_set():
+            raise GarmentFetchError("attempt_replaced")
+        timeout = httpx.Timeout(connect=1.0, read=0.25, write=1.0, pool=1.0)
         try:
-            target = url.path or "/"
-            if url.query:
-                target = f"{target}?{url.query}"
-            if cancel_event is not None and cancel_event.is_set():
-                raise GarmentFetchError("attempt_replaced")
-            connection.request("GET", target)
-            response = connection.getresponse()
-            if 300 <= response.status < 400:
-                raise GarmentFetchError("redirect")
-            if response.status != 200 or response.getheader("Content-Type", "").split(";", 1)[0] != "image/png":
-                raise GarmentFetchError("content_type")
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    connection.close()
-                    raise GarmentFetchError("attempt_replaced")
-                if cv2.getTickCount() / cv2.getTickFrequency() > deadline:
-                    connection.close()
-                    raise GarmentFetchError("deadline")
-                chunk = response.read(min(64 * 1024, self.max_garment_bytes + 1 - total))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-                if total > self.max_garment_bytes:
-                    raise GarmentFetchError("byte_size")
-            payload = b"".join(chunks)
-        finally:
-            connection.close()
+            async with asyncio.timeout(5.0):
+                # trust_env is intentionally disabled: a local daemon read
+                # grant must never be diverted to a configured proxy.
+                async with httpx.AsyncClient(
+                    trust_env=False,
+                    follow_redirects=False,
+                    timeout=timeout,
+                ) as client:
+                    stream = client.stream("GET", reference)
+                    response = await self._await_or_cancel(stream.__aenter__(), cancel_event)
+                    try:
+                        if 300 <= response.status_code < 400:
+                            raise GarmentFetchError("redirect")
+                        if (
+                            response.status_code != 200
+                            or response.headers.get("content-type", "").split(";", 1)[0]
+                            != "image/png"
+                        ):
+                            raise GarmentFetchError("content_type")
+                        chunks: list[bytes] = []
+                        total = 0
+                        iterator = response.aiter_bytes(64 * 1024).__aiter__()
+                        while True:
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise GarmentFetchError("attempt_replaced")
+                            try:
+                                chunk = await self._await_or_cancel(anext(iterator), cancel_event)
+                            except StopAsyncIteration:
+                                break
+                            if not chunk:
+                                continue
+                            chunks.append(chunk)
+                            total += len(chunk)
+                            if total > self.max_garment_bytes:
+                                raise GarmentFetchError("byte_size")
+                        payload = b"".join(chunks)
+                    finally:
+                        await stream.__aexit__(None, None, None)
+        except TimeoutError as exc:
+            raise GarmentFetchError("deadline") from exc
+        except httpx.HTTPError as exc:
+            raise GarmentFetchError("transport") from exc
         if len(payload) > self.max_garment_bytes or len(payload) != descriptor.get("byteSize"):
             raise GarmentFetchError("byte_size")
         digest = "sha256:" + hashlib.sha256(payload).hexdigest()
@@ -104,6 +118,28 @@ class FastTryOnRuntime:
             alpha_mask=alpha_mask,
             opaque_bounds=(x, y, width, height),
         )
+
+    @staticmethod
+    async def _await_or_cancel(awaitable, cancel_event):
+        """Race every socket wait, including response headers, with cancellation."""
+        operation = asyncio.create_task(awaitable)
+        if cancel_event is None:
+            return await operation
+        cancel_waiter = asyncio.create_task(cancel_event.wait())
+        done, pending = await asyncio.wait(
+            {operation, cancel_waiter}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for pending_task in pending:
+            pending_task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if cancel_waiter in done:
+            # Cancelling the in-flight transport call before the client context
+            # exits closes a blocked connect/header/body read immediately.
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            raise GarmentFetchError("attempt_replaced")
+        return operation.result()
 
     def _predecode_png(self, payload: bytes) -> None:
         if not payload.startswith(b"\x89PNG\r\n\x1a\n"):

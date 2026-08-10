@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,6 +37,27 @@ class GarmentHandler(BaseHTTPRequestHandler):
         return
 
 
+class SlowDripHandler(BaseHTTPRequestHandler):
+    entered = threading.Event()
+    closed = threading.Event()
+
+    def do_GET(self):
+        self.entered.set()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.end_headers()
+        try:
+            while True:
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                threading.Event().wait(0.25)
+        except (BrokenPipeError, ConnectionResetError):
+            self.closed.set()
+
+    def log_message(self, *_):
+        return
+
+
 @pytest.fixture
 def garment_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), GarmentHandler)
@@ -53,7 +75,7 @@ def test_fast_runtime_downloads_only_declared_loopback_png_and_composites_a_deco
 
     garment = GarmentHandler.payload
     runtime = FastTryOnRuntime(max_garment_bytes=1024 * 1024)
-    prepared = runtime.fetch_garment(
+    prepared = asyncio.run(runtime.fetch_garment(
         {
             "reference": garment_server,
             "digest": "sha256:" + hashlib.sha256(garment).hexdigest(),
@@ -61,7 +83,7 @@ def test_fast_runtime_downloads_only_declared_loopback_png_and_composites_a_deco
             "byteSize": len(garment),
             "template": "tshirt_short_sleeve",
         }
-    )
+    ))
     frame = np.full((160, 120, 3), (235, 220, 205), dtype=np.uint8)
     result = runtime.render(frame, prepared)
 
@@ -86,12 +108,12 @@ def test_fast_runtime_rejects_redirect_and_digest_mismatch(garment_server):
         "template": "tshirt_short_sleeve",
     }
     with pytest.raises(GarmentFetchError, match="digest"):
-        runtime.fetch_garment(descriptor)
+        asyncio.run(runtime.fetch_garment(descriptor))
 
     GarmentHandler.redirect = True
     try:
         with pytest.raises(GarmentFetchError, match="redirect"):
-            runtime.fetch_garment({**descriptor, "digest": "sha256:" + hashlib.sha256(GarmentHandler.payload).hexdigest()})
+            asyncio.run(runtime.fetch_garment({**descriptor, "digest": "sha256:" + hashlib.sha256(GarmentHandler.payload).hexdigest()}))
     finally:
         GarmentHandler.redirect = False
 
@@ -115,7 +137,7 @@ def test_fast_runtime_rejects_png_bomb_dimensions_before_decode(garment_server):
     try:
         runtime = FastTryOnRuntime(max_garment_bytes=1024 * 1024)
         with pytest.raises(GarmentFetchError, match="png_dimensions"):
-            runtime.fetch_garment(
+            asyncio.run(runtime.fetch_garment(
                 {
                     "reference": garment_server,
                     "digest": "sha256:" + hashlib.sha256(oversized_ihdr).hexdigest(),
@@ -123,6 +145,45 @@ def test_fast_runtime_rejects_png_bomb_dimensions_before_decode(garment_server):
                     "byteSize": len(oversized_ihdr),
                     "template": "tshirt_short_sleeve",
                 }
-            )
+            ))
     finally:
         GarmentHandler.payload = png_bytes()
+
+
+def test_fast_runtime_cancels_a_slow_drip_and_closes_its_stream():
+    """A replacement never leaves a blocking response reader behind."""
+    SlowDripHandler.entered.clear()
+    SlowDripHandler.closed.clear()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowDripHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    async def exercise():
+        runtime = FastTryOnRuntime(max_garment_bytes=1024 * 1024)
+        canceled = asyncio.Event()
+        task = asyncio.create_task(
+            runtime.fetch_garment(
+                {
+                    "reference": f"http://127.0.0.1:{server.server_port}/garment?token=opaque",
+                    "digest": "sha256:" + "0" * 64,
+                    "contentType": "image/png",
+                    "byteSize": 1024,
+                    "template": "tshirt_short_sleeve",
+                },
+                canceled,
+            )
+        )
+        assert await asyncio.to_thread(SlowDripHandler.entered.wait, 1.0)
+        canceled.set()
+        with pytest.raises(GarmentFetchError, match="attempt_replaced"):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert task.done()
+        assert await asyncio.to_thread(SlowDripHandler.closed.wait, 1.0)
+
+    from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        server.shutdown()
+        thread.join()

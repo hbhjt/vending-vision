@@ -227,21 +227,148 @@ def test_v2_fast_attempt_replays_same_owner_active_attempt_without_new_terminal(
     assert completed["payload"]["attemptId"] == attempt_id
 
 
+def test_v2_fast_attempt_second_socket_joins_and_both_receive_one_terminal(
+    monkeypatch, garment_reference
+):
+    """A reconnecting transport is a subscriber, never a competing owner."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    _GarmentHandler.release.clear()
+    attempt_id = str(uuid4())
+    start = _start(attempt_id, garment_reference)
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as owner, client.websocket_connect("/ws") as subscriber:
+            owner.send_json(_hello(manifest))
+            assert owner.receive_json()["type"] == "vision.ready"
+            subscriber.send_json(_hello(manifest))
+            assert subscriber.receive_json()["type"] == "vision.ready"
+
+            owner.send_json(start)
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert _GarmentHandler.entered.wait(timeout=2)
+
+            subscriber.send_json(start)
+            replay = [subscriber.receive_json(), subscriber.receive_json()]
+            assert [message["type"] for message in replay] == [
+                "vision.try_on.attempt.accepted",
+                "vision.try_on.attempt.progress",
+            ]
+
+            _GarmentHandler.release.set()
+            owner_terminal = owner.receive_json()
+            subscriber_terminal = subscriber.receive_json()
+
+    assert owner_terminal["type"] == subscriber_terminal["type"] == "vision.try_on.attempt.completed"
+    assert owner_terminal == subscriber_terminal
+
+
+def test_v2_fast_attempt_second_socket_joins_without_cancelling_owner(
+    monkeypatch, garment_reference
+):
+    """A retry on another WS is a subscriber, never a second owner or terminal."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    _GarmentHandler.release.clear()
+    attempt_id = str(uuid4())
+    start = _start(attempt_id, garment_reference)
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as owner, client.websocket_connect("/ws") as retry:
+            owner.send_json(_hello(manifest))
+            retry.send_json(_hello(manifest))
+            assert owner.receive_json()["type"] == "vision.ready"
+            assert retry.receive_json()["type"] == "vision.ready"
+            owner.send_json(start)
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert _GarmentHandler.entered.wait(timeout=2)
+
+            retry.send_json(start)
+            assert [retry.receive_json()["type"], retry.receive_json()["type"]] == [
+                "vision.try_on.attempt.accepted",
+                "vision.try_on.attempt.progress",
+            ]
+            # Losing the subscriber must not cancel the connection that owns work.
+            retry.close()
+            _GarmentHandler.release.set()
+            completed = owner.receive_json()
+
+    assert completed["type"] == "vision.try_on.attempt.completed"
+    assert completed["payload"]["attemptId"] == attempt_id
+
+
+def test_v2_fast_attempt_terminal_reconnect_replays_the_identical_grant(
+    monkeypatch, garment_reference
+):
+    """Terminal records are canonical across a fresh WebSocket connection."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    attempt_id = str(uuid4())
+    start = _start(attempt_id, garment_reference)
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as owner:
+            owner.send_json(_hello(manifest))
+            assert owner.receive_json()["type"] == "vision.ready"
+            owner.send_json(start)
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.progress"
+            terminal = owner.receive_json()
+
+        with client.websocket_connect("/ws") as reconnect:
+            reconnect.send_json(_hello(manifest))
+            assert reconnect.receive_json()["type"] == "vision.ready"
+            reconnect.send_json(start)
+            replay = reconnect.receive_json()
+
+    assert terminal["type"] == "vision.try_on.attempt.completed"
+    assert replay == terminal
+
+
+def test_v2_fast_attempt_replacement_joins_old_worker_before_new_admission(
+    monkeypatch, garment_reference
+):
+    """A different attempt cannot overtake its canceled worker's cleanup."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    _GarmentHandler.release.clear()
+    first_id, second_id = str(uuid4()), str(uuid4())
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(first_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            assert _GarmentHandler.entered.wait(timeout=2)
+
+            socket.send_json(_start(second_id, garment_reference))
+            replaced = socket.receive_json()
+            assert replaced["type"] == "vision.try_on.attempt.failed"
+            assert replaced["payload"] == {"attemptId": first_id, "reason": "attempt_replaced"}
+
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            _GarmentHandler.release.set()
+            completed = socket.receive_json()
+
+    assert completed["type"] == "vision.try_on.attempt.completed"
+    assert completed["payload"]["attemptId"] == second_id
+
+
 def test_v2_fast_result_store_rejects_self_too_large_without_publishing(monkeypatch):
     monkeypatch.setattr(vision_app, "_FAST_RESULT_MAX_BYTES", 8)
-    active = {
-        "attemptId": str(uuid4()),
-        "ownerId": "owner",
-        "canceled": threading.Event(),
-        "terminal": False,
-    }
     image = _png_bytes()
-    with vision_app._fast_attempt_lock:
-        vision_app._fast_attempt_active = active
-    try:
-        with pytest.raises(RuntimeError, match="fast_result_too_large"):
-            vision_app._store_fast_result(active, image)
-        assert active["attemptId"] not in vision_app._fast_results
-    finally:
-        with vision_app._fast_attempt_lock:
-            vision_app._fast_attempt_active = None
+    with pytest.raises(RuntimeError, match="fast_result_too_large"):
+        vision_app._prepare_fast_result(str(uuid4()), image)
