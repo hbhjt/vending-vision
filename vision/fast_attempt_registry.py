@@ -1,9 +1,8 @@
 """Process-wide ownership and replay state for Fast try-on attempts.
 
-The registry deliberately has one small async transition gate.  It makes
-replacement wait for the old worker (and every resource it owns) before the
-next attempt becomes visible, while still leaving network and image work
-outside the gate.
+Replacement uses a pending admission reservation while the old owner joins.
+No accepted/progress state becomes visible until readiness and active ownership
+are committed together under the short state gate.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ import asyncio
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 
@@ -70,6 +69,34 @@ class TerminalTransition:
     subscribers: list[AttemptSubscriber]
 
 
+@dataclass
+class PendingAdmission:
+    attempt_id: str
+    token: str
+    task: asyncio.Task
+    prior_task: asyncio.Task | None
+    owner_receipts: set[AttemptReceipt] | None
+    owner_subscriber_key: int
+    subscribers: dict[int, AttemptSubscriber]
+    canceled_terminal: dict | None
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
+class AdmissionPreparation:
+    attempt_id: str
+    resolved: bool = False
+    token: str | None = None
+    join_task: asyncio.Task | None = None
+    wait_event: asyncio.Event | None = None
+    replay: list[dict] = field(default_factory=list)
+    transitions: list[TerminalTransition] = field(default_factory=list)
+
+    @property
+    def is_pending_owner(self) -> bool:
+        return self.token is not None
+
+
 class FastAttemptRegistry:
     """One active attempt plus bounded canonical terminal replay records.
 
@@ -88,16 +115,18 @@ class FastAttemptRegistry:
         terminal_max_count: int = 32,
         subscriber_max_count: int = 32,
     ):
-        self._transition_gate = asyncio.Lock()
         self._gate = asyncio.Lock()
         self._active: ActiveAttempt | None = None
+        self._pending: PendingAdmission | None = None
         self._terminals: OrderedDict[str, TerminalAttempt] = OrderedDict()
         self._generation = 0
         self._terminal_ttl_seconds = terminal_ttl_seconds
         self._terminal_max_count = terminal_max_count
         self._subscriber_max_count = subscriber_max_count
 
-    def _attach_subscriber_unlocked(self, active: ActiveAttempt, subscriber: AttemptSubscriber) -> None:
+    def _attach_subscriber_unlocked(
+        self, active: ActiveAttempt, subscriber: AttemptSubscriber
+    ) -> None:
         if subscriber.key in active.subscribers:
             active.subscribers[subscriber.key] = subscriber
             return
@@ -112,6 +141,27 @@ class FastAttemptRegistry:
         if len(active.subscribers) < self._subscriber_max_count:
             active.subscribers[subscriber.key] = subscriber
 
+    def _attach_pending_subscriber_unlocked(
+        self, pending: PendingAdmission, subscriber: AttemptSubscriber
+    ) -> None:
+        if subscriber.key in pending.subscribers:
+            pending.subscribers[subscriber.key] = subscriber
+            return
+        while len(pending.subscribers) >= self._subscriber_max_count:
+            stale_key = next(
+                (
+                    key
+                    for key in pending.subscribers
+                    if key != pending.owner_subscriber_key
+                ),
+                None,
+            )
+            if stale_key is None:
+                break
+            pending.subscribers.pop(stale_key, None)
+        if len(pending.subscribers) < self._subscriber_max_count:
+            pending.subscribers[subscriber.key] = subscriber
+
     def _prune_unlocked(self) -> None:
         now = time.monotonic()
         for attempt_id, terminal in list(self._terminals.items()):
@@ -120,7 +170,9 @@ class FastAttemptRegistry:
         while len(self._terminals) > self._terminal_max_count:
             self._terminals.popitem(last=False)
 
-    def _new_terminal(self, message: dict, result: dict | None = None) -> TerminalAttempt:
+    def _new_terminal(
+        self, message: dict, result: dict | None = None
+    ) -> TerminalAttempt:
         terminal_at = time.monotonic()
         return TerminalAttempt(
             message=message,
@@ -128,6 +180,197 @@ class FastAttemptRegistry:
             terminal_at=terminal_at,
             expires_at=terminal_at + self._terminal_ttl_seconds,
         )
+
+    async def prepare_admission(
+        self,
+        *,
+        attempt_id: str,
+        websocket: Any,
+        send_lock: asyncio.Lock,
+        task: asyncio.Task,
+        canceled_terminal: dict | None = None,
+        owner_receipts: set[AttemptReceipt] | None = None,
+    ) -> AdmissionPreparation:
+        """Reserve one admission without awaiting an old task under the gate."""
+        subscriber = AttemptSubscriber(id(websocket), websocket, send_lock)
+        while True:
+            wait_for_other: asyncio.Event | None = None
+            transitions: list[TerminalTransition] = []
+            async with self._gate:
+                self._prune_unlocked()
+                terminal = self._terminals.get(attempt_id)
+                if terminal is not None:
+                    self._terminals.move_to_end(attempt_id)
+                    return AdmissionPreparation(
+                        attempt_id=attempt_id,
+                        resolved=True,
+                        replay=[terminal.message],
+                    )
+
+                active = self._active
+                if active is not None and active.receipt.attempt_id == attempt_id:
+                    self._attach_subscriber_unlocked(active, subscriber)
+                    replay = [
+                        message
+                        for message in (active.accepted, active.latest_progress)
+                        if message
+                    ]
+                    return AdmissionPreparation(
+                        attempt_id=attempt_id, resolved=True, replay=replay
+                    )
+
+                pending = self._pending
+                if pending is not None:
+                    if pending.attempt_id == attempt_id:
+                        self._attach_pending_subscriber_unlocked(pending, subscriber)
+                        return AdmissionPreparation(
+                            attempt_id=attempt_id, wait_event=pending.done
+                        )
+                    wait_for_other = pending.done
+                else:
+                    join_task = None
+                    if active is not None:
+                        active.cancel_event.set()
+                        join_task = active.task
+                        if active.canceled_terminal is not None:
+                            transitions.append(
+                                self._commit_terminal_unlocked(
+                                    active, active.canceled_terminal
+                                )
+                            )
+                    token = uuid4().hex
+                    self._pending = PendingAdmission(
+                        attempt_id=attempt_id,
+                        token=token,
+                        task=task,
+                        prior_task=join_task,
+                        owner_receipts=owner_receipts,
+                        owner_subscriber_key=subscriber.key,
+                        subscribers={subscriber.key: subscriber},
+                        canceled_terminal=canceled_terminal,
+                    )
+                    return AdmissionPreparation(
+                        attempt_id=attempt_id,
+                        token=token,
+                        join_task=join_task,
+                        transitions=transitions,
+                    )
+            assert wait_for_other is not None
+            await asyncio.shield(wait_for_other.wait())
+
+    async def commit_prepared_admission(
+        self,
+        preparation: AdmissionPreparation,
+        *,
+        accepted: dict | None,
+        progress: dict | None,
+        unavailable_terminal: dict,
+        readiness: Callable[[], bool],
+    ) -> AttemptAdmission:
+        """Join outside the gate, then atomically publish ready active state."""
+        if preparation.resolved:
+            return AttemptAdmission(None, preparation.replay)
+        if preparation.wait_event is not None:
+            await asyncio.shield(preparation.wait_event.wait())
+            async with self._gate:
+                self._prune_unlocked()
+                terminal = self._terminals.get(preparation.attempt_id)
+                if terminal is not None:
+                    self._terminals.move_to_end(preparation.attempt_id)
+                    return AttemptAdmission(None, [terminal.message])
+                active = self._active
+                if (
+                    active is not None
+                    and active.receipt.attempt_id == preparation.attempt_id
+                ):
+                    return AttemptAdmission(
+                        None,
+                        [
+                            message
+                            for message in (active.accepted, active.latest_progress)
+                            if message
+                        ],
+                    )
+                raise RuntimeError("pending Fast admission resolved without state")
+
+        if (
+            preparation.join_task is not None
+            and preparation.join_task is not asyncio.current_task()
+        ):
+            try:
+                await asyncio.shield(preparation.join_task)
+            except asyncio.CancelledError:
+                async with self._gate:
+                    pending = self._pending
+                    if pending is not None and pending.token == preparation.token:
+                        if pending.canceled_terminal is not None:
+                            self._commit_pending_terminal_unlocked(
+                                pending, pending.canceled_terminal
+                            )
+                        else:
+                            self._pending = None
+                            pending.done.set()
+                raise
+
+        async with self._gate:
+            self._prune_unlocked()
+            terminal = self._terminals.get(preparation.attempt_id)
+            pending = self._pending
+            if terminal is not None:
+                self._terminals.move_to_end(preparation.attempt_id)
+                if pending is not None and pending.token == preparation.token:
+                    self._pending = None
+                    pending.done.set()
+                return AttemptAdmission(None, [terminal.message])
+            if pending is None or pending.token != preparation.token:
+                active = self._active
+                if (
+                    active is not None
+                    and active.receipt.attempt_id == preparation.attempt_id
+                ):
+                    return AttemptAdmission(
+                        None,
+                        [
+                            message
+                            for message in (active.accepted, active.latest_progress)
+                            if message
+                        ],
+                    )
+                raise RuntimeError("Fast admission reservation was lost")
+
+            if not readiness():
+                self._terminals[preparation.attempt_id] = self._new_terminal(
+                    unavailable_terminal
+                )
+                self._terminals.move_to_end(preparation.attempt_id)
+                self._pending = None
+                pending.done.set()
+                self._prune_unlocked()
+                return AttemptAdmission(None, [unavailable_terminal])
+
+            self._generation += 1
+            receipt = AttemptReceipt(
+                preparation.attempt_id, uuid4().hex, self._generation
+            )
+            if pending.owner_receipts is not None:
+                pending.owner_receipts.add(receipt)
+            self._active = ActiveAttempt(
+                receipt=receipt,
+                task=pending.task,
+                cancel_event=asyncio.Event(),
+                owner_receipts=pending.owner_receipts,
+                owner_subscriber_key=pending.owner_subscriber_key,
+                subscribers=pending.subscribers,
+                accepted=accepted,
+                latest_progress=progress,
+                canceled_terminal=pending.canceled_terminal,
+            )
+            self._pending = None
+            pending.done.set()
+            return AttemptAdmission(
+                receipt,
+                [message for message in (accepted, progress) if message],
+            )
 
     async def admit(
         self,
@@ -141,80 +384,33 @@ class FastAttemptRegistry:
         canceled_terminal: dict | None = None,
         owner_receipts: set[AttemptReceipt] | None = None,
     ) -> AttemptAdmission:
-        """Attach to a canonical attempt or admit one after replacement joins."""
-        subscriber = AttemptSubscriber(id(websocket), websocket, send_lock)
-        async with self._transition_gate:
-            transitions: list[TerminalTransition] = []
-            active: ActiveAttempt | None = None
-            while True:
-                async with self._gate:
-                    self._prune_unlocked()
-                    terminal = self._terminals.get(attempt_id)
-                    if terminal is not None:
-                        self._terminals.move_to_end(attempt_id)
-                        return AttemptAdmission(None, [terminal.message], transitions)
-
-                    active = self._active
-                    if active is not None and active.receipt.attempt_id == attempt_id:
-                        self._attach_subscriber_unlocked(active, subscriber)
-                        replay = [message for message in (active.accepted, active.latest_progress) if message]
-                        return AttemptAdmission(None, replay, transitions)
-                    if active is not None:
-                        active.cancel_event.set()
-                        if active.canceled_terminal is not None:
-                            transitions.append(
-                                self._commit_terminal_unlocked(active, active.canceled_terminal)
-                            )
-
-                if active is not None and active.task is not task:
-                    # Do not admit new work into the single worker lane until
-                    # the old task has closed its response and joined executor
-                    # work. The state lock is deliberately not held here.
-                    await asyncio.shield(active.task)
-
-                async with self._gate:
-                    self._prune_unlocked()
-                    terminal = self._terminals.get(attempt_id)
-                    if terminal is not None:
-                        self._terminals.move_to_end(attempt_id)
-                        return AttemptAdmission(None, [terminal.message], transitions)
-                    current = self._active
-                    if current is not None and current.receipt.attempt_id == attempt_id:
-                        self._attach_subscriber_unlocked(current, subscriber)
-                        replay = [message for message in (current.accepted, current.latest_progress) if message]
-                        return AttemptAdmission(None, replay, transitions)
-                    if current is not None and current is not active:
-                        continue
-                    if active is not None and self._active is active:
-                        # A task never intentionally reaches this fallback, but a
-                        # cancellation injected before its terminal CAS must still
-                        # not let a replacement inherit live resources.
-                        self._active = None
-                    self._generation += 1
-                    receipt = AttemptReceipt(attempt_id, uuid4().hex, self._generation)
-                    if owner_receipts is not None:
-                        owner_receipts.add(receipt)
-                    self._active = ActiveAttempt(
-                        receipt=receipt,
-                        task=task,
-                        cancel_event=asyncio.Event(),
-                        owner_receipts=owner_receipts,
-                        owner_subscriber_key=subscriber.key,
-                        subscribers={subscriber.key: subscriber},
-                        accepted=accepted,
-                        latest_progress=progress,
-                        canceled_terminal=canceled_terminal,
-                    )
-                    return AttemptAdmission(
-                        receipt,
-                        [message for message in (accepted, progress) if message],
-                        transitions,
-                    )
+        """Compatibility wrapper for callers without a readiness boundary."""
+        preparation = await self.prepare_admission(
+            attempt_id=attempt_id,
+            websocket=websocket,
+            send_lock=send_lock,
+            task=task,
+            canceled_terminal=canceled_terminal,
+            owner_receipts=owner_receipts,
+        )
+        admission = await self.commit_prepared_admission(
+            preparation,
+            accepted=accepted,
+            progress=progress,
+            unavailable_terminal={},
+            readiness=lambda: True,
+        )
+        admission.transitions.extend(preparation.transitions)
+        return admission
 
     async def is_current(self, receipt: AttemptReceipt) -> bool:
         async with self._gate:
             active = self._active
-            return active is not None and active.receipt == receipt and not active.cancel_event.is_set()
+            return (
+                active is not None
+                and active.receipt == receipt
+                and not active.cancel_event.is_set()
+            )
 
     async def reject_or_replay(
         self,
@@ -237,12 +433,62 @@ class FastAttemptRegistry:
                 self._attach_subscriber_unlocked(active, subscriber)
                 return AttemptAdmission(
                     None,
-                    [message for message in (active.accepted, active.latest_progress) if message],
+                    [
+                        message
+                        for message in (active.accepted, active.latest_progress)
+                        if message
+                    ],
                 )
+            pending = self._pending
+            if pending is not None and pending.attempt_id == attempt_id:
+                self._attach_pending_subscriber_unlocked(pending, subscriber)
+                self._commit_pending_terminal_unlocked(pending, terminal)
+                return AttemptAdmission(None, [terminal])
             self._terminals[attempt_id] = self._new_terminal(terminal)
             self._terminals.move_to_end(attempt_id)
             self._prune_unlocked()
             return AttemptAdmission(None, [terminal])
+
+    async def join_pending_or_reject(
+        self,
+        *,
+        attempt_id: str,
+        websocket: Any,
+        send_lock: asyncio.Lock,
+        terminal: dict,
+    ) -> AttemptAdmission:
+        """Attach same-ID overflow to pending state; reject only new work."""
+        subscriber = AttemptSubscriber(id(websocket), websocket, send_lock)
+        while True:
+            wait_event = None
+            async with self._gate:
+                self._prune_unlocked()
+                stored = self._terminals.get(attempt_id)
+                if stored is not None:
+                    self._terminals.move_to_end(attempt_id)
+                    return AttemptAdmission(None, [stored.message])
+                active = self._active
+                if active is not None and active.receipt.attempt_id == attempt_id:
+                    self._attach_subscriber_unlocked(active, subscriber)
+                    return AttemptAdmission(
+                        None,
+                        [
+                            message
+                            for message in (active.accepted, active.latest_progress)
+                            if message
+                        ],
+                    )
+                pending = self._pending
+                if pending is not None and pending.attempt_id == attempt_id:
+                    self._attach_pending_subscriber_unlocked(pending, subscriber)
+                    wait_event = pending.done
+                else:
+                    self._terminals[attempt_id] = self._new_terminal(terminal)
+                    self._terminals.move_to_end(attempt_id)
+                    self._prune_unlocked()
+                    return AttemptAdmission(None, [terminal])
+            assert wait_event is not None
+            await asyncio.shield(wait_event.wait())
 
     async def cancel_event_for(self, receipt: AttemptReceipt) -> asyncio.Event:
         async with self._gate:
@@ -265,7 +511,21 @@ class FastAttemptRegistry:
         self._prune_unlocked()
         return TerminalTransition(message=message, subscribers=subscribers)
 
-    async def cancel_owner_and_join(self, receipt: AttemptReceipt) -> TerminalTransition | None:
+    def _commit_pending_terminal_unlocked(
+        self, pending: PendingAdmission, message: dict
+    ) -> TerminalTransition:
+        self._terminals[pending.attempt_id] = self._new_terminal(message)
+        self._terminals.move_to_end(pending.attempt_id)
+        subscribers = list(pending.subscribers.values())
+        if self._pending is pending:
+            self._pending = None
+        pending.done.set()
+        self._prune_unlocked()
+        return TerminalTransition(message=message, subscribers=subscribers)
+
+    async def cancel_owner_and_join(
+        self, receipt: AttemptReceipt
+    ) -> TerminalTransition | None:
         async with self._gate:
             active = self._active
             if active is None or active.receipt != receipt:
@@ -285,6 +545,8 @@ class FastAttemptRegistry:
         async with self._gate:
             if self._active is not None:
                 self._active.subscribers.pop(id(websocket), None)
+            if self._pending is not None:
+                self._pending.subscribers.pop(id(websocket), None)
 
     async def commit_terminal(
         self,
@@ -313,15 +575,31 @@ class FastAttemptRegistry:
     async def shutdown(self) -> TerminalTransition | None:
         async with self._gate:
             active = self._active
-            if active is None:
-                return None
-            active.cancel_event.set()
-            task = active.task
-            transition = (
-                self._commit_terminal_unlocked(active, active.canceled_terminal)
-                if active.canceled_terminal is not None
-                else None
-            )
-        if task is not asyncio.current_task():
-            await asyncio.shield(task)
+            pending = self._pending
+            task = None
+            prior_task = None
+            transition = None
+            if active is not None:
+                active.cancel_event.set()
+                task = active.task
+                transition = (
+                    self._commit_terminal_unlocked(active, active.canceled_terminal)
+                    if active.canceled_terminal is not None
+                    else None
+                )
+            elif pending is not None:
+                task = pending.task
+                prior_task = pending.prior_task
+                if pending.canceled_terminal is not None:
+                    transition = self._commit_pending_terminal_unlocked(
+                        pending, pending.canceled_terminal
+                    )
+                else:
+                    self._pending = None
+                    pending.done.set()
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if prior_task is not None and prior_task is not asyncio.current_task():
+            await asyncio.shield(prior_task)
         return transition

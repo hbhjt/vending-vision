@@ -1449,37 +1449,32 @@ async def run_v2_fast_attempt(
         if fast_ready
         else None
     )
-    admission = await _fast_attempt_registry.admit(
+    preparation = await _fast_attempt_registry.prepare_admission(
         attempt_id=attempt_id,
         websocket=websocket,
         send_lock=send_lock,
         task=asyncio.current_task(),
-        accepted=accepted,
-        progress=progress,
         canceled_terminal=canceled_terminal,
         owner_receipts=owned_fast_attempt_receipts,
     )
-    for transition in admission.transitions:
+    for transition in preparation.transitions:
         await _publish_fast_transition(transition)
+    admission = await _fast_attempt_registry.commit_prepared_admission(
+        preparation,
+        accepted=accepted,
+        progress=progress,
+        unavailable_terminal=unavailable_terminal,
+        readiness=lambda: bool(fast_ready and _fast_render_broker.ready),
+    )
     if not admission.is_owner:
         for replay_message in admission.replay:
             await _send_json_bounded(websocket, send_lock, replay_message)
         return
     receipt = admission.receipt
     assert receipt is not None
-    # A different-ID admission may have canceled, joined and restarted the
-    # previous render owner while admit() was awaiting it.  Recheck after that
-    # barrier and before publishing accepted/progress.
-    fast_ready = bool(fast_ready and _fast_render_broker.ready)
     if connection_closed.is_set():
         await _publish_fast_transition(
             await _fast_attempt_registry.cancel_owner_and_join(receipt)
-        )
-        return
-    if not fast_ready:
-        subscribers = await _fast_attempt_registry.commit_terminal(receipt, unavailable_terminal)
-        await _publish_fast_transition(
-            TerminalTransition(message=unavailable_terminal, subscribers=subscribers)
         )
         return
     stored_result = None
@@ -1571,7 +1566,7 @@ async def reject_v2_fast_attempt_for_backpressure(
         "vision.try_on.attempt.failed",
         {"attemptId": attempt_id, "reason": "attempt_already_active"},
     )
-    admission = await _fast_attempt_registry.reject_or_replay(
+    admission = await _fast_attempt_registry.join_pending_or_reject(
         attempt_id=attempt_id,
         websocket=websocket,
         send_lock=send_lock,

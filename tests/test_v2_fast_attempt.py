@@ -86,6 +86,41 @@ def _fast_block_then_fail_restart_target(connection, starts, requests):
         connection.close()
 
 
+def _fast_block_then_barrier_restart_target(
+    connection,
+    starts,
+    requests,
+    restart_entered,
+    restart_release,
+    restart_fails,
+):
+    with starts.get_lock():
+        starts.value += 1
+        start_number = starts.value
+    if start_number > 1:
+        restart_entered.set()
+        restart_release.wait()
+        if restart_fails:
+            connection.close()
+            return
+    connection.send(("ready", {"pid": os.getpid()}))
+    try:
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+            with requests.get_lock():
+                requests.value += 1
+                request_number = requests.value
+            if request_number == 1:
+                while True:
+                    threading.Event().wait(1.0)
+            connection.send(("ok", _png_bytes()))
+    finally:
+        connection.close()
+
+
 def _png_bytes():
     image = np.full((48, 36, 4), (20, 120, 220, 255), dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", image)
@@ -547,6 +582,8 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
                 "attemptId": first_id,
                 "reason": "attempt_replaced",
             }
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
             replacement_pid = broker.pid
             assert broker.ready
             assert replacement_pid is not None and replacement_pid != first_pid
@@ -554,8 +591,6 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
             assert {child.pid for child in multiprocessing.active_children()} == {
                 replacement_pid
             }
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
             completed = socket.receive_json()
 
             assert completed["type"] == "vision.try_on.attempt.completed"
@@ -669,6 +704,239 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
 
         assert starts.value == 2
         assert multiprocessing.active_children() == []
+
+    assert broker.pid is None
+
+
+def test_v2_duplicate_waits_for_atomic_failed_replacement_admission(
+    monkeypatch, garment_reference
+):
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    context = multiprocessing.get_context("spawn")
+    starts = context.Value("i", 0)
+    requests = context.Value("i", 0)
+    restart_entered = context.Event()
+    restart_release = context.Event()
+    broker = FastRenderBroker(
+        context=context,
+        target=_fast_block_then_barrier_restart_target,
+        target_args=(
+            starts,
+            requests,
+            restart_entered,
+            restart_release,
+            True,
+        ),
+    )
+    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "fastRenderReady": broker.ready,
+        },
+    )
+    first_id, replacement_id = str(uuid4()), str(uuid4())
+    owner_messages = []
+    duplicate_messages = []
+    replaced_seen = threading.Event()
+    owner_done = threading.Event()
+    duplicate_done = threading.Event()
+
+    with TestClient(vision_app.app) as client:
+        with (
+            client.websocket_connect("/ws") as owner,
+            client.websocket_connect("/ws") as duplicate,
+        ):
+            owner.send_json(_hello(manifest))
+            duplicate.send_json(_hello(manifest))
+            assert owner.receive_json()["payload"]["fastReady"] is True
+            assert duplicate.receive_json()["payload"]["fastReady"] is True
+            owner.send_json(_start(first_id, garment_reference))
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.progress"
+            waiter = threading.Event()
+            for _ in range(200):
+                if requests.value == 1:
+                    break
+                waiter.wait(0.01)
+            assert requests.value == 1
+
+            def receive_owner():
+                owner_messages.append(owner.receive_json())
+                replaced_seen.set()
+                owner_messages.append(owner.receive_json())
+                owner_done.set()
+
+            owner_reader = threading.Thread(target=receive_owner, daemon=True)
+            owner_reader.start()
+            owner.send_json(_start(replacement_id, garment_reference))
+            assert restart_entered.wait(timeout=2)
+            try:
+                assert replaced_seen.wait(timeout=0.5)
+                duplicate.send_json(_start(replacement_id, garment_reference))
+
+                def receive_duplicate():
+                    duplicate_messages.append(duplicate.receive_json())
+                    duplicate_done.set()
+
+                duplicate_reader = threading.Thread(
+                    target=receive_duplicate, daemon=True
+                )
+                duplicate_reader.start()
+            finally:
+                restart_release.set()
+
+            assert owner_done.wait(timeout=3)
+            assert duplicate_done.wait(timeout=3)
+            owner_reader.join(timeout=1)
+            duplicate_reader.join(timeout=1)
+
+            owner.send_json(_start(replacement_id, garment_reference))
+            replayed_terminal = owner.receive_json()
+
+        expected_replaced = {
+            "attemptId": first_id,
+            "reason": "attempt_replaced",
+        }
+        assert owner_messages[0]["payload"] == expected_replaced
+        expected_unavailable = owner_messages[1]
+        assert expected_unavailable["type"] == "vision.try_on.attempt.failed"
+        assert expected_unavailable["payload"] == {
+            "attemptId": replacement_id,
+            "reason": "fast_unavailable",
+        }
+        assert duplicate_messages == [expected_unavailable]
+        assert replayed_terminal == expected_unavailable
+        assert starts.value == 2
+        assert requests.value == 1
+        assert broker.pid is None
+        assert broker.active_request_count == 0
+        assert multiprocessing.active_children() == []
+
+
+def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
+    monkeypatch, garment_reference
+):
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    context = multiprocessing.get_context("spawn")
+    starts = context.Value("i", 0)
+    requests = context.Value("i", 0)
+    restart_entered = context.Event()
+    restart_release = context.Event()
+    broker = FastRenderBroker(
+        context=context,
+        target=_fast_block_then_barrier_restart_target,
+        target_args=(
+            starts,
+            requests,
+            restart_entered,
+            restart_release,
+            False,
+        ),
+    )
+    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "fastRenderReady": broker.ready,
+        },
+    )
+    first_id, replacement_id = str(uuid4()), str(uuid4())
+    owner_messages = []
+    duplicate_messages = []
+    replaced_seen = threading.Event()
+    owner_done = threading.Event()
+    duplicate_message_seen = threading.Event()
+    duplicate_done = threading.Event()
+
+    with TestClient(vision_app.app) as client:
+        first_pid = broker.pid
+        with (
+            client.websocket_connect("/ws") as owner,
+            client.websocket_connect("/ws") as duplicate,
+        ):
+            owner.send_json(_hello(manifest))
+            duplicate.send_json(_hello(manifest))
+            assert owner.receive_json()["payload"]["fastReady"] is True
+            assert duplicate.receive_json()["payload"]["fastReady"] is True
+            owner.send_json(_start(first_id, garment_reference))
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert owner.receive_json()["type"] == "vision.try_on.attempt.progress"
+            waiter = threading.Event()
+            for _ in range(200):
+                if requests.value == 1:
+                    break
+                waiter.wait(0.01)
+            assert requests.value == 1
+
+            def receive_owner():
+                for _ in range(4):
+                    owner_messages.append(owner.receive_json())
+                    if len(owner_messages) == 1:
+                        replaced_seen.set()
+                owner_done.set()
+
+            owner_reader = threading.Thread(target=receive_owner, daemon=True)
+            owner_reader.start()
+            owner.send_json(_start(replacement_id, garment_reference))
+            assert restart_entered.wait(timeout=2)
+            assert replaced_seen.wait(timeout=0.5)
+            duplicate.send_json(_start(replacement_id, garment_reference))
+
+            def receive_duplicate():
+                for _ in range(3):
+                    duplicate_messages.append(duplicate.receive_json())
+                    duplicate_message_seen.set()
+                duplicate_done.set()
+
+            duplicate_reader = threading.Thread(
+                target=receive_duplicate, daemon=True
+            )
+            duplicate_reader.start()
+            assert not duplicate_message_seen.wait(timeout=0.1)
+            restart_release.set()
+
+            assert owner_done.wait(timeout=5)
+            assert duplicate_done.wait(timeout=5)
+            owner_reader.join(timeout=1)
+            duplicate_reader.join(timeout=1)
+
+        assert owner_messages[0]["payload"] == {
+            "attemptId": first_id,
+            "reason": "attempt_replaced",
+        }
+        assert [message["type"] for message in owner_messages[1:]] == [
+            "vision.try_on.attempt.accepted",
+            "vision.try_on.attempt.progress",
+            "vision.try_on.attempt.completed",
+        ]
+        assert duplicate_messages == owner_messages[1:]
+        replacement_pid = broker.pid
+        assert replacement_pid is not None and replacement_pid != first_pid
+        assert starts.value == 2
+        assert requests.value == 2
+        assert broker.active_request_count == 0
+        assert {child.pid for child in multiprocessing.active_children()} == {
+            replacement_pid
+        }
 
     assert broker.pid is None
 
