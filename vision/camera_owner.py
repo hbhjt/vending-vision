@@ -52,6 +52,7 @@ class FrontCameraOwner:
     def __init__(self):
         self.lock = threading.RLock()       # 可重入锁，保护所有状态变更
         self.owner = "idle"                 # 当前持有者
+        self.lease_token = None             # 当前持有者租约令牌
         self.reason = None                  # 持有/释放原因
         self.updated_at = _now_iso()        # 最近一次状态变更时间（ISO格式）
         self.updated_monotonic = time.time()  # 最近一次状态变更时间（单调时钟）
@@ -74,6 +75,7 @@ class FrontCameraOwner:
 
         # 超时回收
         self.owner = "idle"
+        self.lease_token = None
         self.reason = "owner_timeout"
         self.updated_at = _now_iso()
         self.updated_monotonic = time.time()
@@ -85,11 +87,17 @@ class FrontCameraOwner:
             return {
                 "owner": self.owner,
                 "reason": self.reason,
+                "leaseToken": self.lease_token,
                 "updatedAt": self.updated_at,
                 "timeoutMs": settings.FRONT_CAMERA_OWNER_TIMEOUT_MS,
             }
 
-    def acquire(self, owner: str, reason: str | None = None):
+    def acquire(
+        self,
+        owner: str,
+        reason: str | None = None,
+        lease_token: str | None = None,
+    ):
         """尝试获取前置摄像头的所有权。
 
         规则：
@@ -107,6 +115,8 @@ class FrontCameraOwner:
                 "error": "invalid_owner",
             }
 
+        requested_token = str(lease_token or owner)
+
         with self.lock:
             self._expire_locked()
             current_owner = self.owner
@@ -123,7 +133,21 @@ class FrontCameraOwner:
                     "error": "front_camera_busy",
                 }
 
+            if (
+                current_owner == owner
+                and self.lease_token is not None
+                and self.lease_token != requested_token
+            ):
+                return {
+                    "ok": False,
+                    "owner": current_owner,
+                    "requestedOwner": owner,
+                    "reason": self.reason,
+                    "error": "front_camera_busy",
+                }
+
             self.owner = owner
+            self.lease_token = requested_token
             self.reason = reason
             self.updated_at = _now_iso()
             self.updated_monotonic = time.time()
@@ -133,10 +157,16 @@ class FrontCameraOwner:
                 "owner": self.owner,
                 "previousOwner": current_owner,
                 "reason": self.reason,
+                "leaseToken": self.lease_token,
                 "updatedAt": self.updated_at,
             }
 
-    def release(self, owner: str, reason: str | None = None):
+    def release(
+        self,
+        owner: str,
+        reason: str | None = None,
+        lease_token: str | None = None,
+    ):
         """释放前置摄像头的所有权。
 
         只有当前持有者本人才能释放。
@@ -161,8 +191,18 @@ class FrontCameraOwner:
                     "error": "owner_mismatch",
                 }
 
+            requested_token = str(lease_token or owner)
+            if self.lease_token != requested_token:
+                return {
+                    "ok": False,
+                    "owner": self.owner,
+                    "requestedOwner": owner,
+                    "error": "owner_mismatch",
+                }
+
             previous_owner = self.owner
             self.owner = "idle"
+            self.lease_token = None
             self.reason = reason
             self.updated_at = _now_iso()
             self.updated_monotonic = time.time()
@@ -175,11 +215,24 @@ class FrontCameraOwner:
                 "updatedAt": self.updated_at,
             }
 
-    def renew(self, owner: str, reason: str | None = None):
+    def renew(
+        self,
+        owner: str,
+        reason: str | None = None,
+        lease_token: str | None = None,
+    ):
         """Renew an active lease without changing ownership."""
         with self.lock:
             self._expire_locked()
             if self.owner != owner:
+                return {
+                    "ok": False,
+                    "owner": self.owner,
+                    "requestedOwner": owner,
+                    "error": "owner_mismatch",
+                }
+            requested_token = str(lease_token or owner)
+            if self.lease_token != requested_token:
                 return {
                     "ok": False,
                     "owner": self.owner,
@@ -212,19 +265,31 @@ def get_front_camera_owner():
     return _front_camera_owner.status()
 
 
-def acquire_front_camera(owner: str, reason: str | None = None):
+def acquire_front_camera(
+    owner: str,
+    reason: str | None = None,
+    lease_token: str | None = None,
+):
     """尝试获取前置摄像头所有权。"""
-    return _front_camera_owner.acquire(owner, reason=reason)
+    return _front_camera_owner.acquire(owner, reason=reason, lease_token=lease_token)
 
 
-def release_front_camera(owner: str, reason: str | None = None):
+def release_front_camera(
+    owner: str,
+    reason: str | None = None,
+    lease_token: str | None = None,
+):
     """释放前置摄像头所有权。"""
-    return _front_camera_owner.release(owner, reason=reason)
+    return _front_camera_owner.release(owner, reason=reason, lease_token=lease_token)
 
 
-def renew_front_camera(owner: str, reason: str | None = None):
+def renew_front_camera(
+    owner: str,
+    reason: str | None = None,
+    lease_token: str | None = None,
+):
     """Refresh an active camera-owner lease."""
-    return _front_camera_owner.renew(owner, reason=reason)
+    return _front_camera_owner.renew(owner, reason=reason, lease_token=lease_token)
 
 
 @contextmanager

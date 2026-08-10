@@ -17,6 +17,7 @@ from datetime import datetime
 from vision.camera import describe_capture, open_camera, read_warmup_frame
 from vision.camera_binding import acquire_runtime_camera_lease, get_camera_maintenance
 from vision.config import settings
+from vision.directshow_broker import DirectShowCameraBroker
 from vision.frame_source import FrameSource, RecordedVideoFrameSource
 from vision.frame_transform import camera_rotation, rotate_frame
 from vision.logger import logger
@@ -225,7 +226,7 @@ class ManagedCameraStream:
             f"backend={self.config.get('backend')}"
         )
 
-    def read(self, warmup_frames: int | None = None):
+    def read(self, warmup_frames: int | None = None, *, timeout: float | None = None):
         """读取一帧图像，支持自动重连。
 
         读取失败时自动重试（次数由 CAMERA_READ_RETRY_COUNT 配置），
@@ -342,46 +343,81 @@ class _NoopRuntimeMaintenanceHandoff:
 # 按角色存储的持久化摄像头流
 _streams: dict[str, ManagedCameraStream] = {}
 _recorded_sources: dict[str, RecordedVideoFrameSource] = {}
+_dshow_brokers: dict[str, DirectShowCameraBroker] = {}
 _streams_lock = threading.RLock()
 _last_frame_metadata: dict[str, dict] = {}
 _role_read_locks = {role: threading.RLock() for role in CAMERA_ROLES}
 
 
 class DirectShowFrameSource:
-    """FrameSource adapter over the existing bound DirectShow stream lifecycle."""
+    """FrameSource adapter over the single process-level DirectShow broker."""
 
     def __init__(self, role: str, config: dict):
         self.role = role
         self.config = dict(config)
 
-    def read(self, warmup_frames: int | None = None):
-        if _keep_open(self.config):
-            stream = get_camera_stream(self.role)
-            return stream.read(warmup_frames=warmup_frames)
-        cap = _open_role_camera(self.config)
-        try:
-            return _apply_camera_transform(
-                self.config,
-                read_warmup_frame(
-                    cap,
-                    settings.CAMERA_WARMUP_FRAMES if warmup_frames is None else warmup_frames,
-                ),
-            )
-        finally:
-            cap.release()
+    def _broker(self) -> DirectShowCameraBroker:
+        with _streams_lock:
+            broker = _dshow_brokers.get(self.role)
+            if broker is None or broker.config != {**self.config, "logicalRole": self.role}:
+                if broker is not None:
+                    broker.release()
+                broker = DirectShowCameraBroker(self.role, self.config)
+                _dshow_brokers[self.role] = broker
+            return broker
+
+    def read(self, warmup_frames: int | None = None, *, timeout: float | None = None):
+        attempts = max(1, int(settings.CAMERA_READ_RETRY_COUNT) + 1)
+        last_error = None
+        started = time.time()
+        deadline = None
+        if timeout is not None:
+            deadline = time.monotonic() + max(float(timeout), 0.001)
+        for attempt in range(1, attempts + 1):
+            try:
+                remaining = timeout
+                if deadline is not None:
+                    remaining = max(deadline - time.monotonic(), 0.001)
+                image = self._broker().read(warmup_frames=warmup_frames, timeout=remaining)
+                metrics.increment("camera_read_success_total", role=self.role)
+                metrics.observe_ms(
+                    "camera_read_duration_ms",
+                    (time.time() - started) * 1000,
+                    role=self.role,
+                )
+                return image
+            except Exception as exc:
+                last_error = exc
+                get_camera_maintenance().refresh_after_read_failure()
+                self.config = _camera_config(self.role)
+                with _streams_lock:
+                    broker = _dshow_brokers.pop(self.role, None)
+                if broker is not None:
+                    broker.release()
+                metrics.increment("camera_read_failure_total", role=self.role)
+                logger.warning(
+                    f"{self.role} camera broker read failed "
+                    f"attempt={attempt}/{attempts}: {exc}"
+                )
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                if attempt < attempts:
+                    sleep_for = settings.CAMERA_RECONNECT_DELAY_MS / 1000.0
+                    if deadline is not None:
+                        sleep_for = min(sleep_for, max(deadline - time.monotonic(), 0.0))
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+        metrics.observe_ms(
+            "camera_read_duration_ms",
+            (time.time() - started) * 1000,
+            role=self.role,
+        )
+        raise RuntimeError(f"{self.role} camera read failed after broker restart: {last_error}")
 
     def status(self) -> dict:
-        if _keep_open(self.config):
-            return get_camera_stream(self.role).status()
-        cap = _open_role_camera(self.config)
-        try:
-            raw_image = read_warmup_frame(cap, settings.CAMERA_WARMUP_FRAMES)
-            image = _apply_camera_transform(self.config, raw_image)
-            status = _frame_status(self.role, self.config, cap, image, raw_image=raw_image)
-            status["mode"] = "single_capture"
-            return status
-        finally:
-            cap.release()
+        status = self._broker().status(settings.CAMERA_WARMUP_FRAMES)
+        status["requested"] = _requested_config(self.config)
+        return status
 
     def release(self) -> None:
         release_camera(self.role)
@@ -390,7 +426,11 @@ class DirectShowFrameSource:
         reset_camera(self.role)
 
     def last_frame(self) -> dict | None:
-        return None
+        with _streams_lock:
+            broker = _dshow_brokers.get(self.role)
+        if broker is None:
+            return None
+        return {"source": "dshow", "brokerPid": broker.last_pid}
 
 
 def get_camera_config(role: str) -> dict:
@@ -462,7 +502,12 @@ def quiesce_runtime_camera(candidate_id: str):
     return matching[0].quiesce_for_maintenance()
 
 
-def read_camera_with_source(role: str, warmup_frames: int | None = None):
+def read_camera_with_source(
+    role: str,
+    warmup_frames: int | None = None,
+    *,
+    timeout: float | None = None,
+):
     """Read one image and its source evidence as one role-local operation."""
     try:
         role_lock = _role_read_locks[role]
@@ -470,7 +515,10 @@ def read_camera_with_source(role: str, warmup_frames: int | None = None):
         raise ValueError(f"unknown camera role: {role}") from exc
     with role_lock:
         source = get_frame_source(role)
-        image = source.read(warmup_frames=warmup_frames)
+        try:
+            image = source.read(warmup_frames=warmup_frames, timeout=timeout)
+        except TypeError:
+            image = source.read(warmup_frames=warmup_frames)
         frame = source.last_frame() if hasattr(source, "last_frame") else None
         if frame is not None:
             frame = dict(frame)
@@ -480,13 +528,13 @@ def read_camera_with_source(role: str, warmup_frames: int | None = None):
         return image, frame
 
 
-def read_camera(role: str, warmup_frames: int | None = None):
+def read_camera(role: str, warmup_frames: int | None = None, *, timeout: float | None = None):
     """读取指定角色摄像头的一帧。
 
     如果配置为常开模式，使用持久化流；
     否则每次打开新连接，读取后立即释放。
     """
-    image, _ = read_camera_with_source(role, warmup_frames=warmup_frames)
+    image, _ = read_camera_with_source(role, warmup_frames=warmup_frames, timeout=timeout)
     return image
 
 
@@ -529,10 +577,13 @@ def release_camera(role: str):
         with _streams_lock:
             stream = _streams.get(role)
             source = _recorded_sources.get(role)
+            broker = _dshow_brokers.pop(role, None)
         if stream is not None:
             stream.release()
         if source is not None:
             source.release()
+        if broker is not None:
+            broker.release()
         _last_frame_metadata.pop(role, None)
 
 
@@ -542,10 +593,13 @@ def reset_camera(role: str):
         with _streams_lock:
             stream = _streams.get(role)
             source = _recorded_sources.get(role)
+            broker = _dshow_brokers.pop(role, None)
         if stream is not None:
             stream.reset()
         if source is not None:
             source.reset()
+        if broker is not None:
+            broker.reset()
         _last_frame_metadata.pop(role, None)
 
 

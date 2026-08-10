@@ -74,6 +74,34 @@ class TryOnSecurityTest(unittest.TestCase):
         finally:
             settings.FRONT_CAMERA_OWNER_TIMEOUT_MS = original_timeout
 
+    def test_attempt_scoped_fast_lease_cannot_reenter_or_release_legacy_owner(self):
+        owner = FrontCameraOwner()
+        self.assertTrue(
+            owner.acquire(
+                "tryon_frontend",
+                reason="try_on_start:legacy-session",
+                lease_token="tryon_frontend",
+            )["ok"]
+        )
+
+        denied = owner.acquire(
+            "tryon_frontend",
+            reason="fast_attempt:attempt-a",
+            lease_token="fast:attempt-a:1",
+        )
+        self.assertFalse(denied["ok"])
+        self.assertEqual(denied["owner"], "tryon_frontend")
+        self.assertEqual(denied["error"], "front_camera_busy")
+
+        released = owner.release(
+            "tryon_frontend",
+            reason="fast_attempt_done:attempt-a",
+            lease_token="fast:attempt-a:1",
+        )
+        self.assertFalse(released["ok"])
+        self.assertEqual(released["error"], "owner_mismatch")
+        self.assertEqual(owner.status()["owner"], "tryon_frontend")
+
 
 if __name__ == "__main__":
     unittest.main()

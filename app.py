@@ -73,7 +73,7 @@ from vision.try_on_session import (
 )
 from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
 from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
-from vision.attempt_worker import render_attempt_frame, run_attempt_worker
+from vision.attempt_worker import render_attempt_frame
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
@@ -172,20 +172,6 @@ async def _run_owned_attempt_step(receipt: AttemptReceipt, operation, *, timeout
             raise GarmentFetchError("attempt_replaced")
 
 
-def _read_front_frame_worker(connection, warmup_frames: int) -> None:
-    try:
-        from vision.camera_manager import read_camera_with_source as worker_read_camera_with_source
-
-        connection.send(("ok", worker_read_camera_with_source("front", warmup_frames)))
-    except BaseException as exc:
-        try:
-            connection.send(("error", f"{type(exc).__name__}: {exc}"))
-        except BaseException:
-            pass
-    finally:
-        connection.close()
-
-
 async def _acquire_front_io_until(deadline: float) -> None:
     loop = asyncio.get_running_loop()
     while loop.time() < deadline:
@@ -201,39 +187,41 @@ async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
     deadline = loop.time() + timeout
     owner_acquired = False
     io_acquired = False
+    lease_token = f"fast:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}"
     try:
-        owner = acquire_front_camera("tryon_frontend", reason=f"fast_attempt:{receipt.attempt_id}")
-        if not owner.get("ok"):
-            raise GarmentFetchError(owner.get("error") or "front_camera_busy")
-        owner_acquired = True
         await _acquire_front_io_until(deadline)
         io_acquired = True
         if not await _fast_attempt_registry.is_current(receipt):
             raise GarmentFetchError("attempt_replaced")
+        owner = acquire_front_camera(
+            "tryon_frontend",
+            reason=f"fast_attempt:{receipt.attempt_id}",
+            lease_token=lease_token,
+        )
+        if not owner.get("ok"):
+            raise GarmentFetchError(owner.get("error") or "front_camera_busy")
+        owner_acquired = True
 
         if getattr(read_camera_with_source, "__module__", "") != "vision.camera_manager":
             return read_camera_with_source("front", 1)
 
-        config = get_camera_config("front")
-        if str(config.get("source", "dshow")).lower() == "dshow":
-            return await _run_owned_attempt_step(
-                receipt,
-                run_attempt_worker(
-                    _read_front_frame_worker,
-                    (1,),
-                    timeout=max(0.001, deadline - loop.time()),
-                ),
-                timeout=max(0.001, deadline - loop.time()),
-            )
-
-        # Recorded-video is a deterministic in-process adapter and existing
-        # Fast/profile tests assert it stays in the parent process.
-        return read_camera_with_source("front", 1)
+        # All production consumers enter through camera_manager.  Physical
+        # DirectShow reads are served by its single broker process; recorded
+        # video remains deterministic in-process behind the same interface.
+        return read_camera_with_source(
+            "front",
+            1,
+            timeout=max(0.001, deadline - loop.time()),
+        )
     finally:
         if io_acquired:
             release_front_camera_io_lock()
         if owner_acquired:
-            release_front_camera("tryon_frontend", reason=f"fast_attempt_done:{receipt.attempt_id}")
+            release_front_camera(
+                "tryon_frontend",
+                reason=f"fast_attempt_done:{receipt.attempt_id}",
+                lease_token=lease_token,
+            )
 
 
 async def _publish_fast_transition(transition: TerminalTransition | None) -> None:

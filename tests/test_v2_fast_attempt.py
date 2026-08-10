@@ -1,4 +1,5 @@
 import hashlib
+import asyncio
 import json
 import os
 import threading
@@ -433,6 +434,110 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
 
     assert completed["type"] == "vision.try_on.attempt.completed"
     assert read_pids == [(parent_pid, "front", 1)]
+    assert vision_app.get_front_camera_owner()["owner"] == "idle"
+
+
+def test_v2_fast_attempt_does_not_release_legacy_tryon_owner(monkeypatch):
+    """Fast uses its attempt lease and cannot reuse the legacy try-on owner token."""
+    owner = vision_app.acquire_front_camera(
+        "tryon_frontend",
+        reason="try_on_start:legacy-session",
+        lease_token="tryon_frontend",
+    )
+    assert owner["ok"]
+
+    async def is_current(_receipt):
+        return True
+
+    monkeypatch.setattr(vision_app._fast_attempt_registry, "is_current", is_current)
+    receipt = vision_app.AttemptReceipt(
+        attempt_id=str(uuid4()),
+        owner_token="owner-token",
+        generation=7,
+    )
+
+    try:
+        with pytest.raises(vision_app.GarmentFetchError, match="front_camera_busy"):
+            asyncio.run(vision_app._read_fast_front_frame(receipt, timeout=0.1))
+
+        assert vision_app.get_front_camera_owner()["owner"] == "tryon_frontend"
+        assert vision_app.get_front_camera_owner()["leaseToken"] == "tryon_frontend"
+    finally:
+        vision_app.release_front_camera(
+            "tryon_frontend",
+            reason="test_cleanup",
+            lease_token="tryon_frontend",
+        )
+
+
+def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeypatch):
+    """The production dshow branch enters camera_manager and opens one broker boundary."""
+    parent_pid = os.getpid()
+    events = []
+
+    class Candidate:
+        index = 9
+        backend = "dshow"
+        stable_id = "front-stable"
+
+    class Maintenance:
+        def resolve(self, role):
+            assert role == "front"
+            return Candidate()
+
+        def refresh_after_read_failure(self):
+            raise AssertionError("happy path should not refresh")
+
+    class Broker:
+        def __init__(self, role, config):
+            events.append(("open", os.getpid(), role, config["stableId"]))
+            self.config = dict(config)
+            self.config["logicalRole"] = role
+            self.last_pid = 4242
+
+        def read(self, warmup_frames=None, *, timeout=None):
+            events.append(("read", os.getpid(), warmup_frames, timeout))
+            return np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
+
+        def last_frame(self):
+            return {"source": "dshow", "brokerPid": self.last_pid}
+
+        def release(self):
+            events.append(("release", os.getpid()))
+
+    async def is_current(_receipt):
+        return True
+
+    monkeypatch.setattr(vision_app._fast_attempt_registry, "is_current", is_current)
+    monkeypatch.setattr(vision_app.settings, "FRONT_CAMERA_CONFIG", {
+        "role": "profile_tryon",
+        "source": "dshow",
+        "keep_open": True,
+    })
+    monkeypatch.setattr(camera_manager, "get_camera_maintenance", lambda: Maintenance())
+    monkeypatch.setattr(camera_manager, "DirectShowCameraBroker", Broker)
+    camera_manager.release_all_cameras()
+
+    receipt = vision_app.AttemptReceipt(
+        attempt_id=str(uuid4()),
+        owner_token="owner-token",
+        generation=8,
+    )
+
+    try:
+        frame, source = asyncio.run(vision_app._read_fast_front_frame(receipt, timeout=1.0))
+    finally:
+        vision_app.release_front_camera(
+            "tryon_frontend",
+            reason="test_cleanup",
+            lease_token=f"fast:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}",
+        )
+        camera_manager.release_all_cameras()
+
+    assert frame.shape == (80, 60, 3)
+    assert source == {"source": "dshow", "brokerPid": 4242}
+    assert events[0] == ("open", parent_pid, "front", "front-stable")
+    assert events[1][0:3] == ("read", parent_pid, 1)
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
