@@ -296,11 +296,23 @@ class FastTryOnRuntime:
         )
         if any(name not in points for name in required):
             raise PoseUnavailableError("pose_unavailable")
-        left_shoulder = points["left_shoulder"]
-        right_shoulder = points["right_shoulder"]
-        shoulder_axis = right_shoulder - left_shoulder
+        # MediaPipe's LEFT/RIGHT landmarks are anatomical sides.  A person
+        # facing an unmirrored camera therefore commonly has LEFT at a larger
+        # x than RIGHT.  Garment pixels, however, are source *screen* sides:
+        # sort before deriving the projective across axis so a source-left
+        # pixel always reaches screen-left regardless of camera mirroring or
+        # anatomical labels.
+        anatomical_left_shoulder = points["left_shoulder"]
+        anatomical_right_shoulder = points["right_shoulder"]
+        if anatomical_left_shoulder[0] <= anatomical_right_shoulder[0]:
+            screen_left_shoulder = anatomical_left_shoulder
+            screen_right_shoulder = anatomical_right_shoulder
+        else:
+            screen_left_shoulder = anatomical_right_shoulder
+            screen_right_shoulder = anatomical_left_shoulder
+        shoulder_axis = screen_right_shoulder - screen_left_shoulder
         shoulder_span = float(np.linalg.norm(shoulder_axis))
-        shoulder_center = (left_shoulder + right_shoulder) * 0.5
+        shoulder_center = (screen_left_shoulder + screen_right_shoulder) * 0.5
         hip_center = (points["left_hip"] + points["right_hip"]) * 0.5
         torso_axis = hip_center - shoulder_center
         torso_length = float(np.linalg.norm(torso_axis))
@@ -390,9 +402,10 @@ class FastTryOnRuntime:
         x0, y0, source_width, source_height = garment.opaque_bounds
         source = garment.rgba[y0 : y0 + source_height, x0 : x0 + source_width]
         # Map the prepared shirt rectangle onto the shoulder/hip frame-space
-        # quadrilateral.  Every placement value now follows the current
-        # customer's center, shoulder width and torso axis; no screen bands
-        # or fixed percentage placement remain.
+        # quadrilateral in source screen-left -> screen-right order. Every
+        # placement value follows the current customer's center, shoulder
+        # width and torso axis; no screen bands or fixed percentage placement
+        # remain.
         long_sleeve = garment.template == "tshirt_long_sleeve"
         target_width = geometry.shoulder_span * (1.34 if long_sleeve else 1.26)
         target_height = geometry.torso_length * (1.38 if long_sleeve else 1.08)

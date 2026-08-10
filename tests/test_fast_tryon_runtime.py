@@ -74,7 +74,18 @@ def test_fast_runtime_downloads_only_declared_loopback_png_and_composites_a_deco
     from vision.fast_tryon import FastTryOnRuntime
 
     garment = GarmentHandler.payload
-    runtime = FastTryOnRuntime(max_garment_bytes=1024 * 1024)
+    class DeterministicPoseEstimator:
+        """Explicit test-estimator boundary; production obtains MediaPipe in the worker."""
+
+        def detect(self, _frame):
+            points = [type("Point", (), {"x": 0.5, "y": 0.5, "visibility": 0.95})() for _ in range(33)]
+            for index, x, y in ((11, 0.35, 0.32), (12, 0.65, 0.32), (23, 0.38, 0.68), (24, 0.62, 0.68)):
+                points[index] = type("Point", (), {"x": x, "y": y, "visibility": 0.95})()
+            return type("Pose", (), {"pose_landmarks": type("Landmarks", (), {"landmark": points})()})()
+
+    runtime = FastTryOnRuntime(
+        max_garment_bytes=1024 * 1024, pose_estimator=DeterministicPoseEstimator()
+    )
     prepared = asyncio.run(runtime.fetch_garment(
         {
             "reference": garment_server,

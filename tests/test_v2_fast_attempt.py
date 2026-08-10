@@ -64,6 +64,26 @@ def _fast_block_first_render_target(connection, counter):
         connection.close()
 
 
+def _fast_pose_error_then_success_target(connection, counter):
+    """A test-only worker fixture for public typed-attempt outcome coverage."""
+    connection.send(("ready", {"pid": os.getpid(), "poseReady": True}))
+    try:
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+            with counter.get_lock():
+                counter.value += 1
+                request_number = counter.value
+            if request_number <= 3:
+                connection.send(("pose_error", "PoseUnavailableError: C:\\internal\\model"))
+            else:
+                connection.send(("ok", _png_bytes()))
+    finally:
+        connection.close()
+
+
 def _fast_block_then_fail_restart_target(connection, starts, requests):
     with starts.get_lock():
         starts.value += 1
@@ -323,6 +343,51 @@ def test_v2_fast_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(
             assert socket.receive_json()["type"] == "vision.pong"
             _GarmentHandler.release.set()
             assert socket.receive_json()["type"] == "vision.try_on.attempt.completed"
+
+
+def test_v2_fast_pose_failures_are_stable_terminals_without_worker_recovery(
+    monkeypatch, garment_reference
+):
+    """Public failed attempts expose no result and retain the warmed worker."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    context = multiprocessing.get_context("spawn")
+    counter = context.Value("i", 0)
+    broker = FastRenderBroker(
+        context=context,
+        target=_fast_pose_error_then_success_target,
+        target_args=(counter,),
+    )
+    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+
+    with TestClient(vision_app.app) as client:
+        pid = broker.pid
+        assert pid is not None
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            for _ in range(3):
+                socket.send_json(_start(str(uuid4()), garment_reference))
+                assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+                assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+                failed = socket.receive_json()
+                assert failed["type"] == "vision.try_on.attempt.failed"
+                assert failed["payload"]["reason"] == "fast_failed"
+                assert "result" not in failed["payload"]
+                assert broker.pid == pid
+            attempt_id = str(uuid4())
+            socket.send_json(_start(attempt_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            completed = socket.receive_json()
+            assert completed["type"] == "vision.try_on.attempt.completed"
+            assert completed["payload"]["attemptId"] == attempt_id
+            assert broker.pid == pid
+            assert counter.value == 4
+
+    assert broker.pid is None
 
 
 def test_v2_fast_attempt_replays_same_owner_active_attempt_without_new_terminal(

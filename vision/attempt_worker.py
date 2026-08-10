@@ -359,6 +359,10 @@ class FastRenderBroker:
                         f"render broker connection closed: {exc}"
                     ) from exc
                 if kind == "ok":
+                    if not isinstance(response, bytes):
+                        raise AttemptWorkerError(
+                            "render broker returned corrupt response"
+                        )
                     return response
                 if kind == "garment_error":
                     from vision.fast_tryon import GarmentFetchError
@@ -367,7 +371,10 @@ class FastRenderBroker:
                 if kind == "pose_error":
                     from vision.fast_tryon import PoseUnavailableError
 
-                    raise PoseUnavailableError(response)
+                    # Child diagnostics may contain model paths or native
+                    # exception detail.  Pose absence is a normal attempt
+                    # outcome, and its parent-facing contract is stable.
+                    raise PoseUnavailableError("pose_unavailable")
                 raise AttemptWorkerError(response)
             if not process.is_alive():
                 process.join(timeout=0)
@@ -473,6 +480,14 @@ class FastRenderBroker:
                 self._job_slot.release()
         if "error" in outcome:
             error = outcome["error"]
+            # A valid typed attempt outcome proves the worker stayed alive;
+            # keep its warmed model and PID for the next captured person.
+            # Transport/protocol/corrupt-response failures still fall through
+            # to bounded recovery below.
+            from vision.fast_tryon import GarmentFetchError, PoseUnavailableError
+
+            if isinstance(error, (GarmentFetchError, PoseUnavailableError)):
+                raise error
             await self._recover("render_job_failed")
             raise error
         return outcome["value"]

@@ -13,6 +13,17 @@ from vision.attempt_worker import AttemptWorkerError, FastRenderBroker, render_a
 from vision.render_worker_target import render_worker_entry
 
 
+_TEST_POSE_FIXTURE = {
+    "testOnly": True,
+    "landmarks": {
+        11: (0.35, 0.32, 0.95),
+        12: (0.65, 0.32, 0.95),
+        23: (0.38, 0.68, 0.95),
+        24: (0.62, 0.68, 0.95),
+    },
+}
+
+
 def _block_first_render_target(connection, counter):
     connection.send(("ready", {"pid": os.getpid()}))
     try:
@@ -56,7 +67,30 @@ def _crash_first_render_target(connection, counter):
         connection.close()
 
 
-def _blocked_worker_encode_target(connection, entered):
+def _pose_error_then_success_target(connection, counter):
+    """Test-only deterministic worker response fixture: no pose model boundary."""
+    connection.send(("ready", {"pid": os.getpid(), "poseReady": True}))
+    try:
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+            with counter.get_lock():
+                counter.value += 1
+                request_number = counter.value
+            if request_number <= 3:
+                connection.send(("pose_error", "PoseUnavailableError: C:\\internal\\model\\details"))
+                continue
+            image = np.full((24, 18, 3), (20, 120, 220), dtype=np.uint8)
+            ok, encoded = cv2.imencode(".png", image)
+            assert ok
+            connection.send(("ok", encoded.tobytes()))
+    finally:
+        connection.close()
+
+
+def _blocked_worker_encode_target(connection, entered, test_pose_fixture):
     import vision.fast_tryon as fast_tryon
 
     def blocked_encode(*_args, **_kwargs):
@@ -65,10 +99,10 @@ def _blocked_worker_encode_target(connection, entered):
             time.sleep(1)
 
     fast_tryon.cv2.imencode = blocked_encode
-    render_worker_entry(connection)
+    render_worker_entry(connection, test_pose_fixture)
 
 
-def _slow_worker_encode_target(connection, entered, delay_seconds):
+def _slow_worker_encode_target(connection, entered, delay_seconds, test_pose_fixture):
     import vision.fast_tryon as fast_tryon
 
     real_encode = fast_tryon.cv2.imencode
@@ -79,7 +113,7 @@ def _slow_worker_encode_target(connection, entered, delay_seconds):
         return real_encode(*args, **kwargs)
 
     fast_tryon.cv2.imencode = slow_encode
-    render_worker_entry(connection)
+    render_worker_entry(connection, test_pose_fixture)
 
 
 @pytest.mark.parametrize("compression", ["compressible", "difficult"])
@@ -164,7 +198,11 @@ def test_prestarted_render_broker_completes_one_real_encoded_job():
     frame = np.full((720, 1280, 3), (235, 220, 205), dtype=np.uint8)
 
     async def scenario():
-        broker = FastRenderBroker()
+        # This is a broker/resource test.  The explicit worker-only fixture
+        # avoids claiming a blank frame is a real production person.
+        broker = FastRenderBroker(
+            target=render_worker_entry, target_args=(_TEST_POSE_FIXTURE,)
+        )
         await broker.start()
         pid = broker.pid
         result = await render_attempt_frame(
@@ -228,7 +266,9 @@ def test_parent_cv2_encode_block_cannot_enter_the_prestarted_render_path(monkeyp
         raise AssertionError("parent cv2.imencode must not run")
 
     async def scenario():
-        broker = FastRenderBroker()
+        broker = FastRenderBroker(
+            target=render_worker_entry, target_args=(_TEST_POSE_FIXTURE,)
+        )
         await broker.start()
         monkeypatch.setattr(cv2, "imencode", blocked_parent_encode)
         task = asyncio.create_task(
@@ -276,7 +316,7 @@ def test_cancel_joins_blocked_native_encode_then_readies_one_replacement():
         broker = FastRenderBroker(
             context=context,
             target=_blocked_worker_encode_target,
-            target_args=(entered,),
+            target_args=(entered, _TEST_POSE_FIXTURE),
         )
         await broker.start()
         first_pid = broker.pid
@@ -334,7 +374,7 @@ def test_worker_slow_encode_times_out_then_readies_one_replacement():
         broker = FastRenderBroker(
             context=context,
             target=_slow_worker_encode_target,
-            target_args=(entered, 0.2),
+            target_args=(entered, 0.2, _TEST_POSE_FIXTURE),
         )
         await broker.start()
         first_pid = broker.pid
@@ -469,6 +509,49 @@ def test_crashed_render_is_joined_and_one_replacement_is_prestarted():
         await broker.shutdown()
 
     asyncio.run(scenario())
+
+
+def test_pose_failures_are_typed_attempt_outcomes_and_keep_the_worker_pid():
+    """Blank/no-person/degenerate pose failures do not kill a healthy worker."""
+    from vision.fast_tryon import PoseUnavailableError
+
+    context = multiprocessing.get_context("spawn")
+    counter = context.Value("i", 0)
+    garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
+    ok, encoded = cv2.imencode(".png", garment)
+    assert ok
+    garment_png = encoded.tobytes()
+    frame = np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
+    digest = "sha256:" + hashlib.sha256(garment_png).hexdigest()
+
+    async def scenario():
+        broker = FastRenderBroker(
+            context=context,
+            target=_pose_error_then_success_target,
+            target_args=(counter,),
+        )
+        await broker.start()
+        pid = broker.pid
+        assert pid is not None
+        for _ in range(3):
+            with pytest.raises(PoseUnavailableError) as error:
+                await render_attempt_frame(
+                    frame, garment_png, digest=digest,
+                    template="tshirt_short_sleeve", timeout=5.0, broker=broker,
+                )
+            assert str(error.value) == "pose_unavailable"
+            assert broker.pid == pid
+            assert broker.ready
+        result = await render_attempt_frame(
+            frame, garment_png, digest=digest,
+            template="tshirt_short_sleeve", timeout=5.0, broker=broker,
+        )
+        assert broker.pid == pid
+        assert counter.value == 4
+        await broker.shutdown()
+        return result
+
+    assert cv2.imdecode(np.frombuffer(asyncio.run(scenario()), dtype=np.uint8), cv2.IMREAD_COLOR) is not None
 
 
 def test_stubborn_kill_oserror_retains_handle_and_fails_closed_without_restart():
