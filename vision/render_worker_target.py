@@ -12,13 +12,14 @@ from multiprocessing.connection import Connection
 
 
 MAX_GARMENT_BYTES = 8 * 1024 * 1024
-MAX_FRAME_BYTES = 12 * 1024 * 1024
+MAX_FRAME_WIDTH = 1920
+MAX_FRAME_HEIGHT = 1080
+MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
 MAX_RESULT_BYTES = 16 * 1024 * 1024
 
 
 def _render(payload: dict) -> bytes:
     """Decode, prepare and render entirely inside the bounded child."""
-    import cv2
     import numpy as np
 
     from vision.fast_tryon import (
@@ -28,27 +29,44 @@ def _render(payload: dict) -> bytes:
     )
 
     if not isinstance(payload, dict) or set(payload) != {
-        "framePng",
+        "frameBytes",
+        "frameShape",
+        "frameDtype",
         "garmentPng",
         "garmentDigest",
         "template",
     }:
         raise ValueError("invalid render payload")
-    frame_png = payload["framePng"]
+    frame_bytes = payload["frameBytes"]
+    frame_shape = payload["frameShape"]
     garment_png = payload["garmentPng"]
-    if not isinstance(frame_png, bytes) or len(frame_png) > MAX_FRAME_BYTES:
-        raise ValueError("frame PNG exceeds render cap")
+    if not isinstance(frame_bytes, bytes) or len(frame_bytes) > MAX_FRAME_RAW_BYTES:
+        raise ValueError("raw frame exceeds render cap")
+    if (
+        not isinstance(frame_shape, (tuple, list))
+        or len(frame_shape) != 3
+        or any(type(value) is not int for value in frame_shape)
+    ):
+        raise ValueError("raw frame shape is invalid")
+    height, width, channels = frame_shape
+    if (
+        height <= 0
+        or width <= 0
+        or height > MAX_FRAME_HEIGHT
+        or width > MAX_FRAME_WIDTH
+        or channels != 3
+        or payload["frameDtype"] != "uint8"
+        or len(frame_bytes) != height * width * channels
+    ):
+        raise ValueError("raw frame metadata exceeds render cap")
     if not isinstance(garment_png, bytes) or len(garment_png) > MAX_GARMENT_BYTES:
         raise GarmentFetchError("byte_size")
     digest = "sha256:" + hashlib.sha256(garment_png).hexdigest()
     if digest != payload["garmentDigest"]:
         raise GarmentFetchError("digest")
-    frame = cv2.imdecode(np.frombuffer(frame_png, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
-        raise ValueError("frame PNG decode failed")
-    height, width = frame.shape[:2]
-    if height <= 0 or width <= 0 or height > 1080 or width > 1920:
-        raise ValueError("frame dimensions exceed render cap")
+    frame = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(
+        (height, width, channels)
+    )
     source = ValidatedGarmentSource(
         png_bytes=garment_png,
         digest=digest,

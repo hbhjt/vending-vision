@@ -1,7 +1,7 @@
 """Lifecycle-owned, bounded Fast render broker.
 
 The Vision application starts one spawn-compatible child before accepting Fast
-attempt work.  Attempt requests submit at most one bounded encoded job and
+attempt work.  Attempt requests submit at most one bounded raw-frame job and
 never synchronously create a process on the event-loop thread.
 """
 
@@ -14,7 +14,6 @@ import time
 from multiprocessing.connection import Connection
 from typing import Any
 
-import cv2
 import numpy as np
 
 from vision.render_worker_target import render_worker_entry
@@ -27,14 +26,14 @@ class AttemptWorkerError(RuntimeError):
 _MAX_GARMENT_BYTES = 8 * 1024 * 1024
 _MAX_FRAME_WIDTH = 1920
 _MAX_FRAME_HEIGHT = 1080
-_MAX_FRAME_RAW_BYTES = _MAX_FRAME_WIDTH * _MAX_FRAME_HEIGHT * 4
+_MAX_FRAME_RAW_BYTES = _MAX_FRAME_WIDTH * _MAX_FRAME_HEIGHT * 3
 _CONSERVATIVE_PREPARE_BYTES_PER_SECOND = 64 * 1024 * 1024
 _CONSERVATIVE_PREPARE_FIXED_SECONDS = 0.020
 _START_TIMEOUT_SECONDS = 5.0
 
 
-async def _run_joined_thread(name: str, operation):
-    """Run one blocking control operation and never return before its thread."""
+async def _run_broker_control(name: str, operation):
+    """Keep bounded process-control calls off the event loop and join them."""
     done = threading.Event()
     outcome: dict[str, Any] = {}
 
@@ -180,7 +179,7 @@ class FastRenderBroker:
                     f"render broker is unavailable: {self._fatal_error}"
                 )
             self._quiesced = False
-        await _run_joined_thread("fast-render-start", self._start_sync)
+        await _run_broker_control("fast-render-start", self._start_sync)
 
     def _stop_sync(self, *, graceful: bool, reason: str) -> bool:
         """Stop and join truthfully; retain a live handle on any failed stop."""
@@ -188,6 +187,9 @@ class FastRenderBroker:
             parent = self._parent
             process = self._process
             self._ready = False
+            has_active_request = any(
+                thread.is_alive() for thread in self._request_threads
+            )
             errors: list[str] = []
 
             def record(action: str, exc: BaseException) -> None:
@@ -209,6 +211,7 @@ class FastRenderBroker:
 
             if (
                 graceful
+                and not has_active_request
                 and parent is not None
                 and process is not None
                 and process.is_alive()
@@ -277,7 +280,9 @@ class FastRenderBroker:
                     )
             return dead and requests_done
 
-        dead = await _run_joined_thread("fast-render-shutdown", stop_and_join_requests)
+        dead = await _run_broker_control(
+            "fast-render-shutdown", stop_and_join_requests
+        )
         if not dead:
             raise AttemptWorkerError("render broker shutdown incomplete")
 
@@ -296,7 +301,19 @@ class FastRenderBroker:
                 or not process.is_alive()
             ):
                 raise AttemptWorkerError("render broker is not ready")
-        parent.send(("render", payload))
+        frame = payload["frame"]
+        wire_payload = {
+            key: value for key, value in payload.items() if key != "frame"
+        }
+        # The only parent-side frame copy is explicitly capped above and runs
+        # on this same abortable broker request lane.  It cannot create an
+        # independent native encode thread that outlives cancellation.
+        wire_payload["frameBytes"] = frame.tobytes(order="C")
+        wire_payload["frameShape"] = tuple(int(value) for value in frame.shape)
+        wire_payload["frameDtype"] = str(frame.dtype)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("render broker deadline exceeded during frame copy")
+        parent.send(("render", wire_payload))
         while time.monotonic() < deadline:
             if parent.poll(0.005):
                 try:
@@ -319,18 +336,18 @@ class FastRenderBroker:
                 )
         raise TimeoutError("render broker job deadline exceeded")
 
-    async def _recover(self, reason: str) -> None:
-        """Terminate/join the failed job owner, then prestart one replacement."""
+    async def _recover(self, reason: str, *, restart: bool = True) -> None:
+        """Terminate/join the failed job owner and optionally prestart recovery."""
         def recover() -> None:
             dead = self._stop_sync(graceful=False, reason=reason)
             if not dead:
                 raise AttemptWorkerError("render broker recovery incomplete")
             with self._state_lock:
-                if self._quiesced:
+                if self._quiesced or not restart:
                     return
             self._start_sync()
 
-        await _run_joined_thread("fast-render-recover", recover)
+        await _run_broker_control("fast-render-recover", recover)
 
     async def render(self, payload: dict, *, deadline: float) -> bytes:
         """Submit exactly one non-queued job and keep pipe waits off the loop."""
@@ -370,7 +387,9 @@ class FastRenderBroker:
         except asyncio.CancelledError:
             recovery_error: BaseException | None = None
             try:
-                await asyncio.shield(self._recover("render_job_cancelled"))
+                await asyncio.shield(
+                    self._recover("render_job_cancelled", restart=False)
+                )
             except BaseException as exc:
                 recovery_error = exc
             while not done.is_set():
@@ -387,7 +406,9 @@ class FastRenderBroker:
                 self._job_slot.release()
         if "error" in outcome:
             error = outcome["error"]
-            await self._recover("render_job_failed")
+            await self._recover(
+                "render_job_failed", restart=not isinstance(error, TimeoutError)
+            )
             raise error
         return outcome["value"]
 
@@ -405,6 +426,10 @@ def _validate_render_inputs(frame: np.ndarray, garment_png: bytes, template: str
         raise ValueError("fast frame dimensions exceed render cap")
     if frame.nbytes > _MAX_FRAME_RAW_BYTES:
         raise ValueError("fast frame bytes exceed render cap")
+    if frame.dtype != np.uint8:
+        raise ValueError("fast frame dtype must be uint8")
+    if not frame.flags.c_contiguous:
+        raise ValueError("fast frame must be C-contiguous")
     if not isinstance(garment_png, bytes) or not garment_png:
         raise ValueError("garment PNG bytes are required")
     if len(garment_png) > _MAX_GARMENT_BYTES:
@@ -423,7 +448,7 @@ async def render_attempt_frame(
     timeout: float,
     broker: FastRenderBroker,
 ) -> bytes:
-    """Apply one absolute deadline before any encoding, serialization, or IPC."""
+    """Apply one absolute deadline before any bounded frame copy or IPC."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     source_bytes = _validate_render_inputs(frame, garment_png, template)
@@ -434,26 +459,13 @@ async def render_attempt_frame(
     if not broker.ready:
         raise AttemptWorkerError("render broker is not ready")
     if timeout <= 0 or loop.time() + conservative_seconds >= deadline:
-        raise TimeoutError("render deadline exceeded before frame encoding")
-
-    def encode_frame() -> bytes:
-        ok, encoded = cv2.imencode(".png", frame)
-        if not ok:
-            raise RuntimeError("fast frame encode failed")
-        return encoded.tobytes()
-
-    frame_png = await _run_joined_thread("fast-render-encode", encode_frame)
+        raise TimeoutError("render deadline exceeded before frame copy")
     remaining = deadline - loop.time()
-    actual_payload_bytes = len(frame_png) + len(garment_png)
-    conservative_ipc_seconds = (
-        _CONSERVATIVE_PREPARE_FIXED_SECONDS
-        + actual_payload_bytes / _CONSERVATIVE_PREPARE_BYTES_PER_SECOND
-    )
-    if remaining <= 0 or conservative_ipc_seconds >= remaining:
-        raise TimeoutError("render deadline exceeded before IPC")
+    if remaining <= 0:
+        raise TimeoutError("render deadline exceeded before broker request")
     return await broker.render(
         {
-            "framePng": frame_png,
+            "frame": frame,
             "garmentPng": garment_png,
             "garmentDigest": digest,
             "template": template,

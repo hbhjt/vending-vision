@@ -164,7 +164,7 @@ def _envelope(message_type, payload):
 def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
     monkeypatch, garment_reference
 ):
-    """The public V2 WS route owns one Fast attempt and returns a read grant."""
+    """Public V2 completes a max garment against a recorded 720p frame."""
     manifest = json.loads(
         (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
             "utf-8"
@@ -177,8 +177,28 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     _configure_recorded_front(monkeypatch)
+    garment_image = np.zeros((4096, 4096, 4), dtype=np.uint8)
+    garment_image[384:3712, 640:3456] = (20, 120, 220, 220)
+    ok, encoded_garment = cv2.imencode(".png", garment_image)
+    assert ok
+    garment = encoded_garment.tobytes()
+    assert len(garment) <= 8 * 1024 * 1024
+    monkeypatch.setattr(_GarmentHandler, "payload", garment)
+
+    recorded_dimensions = []
+    original_recorded_read = camera_manager.RecordedVideoFrameSource.read
+
+    def read_recorded_720p(source, warmup_frames=None):
+        recorded = original_recorded_read(source, warmup_frames=warmup_frames)
+        recorded_dimensions.append(recorded.shape)
+        return cv2.resize(recorded, (1280, 720), interpolation=cv2.INTER_LINEAR)
+
+    monkeypatch.setattr(
+        camera_manager.RecordedVideoFrameSource,
+        "read",
+        read_recorded_720p,
+    )
     attempt_id = str(uuid4())
-    garment = _GarmentHandler.payload
     hello = _hello(manifest)
     start = _start(attempt_id, garment_reference)
 
@@ -216,7 +236,12 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
     assert wrong_grant.status_code == missing_grant.status_code == 404
     assert extra_grant.status_code == duplicate_grant.status_code == 404
     assert wrong_method.status_code == 405
-    assert cv2.imdecode(np.frombuffer(response.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED) is not None
+    result_image = cv2.imdecode(
+        np.frombuffer(response.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+    )
+    assert result_image is not None
+    assert result_image.shape == (720, 1280, 3)
+    assert recorded_dimensions == [(360, 640, 3)]
     assert camera_manager.get_frame_source("front").status()["source"] == "recorded_video"
 
 
@@ -453,7 +478,7 @@ def test_v2_fast_attempt_replacement_joins_old_worker_before_new_admission(
     assert completed["payload"]["attemptId"] == second_id
 
 
-def test_v2_replacement_joins_blocked_render_then_completes_on_prestarted_recovery(
+def test_v2_replacement_joins_blocked_render_then_stays_stably_unavailable(
     monkeypatch, garment_reference
 ):
     manifest = json.loads(
@@ -479,7 +504,6 @@ def test_v2_replacement_joins_blocked_render_then_completes_on_prestarted_recove
     first_id, second_id = str(uuid4()), str(uuid4())
 
     with TestClient(vision_app.app) as client:
-        first_pid = broker.pid
         with client.websocket_connect("/ws") as socket:
             socket.send_json(_hello(manifest))
             assert socket.receive_json()["type"] == "vision.ready"
@@ -499,15 +523,16 @@ def test_v2_replacement_joins_blocked_render_then_completes_on_prestarted_recove
                 "attemptId": first_id,
                 "reason": "attempt_replaced",
             }
-            assert broker.pid is not None and broker.pid != first_pid
+            assert broker.pid is None
+            assert not broker.ready
             assert broker.active_request_count == 0
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
             assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
-            completed = socket.receive_json()
+            failed = socket.receive_json()
 
-        assert completed["type"] == "vision.try_on.attempt.completed"
-        assert completed["payload"]["attemptId"] == second_id
-        assert counter.value == 2
+        assert failed["type"] == "vision.try_on.attempt.failed"
+        assert failed["payload"] == {"attemptId": second_id, "reason": "fast_failed"}
+        assert counter.value == 1
         assert broker.active_request_count == 0
 
     assert broker.pid is None
@@ -538,7 +563,6 @@ def test_v2_disconnect_joins_blocked_render_before_session_cleanup_returns(
     monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
 
     with TestClient(vision_app.app) as client:
-        first_pid = broker.pid
         with client.websocket_connect("/ws") as socket:
             socket.send_json(_hello(manifest))
             assert socket.receive_json()["type"] == "vision.ready"
@@ -553,13 +577,8 @@ def test_v2_disconnect_joins_blocked_render_before_session_cleanup_returns(
             assert counter.value == 1
             socket.close()
 
-        waiter = threading.Event()
-        for _ in range(200):
-            if broker.ready and broker.active_request_count == 0:
-                break
-            waiter.wait(0.01)
-        assert broker.ready
-        assert broker.pid is not None and broker.pid != first_pid
+        assert not broker.ready
+        assert broker.pid is None
         assert broker.active_request_count == 0
 
     assert broker.pid is None
