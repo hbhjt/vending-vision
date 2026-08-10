@@ -5,6 +5,27 @@ import re
 ROOT = Path(__file__).parents[1]
 
 
+def test_packaged_archive_guard_rejects_retired_modules_and_resources():
+    from scripts.verify_packaged_exe import retired_packaged_entries
+
+    retired_module = "PYZ.pyz:" + ".".join(
+        ("vision", "".join(("try", "_on", "_session")))
+    )
+    retired_resource = "resource:" + "/".join(
+        ("contracts", "".join(("vem", "_vision", "_v1")), "manifest.json")
+    )
+    entries = {
+        retired_module,
+        retired_resource,
+        "PYZ.pyz:vision.fast_attempt",
+        "resource:contracts/vem_vision_v2/manifest.json",
+    }
+
+    assert retired_packaged_entries(entries) == sorted(
+        [retired_module, retired_resource]
+    )
+
+
 def test_frozen_spec_keeps_the_generated_v2_bundle_and_static_boundary_import():
     spec = (ROOT / "vending_vision.spec").read_text("utf-8")
 
@@ -34,6 +55,10 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     assert "verify_result_query_is_not_logged" in verifier
     assert "assert_result_query_not_logged" in verifier
     assert "_safe_process_log" in verifier
+    assert "packaged_archive_entries" in verifier
+    assert "assert_hard_cutover_archive_absence(exe_path)" in verifier
+    assert "retired modules remain in packaged archive" in verifier
+    assert "retired_try_on_route" in verifier
 
 
 def test_frozen_runtime_keeps_the_spawn_safe_render_worker_entry():

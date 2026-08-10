@@ -13,10 +13,29 @@ FORBIDDEN_PATTERNS = (
     ),
     ("legacy-try-on-client", re.compile(r"\btryon_frontend\b")),
     (
+        "legacy-try-on-session-module",
+        re.compile(r"\b(?:VisionTryOnSession|try_on_session|tryOnSession)\b"),
+    ),
+    (
         "legacy-preview-route",
         re.compile(r"/try-on/\{[^}]+}[.]mjpeg\b|try-on-preview", re.I),
     ),
     ("transport-specific-preview", re.compile(r"\bmjpeg\b", re.I)),
+    (
+        "legacy-nested-customer-route",
+        re.compile(
+            r"#/products/[^\s\"'`]+/try-on\b"
+            r"|path\s*:\s*[\"']/products/:[^\"']+/try-on\b"
+        ),
+    ),
+    (
+        "legacy-try-on-selector",
+        re.compile(r"(?:data-test\s*=\s*[\"']|\[data-test=[\"'])try-on-exit\b"),
+    ),
+    (
+        "fabricated-try-on-phase-evidence",
+        re.compile(r"\b(?:accepted|progress|completed)Observed\b"),
+    ),
 )
 
 
@@ -66,6 +85,10 @@ def test_hard_cutover_guard_detects_every_forbidden_category(tmp_path):
         "client.txt": compact("tryon", "_", "frontend"),
         "route.txt": f"/{'/'.join(('try-on', '{session}'))}.{compact('m', 'jpeg')}",
         "transport.txt": compact("M", "JPEG"),
+        "nested-route.txt": "/".join(("#", "products", "product", "try-on")),
+        "selector.txt": f'[data-test="{compact("try", "-on", "-exit")}"]',
+        "phase.txt": compact("completed", "Observed"),
+        "session.txt": compact("try", "_on", "_session"),
     }
     for name, body in fixtures.items():
         (tmp_path / name).write_text(f"{body}\n", encoding="utf-8")

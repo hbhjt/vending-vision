@@ -166,6 +166,46 @@ def assert_v2_contract_resources(contract_root):
         raise AssertionError("packaged V2 contract resources must not contain Python bytecode")
 
 
+def packaged_archive_entries(exe_path):
+    try:
+        from PyInstaller.archive.readers import CArchiveReader
+    except ImportError as exc:
+        raise AssertionError(
+            "PyInstaller archive reader is required for package verification"
+        ) from exc
+
+    archive = CArchiveReader(str(exe_path))
+    entries = set(archive.toc)
+    for name in tuple(entries):
+        if not name.lower().endswith(".pyz"):
+            continue
+        embedded = archive.open_embedded_archive(name)
+        entries.update(f"{name}:{module}" for module in embedded.toc)
+    return entries
+
+
+def retired_packaged_entries(entries):
+    retired = re.compile(
+        r"(?:^|[./\\])try[_-]?on[_-]?(?:session|frontend)(?:[./\\]|$)"
+        r"|(?:^|[./\\])vem[_-]?vision[_-]?v1(?:[./\\]|$)",
+        re.I,
+    )
+    return sorted(entry for entry in entries if retired.search(entry))
+
+
+def assert_hard_cutover_archive_absence(exe_path):
+    internal = exe_path.parent / "_internal"
+    entries = set(packaged_archive_entries(exe_path))
+    entries.update(
+        f"resource:{path.relative_to(internal).as_posix()}"
+        for path in internal.rglob("*")
+        if path.is_file()
+    )
+    violations = retired_packaged_entries(entries)
+    if violations:
+        raise AssertionError(f"retired modules remain in packaged archive: {violations}")
+
+
 def assert_bundled_resources(exe_path):
     internal = exe_path.parent / "_internal"
     contract_root = internal / "contracts" / "vem_vision_v2"
@@ -200,6 +240,7 @@ def assert_bundled_resources(exe_path):
     camera_adapter = internal / "cv2_enumerate_cameras"
     if sys.platform == "win32" and not any(camera_adapter.glob("_windows_backend*.pyd")):
         raise AssertionError("missing packaged cv2-enumerate-cameras Windows DirectShow adapter")
+    assert_hard_cutover_archive_absence(exe_path)
 
 
 async def verify_websocket(port):
@@ -355,7 +396,18 @@ def verify_managed_production_surface(exe_path, *, port, startup_timeout, temp_d
             wait_for_http(base_url, process, startup_timeout)
             result_token, result_query = verify_result_query_is_not_logged(base_url)
             verify_plain_camera_maintenance_contract(base_url)
-            for legacy_url in ("/dashboard", "/camera/top/snapshot.jpg", "/camera/top/reopen"):
+            retired_try_on_route = (
+                "/"
+                + "/".join(("try-on", "retired-session"))
+                + "."
+                + "".join(("m", "jpeg"))
+            )
+            for legacy_url in (
+                "/dashboard",
+                "/camera/top/snapshot.jpg",
+                "/camera/top/reopen",
+                retired_try_on_route,
+            ):
                 method = "POST" if legacy_url.endswith("/reopen") else "GET"
                 status = http_status(f"{base_url}{legacy_url}", method=method)
                 if status != 404:
