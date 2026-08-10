@@ -39,12 +39,13 @@ manifest、JSON Schema、Python 生成模型及共享 fixtures 必须一起校�
 | --- | --- |
 | `protocol` | 必须等于 manifest 的 `protocol` |
 | `type` | 必须是合同已定义的 discriminator |
-| `messageId` | 1–128 个 Unicode 字符；它是传输追踪 ID，不等同业务事件 ID |
+| `messageId` | 1–128 个 Unicode code point；它是传输追踪 ID，不等同业务事件 ID |
 | `timestamp` | 严格 UTC ISO 格式：大写 `T`/`Z`，接受 `HH:MMZ`、带秒和带小数秒；拒绝空格、小写和 offset |
 | `payload` | 必须匹配该 `type` 的严格对象模型 |
 
-时间值还必须是实际日历时间。例如 `2026-02-30T00:00Z` 无效。合同采用字符数而非
-UTF-8 字节数计算 `messageId`、服务器元数据和 capability 的长度。
+时间值还必须是实际日历时间。例如 `2026-02-30T00:00Z` 无效。合同采用 Unicode code
+point 数而非 UTF-16 code unit 或 UTF-8 字节数计算 `messageId`、服务器元数据和
+capability 的长度。
 
 ## 连接与握手
 
@@ -97,8 +98,9 @@ V1 hello、`protocolVersion`、`modelReady` 与所有 V1 成功条件均不受�
 }
 ```
 
-`serverName` 与 `schemaVersion` 最多 128 个字符；`serverVersion`、`bundleVersion` 和每项
-capability 最多 64 个字符。`contractDigest` 必须是 64 位小写十六进制摘要。机器必须逐项
+`serverName` 与 `schemaVersion` 最多 128 个 Unicode code point；`serverVersion`、
+`bundleVersion` 和每项 capability 最多 64 个 Unicode code point。`contractDigest` 必须是
+64 位小写十六进制摘要。机器必须逐项
 比较 ready 的四个身份值；任何不匹配都是稳定的合同错误，不能被业务 readiness 覆盖。
 
 若严格模型可用但 bundle 身份不可用，服务端可返回受限 ready：
