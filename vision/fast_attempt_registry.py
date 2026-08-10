@@ -83,6 +83,12 @@ class PendingAdmission:
 
 
 @dataclass
+class CleanupReservation:
+    prior_task: asyncio.Task
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
 class AdmissionPreparation:
     attempt_id: str
     resolved: bool = False
@@ -118,6 +124,7 @@ class FastAttemptRegistry:
         self._gate = asyncio.Lock()
         self._active: ActiveAttempt | None = None
         self._pending: PendingAdmission | None = None
+        self._cleanup: CleanupReservation | None = None
         self._terminals: OrderedDict[str, TerminalAttempt] = OrderedDict()
         self._generation = 0
         self._terminal_ttl_seconds = terminal_ttl_seconds
@@ -195,6 +202,7 @@ class FastAttemptRegistry:
         subscriber = AttemptSubscriber(id(websocket), websocket, send_lock)
         while True:
             wait_for_other: asyncio.Event | None = None
+            wait_for_cleanup: asyncio.Event | None = None
             transitions: list[TerminalTransition] = []
             async with self._gate:
                 self._prune_unlocked()
@@ -219,8 +227,11 @@ class FastAttemptRegistry:
                         attempt_id=attempt_id, resolved=True, replay=replay
                     )
 
+                cleanup = self._cleanup
                 pending = self._pending
-                if pending is not None:
+                if cleanup is not None:
+                    wait_for_cleanup = cleanup.done
+                elif pending is not None:
                     if pending.attempt_id == attempt_id:
                         self._attach_pending_subscriber_unlocked(pending, subscriber)
                         return AdmissionPreparation(
@@ -255,6 +266,9 @@ class FastAttemptRegistry:
                         join_task=join_task,
                         transitions=transitions,
                     )
+            if wait_for_cleanup is not None:
+                await asyncio.shield(wait_for_cleanup.wait())
+                continue
             assert wait_for_other is not None
             await asyncio.shield(wait_for_other.wait())
 
@@ -300,9 +314,13 @@ class FastAttemptRegistry:
             try:
                 await asyncio.shield(preparation.join_task)
             except asyncio.CancelledError:
+                cleanup = None
                 async with self._gate:
                     pending = self._pending
                     if pending is not None and pending.token == preparation.token:
+                        cleanup = self._reserve_cleanup_unlocked(
+                            preparation.join_task
+                        )
                         if pending.canceled_terminal is not None:
                             self._commit_pending_terminal_unlocked(
                                 pending, pending.canceled_terminal
@@ -310,6 +328,10 @@ class FastAttemptRegistry:
                         else:
                             self._pending = None
                             pending.done.set()
+                    elif self._cleanup is not None:
+                        cleanup = self._cleanup
+                if cleanup is not None:
+                    await self._finish_cleanup_uncancelled(cleanup)
                 raise
 
         async with self._gate:
@@ -422,32 +444,39 @@ class FastAttemptRegistry:
     ) -> AttemptAdmission:
         """Bounded-admission fallback with stable terminal replay semantics."""
         subscriber = AttemptSubscriber(id(websocket), websocket, send_lock)
-        async with self._gate:
-            self._prune_unlocked()
-            stored = self._terminals.get(attempt_id)
-            if stored is not None:
-                self._terminals.move_to_end(attempt_id)
-                return AttemptAdmission(None, [stored.message])
-            active = self._active
-            if active is not None and active.receipt.attempt_id == attempt_id:
-                self._attach_subscriber_unlocked(active, subscriber)
-                return AttemptAdmission(
-                    None,
-                    [
-                        message
-                        for message in (active.accepted, active.latest_progress)
-                        if message
-                    ],
-                )
-            pending = self._pending
-            if pending is not None and pending.attempt_id == attempt_id:
-                self._attach_pending_subscriber_unlocked(pending, subscriber)
-                self._commit_pending_terminal_unlocked(pending, terminal)
-                return AttemptAdmission(None, [terminal])
-            self._terminals[attempt_id] = self._new_terminal(terminal)
-            self._terminals.move_to_end(attempt_id)
-            self._prune_unlocked()
-            return AttemptAdmission(None, [terminal])
+        while True:
+            wait_cleanup = None
+            async with self._gate:
+                self._prune_unlocked()
+                stored = self._terminals.get(attempt_id)
+                if stored is not None:
+                    self._terminals.move_to_end(attempt_id)
+                    return AttemptAdmission(None, [stored.message])
+                active = self._active
+                if active is not None and active.receipt.attempt_id == attempt_id:
+                    self._attach_subscriber_unlocked(active, subscriber)
+                    return AttemptAdmission(
+                        None,
+                        [
+                            message
+                            for message in (active.accepted, active.latest_progress)
+                            if message
+                        ],
+                    )
+                pending = self._pending
+                if pending is not None and pending.attempt_id == attempt_id:
+                    self._attach_pending_subscriber_unlocked(pending, subscriber)
+                    self._commit_pending_terminal_unlocked(pending, terminal)
+                    return AttemptAdmission(None, [terminal])
+                if self._cleanup is not None:
+                    wait_cleanup = self._cleanup.done
+                else:
+                    self._terminals[attempt_id] = self._new_terminal(terminal)
+                    self._terminals.move_to_end(attempt_id)
+                    self._prune_unlocked()
+                    return AttemptAdmission(None, [terminal])
+            assert wait_cleanup is not None
+            await asyncio.shield(wait_cleanup.wait())
 
     async def join_pending_or_reject(
         self,
@@ -482,6 +511,8 @@ class FastAttemptRegistry:
                 if pending is not None and pending.attempt_id == attempt_id:
                     self._attach_pending_subscriber_unlocked(pending, subscriber)
                     wait_event = pending.done
+                elif self._cleanup is not None:
+                    wait_event = self._cleanup.done
                 else:
                     self._terminals[attempt_id] = self._new_terminal(terminal)
                     self._terminals.move_to_end(attempt_id)
@@ -522,6 +553,38 @@ class FastAttemptRegistry:
         pending.done.set()
         self._prune_unlocked()
         return TerminalTransition(message=message, subscribers=subscribers)
+
+    def _reserve_cleanup_unlocked(
+        self, prior_task: asyncio.Task | None
+    ) -> CleanupReservation | None:
+        if prior_task is None:
+            return self._cleanup
+        if self._cleanup is None:
+            self._cleanup = CleanupReservation(prior_task=prior_task)
+        return self._cleanup
+
+    async def _finish_cleanup_uncancelled(
+        self, cleanup: CleanupReservation
+    ) -> None:
+        async def finalize() -> None:
+            try:
+                await asyncio.shield(cleanup.prior_task)
+            except BaseException:
+                # The prior owner's outcome is already represented by its
+                # canonical terminal.  Admission only needs resource closure.
+                pass
+            async with self._gate:
+                if self._cleanup is cleanup:
+                    self._cleanup = None
+                cleanup.done.set()
+
+        finalizer = asyncio.create_task(finalize())
+        while not finalizer.done():
+            try:
+                await asyncio.shield(finalizer)
+            except asyncio.CancelledError:
+                continue
+        finalizer.result()
 
     async def cancel_owner_and_join(
         self, receipt: AttemptReceipt
@@ -577,7 +640,7 @@ class FastAttemptRegistry:
             active = self._active
             pending = self._pending
             task = None
-            prior_task = None
+            cleanup = self._cleanup
             transition = None
             if active is not None:
                 active.cancel_event.set()
@@ -589,7 +652,7 @@ class FastAttemptRegistry:
                 )
             elif pending is not None:
                 task = pending.task
-                prior_task = pending.prior_task
+                cleanup = self._reserve_cleanup_unlocked(pending.prior_task)
                 if pending.canceled_terminal is not None:
                     transition = self._commit_pending_terminal_unlocked(
                         pending, pending.canceled_terminal
@@ -599,7 +662,8 @@ class FastAttemptRegistry:
                     pending.done.set()
         if task is not None and task is not asyncio.current_task():
             task.cancel()
+        if cleanup is not None:
+            await self._finish_cleanup_uncancelled(cleanup)
+        if task is not None and task is not asyncio.current_task():
             await asyncio.gather(task, return_exceptions=True)
-        if prior_task is not None and prior_task is not asyncio.current_task():
-            await asyncio.shield(prior_task)
         return transition
