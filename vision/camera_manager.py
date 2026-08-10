@@ -480,28 +480,6 @@ def read_camera_with_source(role: str, warmup_frames: int | None = None):
         return image, frame
 
 
-def capture_configured_frame(role: str, config: dict, warmup_frames: int = 1):
-    """Capture once through the same DirectShow/recorded adapter in a child.
-
-    Attempt workers intentionally own no persistent stream: process teardown is
-    the hard stop handle for a blocked native capture.  The supplied resolved
-    configuration preserves the production role binding across that boundary.
-    """
-    source_kind = str(config.get("source", "dshow")).lower()
-    if source_kind == "recorded_video":
-        source = RecordedVideoFrameSource(role, config)
-    elif source_kind == "dshow":
-        source = DirectShowFrameSource(role, config)
-    else:
-        raise ValueError(f"unsupported Vision frame source: {source_kind}")
-    try:
-        image = source.read(warmup_frames=warmup_frames)
-        frame = source.last_frame() if hasattr(source, "last_frame") else None
-        return image, dict(frame) if frame is not None else None
-    finally:
-        source.release()
-
-
 def read_camera(role: str, warmup_frames: int | None = None):
     """读取指定角色摄像头的一帧。
 

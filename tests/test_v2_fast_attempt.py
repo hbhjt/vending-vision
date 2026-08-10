@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import threading
 from urllib.parse import urlsplit
 from datetime import datetime, timezone
@@ -398,6 +399,39 @@ def test_v2_fast_attempt_replacement_joins_old_worker_before_new_admission(
 
     assert completed["type"] == "vision.try_on.attempt.completed"
     assert completed["payload"]["attemptId"] == second_id
+
+
+def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garment_reference):
+    """Fast must not spawn a child that opens the front camera device."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    parent_pid = os.getpid()
+    read_pids = []
+
+    def read_front(role, warmup_frames=None):
+        read_pids.append((os.getpid(), role, warmup_frames))
+        return np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8), {"source": "dshow"}
+
+    async def render(frame, prepared, *, timeout):
+        assert os.getpid() == parent_pid
+        return _png_bytes()
+
+    monkeypatch.setattr(vision_app, "read_camera_with_source", read_front)
+    monkeypatch.setattr(vision_app, "render_attempt_frame", render)
+    attempt_id = str(uuid4())
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(attempt_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.progress"
+            completed = socket.receive_json()
+
+    assert completed["type"] == "vision.try_on.attempt.completed"
+    assert read_pids == [(parent_pid, "front", 1)]
 
 
 def test_v2_fast_result_store_rejects_self_too_large_without_publishing(monkeypatch):

@@ -36,6 +36,7 @@ from vision.camera_manager import (
     get_camera_config,
     get_camera_status,
     read_camera,
+    read_camera_with_source,
     release_all_cameras,
     reset_camera,
 )
@@ -66,7 +67,7 @@ from vision.try_on_session import (
 )
 from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
 from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
-from vision.attempt_worker import capture_attempt_frame, render_attempt_frame
+from vision.attempt_worker import render_attempt_frame
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
@@ -84,6 +85,7 @@ _FAST_RESULT_TTL_SECONDS = 5 * 60
 _FAST_RESULT_MAX_BYTES = 16 * 1024 * 1024
 _FAST_ATTEMPT_TIMEOUT_SECONDS = 15
 _FAST_ATTEMPT_MAX_TASKS = 2
+_FAST_TERMINAL_SEND_TIMEOUT_SECONDS = 0.25
 _fast_runtime = FastTryOnRuntime()
 _fast_attempt_registry = FastAttemptRegistry(
     terminal_ttl_seconds=_FAST_RESULT_TTL_SECONDS,
@@ -168,12 +170,20 @@ async def _publish_fast_transition(transition: TerminalTransition | None) -> Non
     """Deliver a registry-won terminal to every still-live subscriber."""
     if transition is None:
         return
-    for subscriber in transition.subscribers:
+    async def send_one(subscriber) -> None:
         try:
             async with subscriber.send_lock:
-                await subscriber.websocket.send_json(transition.message)
+                await asyncio.wait_for(
+                    subscriber.websocket.send_json(transition.message),
+                    timeout=_FAST_TERMINAL_SEND_TIMEOUT_SECONDS,
+                )
         except Exception:
             await _fast_attempt_registry.detach_subscriber(subscriber.websocket)
+
+    await asyncio.gather(
+        *(send_one(subscriber) for subscriber in transition.subscribers),
+        return_exceptions=True,
+    )
 
 
 def get_startup_check():
@@ -1326,12 +1336,7 @@ async def run_v2_fast_attempt(
             raise GarmentFetchError("attempt_replaced")
         frame, source_frame = await _run_owned_attempt_step(
             receipt,
-            capture_attempt_frame(
-                "front",
-                get_camera_config("front"),
-                warmup_frames=1,
-                timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
-            ),
+            asyncio.to_thread(read_camera_with_source, "front", 1),
             timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
         )
         result_image = await _run_owned_attempt_step(

@@ -1,9 +1,10 @@
-"""Attempt-owned, forcibly terminable Fast frame and render workers.
+"""Attempt-owned, forcibly terminable Fast render workers.
 
-OpenCV and DirectShow calls are synchronous and do not expose a dependable
-cross-platform cancellation primitive.  They therefore run in a short-lived
-process, not in the shared Python thread pool.  The parent owns the process and
-terminates it on cancellation or deadline before a replacement is admitted.
+Fast frame acquisition stays in the parent Vision process so DirectShow and
+recorded-video sources share the one camera-manager owner with profile and
+presence work.  CPU rendering runs in a short-lived spawned process owned by the
+attempt; cancellation or deadline terminates and joins that child before a
+replacement is admitted.
 """
 
 from __future__ import annotations
@@ -18,17 +19,6 @@ class AttemptWorkerError(RuntimeError):
     pass
 
 
-def _capture_worker(connection: Connection, role: str, config: dict, warmup_frames: int) -> None:
-    try:
-        from vision.camera_manager import capture_configured_frame
-
-        connection.send(("ok", capture_configured_frame(role, config, warmup_frames=warmup_frames)))
-    except BaseException as exc:
-        connection.send(("error", f"{type(exc).__name__}: {exc}"))
-    finally:
-        connection.close()
-
-
 def _render_worker(connection: Connection, frame: Any, garment: Any) -> None:
     try:
         from vision.fast_tryon import FastTryOnRuntime
@@ -36,6 +26,19 @@ def _render_worker(connection: Connection, frame: Any, garment: Any) -> None:
         connection.send(("ok", FastTryOnRuntime().render(frame, garment)))
     except BaseException as exc:
         connection.send(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        connection.close()
+
+
+def _child_entry(connection: Connection, target) -> None:
+    try:
+        args = connection.recv()
+        target(connection, *args)
+    except BaseException as exc:
+        try:
+            connection.send(("error", f"{type(exc).__name__}: {exc}"))
+        except BaseException:
+            pass
     finally:
         connection.close()
 
@@ -53,14 +56,18 @@ async def _wait_for_exit(process, deadline: float) -> None:
 
 async def _run_worker(target, args: tuple[Any, ...], *, timeout: float):
     """Return a child result, leaving no attempt process after any outcome."""
+    multiprocessing.freeze_support()
     context = multiprocessing.get_context("spawn")
-    parent, child = context.Pipe(duplex=False)
-    process = context.Process(target=target, args=(child, *args), daemon=True)
-    process.start()
-    child.close()
+    parent, child = context.Pipe(duplex=True)
+    process = context.Process(target=_child_entry, args=(child, target), daemon=True)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
+    started = False
     try:
+        await asyncio.wait_for(asyncio.to_thread(process.start), timeout=max(0, deadline - loop.time()))
+        started = True
+        child.close()
+        await asyncio.wait_for(asyncio.to_thread(parent.send, args), timeout=max(0, deadline - loop.time()))
         while loop.time() < deadline:
             if parent.poll():
                 kind, payload = parent.recv()
@@ -76,14 +83,11 @@ async def _run_worker(target, args: tuple[Any, ...], *, timeout: float):
         raise TimeoutError("attempt worker deadline exceeded")
     finally:
         parent.close()
-        if process.is_alive():
+        child.close()
+        if started and process.is_alive():
             process.terminate()
-        await _wait_for_exit(process, loop.time() + 0.5)
-
-
-async def capture_attempt_frame(role: str, config: dict, *, warmup_frames: int, timeout: float):
-    """Use the configured DirectShow/recorded adapter in an owned worker."""
-    return await _run_worker(_capture_worker, (role, config, warmup_frames), timeout=timeout)
+        if started:
+            await _wait_for_exit(process, loop.time() + 0.5)
 
 
 async def render_attempt_frame(frame, garment, *, timeout: float) -> bytes:

@@ -48,6 +48,7 @@ class TerminalAttempt:
     message: dict
     result: dict | None
     terminal_at: float
+    expires_at: float
 
 
 @dataclass
@@ -112,14 +113,21 @@ class FastAttemptRegistry:
             active.subscribers[subscriber.key] = subscriber
 
     def _prune_unlocked(self) -> None:
-        cutoff = time.monotonic() - self._terminal_ttl_seconds
-        while self._terminals:
-            attempt_id, terminal = next(iter(self._terminals.items()))
-            if terminal.terminal_at > cutoff:
-                break
-            self._terminals.pop(attempt_id)
+        now = time.monotonic()
+        for attempt_id, terminal in list(self._terminals.items()):
+            if terminal.expires_at <= now:
+                self._terminals.pop(attempt_id, None)
         while len(self._terminals) > self._terminal_max_count:
             self._terminals.popitem(last=False)
+
+    def _new_terminal(self, message: dict, result: dict | None = None) -> TerminalAttempt:
+        terminal_at = time.monotonic()
+        return TerminalAttempt(
+            message=message,
+            result=result,
+            terminal_at=terminal_at,
+            expires_at=terminal_at + self._terminal_ttl_seconds,
+        )
 
     async def admit(
         self,
@@ -136,58 +144,72 @@ class FastAttemptRegistry:
         """Attach to a canonical attempt or admit one after replacement joins."""
         subscriber = AttemptSubscriber(id(websocket), websocket, send_lock)
         async with self._transition_gate:
-            async with self._gate:
-                self._prune_unlocked()
-                terminal = self._terminals.get(attempt_id)
-                if terminal is not None:
-                    self._terminals.move_to_end(attempt_id)
-                    return AttemptAdmission(None, [terminal.message])
+            transitions: list[TerminalTransition] = []
+            active: ActiveAttempt | None = None
+            while True:
+                async with self._gate:
+                    self._prune_unlocked()
+                    terminal = self._terminals.get(attempt_id)
+                    if terminal is not None:
+                        self._terminals.move_to_end(attempt_id)
+                        return AttemptAdmission(None, [terminal.message], transitions)
 
-                active = self._active
-                if active is not None and active.receipt.attempt_id == attempt_id:
-                    self._attach_subscriber_unlocked(active, subscriber)
-                    replay = [message for message in (active.accepted, active.latest_progress) if message]
-                    return AttemptAdmission(None, replay)
-                transitions: list[TerminalTransition] = []
-                if active is not None:
-                    active.cancel_event.set()
-                    if active.canceled_terminal is not None:
-                        transitions.append(
-                            self._commit_terminal_unlocked(active, active.canceled_terminal)
-                        )
+                    active = self._active
+                    if active is not None and active.receipt.attempt_id == attempt_id:
+                        self._attach_subscriber_unlocked(active, subscriber)
+                        replay = [message for message in (active.accepted, active.latest_progress) if message]
+                        return AttemptAdmission(None, replay, transitions)
+                    if active is not None:
+                        active.cancel_event.set()
+                        if active.canceled_terminal is not None:
+                            transitions.append(
+                                self._commit_terminal_unlocked(active, active.canceled_terminal)
+                            )
 
-            if active is not None and active.task is not task:
-                # Do not admit new work into the single worker lane until the
-                # old task has closed its response and joined executor work.
-                # The state lock is deliberately not held while joining.
-                await asyncio.shield(active.task)
+                if active is not None and active.task is not task:
+                    # Do not admit new work into the single worker lane until
+                    # the old task has closed its response and joined executor
+                    # work. The state lock is deliberately not held here.
+                    await asyncio.shield(active.task)
 
-            async with self._gate:
-                if active is not None and self._active is active:
-                    # A task never intentionally reaches this fallback, but a
-                    # cancellation injected before its terminal CAS must still
-                    # not let a replacement inherit live resources.
-                    self._active = None
-                self._generation += 1
-                receipt = AttemptReceipt(attempt_id, uuid4().hex, self._generation)
-                if owner_receipts is not None:
-                    owner_receipts.add(receipt)
-                self._active = ActiveAttempt(
-                    receipt=receipt,
-                    task=task,
-                    cancel_event=asyncio.Event(),
-                    owner_receipts=owner_receipts,
-                    owner_subscriber_key=subscriber.key,
-                    subscribers={subscriber.key: subscriber},
-                    accepted=accepted,
-                    latest_progress=progress,
-                    canceled_terminal=canceled_terminal,
-                )
-                return AttemptAdmission(
-                    receipt,
-                    [message for message in (accepted, progress) if message],
-                    transitions,
-                )
+                async with self._gate:
+                    self._prune_unlocked()
+                    terminal = self._terminals.get(attempt_id)
+                    if terminal is not None:
+                        self._terminals.move_to_end(attempt_id)
+                        return AttemptAdmission(None, [terminal.message], transitions)
+                    current = self._active
+                    if current is not None and current.receipt.attempt_id == attempt_id:
+                        self._attach_subscriber_unlocked(current, subscriber)
+                        replay = [message for message in (current.accepted, current.latest_progress) if message]
+                        return AttemptAdmission(None, replay, transitions)
+                    if current is not None and current is not active:
+                        continue
+                    if active is not None and self._active is active:
+                        # A task never intentionally reaches this fallback, but a
+                        # cancellation injected before its terminal CAS must still
+                        # not let a replacement inherit live resources.
+                        self._active = None
+                    self._generation += 1
+                    receipt = AttemptReceipt(attempt_id, uuid4().hex, self._generation)
+                    if owner_receipts is not None:
+                        owner_receipts.add(receipt)
+                    self._active = ActiveAttempt(
+                        receipt=receipt,
+                        task=task,
+                        cancel_event=asyncio.Event(),
+                        owner_receipts=owner_receipts,
+                        owner_subscriber_key=subscriber.key,
+                        subscribers={subscriber.key: subscriber},
+                        accepted=accepted,
+                        latest_progress=progress,
+                        canceled_terminal=canceled_terminal,
+                    )
+                    return AttemptAdmission(
+                        receipt,
+                        [message for message in (accepted, progress) if message],
+                        transitions,
+                    )
 
     async def is_current(self, receipt: AttemptReceipt) -> bool:
         async with self._gate:
@@ -217,11 +239,7 @@ class FastAttemptRegistry:
                     None,
                     [message for message in (active.accepted, active.latest_progress) if message],
                 )
-            self._terminals[attempt_id] = TerminalAttempt(
-                message=terminal,
-                result=None,
-                terminal_at=time.monotonic(),
-            )
+            self._terminals[attempt_id] = self._new_terminal(terminal)
             self._terminals.move_to_end(attempt_id)
             self._prune_unlocked()
             return AttemptAdmission(None, [terminal])
@@ -238,11 +256,7 @@ class FastAttemptRegistry:
     def _commit_terminal_unlocked(
         self, active: ActiveAttempt, message: dict, result: dict | None = None
     ) -> TerminalTransition:
-        self._terminals[active.receipt.attempt_id] = TerminalAttempt(
-            message=message,
-            result=result,
-            terminal_at=time.monotonic(),
-        )
+        self._terminals[active.receipt.attempt_id] = self._new_terminal(message, result)
         self._terminals.move_to_end(active.receipt.attempt_id)
         subscribers = list(active.subscribers.values())
         self._active = None
