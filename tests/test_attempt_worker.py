@@ -183,6 +183,48 @@ def test_production_render_target_rejects_test_arguments():
         )
 
 
+def test_render_spawn_failure_unlinks_slot_and_closes_process_handle():
+    real_context = multiprocessing.get_context("spawn")
+
+    class StartFailureProcess:
+        def __init__(self):
+            self.closed = False
+
+        def start(self):
+            raise OSError("spawn denied")
+
+        def close(self):
+            self.closed = True
+
+    class StartFailureContext:
+        def __init__(self):
+            self.process = StartFailureProcess()
+
+        def Event(self):
+            return real_context.Event()
+
+        def Lock(self):
+            return real_context.Lock()
+
+        def Process(self, **_kwargs):
+            return self.process
+
+    before = set(os.listdir("/dev/shm")) if os.path.isdir("/dev/shm") else set()
+    context = StartFailureContext()
+    broker = FastRenderBroker(context=context)
+
+    with pytest.raises(AttemptWorkerError, match="spawn denied"):
+        broker._start_sync()
+
+    after = set(os.listdir("/dev/shm")) if os.path.isdir("/dev/shm") else set()
+    assert context.process.closed is True
+    assert {name for name in after - before if "vem_render" in name} == set()
+    assert broker.pid is None
+    assert broker.ready is False
+    with pytest.raises(AttemptWorkerError, match="render_broker_start_failed"):
+        broker._start_sync()
+
+
 @pytest.mark.parametrize("compression", ["compressible", "difficult"])
 def test_prestarted_render_broker_rejects_real_max_images_without_blocking_or_leaking(
     compression,
@@ -406,6 +448,24 @@ def test_oversized_frame_is_rejected_before_parent_copy():
             "nbytes": 8 * 8 * 3,
             "generation": True,
             "processGeneration": 1,
+        },
+        {
+            "kind": "shared_frame",
+            "name": "vem_render_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaax",
+            "shape": [8, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 8 * 8 * 3,
+            "generation": 1,
+            "processGeneration": 1,
+        },
+        {
+            "kind": "shared_frame",
+            "name": "vem_render_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "shape": [8, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 8 * 8 * 3,
+            "generation": 1,
+            "processGeneration": 999,
         },
     ],
 )

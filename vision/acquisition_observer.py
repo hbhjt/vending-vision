@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import re
+import threading
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
@@ -27,6 +29,7 @@ from vision.shared_ipc_slot import SharedIpcSlot, run_shared_ipc_child
 MAX_FRAME_WIDTH = 1920
 MAX_FRAME_HEIGHT = 1080
 MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
+_ACQ_SHARED_NAME = re.compile(r"^vem_acq_[0-9a-f]{32}$")
 
 
 @dataclass(frozen=True)
@@ -91,7 +94,9 @@ def _write_shared_frame(frame: Any, *, generation: int) -> tuple[_SharedFrame, s
     )
 
 
-def _read_shared_frame(metadata: Any, *, generation: int) -> np.ndarray:
+def _read_shared_frame(
+    metadata: Any, *, generation: int, process_generation: int
+) -> np.ndarray:
     if not isinstance(metadata, dict) or set(metadata) != {
         "kind",
         "name",
@@ -115,6 +120,8 @@ def _read_shared_frame(metadata: Any, *, generation: int) -> np.ndarray:
     if (
         type(metadata.get("generation")) is not int
         or metadata.get("generation") != generation
+        or type(metadata.get("processGeneration")) is not int
+        or metadata.get("processGeneration") != process_generation
         or dtype != "uint8"
         or channels != 3
         or height <= 0
@@ -122,13 +129,12 @@ def _read_shared_frame(metadata: Any, *, generation: int) -> np.ndarray:
         or height > MAX_FRAME_HEIGHT
         or width > MAX_FRAME_WIDTH
         or type(nbytes) is not int
-        or type(metadata.get("processGeneration")) is not int
         or nbytes != height * width * channels
         or nbytes > MAX_FRAME_RAW_BYTES
     ):
         raise ValueError("acquisition frame metadata exceeds cap")
     name = metadata.get("name")
-    if not isinstance(name, str) or not name.startswith("vem_acq_"):
+    if not isinstance(name, str) or not _ACQ_SHARED_NAME.fullmatch(name):
         raise ValueError("invalid acquisition frame shared memory name")
     shm = shared_memory.SharedMemory(name=name)
     try:
@@ -216,7 +222,11 @@ def acquisition_observer_entry(connection: Connection) -> None:
             if command != "observe":
                 raise RuntimeError("unknown acquisition observer command")
             generation += 1
-            frame = _read_shared_frame(payload, generation=generation)
+            frame = _read_shared_frame(
+                payload,
+                generation=generation,
+                process_generation=connection.expected_process_generation or 0,
+            )
             observation = _observe_frame(detector, estimator, frame)
             connection.send(("ok", observation))
     except BaseException as exc:
@@ -270,14 +280,32 @@ class AcquisitionObservationWorker:
                 request_bytes=0,
                 response_bytes=MAX_FRAME_RAW_BYTES,
             )
+            next_generation = self._generation + 1
+            slot_config = dict(slot.config)
+            slot_config["expectedProcessGeneration"] = next_generation
             process = self._mp_context().Process(
                 target=run_shared_ipc_child,
-                args=(self._target, slot.config, self._target_args),
+                args=(self._target, slot_config, self._target_args),
                 daemon=True,
             )
-            process.start()
+            try:
+                process.start()
+            except BaseException as exc:
+                slot.close(unlink=True)
+                try:
+                    process.close()
+                except Exception:
+                    pass
+                self._parent = None
+                self._process = None
+                self._slot = None
+                self._ready = False
+                self._fatal_error = (
+                    f"acquisition_observer_start_failed: {type(exc).__name__}: {exc}"
+                )
+                raise RuntimeError(self._fatal_error) from exc
             self._parent, self._process, self._slot = None, process, slot
-            self._generation += 1
+            self._generation = next_generation
             self._request_generation = 0
 
     async def start(self) -> None:
@@ -340,7 +368,10 @@ class AcquisitionObservationWorker:
             deadline = time.monotonic() + max(timeout, 0.001)
             while time.monotonic() < deadline:
                 if slot.poll_response():
-                    kind, payload, process_generation, response_generation = slot.recv_response()
+                    kind, payload, process_generation, response_generation = slot.recv_response(
+                        expected_process_generation=generation,
+                        expected_request_generation=request_generation,
+                    )
                     if kind == "ok":
                         with self._state_lock:
                             if (
@@ -390,39 +421,86 @@ class AcquisitionObservationWorker:
                 self._ready = False
                 self._generation += 1
                 return True
-            self._parent = None
-            self._process = None
-            self._slot = None
             self._ready = False
-            self._generation += 1
             self._request_generation = 0
+        errors: list[str] = []
         if parent is not None:
             try:
                 parent.close()
             except Exception:
                 pass
-        if slot is not None:
-            slot.close(unlink=True)
         if process is not None:
             if process.is_alive():
                 try:
                     process.kill()
-                except (AttributeError, NotImplementedError, OSError, PermissionError):
+                except (AttributeError, NotImplementedError):
                     try:
                         process.terminate()
-                    except (AttributeError, NotImplementedError, OSError, PermissionError):
-                        pass
-                process.join(timeout=0.5)
+                    except (AttributeError, NotImplementedError, OSError, PermissionError) as exc:
+                        errors.append(f"terminate {type(exc).__name__}: {exc}")
+                except (OSError, PermissionError) as exc:
+                    errors.append(f"kill {type(exc).__name__}: {exc}")
+                    try:
+                        process.terminate()
+                    except (AttributeError, NotImplementedError, OSError, PermissionError) as terminate_exc:
+                        errors.append(
+                            f"terminate {type(terminate_exc).__name__}: {terminate_exc}"
+                        )
+                try:
+                    process.join(timeout=0.5)
+                except (OSError, PermissionError) as exc:
+                    errors.append(f"join {type(exc).__name__}: {exc}")
             if process.is_alive():
                 with self._state_lock:
+                    self._parent = parent
                     self._process = process
+                    self._slot = slot
                     self._fatal_error = reason
                 return False
-            process.join(timeout=0)
+            try:
+                process.join(timeout=0)
+            except (OSError, PermissionError) as exc:
+                errors.append(f"join {type(exc).__name__}: {exc}")
+                with self._state_lock:
+                    self._parent = parent
+                    self._process = process
+                    self._slot = slot
+                    self._fatal_error = f"{reason}: {'; '.join(errors)}"
+                return False
+        if slot is not None:
+            slot.close(unlink=True)
+        with self._state_lock:
+            self._parent = None
+            self._process = None
+            self._slot = None
+            self._generation += 1
         return True
 
     async def abort_async(self, *, reason: str) -> bool:
-        result = {"dead": self.abort(reason=reason)}
+        result: dict[str, Any] = {}
+
+        def run_abort() -> None:
+            try:
+                result["dead"] = self.abort(reason=reason)
+            except BaseException as exc:
+                result["error"] = exc
+
+        thread = threading.Thread(
+            target=run_abort,
+            name="acquisition-observer-abort",
+            daemon=False,
+        )
+        thread.start()
+        while thread.is_alive():
+            await asyncio.sleep(0.002)
+        thread.join(timeout=0)
+        if "error" in result:
+            with self._state_lock:
+                self._ready = False
+                self._fatal_error = (
+                    f"{reason}: {type(result['error']).__name__}: {result['error']}"
+                )
+            result["dead"] = False
         idle = await self.wait_idle(timeout=0.05)
         if not idle:
             with self._state_lock:

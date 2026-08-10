@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from multiprocessing import shared_memory
 from multiprocessing.connection import Connection
 
@@ -17,6 +18,7 @@ MAX_FRAME_WIDTH = 1920
 MAX_FRAME_HEIGHT = 1080
 MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
 MAX_RESULT_BYTES = 16 * 1024 * 1024
+_RENDER_SHARED_NAME = re.compile(r"^vem_render_[0-9a-f]{32}$")
 
 # Kept module-local so the official MediaPipe estimator is initialized once
 # per spawn worker, rather than once per attempt.  Dynamic import keeps the
@@ -43,7 +45,7 @@ def _initialize_runtime():
     return _FAST_RUNTIME
 
 
-def _render(payload: dict) -> bytes:
+def _render(payload: dict, *, expected_process_generation: int | None = 1) -> bytes:
     """Decode, prepare and render entirely inside the bounded child."""
     import numpy as np
 
@@ -87,12 +89,16 @@ def _render(payload: dict) -> bytes:
         or type(frame_nbytes) is not int
         or type(frame_shared.get("generation")) is not int
         or type(frame_shared.get("processGeneration")) is not int
+        or (
+            expected_process_generation is not None
+            and frame_shared.get("processGeneration") != expected_process_generation
+        )
         or frame_nbytes != height * width * channels
         or frame_nbytes > MAX_FRAME_RAW_BYTES
     ):
         raise ValueError("raw frame metadata exceeds render cap")
     name = frame_shared.get("name")
-    if not isinstance(name, str) or not name.startswith("vem_render_"):
+    if not isinstance(name, str) or not _RENDER_SHARED_NAME.fullmatch(name):
         raise ValueError("raw frame shared memory name is invalid")
     if not isinstance(garment_png, bytes) or len(garment_png) > MAX_GARMENT_BYTES:
         raise GarmentFetchError("byte_size")
@@ -134,7 +140,15 @@ def render_worker_entry(connection: Connection) -> None:
                 connection.send(("error", f"unknown render command: {command}"))
                 continue
             try:
-                connection.send(("ok", _render(payload)))
+                connection.send(
+                    (
+                        "ok",
+                        _render(
+                            payload,
+                            expected_process_generation=connection.expected_process_generation,
+                        ),
+                    )
+                )
             except BaseException as exc:
                 from vision.fast_tryon import GarmentFetchError, PoseUnavailableError
 

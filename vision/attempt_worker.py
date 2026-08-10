@@ -210,15 +210,22 @@ class FastRenderBroker:
                 request_bytes=_MAX_GARMENT_BYTES,
                 response_bytes=16 * 1024 * 1024,
             )
+            next_process_generation = self._process_generation + 1
+            slot_config = dict(slot.config)
+            slot_config["expectedProcessGeneration"] = next_process_generation
             process = context.Process(
                 target=run_shared_ipc_child,
-                args=(self._target, slot.config, self._target_args),
+                args=(self._target, slot_config, self._target_args),
                 daemon=True,
             )
             try:
                 process.start()
             except BaseException as exc:
                 slot.close(unlink=True)
+                try:
+                    process.close()
+                except Exception:
+                    pass
                 self._fatal_error = (
                     f"render_broker_start_failed: {type(exc).__name__}: {exc}"
                 )
@@ -228,7 +235,7 @@ class FastRenderBroker:
             self._parent = None
             self._process = process
             self._slot = slot
-            self._process_generation += 1
+            self._process_generation = next_process_generation
             self._request_generation = 0
 
         if not wait_for_event(slot.config["responseEvent"], _START_TIMEOUT_SECONDS, process=process):
@@ -459,7 +466,10 @@ class FastRenderBroker:
             while time.monotonic() < deadline:
                 if slot.poll_response():
                     try:
-                        kind, response, response_process_generation, response_request_generation = slot.recv_response()
+                        kind, response, response_process_generation, response_request_generation = slot.recv_response(
+                            expected_process_generation=process_generation,
+                            expected_request_generation=request_generation,
+                        )
                     except (EOFError, OSError) as exc:
                         raise AttemptWorkerError(
                             f"render broker connection closed: {exc}"

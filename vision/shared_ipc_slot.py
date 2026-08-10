@@ -124,28 +124,53 @@ class SharedIpcSlot:
     def poll_response(self) -> bool:
         return self._response_event.is_set()
 
-    def recv_response(self) -> tuple[str, Any, int, int]:
+    def recv_response(
+        self,
+        *,
+        expected_process_generation: int | None = None,
+        expected_request_generation: int | None = None,
+    ) -> tuple[str, Any, int, int]:
         if not self._response_event.is_set():
             raise SharedIpcError("response is not ready")
         _request_json_len, response_json_len, _request_bytes_len, response_bytes_len = _HEADER.unpack_from(self._shm.buf, 0)
         if response_json_len <= 0 or response_json_len > _JSON_BYTES:
             raise SharedIpcError("invalid response metadata length")
+        if response_bytes_len > self._response_bytes_cap:
+            raise SharedIpcError("invalid response bytes length")
         _request_json_offset, response_json_offset, _request_bytes_offset, response_bytes_offset = self._offsets()
         raw = bytes(self._shm.buf[response_json_offset: response_json_offset + response_json_len])
         message = _decode_json_object(raw, label="response")
         expected_keys = {"kind", "payload", "processGeneration", "requestGeneration", "responseBytes"}
         if set(message) != expected_keys:
             raise SharedIpcError("invalid response metadata keys")
-        if message["responseBytes"] != response_bytes_len:
+        kind = message["kind"]
+        process_generation = _strict_int(message["processGeneration"], "processGeneration")
+        request_generation = _strict_int(message["requestGeneration"], "requestGeneration")
+        response_bytes = _strict_int(message["responseBytes"], "responseBytes")
+        if response_bytes < 0 or response_bytes > self._response_bytes_cap:
+            raise SharedIpcError("invalid response bytes length")
+        if response_bytes != response_bytes_len:
             raise SharedIpcError("response byte length mismatch")
+        if not isinstance(kind, str):
+            raise SharedIpcError("response kind must be string")
+        if (
+            expected_process_generation is not None
+            and process_generation != expected_process_generation
+        ):
+            raise SharedIpcError("response process generation mismatch")
+        if (
+            expected_request_generation is not None
+            and request_generation != expected_request_generation
+        ):
+            raise SharedIpcError("response request generation mismatch")
         response_blob = bytes(self._shm.buf[response_bytes_offset: response_bytes_offset + response_bytes_len])
         payload = _decode_payload_from_json(message["payload"], response_blob)
         self._response_event.clear()
         return (
-            str(message["kind"]),
+            kind,
             payload,
-            int(message["processGeneration"]),
-            int(message["requestGeneration"]),
+            process_generation,
+            request_generation,
         )
 
 
@@ -161,6 +186,10 @@ class SharedIpcChildConnection:
         self._response_event = config["responseEvent"]
         self._lock = config["lock"]
         self._shm = shared_memory.SharedMemory(name=str(config["name"]))
+        self.expected_process_generation = _optional_strict_int(
+            config.get("expectedProcessGeneration"),
+            "expectedProcessGeneration",
+        )
         self._last_process_generation = 0
         self._last_request_generation = 0
         self._closed = False
@@ -193,6 +222,11 @@ class SharedIpcChildConnection:
             raise SharedIpcError("invalid request command payload")
         self._last_process_generation = _strict_int(message["processGeneration"], "processGeneration")
         self._last_request_generation = _strict_int(message["requestGeneration"], "requestGeneration")
+        if (
+            self.expected_process_generation is not None
+            and self._last_process_generation != self.expected_process_generation
+        ):
+            raise SharedIpcError("request process generation mismatch")
         request_blob = bytes(self._shm.buf[request_bytes_offset: request_bytes_offset + request_bytes_len])
         if "garmentBytes" in payload:
             if payload["garmentBytes"] != request_bytes_len:
@@ -269,6 +303,12 @@ def _strict_int(value: Any, label: str) -> int:
     return value
 
 
+def _optional_strict_int(value: Any, label: str) -> int | None:
+    if value is None:
+        return None
+    return _strict_int(value, label)
+
+
 def _encode_json_object(value: dict[str, Any], *, max_bytes: int, label: str) -> bytes:
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
     if len(encoded) > max_bytes:
@@ -303,13 +343,16 @@ def _encode_payload_for_json(payload: Any) -> tuple[Any, bytes]:
 
 def _decode_payload_from_json(payload: Any, response_blob: bytes) -> Any:
     if isinstance(payload, dict) and payload.get("payloadType") == "bytes":
-        if set(payload) != {"payloadType", "byteSize"} or payload["byteSize"] != len(response_blob):
+        if (
+            set(payload) != {"payloadType", "byteSize"}
+            or _strict_int(payload["byteSize"], "byteSize") != len(response_blob)
+        ):
             raise SharedIpcError("invalid byte response metadata")
         return response_blob
     if isinstance(payload, dict) and payload.get("payloadType") == "acquisition_observation":
         if set(payload) != {"payloadType", "byteSize", "occupancy", "aligned"}:
             raise SharedIpcError("invalid acquisition response metadata")
-        if payload["byteSize"] != len(response_blob):
+        if _strict_int(payload["byteSize"], "byteSize") != len(response_blob):
             raise SharedIpcError("acquisition response byte length mismatch")
         from vision.acquisition_observer import AcquisitionObservation
 

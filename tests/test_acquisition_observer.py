@@ -91,6 +91,48 @@ def test_normal_acquisition_observer_reuses_one_prewarmed_child_for_multiple_obs
     asyncio.run(scenario())
 
 
+def test_acquisition_spawn_failure_unlinks_slot_and_closes_process_handle():
+    real_context = multiprocessing.get_context("spawn")
+
+    class StartFailureProcess:
+        def __init__(self):
+            self.closed = False
+
+        def start(self):
+            raise OSError("spawn denied")
+
+        def close(self):
+            self.closed = True
+
+    class StartFailureContext:
+        def __init__(self):
+            self.process = StartFailureProcess()
+
+        def Event(self):
+            return real_context.Event()
+
+        def Lock(self):
+            return real_context.Lock()
+
+        def Process(self, **_kwargs):
+            return self.process
+
+    before = set(__import__("os").listdir("/dev/shm")) if __import__("os").path.isdir("/dev/shm") else set()
+    context = StartFailureContext()
+    worker = AcquisitionObservationWorker(context=context)
+
+    with pytest.raises(RuntimeError, match="acquisition_observer_start_failed"):
+        worker._start()
+
+    after = set(__import__("os").listdir("/dev/shm")) if __import__("os").path.isdir("/dev/shm") else set()
+    assert context.process.closed is True
+    assert {name for name in after - before if "vem_acq" in name} == set()
+    assert worker.pid is None
+    assert worker.ready is False
+    with pytest.raises(RuntimeError, match="acquisition_observer_start_failed"):
+        worker._start()
+
+
 def test_production_observation_request_does_not_call_parent_connection_send(monkeypatch):
     """A normal request must complete even if parent-side Pipe send is unusable."""
     from multiprocessing.connection import Connection
@@ -260,6 +302,45 @@ def test_observation_abort_is_bounded_when_parent_connection_send_blocks(monkeyp
     asyncio.run(scenario())
 
 
+def test_observer_abort_async_runs_process_control_off_the_event_loop():
+    class SlowKillProcess:
+        pid = 7474
+        exitcode = None
+
+        def __init__(self):
+            self._alive = True
+
+        def is_alive(self):
+            return self._alive
+
+        def kill(self):
+            time.sleep(0.08)
+            self._alive = False
+
+        def terminate(self):
+            self._alive = False
+
+        def join(self, timeout=None):
+            return None
+
+    async def scenario():
+        worker = AcquisitionObservationWorker()
+        worker._process = SlowKillProcess()
+        worker._ready = True
+        worker._generation = 1
+        abort = asyncio.create_task(worker.abort_async(reason="replacement"))
+        ticks = 0
+        deadline = asyncio.get_running_loop().time() + 0.04
+        while asyncio.get_running_loop().time() < deadline:
+            ticks += 1
+            await asyncio.sleep(0.001)
+        assert ticks >= 5
+        assert await asyncio.wait_for(abort, timeout=0.5) is True
+        assert worker.assert_dead
+
+    asyncio.run(scenario())
+
+
 def test_public_start_revalidates_stale_ready_and_preserves_fatal_handle():
     """The public start gate must use ready/process/fatal, not the raw _ready flag."""
     async def scenario():
@@ -347,6 +428,24 @@ def test_acquisition_observer_abort_permission_errors_fail_closed_without_traceb
             "generation": True,
             "processGeneration": 1,
         },
+        {
+            "kind": "shared_frame",
+            "name": "vem_acq_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaax",
+            "shape": [8, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 8 * 8 * 3,
+            "generation": 1,
+            "processGeneration": 1,
+        },
+        {
+            "kind": "shared_frame",
+            "name": "vem_acq_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "shape": [8, 8, 3],
+            "dtype": "uint8",
+            "nbytes": 8 * 8 * 3,
+            "generation": 1,
+            "processGeneration": 999,
+        },
     ],
 )
 def test_acquisition_rejects_strict_frame_metadata_before_arbitrary_shm_attach(
@@ -361,5 +460,5 @@ def test_acquisition_rejects_strict_frame_metadata_before_arbitrary_shm_attach(
     monkeypatch.setattr("vision.acquisition_observer.shared_memory.SharedMemory", forbidden_attach)
 
     with pytest.raises(ValueError):
-        _read_shared_frame(metadata, generation=1)
+        _read_shared_frame(metadata, generation=1, process_generation=1)
     assert not attached.is_set()
