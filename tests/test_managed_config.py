@@ -20,6 +20,13 @@ def import_config(config_path):
             "VISION_CONFIG_MODE": "managed",
         }
     )
+    return subprocess.run(
+        [sys.executable, "-c", "from vision.config import settings; print(settings.HOST)"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
 
 
 def import_config_values(config_path):
@@ -38,13 +45,6 @@ def import_config_values(config_path):
             "from vision.config import settings; "
             "print(f'{settings.HOST}:{settings.PORT}:{settings.TOP_CAMERA_CONFIG[\"role\"]}:{settings.FRONT_CAMERA_CONFIG[\"role\"]}')",
         ],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-    )
-    return subprocess.run(
-        [sys.executable, "-c", "from vision.config import settings; print(settings.HOST)"],
         cwd=ROOT,
         env=env,
         text=True,
