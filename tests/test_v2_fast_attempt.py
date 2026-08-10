@@ -410,6 +410,7 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
     read_pids = []
 
     def read_front(role, warmup_frames=None):
+        assert vision_app.get_front_camera_owner()["owner"] == "tryon_frontend"
         read_pids.append((os.getpid(), role, warmup_frames))
         return np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8), {"source": "dshow"}
 
@@ -432,6 +433,7 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
 
     assert completed["type"] == "vision.try_on.attempt.completed"
     assert read_pids == [(parent_pid, "front", 1)]
+    assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
 def test_v2_fast_result_store_rejects_self_too_large_without_publishing(monkeypatch):

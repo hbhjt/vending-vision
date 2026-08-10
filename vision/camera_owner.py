@@ -236,3 +236,13 @@ def front_camera_io_lock():
     """
     with _front_camera_io_lock:
         yield
+
+
+def try_acquire_front_camera_io_lock() -> bool:
+    """Attempt to enter the front-camera I/O lane without blocking."""
+    return _front_camera_io_lock.acquire(blocking=False)
+
+
+def release_front_camera_io_lock() -> None:
+    """Release a lock acquired by try_acquire_front_camera_io_lock()."""
+    _front_camera_io_lock.release()

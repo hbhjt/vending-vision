@@ -19,6 +19,22 @@ class AttemptWorkerError(RuntimeError):
     pass
 
 
+_INLINE_ARGUMENT_BYTE_LIMIT = 1024 * 1024
+
+
+def _estimated_argument_bytes(value: Any) -> int:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value)
+    if isinstance(value, (tuple, list)):
+        return sum(_estimated_argument_bytes(item) for item in value)
+    if isinstance(value, dict):
+        return sum(
+            _estimated_argument_bytes(key) + _estimated_argument_bytes(item)
+            for key, item in value.items()
+        )
+    return 0
+
+
 def _render_worker(connection: Connection, frame: Any, garment: Any) -> None:
     try:
         from vision.fast_tryon import FastTryOnRuntime
@@ -48,10 +64,13 @@ async def _wait_for_exit(process, deadline: float) -> None:
     while process.is_alive() and loop.time() < deadline:
         await asyncio.sleep(0.005)
     if process.is_alive():
-        process.kill()
+        try:
+            process.kill()
+        except AttributeError:
+            process.terminate()
         while process.is_alive() and loop.time() < deadline + 0.25:
             await asyncio.sleep(0.005)
-    process.join(timeout=0)
+    process.join(timeout=0.05)
 
 
 async def _run_worker(target, args: tuple[Any, ...], *, timeout: float):
@@ -64,13 +83,27 @@ async def _run_worker(target, args: tuple[Any, ...], *, timeout: float):
     deadline = loop.time() + timeout
     started = False
     try:
-        await asyncio.wait_for(asyncio.to_thread(process.start), timeout=max(0, deadline - loop.time()))
+        if timeout <= 0:
+            raise TimeoutError("attempt worker deadline exceeded before start")
+        if (
+            timeout < 0.05
+            and _estimated_argument_bytes(args) > _INLINE_ARGUMENT_BYTE_LIMIT
+        ):
+            raise TimeoutError("attempt worker deadline exceeded before IPC")
+        process.start()
         started = True
         child.close()
-        await asyncio.wait_for(asyncio.to_thread(parent.send, args), timeout=max(0, deadline - loop.time()))
+        if loop.time() >= deadline:
+            raise TimeoutError("attempt worker deadline exceeded before IPC")
+        parent.send(args)
         while loop.time() < deadline:
             if parent.poll():
-                kind, payload = parent.recv()
+                try:
+                    kind, payload = parent.recv()
+                except (EOFError, OSError) as exc:
+                    raise AttemptWorkerError(
+                        f"attempt worker connection closed: {exc}"
+                    ) from exc
                 await _wait_for_exit(process, loop.time() + 0.25)
                 if kind == "ok":
                     return payload
@@ -93,3 +126,8 @@ async def _run_worker(target, args: tuple[Any, ...], *, timeout: float):
 async def render_attempt_frame(frame, garment, *, timeout: float) -> bytes:
     """Render in an owned worker so a non-cooperative OpenCV call can end."""
     return await _run_worker(_render_worker, (frame, garment), timeout=timeout)
+
+
+async def run_attempt_worker(target, args: tuple[Any, ...], *, timeout: float):
+    """Run one attempt-owned child boundary with guaranteed cleanup."""
+    return await _run_worker(target, args, timeout=timeout)

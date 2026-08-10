@@ -45,6 +45,12 @@ from vision.camera_binding import (
     get_camera_maintenance,
 )
 from vision.camera_owner import get_front_camera_owner
+from vision.camera_owner import (
+    acquire_front_camera,
+    release_front_camera,
+    release_front_camera_io_lock,
+    try_acquire_front_camera_io_lock,
+)
 from vision.config import runtime_path, settings
 from vision.logger import logger
 from vision.metrics import metrics
@@ -67,7 +73,7 @@ from vision.try_on_session import (
 )
 from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
 from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
-from vision.attempt_worker import render_attempt_frame
+from vision.attempt_worker import render_attempt_frame, run_attempt_worker
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
@@ -166,17 +172,82 @@ async def _run_owned_attempt_step(receipt: AttemptReceipt, operation, *, timeout
             raise GarmentFetchError("attempt_replaced")
 
 
+def _read_front_frame_worker(connection, warmup_frames: int) -> None:
+    try:
+        from vision.camera_manager import read_camera_with_source as worker_read_camera_with_source
+
+        connection.send(("ok", worker_read_camera_with_source("front", warmup_frames)))
+    except BaseException as exc:
+        try:
+            connection.send(("error", f"{type(exc).__name__}: {exc}"))
+        except BaseException:
+            pass
+    finally:
+        connection.close()
+
+
+async def _acquire_front_io_until(deadline: float) -> None:
+    loop = asyncio.get_running_loop()
+    while loop.time() < deadline:
+        if try_acquire_front_camera_io_lock():
+            return
+        await asyncio.sleep(0.002)
+    raise asyncio.TimeoutError()
+
+
+async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
+    """Read Fast's front frame through the production front-camera lane."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    owner_acquired = False
+    io_acquired = False
+    try:
+        owner = acquire_front_camera("tryon_frontend", reason=f"fast_attempt:{receipt.attempt_id}")
+        if not owner.get("ok"):
+            raise GarmentFetchError(owner.get("error") or "front_camera_busy")
+        owner_acquired = True
+        await _acquire_front_io_until(deadline)
+        io_acquired = True
+        if not await _fast_attempt_registry.is_current(receipt):
+            raise GarmentFetchError("attempt_replaced")
+
+        if getattr(read_camera_with_source, "__module__", "") != "vision.camera_manager":
+            return read_camera_with_source("front", 1)
+
+        config = get_camera_config("front")
+        if str(config.get("source", "dshow")).lower() == "dshow":
+            return await _run_owned_attempt_step(
+                receipt,
+                run_attempt_worker(
+                    _read_front_frame_worker,
+                    (1,),
+                    timeout=max(0.001, deadline - loop.time()),
+                ),
+                timeout=max(0.001, deadline - loop.time()),
+            )
+
+        # Recorded-video is a deterministic in-process adapter and existing
+        # Fast/profile tests assert it stays in the parent process.
+        return read_camera_with_source("front", 1)
+    finally:
+        if io_acquired:
+            release_front_camera_io_lock()
+        if owner_acquired:
+            release_front_camera("tryon_frontend", reason=f"fast_attempt_done:{receipt.attempt_id}")
+
+
 async def _publish_fast_transition(transition: TerminalTransition | None) -> None:
     """Deliver a registry-won terminal to every still-live subscriber."""
     if transition is None:
         return
     async def send_one(subscriber) -> None:
         try:
-            async with subscriber.send_lock:
-                await asyncio.wait_for(
-                    subscriber.websocket.send_json(transition.message),
-                    timeout=_FAST_TERMINAL_SEND_TIMEOUT_SECONDS,
-                )
+            await _send_json_bounded(
+                subscriber.websocket,
+                subscriber.send_lock,
+                transition.message,
+                timeout=_FAST_TERMINAL_SEND_TIMEOUT_SECONDS,
+            )
         except Exception:
             await _fast_attempt_registry.detach_subscriber(subscriber.websocket)
 
@@ -184,6 +255,27 @@ async def _publish_fast_transition(transition: TerminalTransition | None) -> Non
         *(send_one(subscriber) for subscriber in transition.subscribers),
         return_exceptions=True,
     )
+
+
+async def _send_json_bounded(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    message: dict,
+    *,
+    timeout: float | None = None,
+) -> None:
+    """Bound acquiring the per-connection send lock and the actual send."""
+    send_timeout = (
+        timeout
+        if timeout is not None
+        else max(settings.WEBSOCKET_SEND_TIMEOUT_MS, 1) / 1000.0
+    )
+
+    async def locked_send() -> None:
+        async with send_lock:
+            await websocket.send_json(message)
+
+    await asyncio.wait_for(locked_send(), timeout=max(send_timeout, 0.001))
 
 
 def get_startup_check():
@@ -1304,9 +1396,8 @@ async def run_v2_fast_attempt(
     for transition in admission.transitions:
         await _publish_fast_transition(transition)
     if not admission.is_owner:
-        async with send_lock:
-            for replay_message in admission.replay:
-                await websocket.send_json(replay_message)
+        for replay_message in admission.replay:
+            await _send_json_bounded(websocket, send_lock, replay_message)
         return
     receipt = admission.receipt
     assert receipt is not None
@@ -1323,9 +1414,8 @@ async def run_v2_fast_attempt(
         return
     stored_result = None
     try:
-        async with send_lock:
-            for replay_message in admission.replay:
-                await websocket.send_json(replay_message)
+        for replay_message in admission.replay:
+            await _send_json_bounded(websocket, send_lock, replay_message)
         prepared = await asyncio.wait_for(
             _fast_runtime.fetch_garment(
                 payload["garment"], await _fast_attempt_registry.cancel_event_for(receipt)
@@ -1334,9 +1424,8 @@ async def run_v2_fast_attempt(
         )
         if not await _fast_attempt_registry.is_current(receipt):
             raise GarmentFetchError("attempt_replaced")
-        frame, source_frame = await _run_owned_attempt_step(
+        frame, source_frame = await _read_fast_front_frame(
             receipt,
-            asyncio.to_thread(read_camera_with_source, "front", 1),
             timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
         )
         result_image = await _run_owned_attempt_step(
@@ -1411,9 +1500,8 @@ async def reject_v2_fast_attempt_for_backpressure(
         send_lock=send_lock,
         terminal=terminal,
     )
-    async with send_lock:
-        for replay in admission.replay:
-            await websocket.send_json(replay)
+    for replay in admission.replay:
+        await _send_json_bounded(websocket, send_lock, replay)
 
 
 def websocket_origin_allowed(websocket: WebSocket) -> bool:
@@ -1626,14 +1714,15 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 continue
 
             if message_type == "vision.ping":
-                async with send_lock:
-                    await websocket.send_json(
-                        envelope(
-                            message_type="vision.pong",
-                            message_id=f"pong-{message_id}-{uuid4()}",
-                            payload={},
-                        )
+                await _send_json_bounded(
+                    websocket,
+                    send_lock,
+                    envelope(
+                        message_type="vision.pong",
+                        message_id=f"pong-{message_id}-{uuid4()}",
+                        payload={},
                     )
+                )
                 continue
 
             if message_type == "vision.try_on.start":
