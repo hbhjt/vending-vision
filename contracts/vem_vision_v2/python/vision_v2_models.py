@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Annotated, Any, Literal, Union
 from urllib.parse import urlparse
@@ -103,9 +104,7 @@ def _validate_extensions(value: Any, schema: dict[str, Any]) -> None:
             or parsed.fragment
             or not parsed.query.startswith("token=")
             or "&" in parsed.query
-            or not parsed.query.removeprefix("token=")
-            or "?" in parsed.query.removeprefix("token=")
-            or len(parsed.query.removeprefix("token=")) > 512
+            or re.fullmatch(schema["pattern"], value) is None
         ):
             raise ValueError("reference must be a tokenized loopback URL")
         return
