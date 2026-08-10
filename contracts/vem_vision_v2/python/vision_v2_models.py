@@ -82,6 +82,21 @@ def _normalize_json_integers(value: Any, schema: dict[str, Any]) -> Any:
     return value
 
 def _validate_extensions(value: Any, schema: dict[str, Any]) -> None:
+    if schema.get("x-vem-semantic") == "vision-v2-acquiring-payload":
+        if not isinstance(value, dict):
+            return
+        attempt_id = value.get("attemptId")
+        preview = value.get("preview")
+        if isinstance(attempt_id, str) and isinstance(preview, dict):
+            reference = preview.get("reference")
+            try:
+                path = urlparse(reference).path if isinstance(reference, str) else ""
+            except ValueError:
+                path = ""
+            expected_suffix = f"/attempts/{attempt_id}/preview.mjpeg"
+            if not path.endswith(expected_suffix):
+                raise ValueError("preview reference must be scoped to attemptId")
+        return
     if "oneOf" in schema and isinstance(value, dict):
         message_type = value.get("type")
         for branch in schema["oneOf"]:

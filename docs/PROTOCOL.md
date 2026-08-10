@@ -131,9 +131,20 @@ V1 hello、`protocolVersion`、`modelReady` 与所有 V1 成功条件均不受�
 ## Fast 尝试与结果
 
 Machine 仅可在 ready 后发起一个 `vision.try_on.attempt.start`。Fast 尝试会依次发布
-accepted、progress 和 completed/failed/canceled 之一。完成事件含一次性 tokenized loopback
-PNG 结果引用；Machine 可解码显示、重试同一变体或返回商品详情。采集预览仅属于维护诊断，
-不是客户试衣会话接口。
+accepted 只是启动确认，不是生命周期 phase。客户试衣的公开 phase 是
+`acquiring -> generating -> completed`，并以 `failed` 或 `canceled` 作为 terminal；
+旧 `vision.try_on.attempt.progress` 仅在 Phase B 迁移完成前保留。采集阶段返回当前
+attempt 的 tokenized loopback HTTP MJPEG preview、`streamType`、真实 occupancy、guidance
+和 `manualCaptureAllowed`。Machine 发送 capture 或仅带 `user`/`route_leave` 的 cancel；
+manual 只绕过 stability waiting，不能绕过 no-person、multiple-person 或 alignment 保护。
+
+Vision 直接拥有源帧，Machine 不从渲染后的 preview bytes 提取生成输入。capture 后 preview
+关闭且 front-camera lease 在 generating 前释放；generating 只发布 `preparing`/`rendering`
+等 coarse stage，不发布百分比。服务端 canceled reason 仅允许 `user`、`route_leave`、
+`disconnect`、`departure`、`replaced`、`timeout`。一个 machine-wide 非 terminal attempt
+以及 attempt identity fencing 保证 replacement、departure、disconnect、timeout 和 late
+worker output 不会污染新交互。top-camera presence/departure/ambient 贯穿全流程，try-on
+route 内 profile 不触发导航，也不存在 automaticFast/AI fallback。
 
 ## 验证与兼容性
 

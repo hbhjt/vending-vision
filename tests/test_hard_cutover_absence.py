@@ -20,7 +20,6 @@ FORBIDDEN_PATTERNS = (
         "legacy-preview-route",
         re.compile(r"/try-on/\{[^}]+}[.]mjpeg\b|try-on-preview", re.I),
     ),
-    ("transport-specific-preview", re.compile(r"\bmjpeg\b", re.I)),
     (
         "legacy-nested-customer-route",
         re.compile(
@@ -84,7 +83,6 @@ def test_hard_cutover_guard_detects_every_forbidden_category(tmp_path):
         "wire.txt": dot("vision", "try_on", "start"),
         "client.txt": compact("tryon", "_", "frontend"),
         "route.txt": f"/{'/'.join(('try-on', '{session}'))}.{compact('m', 'jpeg')}",
-        "transport.txt": compact("M", "JPEG"),
         "nested-route.txt": "/".join(("#", "products", "product", "try-on")),
         "selector.txt": f'[data-test="{compact("try", "-on", "-exit")}"]',
         "phase.txt": compact("completed", "Observed"),
