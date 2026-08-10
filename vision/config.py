@@ -71,7 +71,7 @@ def _validate_managed_config(config, config_path):
         "backend", "width", "height", "fps", "fourcc", "role",
         "keep_open", "rotate", "roi", "source", "video_path", "loop",
     }
-    expected_roles = {"top": "presence", "front": "profile_tryon"}
+    expected_roles = {"top": "presence", "front": "profile_fast_try_on"}
     camera_sources = {}
     for camera_name, camera in cameras.items():
         if not isinstance(camera, dict):
@@ -665,21 +665,6 @@ class Settings:
         "front_camera_owner_timeout_ms",
         "VISION_FRONT_CAMERA_OWNER_TIMEOUT_MS",
         120000
-    )
-    TRY_ON_SESSION_TTL_MS = get_config_value(
-        "try_on_session_ttl_ms",
-        "VISION_TRY_ON_SESSION_TTL_MS",
-        10 * 60 * 1000,
-    )
-    TRY_ON_SESSION_HISTORY_LIMIT = get_config_value(
-        "try_on_session_history_limit",
-        "VISION_TRY_ON_SESSION_HISTORY_LIMIT",
-        32,
-    )
-    TRY_ON_MAX_STREAM_CLIENTS = get_config_value(
-        "try_on_max_stream_clients",
-        "VISION_TRY_ON_MAX_STREAM_CLIENTS",
-        2,
     )
     WEBSOCKET_SEND_TIMEOUT_MS = get_config_value(
         "websocket_send_timeout_ms",

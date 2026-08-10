@@ -7,7 +7,7 @@
 - 顶部摄像头 `top`：常开，用于检测有人、无人、离开和多人状态。
 - 中部摄像头 `front`：按需占用，用于人物画像采集和前端试衣预览。
 - 视觉端通过 WebSocket 主动推送 `vision.presence_status`、`vision.profile_result`、`vision.person_departed`。
-- 前端通过 `vision.try_on.start/stop` 申请和归还试衣预览流。
+- Machine uses the strict V2 attempt protocol for generated try-on.
 - 多人场景只推状态，不推人物画像字段。
 
 ## 快速启动
@@ -56,7 +56,7 @@ scripts\stop_server.bat
       "keep_open": true
     },
     "front": {
-      "role": "profile_tryon",
+      "role": "profile_fast_try_on",
       "keep_open": true
     }
   }
@@ -196,7 +196,7 @@ http://127.0.0.1:7892/proximity/debug
 - 仅合并到 `main` 的受保护 `vX.Y.Z-rc.N` tag 触发 Experimental Candidate Release。
 - release 同时发布原始 zip、descriptor、由实际离线安装的完整依赖闭包和选中 wheel SHA-256 生成的 SPDX SBOM、SLSA provenance、artifact attestation，及与 VEM 验证器契约一致的 Ed25519 签名信封。SBOM 显式标注 `cv2-enumerate-cameras` 的 GPL-3.0-or-later 许可，发布前须完成相应合规审查。
 - VEM 之后由操作员手动输入 tag 与预期 bundle digest，执行独立 conformance/approval；供应仓不安装、不批准、也不重打包候选。
-- `scripts/verify_real_camera_capability.py` 用于现场真实双摄能力验收，强制 `mockScenario=off` 并验证 presence、单人可用画像、离开和试衣 MJPEG。
+- `scripts/verify_real_camera_capability.py` 用于现场真实双摄核心能力验收，强制 `mockScenario=off` 并验证 presence、单人可用画像和离开。
 - `/dashboard` 与旧 `/camera/{role}/snapshot.jpg` 仅在供应方开发启动显式设置 `VISION_DEVELOPMENT_DASHBOARD=true` 时开放；托管生产模式固定关闭。
 
 ## 编码说明

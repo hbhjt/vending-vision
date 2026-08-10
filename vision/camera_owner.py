@@ -1,13 +1,13 @@
 """
 前置摄像头所有权管理模块
 
-中部（前置）摄像头是共享资源，可能被 vision 画像采集和 tryon 试衣前端同时竞争。
+中部（前置）摄像头是共享资源，可能被 profile 采集和 Fast Virtual Try-On attempt 竞争。
 本模块实现基于优先级的准入控制：
 
 优先级（从低到高）：
 - idle (0): 无人使用
 - vision (1): 视觉画像采集
-- tryon_frontend (2): 试衣前端（最高优先级）
+- fast_try_on (2): Fast Virtual Try-On attempt（最高优先级）
 
 特性：
 - 支持超时自动过期，防止死锁
@@ -26,12 +26,12 @@ from vision.config import settings
 
 
 # 合法的前置摄像头使用者
-ALLOWED_FRONT_CAMERA_OWNERS = {"vision", "tryon_frontend"}
+ALLOWED_FRONT_CAMERA_OWNERS = {"vision", "fast_try_on"}
 # 使用者优先级映射
 FRONT_CAMERA_PRIORITY = {
     "idle": 0,
     "vision": 1,
-    "tryon_frontend": 2,
+    "fast_try_on": 2,
 }
 
 
@@ -44,7 +44,7 @@ class FrontCameraOwner:
     """前置摄像头的所有权管理器。
 
     管理对前置摄像头的独占访问，支持：
-    - 按优先级抢占（tryon_frontend > vision > idle）
+    - 按优先级抢占（fast_try_on > vision > idle）
     - 超时自动回收（防止持有者异常退出导致死锁）
     - 线程安全的所有权变更
     """

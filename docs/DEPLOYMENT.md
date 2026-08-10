@@ -88,11 +88,10 @@ python scripts\verify_real_camera_capability.py `
 - 真实的有人 `vision.presence_status`；
 - 单人且可用于推荐的 `vision.profile_result`；
 - 去抖后的 `vision.person_departed` 边沿事件；
-- `vision.try_on.started`、可读取的受保护 MJPEG 数据，以及
-  `vision.try_on.stopped.reason=client_stop`。
+- strict V2 `vision.ready` and independent core capability events.
 
 现场还需确认多人产生 `occupancy.state=multiple` 且不生成可用个体推荐、
-摄像头拔插后恢复、试衣释放中部摄像头后画像恢复。这些真实硬件观察不能由
+摄像头拔插后恢复。这些真实硬件观察不能由
 打包 mock 冒烟测试替代。
 
 ## 仅供供应方开发

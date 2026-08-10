@@ -158,7 +158,7 @@ def test_vendored_bundle_check_rejects_manifest_metadata_and_path_bypasses(
     shutil.copytree(BUNDLE_ROOT, drifted_bundle)
     manifest_path = drifted_bundle / "manifest.json"
     manifest = json.loads(manifest_path.read_text("utf-8"))
-    manifest["protocol"] = "vem.vision.v1"
+    manifest["protocol"] = "vem.vision.unsupported"
     manifest["files"]["../escape.json"] = "a" * 64
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 

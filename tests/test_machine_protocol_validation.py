@@ -52,18 +52,9 @@ def test_hello_uses_the_generated_v2_boundary_without_a_v1_payload_adapter():
         raise AssertionError("generated V2 boundary accepted an overlong machineCode")
 
 
-def test_try_on_payload_matches_vem_bounds_and_stop_enum():
-    assert validate_message_payload(
-        "vision.try_on.start",
-        {"sessionId": "s" * 128, "catalogKey": "c" * 128, "variantId": "v" * 128},
-    ) is None
-    assert validate_message_payload("vision.try_on.start", {"sessionId": "s" * 129}) is not None
-    assert validate_message_payload(
-        "vision.try_on.stop", {"sessionId": "session", "reason": "route_leave"}
-    ) is None
-    assert validate_message_payload(
-        "vision.try_on.stop", {"sessionId": "session", "reason": "websocket_disconnected"}
-    ) is not None
+def test_legacy_try_on_messages_are_hard_rejected():
+    assert validate_message_payload("vision.try_on.start", {}) is not None
+    assert validate_message_payload("vision.try_on.stop", {}) is not None
 
 
 def test_unknown_client_message_type_is_rejected():

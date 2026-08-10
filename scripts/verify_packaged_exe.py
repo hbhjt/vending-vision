@@ -43,7 +43,7 @@ def create_managed_maintenance_fixture(temp_dir, *, port):
         "allowed_origins": [f"http://127.0.0.1:{port}", "http://tauri.localhost"],
         "cameras": {
             "top": {"backend": "dshow", "role": "presence", "keep_open": True, "rotate": 0},
-            "front": {"backend": "dshow", "role": "profile_tryon", "keep_open": True, "rotate": 0},
+            "front": {"backend": "dshow", "role": "profile_fast_try_on", "keep_open": True, "rotate": 0},
         },
     }), encoding="utf-8")
     return config_path

@@ -184,7 +184,7 @@ def _configure_recorded_front(monkeypatch):
         settings,
         "FRONT_CAMERA_CONFIG",
         {
-            "role": "profile_tryon",
+            "role": "profile_fast_try_on",
             "source": "recorded_video",
             "video_path": str(fixture_root / "front.mp4"),
             "loop": True,
@@ -1214,7 +1214,7 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
     read_pids = []
 
     def read_front(role, warmup_frames=None):
-        assert vision_app.get_front_camera_owner()["owner"] == "tryon_frontend"
+        assert vision_app.get_front_camera_owner()["owner"] == "fast_try_on"
         read_pids.append((os.getpid(), role, warmup_frames))
         return np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8), {"source": "dshow"}
 
@@ -1244,12 +1244,12 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
-def test_v2_fast_attempt_does_not_release_legacy_tryon_owner(monkeypatch):
-    """Fast uses its attempt lease and cannot reuse the legacy try-on owner token."""
+def test_v2_fast_attempt_respects_fast_owner_lease(monkeypatch):
+    """Fast cannot replace an existing generation lease."""
     owner = vision_app.acquire_front_camera(
-        "tryon_frontend",
-        reason="try_on_start:legacy-session",
-        lease_token="tryon_frontend",
+        "fast_try_on",
+        reason="fast_attempt:existing",
+        lease_token="fast:existing",
     )
     assert owner["ok"]
 
@@ -1267,13 +1267,13 @@ def test_v2_fast_attempt_does_not_release_legacy_tryon_owner(monkeypatch):
         with pytest.raises(vision_app.GarmentFetchError, match="front_camera_busy"):
             asyncio.run(vision_app._read_fast_front_frame(receipt, timeout=0.1))
 
-        assert vision_app.get_front_camera_owner()["owner"] == "tryon_frontend"
-        assert vision_app.get_front_camera_owner()["leaseToken"] == "tryon_frontend"
+        assert vision_app.get_front_camera_owner()["owner"] == "fast_try_on"
+        assert vision_app.get_front_camera_owner()["leaseToken"] == "fast:existing"
     finally:
         vision_app.release_front_camera(
-            "tryon_frontend",
+            "fast_try_on",
             reason="test_cleanup",
-            lease_token="tryon_frontend",
+            lease_token="fast:existing",
         )
 
 
@@ -1324,7 +1324,7 @@ def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeyp
 
     monkeypatch.setattr(vision_app._fast_attempt_registry, "is_current", is_current)
     monkeypatch.setattr(vision_app.settings, "FRONT_CAMERA_CONFIG", {
-        "role": "profile_tryon",
+        "role": "profile_fast_try_on",
         "source": "dshow",
         "keep_open": True,
     })
@@ -1342,7 +1342,7 @@ def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeyp
         frame, source = asyncio.run(vision_app._read_fast_front_frame(receipt, timeout=1.0))
     finally:
         vision_app.release_front_camera(
-            "tryon_frontend",
+            "fast_try_on",
             reason="test_cleanup",
             lease_token=f"fast:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}",
         )
@@ -1361,7 +1361,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
     broker = DirectShowCameraBroker(
         "front",
         {
-            "role": "profile_tryon",
+        "role": "profile_fast_try_on",
             "index": 9,
             "backend": "dshow",
             "stableId": "front-stable",
@@ -1398,7 +1398,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
     registry = Registry()
     monkeypatch.setattr(vision_app, "_fast_attempt_registry", registry)
     monkeypatch.setattr(vision_app.settings, "FRONT_CAMERA_CONFIG", {
-        "role": "profile_tryon", "source": "dshow", "keep_open": True,
+        "role": "profile_fast_try_on", "source": "dshow", "keep_open": True,
     })
     monkeypatch.setattr(camera_manager, "get_camera_maintenance", lambda: Maintenance())
     monkeypatch.setattr(camera_manager, "DirectShowCameraBroker", lambda _role, _config: broker)

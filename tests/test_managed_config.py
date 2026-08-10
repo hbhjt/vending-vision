@@ -35,7 +35,7 @@ def valid_config():
         "port": 7892,
         "cameras": {
             "top": {"role": "presence", "rotate": 0},
-            "front": {"role": "profile_tryon", "rotate": 270},
+        "front": {"role": "profile_fast_try_on", "rotate": 270},
         },
         "allowed_origins": ["http://tauri.localhost"],
     }

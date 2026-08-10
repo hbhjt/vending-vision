@@ -40,8 +40,6 @@
     "front_camera_profile_sample_count": { "type": "integer", "minimum": 1, "maximum": 100 },
     "front_camera_profile_sample_interval_ms": { "type": "integer", "minimum": 10, "maximum": 10000 },
     "front_camera_owner_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 3600000 },
-    "try_on_session_ttl_ms": { "type": "integer", "minimum": 1000, "maximum": 3600000 },
-    "try_on_max_stream_clients": { "type": "integer", "minimum": 1, "maximum": 8 }
   },
   "allOf": [
     {
@@ -198,7 +196,7 @@
             "source": { "enum": ["dshow", "recorded_video"] },
             "video_path": { "type": "string", "minLength": 1 },
             "loop": { "type": "boolean" },
-            "role": { "const": "profile_tryon" }
+            "role": { "const": "profile_fast_try_on" }
           },
           "allOf": [
             {

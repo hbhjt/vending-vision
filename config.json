@@ -87,7 +87,7 @@
       "height": 720,
       "fps": 30,
       "fourcc": "MJPG",
-      "role": "profile_tryon",
+      "role": "profile_fast_try_on",
       "keep_open": true,
       "rotate": 270
     }
@@ -96,9 +96,6 @@
   "front_camera_profile_sample_count": 6,
   "front_camera_profile_sample_interval_ms": 125,
   "front_camera_owner_timeout_ms": 120000,
-  "try_on_session_ttl_ms": 600000,
-  "try_on_session_history_limit": 32,
-  "try_on_max_stream_clients": 2,
   "websocket_send_timeout_ms": 2000,
   "websocket_queue_size": 16,
 

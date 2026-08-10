@@ -30,10 +30,8 @@ from vision.proximity import ProximityMonitor
 from vision.session_state import (
     mark_vision_session_departed,
     mark_vision_session_presence,
-    mark_vision_session_tryon_departed,
     reset_vision_session,
 )
-from vision.try_on_session import get_try_on_status, mark_active_try_on_departed
 
 
 @dataclass
@@ -80,7 +78,6 @@ class PresenceRuntime:
             return bool(
                 self.collection_generation == generation
                 and snapshot.get("occupancy", {}).get("state") == "single"
-                and not snapshot.get("tryOnActive")
                 and get_occupancy_gate().can_trigger()
             )
 
@@ -111,7 +108,6 @@ class PresenceRuntime:
             protocol_occupancy_snapshot(proximity),
         )
         event_id = f"vision-event-{uuid4()}"
-        try_on_active = bool(get_try_on_status().get("activeSessionId"))
         now = time.monotonic()
 
         with self.lock:
@@ -120,7 +116,6 @@ class PresenceRuntime:
                 "proximity": copy.deepcopy(proximity),
                 "occupancy": copy.deepcopy(occupancy),
                 "ambientLight": copy.deepcopy(ambient_light),
-                "tryOnActive": try_on_active,
                 "polledAt": time.time(),
             }
             self.latest_snapshot = snapshot
@@ -140,11 +135,7 @@ class PresenceRuntime:
                 if departure is not None:
                     self.profiled_signature = None
                     self.target_change_streak = 0
-                    if try_on_active:
-                        mark_active_try_on_departed(departure)
-                        mark_vision_session_tryon_departed(departure)
-                    else:
-                        mark_vision_session_departed(departure)
+                    mark_vision_session_departed(departure)
                     if include_departure:
                         departure = dict(departure)
                         departure["source"] = "top"
@@ -184,7 +175,6 @@ class PresenceRuntime:
 
             if (
                 state == "single"
-                and not try_on_active
                 and gate.public_state().get("state") == "occupied"
                 and self.profiled_signature
                 and signature
@@ -216,13 +206,6 @@ class PresenceRuntime:
                     proximity=proximity, occupancy=occupancy,
                 )
                 status_state, reason = "waiting", "top_occupancy_unknown"
-            elif try_on_active:
-                self._invalidate_collection_locked()
-                mark_vision_session_presence(
-                    "tryon_active", reason="front_camera_reserved_by_tryon",
-                    proximity=proximity, occupancy=occupancy,
-                )
-                status_state, reason = "waiting", "front_camera_reserved_by_tryon"
             elif not gate.can_trigger():
                 mark_vision_session_presence(
                     "profile_pushed", reason="occupancy_gate_locked",

@@ -62,22 +62,14 @@ from vision.session_state import (
     mark_vision_session_presence,
     mark_vision_session_profile_pushed,
     mark_vision_session_profiling,
-    mark_vision_session_tryon_departed,
     mark_vision_session_unusable,
     mark_vision_session_waiting_front_camera,
 )
-from vision.try_on_session import get_try_on_status, mark_active_try_on_departed
 
 
 # Mock 模式下的待推送画像和离开事件（跨轮次延迟推送）
 _mock_pending_profile_payload = None
 _mock_pending_departure_payload = None
-
-
-def active_try_on_status():
-    """获取当前活跃的试衣会话状态。"""
-    status = get_try_on_status()
-    return status if status.get("activeSessionId") else None
 
 
 def wait_for_front_camera_owner(event_id):
@@ -165,7 +157,7 @@ def collect_front_profile_update(
     owner_result = wait_for_front_camera_owner(event_id)
 
     if not owner_result.get("ok"):
-        # 获取失败：可能被 tryon 占用或超时
+        # 获取失败：可能被 Fast attempt 占用或超时
         reason = owner_result.get("error") or "front_camera_busy"
         mark_vision_session_waiting_front_camera(
             reason=reason, owner_status=owner_result,
@@ -403,7 +395,7 @@ def collect_profile_update(
        b. occupancy=none -> 门控标记 absent、离开检测
        c. occupancy=multiple -> 广播多人状态
        d. occupancy=unknown -> 广播等待状态
-       e. occupancy=single + gate open + no tryon -> 画像采集流程
+       e. occupancy=single + gate open -> 画像采集流程
 
     Args:
         include_status: 是否返回 presence_status 消息（非画像推送状态）
@@ -496,15 +488,7 @@ def collect_profile_update(
                 reason="no_person", ambient_light=ambient_light,
             )
 
-            try_on_status = active_try_on_status()
-
-            # 试衣期间人物离开
-            if departure_payload is not None and try_on_status:
-                mark_active_try_on_departed(departure_payload)
-                mark_vision_session_tryon_departed(departure_payload)
-
-            # 正常离开
-            if departure_payload is not None and not try_on_status:
+            if departure_payload is not None:
                 mark_vision_session_departed(departure_payload)
 
             if departure_payload is not None and include_departure:
@@ -564,29 +548,6 @@ def collect_profile_update(
                     build_presence_status(
                         event_id=event_id, state="waiting",
                         reason="top_occupancy_unknown",
-                        proximity=proximity, tracking=track.public_state(),
-                        occupancy=occupancy_snapshot, ambient_light=ambient_light,
-                        source="top",
-                        source_frame=get_last_frame_source("top"),
-                    ),
-                )
-
-            return None
-
-        # ----- 试衣活跃检查 -----
-        try_on_status = active_try_on_status()
-        if try_on_status is not None:
-            mark_vision_session_presence(
-                "tryon_active", reason="front_camera_reserved_by_tryon",
-                proximity=proximity, occupancy=occupancy_snapshot,
-            )
-
-            if include_status:
-                return profile_update(
-                    "vision.presence_status",
-                    build_presence_status(
-                        event_id=event_id, state="waiting",
-                        reason="front_camera_reserved_by_tryon",
                         proximity=proximity, tracking=track.public_state(),
                         occupancy=occupancy_snapshot, ambient_light=ambient_light,
                         source="top",

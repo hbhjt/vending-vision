@@ -74,7 +74,7 @@ def _block_first_broker_target(connection, config):
 
 def _broker_config():
     return {
-        "role": "profile_tryon",
+        "role": "profile_fast_try_on",
         "index": 0,
         "backend": "dshow",
         "stableId": "test-front",

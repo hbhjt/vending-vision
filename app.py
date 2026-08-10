@@ -62,19 +62,7 @@ from vision.presence_runtime import get_presence_runtime
 from vision.profile_push import collect_front_profile_update, collect_profile_update
 from vision.protocol import APP_VERSION, PROTOCOL, envelope, error_envelope
 from vision.self_check import check_camera, run_self_check
-from vision.session_state import (
-    get_vision_session_status,
-    mark_vision_session_tryon_started,
-    mark_vision_session_tryon_stopped,
-)
-from vision.try_on_session import (
-    get_try_on_status,
-    prepare_first_try_on_frame,
-    iter_try_on_mjpeg,
-    is_try_on_session_active,
-    start_try_on_session,
-    stop_try_on_session,
-)
+from vision.session_state import get_vision_session_status
 from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError, PoseUnavailableError
 from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
 from vision.attempt_worker import FastRenderBroker, render_attempt_frame
@@ -226,7 +214,7 @@ async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
         if not await _fast_attempt_registry.is_current(receipt):
             raise GarmentFetchError("attempt_replaced")
         owner = acquire_front_camera(
-            "tryon_frontend",
+            "fast_try_on",
             reason=f"fast_attempt:{receipt.attempt_id}",
             lease_token=lease_token,
         )
@@ -289,7 +277,7 @@ async def _read_fast_front_frame(receipt: AttemptReceipt, *, timeout: float):
             release_front_camera_io_lock()
         if owner_acquired:
             release_front_camera(
-                "tryon_frontend",
+                "fast_try_on",
                 reason=f"fast_attempt_done:{receipt.attempt_id}",
                 lease_token=lease_token,
             )
@@ -580,50 +568,11 @@ def validate_message_payload(message_type: str, payload: dict):
     """根据消息类型验证 payload 的字段格式。
 
     支持的验证：
-    - vision.try_on.start: sessionId, catalogKey, variantId
-    - vision.try_on.stop: sessionId, reason
+    - vision.ping: empty payload
     """
-    supported_types = {
-        "vision.ping",
-        "vision.try_on.start",
-        "vision.try_on.stop",
-    }
+    supported_types = {"vision.ping"}
     if message_type not in supported_types:
         return f"unsupported client message type: {message_type}"
-
-    if message_type == "vision.try_on.start":
-        session_id = payload.get("sessionId")
-        catalog_key = payload.get("catalogKey")
-        variant_id = payload.get("variantId")
-
-        if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
-            return "payload.sessionId must contain 1-128 characters"
-
-        if catalog_key is not None and (
-            not isinstance(catalog_key, str) or not catalog_key or len(catalog_key) > 128
-        ):
-            return "payload.catalogKey must contain 1-128 characters"
-
-        if variant_id is not None and (
-            not isinstance(variant_id, str) or not variant_id or len(variant_id) > 128
-        ):
-            return "payload.variantId must contain 1-128 characters"
-
-    if message_type == "vision.try_on.stop":
-        session_id = payload.get("sessionId")
-        reason = payload.get("reason")
-
-        if not isinstance(session_id, str) or not session_id or len(session_id) > 128:
-            return "payload.sessionId must contain 1-128 characters"
-
-        if reason is not None and reason not in {
-            "user_exit",
-            "route_leave",
-            "replaced",
-            "error",
-            "unknown",
-        }:
-            return "payload.reason is not a supported try-on stop reason"
 
     return None
 
@@ -639,7 +588,6 @@ def root():
             "camera_maintenance": "/maintenance/cameras",
             "front_camera_owner": "/camera/front/owner",
             "proximity_debug": "/proximity/debug",
-            "try_on_preview": "/try-on/{sessionId}.mjpeg",
             "session_status": "/session/status",
             "metrics": "/metrics",
             "ws": "/ws",
@@ -792,7 +740,6 @@ def version():
             "top": {key: value for key, value in settings.TOP_CAMERA_CONFIG.items() if key != "index"},
             "front": {key: value for key, value in settings.FRONT_CAMERA_CONFIG.items() if key != "index"},
             "front_owner": get_front_camera_owner(),
-            "try_on": get_try_on_status(),
             "vision_session": get_vision_session_status(),
             "profile": {
                 "max_wait_ms": settings.FRONT_CAMERA_PROFILE_MAX_WAIT_MS,
@@ -926,10 +873,7 @@ def camera_role_snapshot(role: str):
         return JSONResponse(status_code=404, content={"ok": False, "error": "not found"})
     try:
         get_camera_config(role)
-        if role == "front" and (
-            get_front_camera_owner().get("owner") != "idle"
-            or get_try_on_status().get("activeSessionId")
-        ):
+        if role == "front" and get_front_camera_owner().get("owner") != "idle":
             return JSONResponse(
                 status_code=409,
                 content={"ok": False, "error": "front camera is reserved"},
@@ -957,10 +901,7 @@ def camera_role_reopen(role: str):
         return JSONResponse(status_code=404, content={"ok": False, "error": "not found"})
     try:
         get_camera_config(role)
-        if role == "front" and (
-            get_front_camera_owner().get("owner") != "idle"
-            or get_try_on_status().get("activeSessionId")
-        ):
+        if role == "front" and get_front_camera_owner().get("owner") != "idle":
             return JSONResponse(
                 status_code=409,
                 content={"ok": False, "error": "front camera is reserved"},
@@ -1000,65 +941,6 @@ def metrics_snapshot():
     return metrics.snapshot()
 
 
-@app.get("/try-on/{session_id}.mjpeg")
-def try_on_mjpeg(session_id: str, token: Optional[str] = None):
-    if not token or not is_try_on_session_active(session_id, stream_token=token):
-        return JSONResponse(
-            status_code=404,
-            content={"ok": False, "error": "try-on session is not active"},
-        )
-
-    first_frame = None
-    source_frame = None
-    try:
-        first_frame, source_frame = prepare_first_try_on_frame(
-            session_id=session_id,
-            stream_token=str(token),
-        )
-    except Exception as exc:
-        logger.exception("Failed to prepare first try-on frame")
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "error": str(exc)},
-        )
-
-    headers = {}
-    if (
-        isinstance(source_frame, dict)
-        and source_frame.get("adapter") == "recorded_video"
-        and source_frame.get("role") == "front"
-        and source_frame.get("configSha256")
-        and source_frame.get("fixtureSha256")
-        and isinstance(source_frame.get("frameIndex"), int)
-        and isinstance(source_frame.get("decodedFrameCount"), int)
-        and source_frame["decodedFrameCount"] > 0
-        and 0 <= source_frame["frameIndex"] < source_frame["decodedFrameCount"]
-    ):
-        headers = {
-            "x-vem-frame-source-adapter": source_frame["adapter"],
-            "x-vem-frame-source-role": source_frame["role"],
-            "x-vem-frame-source-config-sha256": source_frame["configSha256"],
-            "x-vem-frame-source-file-sha256": source_frame["fixtureSha256"],
-            "x-vem-frame-source-frame-index": str(source_frame["frameIndex"]),
-            "x-vem-frame-source-decoded-frame-count": str(
-                source_frame["decodedFrameCount"]
-            ),
-            "x-vem-frame-session-id": session_id,
-        }
-
-    media_type = "multipart/x-mixed-replace; boundary=frame"
-    return StreamingResponse(
-        iter_try_on_mjpeg(
-            session_id,
-            stream_token=str(token),
-            prepared_frame=first_frame,
-            already_started=True,
-        ),
-        media_type=media_type,
-        headers=headers,
-    )
-
-
 # ---------------------------------------------------------------------------
 # 画像广播子系统
 # ---------------------------------------------------------------------------
@@ -1077,7 +959,6 @@ async def register_profile_client(
     websocket: WebSocket,
     send_lock: asyncio.Lock,
     capabilities: set[str],
-    owned_try_on_session_ids: set,
 ):
     """Register a post-hello client and start the lightweight worker."""
     global _presence_worker_task
@@ -1091,7 +972,6 @@ async def register_profile_client(
             "websocket": websocket,
             "send_lock": send_lock,
             "capabilities": set(capabilities),
-            "owned_try_on_session_ids": owned_try_on_session_ids,
             "owner_id": str(id(websocket)),
             "queue": queue,
         }
@@ -1106,25 +986,6 @@ async def register_profile_client(
             logger.info("Presence broadcast worker started")
 
 
-def cleanup_owned_try_on_sessions(session_ids: set, reason: str, owner_id: str | None = None):
-    """清理客户端拥有的试衣会话（断开连接时调用）。"""
-    for session_id in list(session_ids):
-        try:
-            stopped = stop_try_on_session(
-                session_id, reason=reason, owner_id=owner_id,
-            )
-            mark_vision_session_tryon_stopped(stopped)
-            session_ids.discard(session_id)
-            logger.info(
-                f"Stopped try-on session reason={reason}, sessionId={session_id}"
-            )
-        except Exception:
-            logger.exception(
-                f"Failed to stop try-on session reason={reason}, "
-                f"sessionId={session_id}"
-            )
-
-
 async def unregister_profile_client(websocket: WebSocket):
     global _profile_cancel_event
     async with _profile_clients_lock:
@@ -1135,11 +996,6 @@ async def unregister_profile_client(websocket: WebSocket):
         sender_task = removed.get("sender_task")
         if sender_task is not None and sender_task is not asyncio.current_task():
             sender_task.cancel()
-        cleanup_owned_try_on_sessions(
-            removed["owned_try_on_session_ids"],
-            reason="websocket_disconnected",
-            owner_id=removed.get("owner_id"),
-        )
         async with _profile_clients_lock:
             metrics.set_gauge("profile_broadcast_clients", len(_profile_clients))
         if no_clients and _profile_cancel_event is not None:
@@ -1647,14 +1503,11 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
     处理以下消息类型：
     - vision.hello: 握手 + 能力协商 + 注册画像广播客户端
     - vision.ping: 心跳（回复 vision.pong）
-    - vision.try_on.start: 启动试衣会话
-    - vision.try_on.stop: 停止试衣会话
     - vision.start_profile / vision.cancel: 不支持（主动推送协议中不需要）
 
-    断开连接时自动清理试衣会话和广播注册。
+    断开连接时自动清理广播注册。
     """
     send_lock = asyncio.Lock()
-    owned_try_on_session_ids = set()
     owned_fast_attempt_receipts: set[AttemptReceipt] = set()
     fast_attempt_tasks: set[asyncio.Task] = set()
     connection_closed = asyncio.Event()
@@ -1774,7 +1627,6 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                         websocket,
                         send_lock,
                         client_capabilities,
-                        owned_try_on_session_ids,
                     )
 
                 handshake_complete = True
@@ -1846,100 +1698,6 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 )
                 continue
 
-            if message_type == "vision.try_on.start":
-                try:
-                    session = start_try_on_session(
-                        payload.get("sessionId"),
-                        catalog_key=payload.get("catalogKey"),
-                        variant_id=payload.get("variantId"),
-                        owner_id=str(id(websocket)),
-                    )
-                except ValueError as e:
-                    async with send_lock:
-                        await send_error(
-                            websocket,
-                            code="invalid_message",
-                            message=str(e),
-                            retryable=False,
-                            message_id=message_id,
-                        )
-                    continue
-                except (PermissionError, RuntimeError) as e:
-                    logger.exception("Try-on start failed")
-                    async with send_lock:
-                        await websocket.send_json(
-                            error_envelope(
-                                code="try_on_unavailable",
-                                message=str(e),
-                                retryable=True,
-                                message_id=f"error-{message_id}-{uuid4()}",
-                            )
-                        )
-                    continue
-
-                if _profile_cancel_event is not None:
-                    _profile_cancel_event.set()
-                mark_vision_session_tryon_started(session)
-                owned_try_on_session_ids.add(session["sessionId"])
-                async with send_lock:
-                    await websocket.send_json(
-                        envelope(
-                            message_type="vision.try_on.started",
-                            message_id=f"try-on-started-{session['sessionId']}-{uuid4()}",
-                            payload={
-                                "sessionId": session["sessionId"],
-                                "previewUrl": session["previewUrl"],
-                                "streamType": session["streamType"],
-                            },
-                        )
-                    )
-                continue
-
-            if message_type == "vision.try_on.stop":
-                try:
-                    stopped = stop_try_on_session(
-                        payload.get("sessionId"),
-                        reason=payload.get("reason"),
-                        owner_id=str(id(websocket)),
-                    )
-                except ValueError as e:
-                    async with send_lock:
-                        await send_error(
-                            websocket,
-                            code="invalid_message",
-                            message=str(e),
-                            retryable=False,
-                            message_id=message_id,
-                        )
-                    continue
-                except (PermissionError, RuntimeError) as e:
-                    logger.exception("Try-on stop failed")
-                    async with send_lock:
-                        await websocket.send_json(
-                            error_envelope(
-                                code="try_on_unavailable",
-                                message=str(e),
-                                retryable=True,
-                                message_id=f"error-{message_id}-{uuid4()}",
-                            )
-                        )
-                    continue
-
-                mark_vision_session_tryon_stopped(stopped)
-                owned_try_on_session_ids.discard(stopped["sessionId"])
-                async with send_lock:
-                    await websocket.send_json(
-                        envelope(
-                            message_type="vision.try_on.stopped",
-                            message_id=f"try-on-stopped-{stopped['sessionId']}-{uuid4()}",
-                            payload={
-                                "sessionId": stopped["sessionId"],
-                                "reason": stopped["reason"],
-                            },
-                        )
-                    )
-                continue
-
             if message_type in {"vision.start_profile", "vision.cancel"}:
                 async with send_lock:
                     await send_error(
@@ -1976,11 +1734,6 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
         if fast_attempt_tasks:
             await asyncio.gather(*list(fast_attempt_tasks), return_exceptions=True)
         await unregister_profile_client(websocket)
-        cleanup_owned_try_on_sessions(
-            owned_try_on_session_ids,
-            reason="websocket_disconnected",
-            owner_id=str(id(websocket)),
-        )
 
 
 @app.websocket("/ws")

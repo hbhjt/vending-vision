@@ -24,7 +24,7 @@
       "height": 720,
       "fps": 30,
       "fourcc": "MJPG",
-      "role": "profile_tryon",
+      "role": "profile_fast_try_on",
       "keep_open": true,
       "rotate": 270
     }

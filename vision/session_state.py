@@ -6,13 +6,11 @@
 状态流转：
 approach_detected -> waiting_front_camera -> profiling -> profile_pushed -> browsing
                                                      |-> unusable
-                                                     |-> tryon_active -> (departed_during_tryon)
 
 特性：
 - 线程安全（RLock 保护所有状态变更）
 - 自动创建和关闭会话
 - 画像缓存（最近推送的 profile payload）
-- 试衣期间离开追踪
 """
 
 import copy
@@ -30,7 +28,6 @@ ACTIVE_STATES = {
     "profiling",
     "profile_pushed",
     "browsing",
-    "tryon_active",
     "multiple",
     "unusable",
 }
@@ -68,8 +65,6 @@ class VisionSessionState:
             "profilePushed": False,
             "profileEventId": None,
             "profilePayload": None,
-            "tryOnSessionId": None,
-            "departedDuringTryon": False,
             "departureEvent": None,
             "startedAt": now,
             "updatedAt": now,
@@ -117,8 +112,6 @@ class VisionSessionState:
             "reason": session.get("reason"),
             "profilePushed": bool(session.get("profilePushed")),
             "profileEventId": session.get("profileEventId"),
-            "tryOnSessionId": session.get("tryOnSessionId"),
-            "departedDuringTryon": bool(session.get("departedDuringTryon")),
             "startedAt": session.get("startedAt"),
             "updatedAt": session.get("updatedAt"),
             "lastPresenceAt": session.get("lastPresenceAt"),
@@ -217,59 +210,6 @@ class VisionSessionState:
             session["updatedAt"] = now_iso()
             return self._summary_locked(session)
 
-    def mark_tryon_started(self, tryon_session):
-        """标记试衣会话已开始。"""
-        with self.lock:
-            session = self._ensure_active_locked(reason="tryon_started")
-            session["state"] = "tryon_active"
-            session["reason"] = "tryon_started"
-            session["tryOnSessionId"] = tryon_session.get("sessionId")
-            session["departedDuringTryon"] = False
-            session["departureEvent"] = None
-            session["updatedAt"] = now_iso()
-            return self._summary_locked(session)
-
-    def mark_tryon_departed(self, departure_event=None):
-        """标记试衣期间人物已离开。"""
-        with self.lock:
-            session = self._ensure_active_locked(reason="departed_during_tryon")
-            session["state"] = "tryon_active"
-            session["reason"] = "departed_during_tryon"
-            session["departedDuringTryon"] = True
-            session["departureEvent"] = copy.deepcopy(departure_event)
-            session["updatedAt"] = now_iso()
-            return self._summary_locked(session)
-
-    def mark_tryon_stopped(self, stopped):
-        """标记试衣会话已停止。
-
-        如果试衣期间人物已离开（shouldRefreshProfile），
-        结束当前 session 并提示需要重新采集画像。
-        """
-        with self.lock:
-            if self.active_session is None:
-                return None
-
-            session = self.active_session
-            session["tryOnSessionId"] = None
-            session["updatedAt"] = now_iso()
-
-            if stopped.get("shouldRefreshProfile"):
-                session["state"] = "departed"
-                session["reason"] = "departed_during_tryon"
-                self.last_session = copy.deepcopy(session)
-                self.active_session = None
-                return self._summary_locked(self.last_session)
-
-            if session.get("profilePushed"):
-                session["state"] = "profile_pushed"
-                session["reason"] = "tryon_stopped_keep_profile"
-            else:
-                session["state"] = "approach_detected"
-                session["reason"] = "tryon_stopped_wait_profile"
-
-            return self._summary_locked(session)
-
     def mark_departed(self, departure_event=None):
         """标记人物已离开，结束当前会话。"""
         with self.lock:
@@ -341,18 +281,6 @@ def mark_vision_session_unusable(reason=None):
 
 def mark_vision_session_profile_pushed(payload):
     return _vision_session_state.mark_profile_pushed(payload)
-
-
-def mark_vision_session_tryon_started(tryon_session):
-    return _vision_session_state.mark_tryon_started(tryon_session)
-
-
-def mark_vision_session_tryon_departed(departure_event=None):
-    return _vision_session_state.mark_tryon_departed(departure_event=departure_event)
-
-
-def mark_vision_session_tryon_stopped(stopped):
-    return _vision_session_state.mark_tryon_stopped(stopped)
 
 
 def mark_vision_session_departed(departure_event=None):
