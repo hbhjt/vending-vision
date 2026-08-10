@@ -1,4 +1,5 @@
 import asyncio
+import gc
 from uuid import uuid4
 
 import pytest
@@ -149,6 +150,123 @@ def test_waiting_replacement_rechecks_after_same_id_backpressure_terminal():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("prior_outcome", ["return", "cancel", "error"])
+@pytest.mark.parametrize("ready", [True, False])
+def test_prior_join_outcome_is_consumed_before_pending_admission_recheck(
+    prior_outcome, ready
+):
+    async def scenario():
+        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        unhandled_contexts = []
+        asyncio.get_running_loop().set_exception_handler(
+            lambda _loop, context: unhandled_contexts.append(context)
+        )
+        first_id, pending_id, next_id = str(uuid4()), str(uuid4()), str(uuid4())
+        prior_release = asyncio.Event()
+        pending_prepared = asyncio.Event()
+
+        async def prior_task():
+            await prior_release.wait()
+            if prior_outcome == "cancel":
+                raise asyncio.CancelledError
+            if prior_outcome == "error":
+                raise RuntimeError("prior resource cleanup failed")
+
+        prior_handle = asyncio.create_task(prior_task())
+        first = await registry.admit(
+            attempt_id=first_id,
+            websocket=object(),
+            send_lock=asyncio.Lock(),
+            task=prior_handle,
+            accepted=_message(
+                "vision.try_on.attempt.accepted", first_id, "first-accepted"
+            ),
+            progress=_message(
+                "vision.try_on.attempt.progress", first_id, "first-progress"
+            ),
+            canceled_terminal=_message(
+                "vision.try_on.attempt.failed", first_id, "first-canceled"
+            ),
+        )
+        assert first.is_owner
+
+        accepted = _message(
+            "vision.try_on.attempt.accepted", pending_id, "pending-accepted"
+        )
+        progress = _message(
+            "vision.try_on.attempt.progress", pending_id, "pending-progress"
+        )
+        unavailable = _message(
+            "vision.try_on.attempt.failed", pending_id, "pending-unavailable"
+        )
+
+        async def pending_owner():
+            preparation = await registry.prepare_admission(
+                attempt_id=pending_id,
+                websocket=object(),
+                send_lock=asyncio.Lock(),
+                task=asyncio.current_task(),
+                canceled_terminal=_message(
+                    "vision.try_on.attempt.failed", pending_id, "pending-canceled"
+                ),
+            )
+            pending_prepared.set()
+            return await registry.commit_prepared_admission(
+                preparation,
+                accepted=accepted,
+                progress=progress,
+                unavailable_terminal=unavailable,
+                readiness=lambda: ready,
+            )
+
+        pending_task = asyncio.create_task(pending_owner())
+        await pending_prepared.wait()
+        assert pending_task.cancelling() == 0
+        prior_release.set()
+        pending = await asyncio.wait_for(pending_task, timeout=1.0)
+
+        replay = await registry.admit(
+            attempt_id=pending_id,
+            websocket=object(),
+            send_lock=asyncio.Lock(),
+            task=asyncio.current_task(),
+            accepted=None,
+            progress=None,
+        )
+        if ready:
+            assert pending.is_owner
+            assert replay.replay == [accepted, progress]
+            await registry.cancel_owner_and_join(pending.receipt)
+        else:
+            assert not pending.is_owner
+            assert pending.replay == [unavailable]
+            assert replay.replay == [unavailable]
+
+        next_admission = await asyncio.wait_for(
+            registry.admit(
+                attempt_id=next_id,
+                websocket=object(),
+                send_lock=asyncio.Lock(),
+                task=asyncio.current_task(),
+                accepted=_message(
+                    "vision.try_on.attempt.accepted", next_id, "next-accepted"
+                ),
+                progress=_message(
+                    "vision.try_on.attempt.progress", next_id, "next-progress"
+                ),
+            ),
+            timeout=1.0,
+        )
+        assert next_admission.is_owner
+        await registry.cancel_owner_and_join(next_admission.receipt)
+        del prior_handle
+        gc.collect()
+        await asyncio.sleep(0)
+        assert unhandled_contexts == []
+
+    asyncio.run(scenario())
+
+
 def test_cancelled_pending_owner_keeps_cleanup_barrier_until_prior_task_ends():
     async def scenario():
         registry = FastAttemptRegistry(terminal_ttl_seconds=60)
@@ -266,7 +384,10 @@ def test_cancelled_pending_owner_keeps_cleanup_barrier_until_prior_task_ends():
     asyncio.run(scenario())
 
 
-def test_repeated_pending_cancel_waits_for_throwing_prior_and_keeps_cancelled_error():
+@pytest.mark.parametrize("prior_outcome", ["cancel", "error"])
+def test_repeated_pending_cancel_waits_for_failed_prior_and_keeps_cancelled_error(
+    prior_outcome,
+):
     async def scenario():
         registry = FastAttemptRegistry(terminal_ttl_seconds=60)
         first_id, pending_id, next_id = str(uuid4()), str(uuid4()), str(uuid4())
@@ -274,12 +395,14 @@ def test_repeated_pending_cancel_waits_for_throwing_prior_and_keeps_cancelled_er
         prior_exited = asyncio.Event()
         pending_prepared = asyncio.Event()
 
-        async def throwing_prior():
+        async def failed_prior():
             await prior_release.wait()
             prior_exited.set()
+            if prior_outcome == "cancel":
+                raise asyncio.CancelledError
             raise RuntimeError("prior cleanup failure")
 
-        prior_handle = asyncio.create_task(throwing_prior())
+        prior_handle = asyncio.create_task(failed_prior())
         first = await registry.admit(
             attempt_id=first_id,
             websocket=object(),
