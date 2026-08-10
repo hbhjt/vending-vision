@@ -87,6 +87,7 @@ class FastRenderBroker:
         self._process = None
         self._fatal_error: str | None = None
         self._ready = False
+        self._pose_ready = True
         self._quiesced = False
         self._request_threads: set[threading.Thread] = set()
 
@@ -106,6 +107,11 @@ class FastRenderBroker:
                 and process is not None
                 and process.is_alive()
             )
+
+    @property
+    def pose_ready(self) -> bool:
+        with self._state_lock:
+            return bool(self._pose_ready and self.ready)
 
     @property
     def pid(self) -> int | None:
@@ -192,6 +198,10 @@ class FastRenderBroker:
                     self._fatal_error = "render_broker_readiness_invalid"
             raise AttemptWorkerError("render broker returned invalid readiness")
         with self._state_lock:
+            # Older injected test targets do not advertise poseReady and are
+            # treated as compatible; the production target explicitly sets
+            # false when MediaPipe cannot initialize.
+            self._pose_ready = payload.get("poseReady", True) is True
             self._ready = True
 
     async def start(self) -> None:
@@ -354,6 +364,10 @@ class FastRenderBroker:
                     from vision.fast_tryon import GarmentFetchError
 
                     raise GarmentFetchError(response)
+                if kind == "pose_error":
+                    from vision.fast_tryon import PoseUnavailableError
+
+                    raise PoseUnavailableError(response)
                 raise AttemptWorkerError(response)
             if not process.is_alive():
                 process.join(timeout=0)
@@ -509,6 +523,10 @@ async def render_attempt_frame(
     )
     if not broker.ready:
         raise AttemptWorkerError("render broker is not ready")
+    if not broker.pose_ready:
+        from vision.fast_tryon import PoseUnavailableError
+
+        raise PoseUnavailableError("pose_unavailable")
     if timeout <= 0 or loop.time() + conservative_seconds >= deadline:
         raise TimeoutError("render deadline exceeded before frame copy")
     remaining = deadline - loop.time()

@@ -74,7 +74,7 @@ from vision.try_on_session import (
     start_try_on_session,
     stop_try_on_session,
 )
-from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
+from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError, PoseUnavailableError
 from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
 from vision.attempt_worker import FastRenderBroker, render_attempt_frame
 from vision.v2_contract_bundle import (
@@ -425,6 +425,7 @@ def get_runtime_status():
         "ageGenderReady": age_gender_ready,
         "ageGenderMode": age_gender_mode,
         "fastRenderReady": _fast_render_broker.ready,
+        "fastPoseReady": _fast_render_broker.pose_ready,
     }
 
 
@@ -470,7 +471,7 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
         schema_version = identity.schema_version
         bundle_version = identity.bundle_version
         contract_digest = identity.contract_digest
-    elif not status.get("fastRenderReady", True):
+    elif not status.get("fastRenderReady", True) or not status.get("fastPoseReady", True):
         # The frozen V2 diagnostic vocabulary has one local Vision capability
         # unavailable value.  Do not extend that cross-repository contract in
         # this worker-only slice.
@@ -1425,7 +1426,9 @@ async def run_v2_fast_attempt(
     # Handshake readiness is a negotiation fact, not a lifetime lease on the
     # render process.  Every attempt must also observe the live broker before
     # constructing admission replay.
-    fast_ready = bool(fast_ready and _fast_render_broker.ready)
+    fast_ready = bool(
+        fast_ready and _fast_render_broker.ready and _fast_render_broker.pose_ready
+    )
     attempt_id = payload["attemptId"]
     unavailable_terminal = _generated_v2_envelope(
         "vision.try_on.attempt.failed",
@@ -1464,7 +1467,11 @@ async def run_v2_fast_attempt(
         accepted=accepted,
         progress=progress,
         unavailable_terminal=unavailable_terminal,
-        readiness=lambda: bool(fast_ready and _fast_render_broker.ready),
+        readiness=lambda: bool(
+            fast_ready
+            and _fast_render_broker.ready
+            and _fast_render_broker.pose_ready
+        ),
     )
     if not admission.is_owner:
         for replay_message in admission.replay:
@@ -1513,6 +1520,15 @@ async def run_v2_fast_attempt(
         )
         terminal = _generated_v2_envelope(
             "vision.try_on.attempt.completed", {"attemptId": attempt_id, "result": result}
+        )
+    except PoseUnavailableError as error:
+        # The contract's existing fast_failed terminal is the stable local
+        # equivalent of pose_unavailable; never publish a result without
+        # valid official shoulder/hip geometry.
+        logger.warning("Fast pose unavailable attemptId=%s reason=%s", attempt_id, error)
+        terminal = _generated_v2_envelope(
+            "vision.try_on.attempt.failed",
+            {"attemptId": attempt_id, "reason": "fast_failed"},
         )
     except GarmentFetchError as error:
         terminal = _generated_v2_envelope(

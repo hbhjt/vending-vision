@@ -17,16 +17,36 @@ MAX_FRAME_HEIGHT = 1080
 MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
 MAX_RESULT_BYTES = 16 * 1024 * 1024
 
+# Kept module-local so the official MediaPipe estimator is initialized once
+# per spawn worker, rather than once per attempt.  Dynamic import keeps the
+# spawn target free of an app/parent import cycle and remains PyInstaller
+# discoverable through the hidden import in the spec.
+_FAST_RUNTIME = None
+_POSE_READY = False
+
+
+def _initialize_runtime():
+    global _FAST_RUNTIME, _POSE_READY
+    from vision.fast_tryon import FastTryOnRuntime
+
+    try:
+        pose_module = __import__("vision." + "pose_estimator", fromlist=["PoseEstimator"])
+        estimator = pose_module.PoseEstimator()
+        _FAST_RUNTIME = FastTryOnRuntime(pose_estimator=estimator)
+        _POSE_READY = True
+    except Exception:
+        # The worker stays alive so the parent can report Fast degradation;
+        # camera/presence/health remain owned by the main Vision process.
+        _FAST_RUNTIME = FastTryOnRuntime(pose_estimator=None)
+        _POSE_READY = False
+    return _FAST_RUNTIME
+
 
 def _render(payload: dict) -> bytes:
     """Decode, prepare and render entirely inside the bounded child."""
     import numpy as np
 
-    from vision.fast_tryon import (
-        FastTryOnRuntime,
-        GarmentFetchError,
-        ValidatedGarmentSource,
-    )
+    from vision.fast_tryon import GarmentFetchError, ValidatedGarmentSource
 
     if not isinstance(payload, dict) or set(payload) != {
         "frameBytes",
@@ -72,7 +92,12 @@ def _render(payload: dict) -> bytes:
         digest=digest,
         template=payload["template"],
     )
-    result = FastTryOnRuntime(max_garment_bytes=MAX_GARMENT_BYTES).render(frame, source)
+    runtime = _FAST_RUNTIME or _initialize_runtime()
+    if not _POSE_READY:
+        from vision.fast_tryon import PoseUnavailableError
+
+        raise PoseUnavailableError("pose_unavailable")
+    result = runtime.render(frame, source)
     if len(result) > MAX_RESULT_BYTES:
         raise RuntimeError("fast result exceeds render cap")
     return result
@@ -81,7 +106,8 @@ def _render(payload: dict) -> bytes:
 def render_worker_entry(connection: Connection) -> None:
     """Own the render loop and announce readiness separately from requests."""
     try:
-        connection.send(("ready", {"pid": os.getpid()}))
+        _initialize_runtime()
+        connection.send(("ready", {"pid": os.getpid(), "poseReady": _POSE_READY}))
         while True:
             command, payload = connection.recv()
             if command == "shutdown":
@@ -93,10 +119,14 @@ def render_worker_entry(connection: Connection) -> None:
             try:
                 connection.send(("ok", _render(payload)))
             except BaseException as exc:
-                from vision.fast_tryon import GarmentFetchError
+                from vision.fast_tryon import GarmentFetchError, PoseUnavailableError
 
                 kind = (
-                    "garment_error" if isinstance(exc, GarmentFetchError) else "error"
+                    "garment_error"
+                    if isinstance(exc, GarmentFetchError)
+                    else "pose_error"
+                    if isinstance(exc, PoseUnavailableError)
+                    else "error"
                 )
                 connection.send((kind, f"{type(exc).__name__}: {exc}"))
     except EOFError:
