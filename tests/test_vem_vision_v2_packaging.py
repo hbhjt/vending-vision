@@ -66,13 +66,16 @@ def test_frozen_runtime_keeps_the_spawn_safe_render_worker_entry():
     spec = (ROOT / "vending_vision.spec").read_text("utf-8")
     launcher = (ROOT / "run_vision_server.py").read_text("utf-8")
     target = (ROOT / "vision" / "render_worker_target.py").read_text("utf-8")
+    acquisition = (ROOT / "vision" / "acquisition_observer.py").read_text("utf-8")
 
     assert '"vision.render_worker_target"' in spec
+    assert '"vision.acquisition_observer"' in spec
     assert "multiprocessing.freeze_support()" in launcher
     assert launcher.index("multiprocessing.freeze_support()") < launcher.index(
         "from app import app as fastapi_app"
     )
     assert "import app" not in target
+    assert "import app" not in acquisition
     assert "vision.pose_estimator" not in target
     assert "vision.model" not in target
 

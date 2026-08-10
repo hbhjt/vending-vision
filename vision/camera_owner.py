@@ -44,7 +44,7 @@ class FrontCameraOwner:
     """前置摄像头的所有权管理器。
 
     管理对前置摄像头的独占访问，支持：
-    - 按优先级抢占（fast_try_on > vision > idle）
+    - 按优先级抢占（try_on_attempt > vision > idle）
     - 超时自动回收（防止持有者异常退出导致死锁）
     - 线程安全的所有权变更
     """

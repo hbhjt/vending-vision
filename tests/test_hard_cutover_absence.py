@@ -35,6 +35,10 @@ FORBIDDEN_PATTERNS = (
         "fabricated-try-on-phase-evidence",
         re.compile(r"\b(?:accepted|progress|completed)Observed\b"),
     ),
+    (
+        "legacy-fast-try-on-owner",
+        re.compile(r"(?<!profile_)fast_try_on\b"),
+    ),
 )
 
 
@@ -87,6 +91,7 @@ def test_hard_cutover_guard_detects_every_forbidden_category(tmp_path):
         "selector.txt": f'[data-test="{compact("try", "-on", "-exit")}"]',
         "phase.txt": compact("completed", "Observed"),
         "session.txt": compact("try", "_on", "_session"),
+        "owner.txt": compact("fast", "_try", "_on"),
     }
     for name, body in fixtures.items():
         (tmp_path / name).write_text(f"{body}\n", encoding="utf-8")

@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import threading
+import time
 from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +21,16 @@ from vision import camera_manager
 from vision.config import settings
 from vision.directshow_broker import DirectShowCameraBroker
 from vision.attempt_worker import FastRenderBroker
+
+
+def _active_child_pids_except_acquisition_observer():
+    observer = vision_app._acquisition_observer
+    observer_pid = observer.pid if observer is not None else None
+    return {
+        child.pid
+        for child in multiprocessing.active_children()
+        if child.pid != observer_pid
+    }
 
 
 def _fast_block_first_broker_target(connection, config):
@@ -208,6 +219,12 @@ def _hello(manifest):
     )
 
 
+def _hello_with_capabilities(manifest, capabilities):
+    message = _hello(manifest)
+    message["payload"]["capabilities"] = list(capabilities)
+    return message
+
+
 def _start(attempt_id, reference):
     garment = _GarmentHandler.payload
     return _envelope(
@@ -245,6 +262,15 @@ def _await_generating(socket):
         if message["type"] == "vision.try_on.attempt.generating":
             return message
         assert message["type"] == "vision.try_on.attempt.acquiring"
+
+
+def await_no_active_fast_attempt():
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if asyncio.run(vision_app._fast_attempt_registry.active_attempt_id()) is None:
+            return True
+        time.sleep(0.002)
+    return False
 
 
 def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
@@ -413,6 +439,125 @@ def test_v2_fast_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(
             assert socket.receive_json()["type"] == "vision.pong"
             _GarmentHandler.release.set()
             assert socket.receive_json()["type"] == "vision.try_on.attempt.completed"
+
+
+def test_v2_top_departure_cancels_active_generated_attempt_without_late_completion(
+    monkeypatch, garment_reference
+):
+    """A production presence departure cancels the active attempt through the public WS."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", True)
+    monkeypatch.setattr(vision_app.settings, "MOCK_SCENARIO", "departure-test")
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 5)
+    _configure_recorded_front(monkeypatch)
+    _GarmentHandler.release.clear()
+    depart = threading.Event()
+    departed_once = threading.Event()
+
+    def collect_departure(_status, _ambient, include_departure):
+        if depart.is_set() and include_departure and not departed_once.is_set():
+            departed_once.set()
+            return {
+                "message_type": "vision.person_departed",
+                "payload": {
+                    "source": "top",
+                    "reason": "no_person",
+                    "occupancy": {"state": "none"},
+                },
+            }
+        return None
+
+    monkeypatch.setattr(vision_app, "collect_profile_update", collect_departure)
+    attempt_id = str(uuid4())
+    messages = []
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(
+                _hello_with_capabilities(
+                    manifest, ["try_on_fast", "person_departed"]
+                )
+            )
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(attempt_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            _await_generating(socket)
+            assert _GarmentHandler.entered.wait(timeout=2)
+
+            depart.set()
+            while len(messages) < 2:
+                messages.append(socket.receive_json())
+                if any(
+                    message["type"] == "vision.try_on.attempt.canceled"
+                    for message in messages
+                ) and any(
+                    message["type"] == "vision.person_departed"
+                    for message in messages
+                ):
+                    break
+
+            _GarmentHandler.release.set()
+
+        assert await_no_active_fast_attempt()
+        assert vision_app.get_front_camera_owner()["owner"] == "idle"
+
+    canceled = [
+        message for message in messages
+        if message["type"] == "vision.try_on.attempt.canceled"
+    ]
+    assert canceled == [
+        {
+            **canceled[0],
+            "payload": {"attemptId": attempt_id, "reason": "departure"},
+        }
+    ]
+    assert [message["type"] for message in messages].count(
+        "vision.try_on.attempt.completed"
+    ) == 0
+    assert departed_once.is_set()
+
+
+def test_v2_route_leave_cancel_during_generation_fences_late_result_and_releases_resources(
+    monkeypatch, garment_reference
+):
+    """Machine route leave is an explicit public cancel, not a hidden disconnect."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch)
+    _GarmentHandler.release.clear()
+    attempt_id = str(uuid4())
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(attempt_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            _await_generating(socket)
+            assert _GarmentHandler.entered.wait(timeout=2)
+            socket.send_json(
+                _envelope(
+                    "vision.try_on.attempt.cancel",
+                    {"attemptId": attempt_id, "reason": "route_leave"},
+                )
+            )
+            canceled = socket.receive_json()
+            _GarmentHandler.release.set()
+
+        assert await_no_active_fast_attempt()
+        assert vision_app.get_front_camera_owner()["owner"] == "idle"
+
+        with client.websocket_connect("/ws") as replay:
+            replay.send_json(_hello(manifest))
+            assert replay.receive_json()["type"] == "vision.ready"
+            replay.send_json(_start(attempt_id, garment_reference))
+            replayed = replay.receive_json()
+
+    assert canceled["type"] == "vision.try_on.attempt.canceled"
+    assert canceled["payload"] == {"attemptId": attempt_id, "reason": "route_leave"}
+    assert replayed == canceled
 
 
 def test_v2_fast_pose_failures_are_stable_terminals_without_worker_recovery(
@@ -723,7 +868,7 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
             assert broker.ready
             assert replacement_pid is not None and replacement_pid != first_pid
             assert broker.active_request_count == 0
-            assert {child.pid for child in multiprocessing.active_children()} == {
+            assert _active_child_pids_except_acquisition_observer() == {
                 replacement_pid
             }
             completed = socket.receive_json()
@@ -812,7 +957,7 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
             assert not broker.ready
             assert broker.pid is None
             assert broker.active_request_count == 0
-            assert multiprocessing.active_children() == []
+            assert _active_child_pids_except_acquisition_observer() == set()
             assert starts.value == 2
 
             socket.send_json(_start(third_id, garment_reference))
@@ -838,7 +983,7 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
             }
 
         assert starts.value == 2
-        assert multiprocessing.active_children() == []
+        assert _active_child_pids_except_acquisition_observer() == set()
 
     assert broker.pid is None
 
@@ -955,7 +1100,7 @@ def test_v2_duplicate_waits_for_atomic_failed_replacement_admission(
         assert requests.value == 1
         assert broker.pid is None
         assert broker.active_request_count == 0
-        assert multiprocessing.active_children() == []
+        assert _active_child_pids_except_acquisition_observer() == set()
 
 
 def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
@@ -1072,7 +1217,7 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
         assert starts.value == 2
         assert requests.value == 2
         assert broker.active_request_count == 0
-        assert {child.pid for child in multiprocessing.active_children()} == {
+        assert _active_child_pids_except_acquisition_observer() == {
             replacement_pid
         }
 
@@ -1201,7 +1346,7 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
         assert broker.ready
         assert replacement_pid is not None and replacement_pid != first_pid
         assert broker.active_request_count == 0
-        assert {child.pid for child in multiprocessing.active_children()} == {
+        assert _active_child_pids_except_acquisition_observer() == {
             replacement_pid
         }
 
@@ -1446,11 +1591,17 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
         assert broker.assert_dead()
         assert broker.active_request_count == 0
 
-        registry.cancel_event = asyncio.Event()
-        second = vision_app.AttemptReceipt(str(uuid4()), "owner-2", 2)
-        frame, source = await vision_app._read_attempt_front_frame(second, timeout=1.0)
-        assert frame.shape == (80, 60, 3)
-        assert source["brokerPid"] is not None
+        for generation in (2, 3):
+            registry.cancel_event = asyncio.Event()
+            receipt = vision_app.AttemptReceipt(
+                str(uuid4()), f"owner-{generation}", generation
+            )
+            frame, source = await vision_app._read_attempt_front_frame(
+                receipt, timeout=1.0
+            )
+            assert frame.shape == (80, 60, 3)
+            assert source["brokerPid"] is not None
+            assert broker.active_request_count == 0
 
     try:
         asyncio.run(scenario())

@@ -66,8 +66,7 @@ from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError, PoseUnavailab
 from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
 from vision.attempt_worker import FastRenderBroker, render_attempt_frame
 from vision.acquisition_preview import AcquisitionPreviewStore
-from vision.person_detector import PersonDetector
-from vision.pose_estimator import PoseEstimator
+from vision.acquisition_observer import AcquisitionObservationWorker
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
@@ -99,8 +98,7 @@ _fast_attempt_registry = FastAttemptRegistry(
 _fast_attempt_task_slots = asyncio.Semaphore(_FAST_ATTEMPT_MAX_TASKS)
 _fast_render_broker = FastRenderBroker()
 _acquisition_previews = AcquisitionPreviewStore()
-_acquisition_person_detector: PersonDetector | None = None
-_acquisition_pose_estimator: PoseEstimator | None = None
+_acquisition_observer: AcquisitionObservationWorker | None = None
 _ACQUISITION_STABLE_FRAMES = 3
 _ACQUISITION_POLL_SECONDS = 0.05
 
@@ -133,6 +131,12 @@ async def on_startup():
         # Fast is an enhancement capability.  A failed broker readiness probe
         # keeps the service alive but is reflected truthfully in V2 readiness.
         logger.exception("Fast render broker failed startup readiness")
+    try:
+        await _get_acquisition_observer().start()
+    except Exception:
+        # Acquisition stays fail-closed until the production observation
+        # boundary can be prewarmed; ordinary Vision capability remains alive.
+        logger.exception("Acquisition observer failed startup readiness")
 
 
 @app.on_event("shutdown")
@@ -145,6 +149,9 @@ async def on_shutdown():
     _fast_render_broker.quiesce()
     await _acquisition_previews.close()
     await _fast_attempt_registry.shutdown()
+    observer = _acquisition_observer
+    if observer is not None:
+        await observer.shutdown()
     render_shutdown_error = None
     try:
         await _fast_render_broker.shutdown()
@@ -362,72 +369,11 @@ def _acquisition_preview_reference(token: str) -> str:
     return f"http://{host}:{settings.PORT}/v2/try-on/acquisition/preview.mjpeg?token={token}"
 
 
-def _encode_preview_jpeg(frame) -> bytes:
-    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-    if not ok:
-        raise RuntimeError("acquisition_preview_encode_failed")
-    return encoded.tobytes()
-
-
-def _front_pose_is_aligned(frame) -> bool:
-    """Require a centered, upright torso from the production pose boundary."""
-    global _acquisition_pose_estimator
-    if _acquisition_pose_estimator is None:
-        _acquisition_pose_estimator = PoseEstimator()
-    result = _acquisition_pose_estimator.detect(frame)
-    landmarks = getattr(getattr(result, "pose_landmarks", None), "landmark", None)
-    if landmarks is None:
-        return False
-    try:
-        left_shoulder, right_shoulder = landmarks[11], landmarks[12]
-        left_hip, right_hip = landmarks[23], landmarks[24]
-    except (IndexError, TypeError):
-        return False
-    points = (left_shoulder, right_shoulder, left_hip, right_hip)
-    if any(float(point.visibility) < 0.55 for point in points):
-        return False
-    shoulder_x = (float(left_shoulder.x) + float(right_shoulder.x)) / 2
-    shoulder_y = (float(left_shoulder.y) + float(right_shoulder.y)) / 2
-    hip_x = (float(left_hip.x) + float(right_hip.x)) / 2
-    hip_y = (float(left_hip.y) + float(right_hip.y)) / 2
-    shoulder_span = abs(float(left_shoulder.x) - float(right_shoulder.x))
-    torso_height = hip_y - shoulder_y
-    return (
-        0.30 <= shoulder_x <= 0.70
-        and 0.30 <= hip_x <= 0.70
-        and 0.10 <= shoulder_y <= 0.68
-        and 0.35 <= hip_y <= 0.95
-        and 0.14 <= shoulder_span <= 0.75
-        and 0.18 <= torso_height <= 0.62
-    )
-
-
-def _front_observation(frame) -> tuple[str, bool]:
-    """YOLO proves occupancy; production pose proves an eligible alignment."""
-    global _acquisition_person_detector
-    if _acquisition_person_detector is None:
-        _acquisition_person_detector = PersonDetector()
-    detector = _acquisition_person_detector
-    status = detector.status()
-    if not status.get("ready"):
-        return "none", False
-    detections = detector.detect(frame)
-    if len(detections) == 0:
-        return "none", False
-    if len(detections) > 1:
-        return "multiple", False
-    x, y, width, height = detections[0]["box"]
-    frame_height, frame_width = frame.shape[:2]
-    center_x = (x + width / 2) / max(frame_width, 1)
-    center_y = (y + height / 2) / max(frame_height, 1)
-    area = (width * height) / max(frame_width * frame_height, 1)
-    aligned = (
-        0.25 <= center_x <= 0.75
-        and 0.10 <= center_y <= 0.82
-        and area >= 0.08
-        and _front_pose_is_aligned(frame)
-    )
-    return "single", aligned
+def _get_acquisition_observer() -> AcquisitionObservationWorker:
+    global _acquisition_observer
+    if _acquisition_observer is None:
+        _acquisition_observer = AcquisitionObservationWorker()
+    return _acquisition_observer
 
 
 def _acquiring_message(attempt_id: str, token: str, occupancy: str, aligned: bool, stable: bool) -> dict:
@@ -528,15 +474,29 @@ async def read_acquisition_preview(request: Request, token: Optional[str] = None
     if request.method == "HEAD":
         return Response(content=b"", media_type=media_type, headers={"Cache-Control": "no-store"})
 
+    try:
+        lease = await _acquisition_previews.acquire(canonical_token)
+    except RuntimeError as exc:
+        if str(exc) == "acquisition_preview_reader_limit":
+            raise HTTPException(status_code=429, detail="preview busy") from exc
+        raise
+    if lease is None:
+        raise HTTPException(status_code=404, detail="preview not found")
+
     async def frames():
-        current = snapshot
-        while current is not None:
-            yield (
-                b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                + str(len(current.jpeg)).encode("ascii")
-                + b"\r\n\r\n" + current.jpeg + b"\r\n"
-            )
-            current = await _acquisition_previews.wait_for_change(canonical_token, current.jpeg)
+        try:
+            current = lease.snapshot
+            while current is not None:
+                yield (
+                    b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(current.jpeg)).encode("ascii")
+                    + b"\r\n\r\n" + current.jpeg + b"\r\n"
+                )
+                current = await _acquisition_previews.wait_for_change(canonical_token, current.jpeg)
+        finally:
+            # ASGI body close/disconnect runs the generator finalizer, returning
+            # the bounded lease even when the client drops mid-frame.
+            await _acquisition_previews.release(lease.lease_id)
 
     return StreamingResponse(frames(), media_type=media_type, headers={"Cache-Control": "no-store"})
 
@@ -1566,12 +1526,13 @@ async def run_v2_fast_attempt(
             frame, source = await _read_attempt_front_frame(
                 receipt, timeout=remaining, lease_token=lease_token
             )
-            jpeg = _encode_preview_jpeg(frame)
+            observation = await _get_acquisition_observer().observe(frame)
+            jpeg = observation.jpeg
             if preview_token is None:
                 preview_token = await _acquisition_previews.open(attempt_id, jpeg)
             else:
                 await _acquisition_previews.update(attempt_id, preview_token, jpeg)
-            occupancy, aligned = _front_observation(frame)
+            occupancy, aligned = observation.occupancy, observation.aligned
             stable_frames = stable_frames + 1 if occupancy == "single" and aligned else 0
             stable = stable_frames >= _ACQUISITION_STABLE_FRAMES
             acquiring = _acquiring_message(attempt_id, preview_token, occupancy, aligned, stable)
@@ -1660,6 +1621,9 @@ async def run_v2_fast_attempt(
     finally:
         if lease_acquired:
             await _release_acquisition_resources(receipt, lease_token)
+        # The registry's cleanup barrier retains admission ownership until the
+        # one worker slot is physically idle, even when a model call was slow.
+        await _get_acquisition_observer().wait_idle()
     # Preparation is deliberately private until the completed contract is
     # encoded and validated.  Any failure above commits the one failed
     # terminal without passing staged token, reference, or bytes across the
@@ -2012,7 +1976,14 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """VEM machine protocol surface; accepts only machine-role clients."""
-    await websocket_session(websocket, {"machine"})
+    try:
+        await websocket_session(websocket, {"machine"})
+    except asyncio.CancelledError:
+        # ASGI servers may cancel the scope immediately after a peer closes.
+        # The attempt itself has already installed its cleanup barrier; do not
+        # surface that transport teardown as an unhandled application task.
+        logger.info("WebSocket scope cancelled after cleanup handoff")
+        return
 
 
 @app.websocket("/debug/ws")

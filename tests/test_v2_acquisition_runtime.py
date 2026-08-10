@@ -9,7 +9,9 @@ from pathlib import Path
 from uuid import uuid4
 import hashlib
 import json
+import multiprocessing
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -21,6 +23,19 @@ from fastapi.testclient import TestClient
 import app as vision_app
 from vision import camera_manager
 from vision.config import settings
+from vision.acquisition_observer import AcquisitionObservationWorker
+
+
+def _permanently_blocking_acquisition_observer(connection):
+    connection.send(("ready", None))
+    try:
+        while True:
+            command, _payload = connection.recv()
+            if command == "observe":
+                while True:
+                    time.sleep(1)
+    finally:
+        connection.close()
 
 
 def _png_bytes():
@@ -61,6 +76,44 @@ def _configure_recorded_front(monkeypatch, filename="front.mp4"):
         "video_path": str(fixture_root / filename), "loop": True, "rotate": 0,
     })
     camera_manager.release_all_cameras()
+
+
+def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkeypatch):
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    frame = cv2.imread(str(Path(__file__).parents[1] / "fixtures/recorded-video/sources/person-man-front.png"))
+    assert frame is not None
+    monkeypatch.setattr(vision_app, "read_camera_with_source", lambda *_args, **_kwargs: (frame, {"source": "recorded_video"}))
+    vision_app._acquisition_observer = AcquisitionObservationWorker(context=multiprocessing.get_context("spawn"), target=_permanently_blocking_acquisition_observer)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _GarmentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    attempt_id = str(uuid4())
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on_fast"]}))
+                assert socket.receive_json()["type"] == "vision.ready"
+                garment = _GarmentHandler.payload
+                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
+                assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+                deadline = time.monotonic() + 1
+                while vision_app._acquisition_observer.active_request_count == 0 and time.monotonic() < deadline:
+                    time.sleep(0.002)
+                assert vision_app._acquisition_observer.active_request_count == 1
+                socket.send_json(_envelope("vision.ping", {}))
+                assert socket.receive_json()["type"] == "vision.pong"
+                socket.send_json(_envelope("vision.try_on.attempt.cancel", {"attemptId": attempt_id, "reason": "user"}))
+                assert socket.receive_json()["type"] == "vision.try_on.attempt.canceled"
+                deadline = time.monotonic() + 1
+                while not vision_app._acquisition_observer.assert_dead and time.monotonic() < deadline:
+                    time.sleep(0.002)
+                assert vision_app._acquisition_observer.assert_dead
+    finally:
+        server.shutdown()
+        thread.join()
+        vision_app._acquisition_observer = None
 
 
 def test_v2_start_exposes_attempt_scoped_tokenized_acquisition_preview(monkeypatch):

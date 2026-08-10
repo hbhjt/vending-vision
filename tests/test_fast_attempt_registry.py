@@ -55,6 +55,66 @@ def test_cancel_wins_over_completed_with_one_canonical_terminal():
     asyncio.run(scenario())
 
 
+def test_disconnect_keeps_cleanup_barrier_before_another_socket_can_admit():
+    """A disconnect terminal fences new owners until the disconnected worker joins."""
+    async def scenario():
+        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        old_id, new_id = str(uuid4()), str(uuid4())
+        release_old = asyncio.Event()
+
+        async def old_owner():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Simulate the bounded-but-real resource close in the owner
+                # finally block: it must finish before a new lease may start.
+                await release_old.wait()
+
+        old_task = asyncio.create_task(old_owner())
+        old = await registry.admit(
+            attempt_id=old_id,
+            websocket=object(),
+            send_lock=asyncio.Lock(),
+            task=old_task,
+            accepted=_message("vision.try_on.attempt.accepted", old_id, "old-accepted"),
+            generating=_message("vision.try_on.attempt.acquiring", old_id, "old-acquiring"),
+        )
+        assert old.is_owner
+        disconnect = _message("vision.try_on.attempt.canceled", old_id, "disconnect")
+        disconnect["payload"]["reason"] = "disconnect"
+        disconnecting = asyncio.create_task(
+            registry.cancel_owner_and_join(old.receipt, disconnect)
+        )
+        await asyncio.sleep(0)
+
+        replacement = asyncio.create_task(
+            registry.prepare_admission(
+                attempt_id=new_id,
+                websocket=object(),
+                send_lock=asyncio.Lock(),
+                task=asyncio.current_task(),
+            )
+        )
+        await asyncio.sleep(0)
+        assert not replacement.done(), "new ID became pending before old cleanup joined"
+
+        replay = await registry.prepare_admission(
+            attempt_id=old_id,
+            websocket=object(),
+            send_lock=asyncio.Lock(),
+            task=asyncio.current_task(),
+        )
+        assert replay.resolved
+        assert replay.replay == [disconnect]
+
+        release_old.set()
+        transition = await asyncio.wait_for(disconnecting, timeout=1)
+        assert transition is not None and transition.message == disconnect
+        assert (await asyncio.wait_for(replacement, timeout=1)).is_pending_owner
+
+    asyncio.run(scenario())
+
+
 def test_completed_wins_over_later_cancel_with_one_canonical_terminal():
     """A success committed first cannot be overwritten by a late cancellation."""
     async def scenario():

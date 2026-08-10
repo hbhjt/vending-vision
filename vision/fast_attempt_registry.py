@@ -740,6 +740,13 @@ class FastAttemptRegistry:
     async def cancel_owner_and_join(
         self, receipt: AttemptReceipt, terminal: dict | None = None
     ) -> TerminalTransition | None:
+        """Cancel a disconnected owner behind the same cleanup barrier as replacement.
+
+        The terminal becomes visible before the join, but no pending admission
+        may cross the owner's physical cleanup boundary.  This is deliberately
+        the synchronous counterpart of ``cancel_current``: disconnect must
+        return only after the task has observed cancellation and exited.
+        """
         async with self._gate:
             active = self._active
             if active is None or active.receipt != receipt:
@@ -748,8 +755,21 @@ class FastAttemptRegistry:
             task = active.task
             chosen = terminal if terminal is not None else active.canceled_terminal
             transition = self._commit_terminal_unlocked(active, chosen) if chosen is not None else None
-        if task is not asyncio.current_task():
-            await asyncio.shield(task)
+            cleanup = (
+                self._reserve_cleanup_unlocked(task)
+                if task is not asyncio.current_task() and not task.done()
+                else None
+            )
+        if cleanup is not None:
+            task.cancel()
+            await self._finish_cleanup_uncancelled(cleanup)
+        elif task is not asyncio.current_task():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                self._consume_finished_task(task)
+            except Exception:
+                self._consume_finished_task(task)
         return transition
 
     async def detach_subscriber(self, websocket: Any) -> None:

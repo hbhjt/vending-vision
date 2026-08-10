@@ -6,7 +6,7 @@ maintenance, and health remain independent core capabilities.
 
 Generated Fast and AI try-on work is represented by one attempt lifecycle and
 uses attempt-scoped result references. The Fast attempt owns a unique
-`fast_try_on` front-camera generation lease only while acquiring its source
+`try_on_attempt` front-camera acquisition lease only while acquiring its source
 frame; profile sampling uses the `vision` lease. A result never travels through
 the platform, MQTT, or managed-media cache.
 
