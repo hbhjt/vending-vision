@@ -134,6 +134,10 @@ class LinuxProcessTree:
     async def _finish_drainers(self) -> None:
         if self._drainers:
             await asyncio.gather(*self._drainers, return_exceptions=True)
+        if self.process is not None:
+            for stream in (self.process.stdout, self.process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
 
     def _pgid_alive(self) -> bool:
         if self.process is None:
