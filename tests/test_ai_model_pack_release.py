@@ -1,4 +1,5 @@
 import hashlib
+import asyncio
 import json
 import subprocess
 import zipfile
@@ -14,6 +15,7 @@ from scripts.ai_model_pack_release import (
     verify_model_pack_zip,
 )
 from scripts.precutover_ai_model_pack import verify_and_install_model_pack
+from scripts.precutover_ai_worker_probe import probe_worker
 from vision.ai_model_pack import (
     MANIFEST_NAME,
     AiModelPackError,
@@ -120,6 +122,22 @@ def test_precutover_verifier_imports_with_the_pinned_stdlib_python():
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_precutover_worker_probe_uses_production_tree_supervisor(tmp_path):
+    worker = tmp_path / "worker"
+    worker.write_text(
+        "#!/usr/bin/python3\nimport json,sys\nprint(json.dumps({'probe':'official-catvton-worker-runtime'}))\n",
+        "utf-8",
+    )
+    worker.chmod(0o700)
+
+    result = asyncio.run(
+        probe_worker(worker=worker, mode="runtime", model_pack=None, timeout=2.0)
+    )
+
+    assert result["returncode"] == 0
+    assert json.loads(result["stdout"])["probe"] == "official-catvton-worker-runtime"
 
 
 def test_model_pack_zip_checker_streams_each_entry_and_rejects_same_size_tamper(tmp_path):
