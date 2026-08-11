@@ -185,7 +185,7 @@ def test_policy_rejects_builder_source_input_shell_interpolation_without_executi
     completed = _check_policy(PUBLISHER, builder=mutated_builder)
 
     assert completed.returncode != 0
-    assert "trusted_builder_raw_workflow_input_in_run" in completed.stdout
+    assert "trusted_builder_workflow_expression_in_run" in completed.stdout
     assert not marker.exists()
 
 
@@ -206,7 +206,7 @@ def test_policy_rejects_publisher_needs_output_shell_injection_without_execution
     completed = _check_policy(mutated_publisher)
 
     assert completed.returncode != 0
-    assert "publisher_raw_needs_output_in_run" in completed.stdout
+    assert "publisher_workflow_expression_in_run" in completed.stdout
     assert not marker.exists()
 
 
@@ -224,7 +224,7 @@ def test_policy_rejects_chomped_literal_run_scalar_injection(tmp_path):
     completed = _check_policy(mutated_publisher)
 
     assert completed.returncode != 0
-    assert "publisher_raw_needs_output_in_run" in completed.stdout
+    assert "publisher_workflow_expression_in_run" in completed.stdout
 
 
 @pytest.mark.parametrize(
@@ -232,45 +232,45 @@ def test_policy_rejects_chomped_literal_run_scalar_injection(tmp_path):
     [
         (
             "builder",
-            "|-",
-            "${{ inputs.source_commit }}",
-            "trusted_builder_raw_workflow_input_in_run",
+            "|",
+            "${{inputs.source_commit}}",
+            "trusted_builder_workflow_expression_in_run",
         ),
         (
             "signer",
-            "|+",
-            "${{ github.event.inputs.source_ref }}",
-            "trusted_signer_raw_event_input_in_run",
+            "|-",
+            "${{  github.event.inputs.source_ref }}",
+            "trusted_signer_workflow_expression_in_run",
         ),
         (
             "publisher",
-            ">-",
-            "${{ needs.verify.outputs.subject_sha256 }}",
-            "publisher_raw_needs_output_in_run",
+            "|+",
+            "${{\tneeds.verify.outputs.subject_sha256\t}}",
+            "publisher_workflow_expression_in_run",
         ),
         (
             "builder",
-            ">+",
-            "${{ needs.probe.outputs.value }}",
-            "trusted_builder_raw_needs_output_in_run",
+            ">",
+            "${{\ninputs.source_commit\n}}",
+            "trusted_builder_workflow_expression_in_run",
         ),
         (
             "signer",
-            "inline",
-            "${{ inputs.source_commit }}",
-            "trusted_signer_raw_workflow_input_in_run",
+            ">-",
+            "${{ github['event'].inputs['source_ref'] }}",
+            "trusted_signer_workflow_expression_in_run",
+        ),
+        (
+            "publisher",
+            ">+",
+            "${{ needs['verify']['outputs']['subject_sha256'] }}",
+            "publisher_workflow_expression_in_run",
         ),
         (
             "publisher",
             "inline",
-            "${{ github.event.inputs.source_ref }}",
-            "publisher_raw_event_input_in_run",
-        ),
-        (
-            "publisher",
-            "inline",
-            "${{ needs.verify.outputs.subject_sha256 }}",
-            "publisher_raw_needs_output_in_run",
+            "${{needs.x}}",
+            "publisher_workflow_expression_in_run",
         ),
     ],
 )
@@ -285,7 +285,9 @@ def test_policy_rejects_untrusted_expressions_in_every_legal_run_scalar_form(
     if scalar == "inline":
         injected = f"        run: 'Write-Output \"{expression}\"'\n"
     else:
-        injected = f'        run: {scalar}\n          Write-Output "{expression}"\n'
+        command = f'Write-Output "{expression}"'
+        body = "\n".join(f"          {line}" for line in command.splitlines())
+        injected = f"        run: {scalar}\n{body}\n"
     mutated = tmp_path / f"{target}-{scalar.replace('|', 'literal').replace('>', 'folded')}.yml"
     mutated.write_text(
         sources[target]
@@ -319,7 +321,7 @@ def test_policy_enumerates_nested_steps_across_multiple_jobs(tmp_path):
     completed = _check_policy(mutated_publisher)
 
     assert completed.returncode != 0
-    assert "publisher_raw_event_input_in_run" in completed.stdout
+    assert "publisher_workflow_expression_in_run" in completed.stdout
 
 
 def test_policy_allows_workflow_expressions_in_non_run_env_and_with_fields(tmp_path):
@@ -342,3 +344,42 @@ def test_policy_allows_workflow_expressions_in_non_run_env_and_with_fields(tmp_p
     completed = _check_policy(mutated_publisher)
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_policy_rejects_whitespace_before_needs_root_context(tmp_path):
+    mutated_publisher = tmp_path / "publish-candidate.yml"
+    mutated_publisher.write_text(
+        PUBLISHER.read_text("utf-8")
+        + "\n      - name: Whitespace expression injection\n"
+          "        shell: pwsh\n"
+          "        run: 'Write-Output \"${{  needs.verify.outputs.x }}\"'\n",
+        "utf-8",
+    )
+
+    completed = _check_policy(mutated_publisher)
+
+    assert completed.returncode != 0
+    assert "publisher_workflow_expression_in_run" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    "expression",
+    (
+        "${{ runner.os }}",
+        "${{ this expression is intentionally unterminated",
+    ),
+)
+def test_policy_rejects_every_workflow_expression_prefix_in_run(tmp_path, expression):
+    mutated_publisher = tmp_path / "publish-candidate.yml"
+    mutated_publisher.write_text(
+        PUBLISHER.read_text("utf-8")
+        + "\n      - name: Conservative expression policy probe\n"
+          "        shell: pwsh\n"
+          f"        run: 'Write-Output \"{expression}\"'\n",
+        "utf-8",
+    )
+
+    completed = _check_policy(mutated_publisher)
+
+    assert completed.returncode != 0
+    assert "publisher_workflow_expression_in_run" in completed.stdout

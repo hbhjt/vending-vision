@@ -69,9 +69,7 @@ def _assert_no_untrusted_run_expressions(source: str, label: str) -> None:
     blocks = workflow_run_scalars(source)
     _require(bool(blocks), f"{label}_run_blocks_missing")
     for block in blocks:
-        _require("${{ inputs." not in block, f"{label}_raw_workflow_input_in_run")
-        _require("${{ github.event.inputs" not in block, f"{label}_raw_event_input_in_run")
-        _require("${{ needs." not in block, f"{label}_raw_needs_output_in_run")
+        _require("${{" not in block, f"{label}_workflow_expression_in_run")
 
 
 def _assert_files_are_immutable(
