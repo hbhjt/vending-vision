@@ -74,6 +74,7 @@ from vision.v2_contract_bundle import (
     parse_v2_client_message,
     parse_v2_server_message,
 )
+from vision.ai_model_pack import official_ai_readiness
 
 
 app = FastAPI(
@@ -658,6 +659,9 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
             "contractDigest": contract_digest,
             "cameraReady": status["cameraReady"],
             "fastReady": diagnostic == "ready",
+            # The separate pack is optional for core/Fast.  This lightweight
+            # verifier never loads model weights or performs inference.
+            "aiReady": diagnostic == "ready" and official_ai_readiness(os.environ.get("VEM_AI_MODEL_PACK")),
             "visionBusinessReady": diagnostic == "ready",
             "businessReadinessDiagnostic": diagnostic,
             "capabilities": [
@@ -666,6 +670,7 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
                 "person_departed",
                 "ambient_light",
                 "try_on_fast",
+                *( ["try_on_ai"] if diagnostic == "ready" and official_ai_readiness(os.environ.get("VEM_AI_MODEL_PACK")) else [] ),
             ],
         },
     )
@@ -1540,6 +1545,19 @@ async def run_v2_fast_attempt(
         and _acquisition_observer_ready()
     )
     attempt_id = payload["attemptId"]
+    # An AI selection can never silently route through Fast.  Until the
+    # official attempt child is ready it receives only the AI-specific
+    # terminal, leaving Fast and ordinary Vision independent.
+    if payload["mode"] != "fast":
+        await _send_json_bounded(
+            websocket,
+            send_lock,
+            _generated_v2_envelope(
+                "vision.try_on.attempt.failed",
+                {"attemptId": attempt_id, "reason": "ai_unavailable"},
+            ),
+        )
+        return
     unavailable_terminal = _generated_v2_envelope(
         "vision.try_on.attempt.failed",
         {"attemptId": attempt_id, "reason": "fast_unavailable"},

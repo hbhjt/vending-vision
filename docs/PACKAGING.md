@@ -13,6 +13,13 @@ Windows 候选版本使用 PyInstaller `onedir`。本地构建只属于开发产
 `vending-vision-main-artifacts.json` 列出两个 archive 的 SHA-256。消费方按该
 commit 下载并原样安装或解压，不重新打包 Vision 内容。
 
+AI 模型是独立的 `vending-vision-ai-models.zip`，绝不嵌入 runtime ZIP。
+解压后目录必须只含 `ai-model-manifest.json` 和其精确 allowlist 文件；manifest
+逐项绑定 `zhengchong/CatVTON` 的不可变 revision、相对路径、大小和 SHA-256。
+部署先验证 pack，再以 `VEM_AI_MODEL_PACK` 指向该目录。启动仅校验 manifest、
+代码和轻量 worker import，不加载完整模型或推理；顾客启动禁止下载。缺 pack
+只使 AI readiness 为 false，Fast 与核心 Vision 仍可用。
+
 CI 会验证 runtime ZIP 根目录包含 `vending-vision.exe` 和 manifest，fixture ZIP
 包含 `recorded-video/top.mp4`、`front.mp4`、expected manifest 与
 `vision-artifact.json`；
