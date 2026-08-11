@@ -125,6 +125,7 @@ def _configure_public_ai(
     *,
     command_by_attempt: dict[str, tuple[Path, str]] | None = None,
     success_png: Path | None = None,
+    worker_args: list[str] | None = None,
 ) -> None:
     monkeypatch.setenv("VEM_AI_MODEL_PACK", str(pack))
     monkeypatch.setattr(
@@ -193,6 +194,7 @@ def _configure_public_ai(
             command.extend(
                 ["--success-png", str(success_png), "--output", str(kwargs["output_png"])]
             )
+        command.extend(worker_args or [])
         return command
 
     monkeypatch.setattr(
@@ -284,6 +286,31 @@ def _assert_staging_clear(attempt_id: str) -> None:
     assert _staging_paths(attempt_id) == []
 
 
+def _process_usage(pid: int) -> dict[str, int]:
+    stat = (Path("/proc") / str(pid) / "stat").read_text("utf-8")
+    fields = stat[stat.rfind(")") + 2 :].split()
+    status = (Path("/proc") / str(pid) / "status").read_text("utf-8")
+    rss_kib = next(
+        int(line.split()[1]) for line in status.splitlines() if line.startswith("VmRSS:")
+    )
+    return {
+        "cpuTicks": int(fields[11]) + int(fields[12]),
+        "nice": int(fields[16]),
+        "rssKiB": rss_kib,
+    }
+
+
+def _latency_distribution(samples: list[float]) -> dict[str, float]:
+    ordered = sorted(samples)
+    p95_index = min(len(ordered) - 1, max(0, int(len(ordered) * 0.95) - 1))
+    return {
+        "min": ordered[0],
+        "median": ordered[len(ordered) // 2],
+        "p95": ordered[p95_index],
+        "max": ordered[-1],
+    }
+
+
 def _success_png(path: Path) -> None:
     image = np.full((42, 54, 4), (25, 190, 75, 255), dtype=np.uint8)
     encoded, payload = cv2.imencode(".png", image)
@@ -331,6 +358,217 @@ def _configure_recorded_presence(monkeypatch, tmp_path: Path) -> tuple[dict, str
     reset_active_track()
     camera_manager.release_all_cameras()
     return manifest, hashlib.sha256(managed_bytes).hexdigest()
+
+
+def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_live(
+    tmp_path, monkeypatch
+):
+    pack = tmp_path / "test-owned-pack"
+    pack.mkdir()
+    pid_file = tmp_path / "pressure-tree.json"
+    _configure_public_ai(
+        monkeypatch,
+        pack,
+        pid_file,
+        "stress",
+        worker_args=["--stress-mib", "16", "--stress-seconds", "8"],
+    )
+    _configure_recorded_presence(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "PROFILE_PUSH_ENABLED", True)
+    monkeypatch.setattr(settings, "PROFILE_PUSH_INTERVAL_MS", 300)
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "fastRenderReady": True,
+            "fastPoseReady": True,
+            "acquisitionObserverReady": True,
+            "ageGenderReady": True,
+            "ageGenderMode": "test-owned",
+            "check": {"checks": {}},
+        },
+    )
+    server, thread, reference = _serve_garment()
+    attempt_id = str(uuid4())
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(
+                    _hello(
+                        "profile_push",
+                        "presence_status",
+                        "person_departed",
+                        "ambient_light",
+                    )
+                )
+                ready = socket.receive_json()
+                socket.send_json(_start(attempt_id, reference))
+                trace = _receive_until_generating(socket)
+                tree = _wait_pid_tree(pid_file)
+                assert all(_pid_alive(pid) for pid in tree.values())
+
+                initial_usage = {
+                    name: _process_usage(pid) for name, pid in tree.items()
+                }
+                peak_usage = {
+                    name: dict(usage) for name, usage in initial_usage.items()
+                }
+                sampler_errors = []
+
+                def sample_process_tree():
+                    deadline = time.monotonic() + 1.5
+                    try:
+                        while time.monotonic() < deadline:
+                            for name, pid in tree.items():
+                                usage = _process_usage(pid)
+                                peak_usage[name]["cpuTicks"] = max(
+                                    peak_usage[name]["cpuTicks"], usage["cpuTicks"]
+                                )
+                                peak_usage[name]["rssKiB"] = max(
+                                    peak_usage[name]["rssKiB"], usage["rssKiB"]
+                                )
+                                peak_usage[name]["nice"] = usage["nice"]
+                            time.sleep(0.025)
+                    except Exception as exc:
+                        sampler_errors.append(exc)
+
+                core_latencies = []
+                core_statuses = []
+                core_errors = []
+
+                def exercise_core():
+                    try:
+                        for path in ("/", "/health") * 4:
+                            started = time.monotonic()
+                            response = client.get(path)
+                            core_latencies.append(time.monotonic() - started)
+                            core_statuses.append((path, response.status_code))
+                    except Exception as exc:
+                        core_errors.append(exc)
+
+                sampler = threading.Thread(target=sample_process_tree)
+                core_worker = threading.Thread(target=exercise_core)
+                sampler.start()
+                core_worker.start()
+
+                ping_latencies = []
+                presence_count = sum(
+                    message["type"] == "vision.presence_status" for message in trace
+                )
+                profile_seen = any(
+                    message["type"] == "vision.profile_result" for message in trace
+                )
+                response_deadline = time.monotonic() + 3.5
+                ping_pacer = threading.Event()
+                while time.monotonic() < response_deadline:
+                    started = time.monotonic()
+                    socket.send_json(_envelope("vision.ping", {}))
+                    while True:
+                        message = socket.receive_json()
+                        trace.append(message)
+                        if message["type"] == "vision.pong":
+                            ping_latencies.append(time.monotonic() - started)
+                            break
+                        if message["type"] == "vision.presence_status":
+                            presence_count += 1
+                        elif message["type"] == "vision.profile_result":
+                            profile_seen = True
+                    if (
+                        len(ping_latencies) >= 5
+                        and presence_count >= 2
+                        and profile_seen
+                        and not sampler.is_alive()
+                        and not core_worker.is_alive()
+                    ):
+                        break
+                    # Pacing is not the correctness clock: the outer deadline,
+                    # sampler completion and public events decide success.
+                    ping_pacer.wait(
+                        min(0.075, settings.PROFILE_PUSH_INTERVAL_MS / 1000.0 / 4)
+                    )
+
+                sampler.join(timeout=2)
+                core_worker.join(timeout=2)
+                assert sampler.is_alive() is False
+                assert core_worker.is_alive() is False
+                assert sampler_errors == []
+                assert core_errors == []
+
+                socket.send_json(
+                    _envelope(
+                        "vision.try_on.attempt.cancel",
+                        {"attemptId": attempt_id, "reason": "user"},
+                    )
+                )
+                terminal_trace, terminal = _receive_until_terminal(socket)
+                trace.extend(terminal_trace)
+                _assert_tree_dead(tree)
+                _assert_staging_clear(attempt_id)
+                socket.send_json(_envelope("vision.ping", {}))
+                while True:
+                    message = socket.receive_json()
+                    trace.append(message)
+                    if message["type"] == "vision.pong":
+                        final_pong = message
+                        break
+
+            missing = client.get(
+                f"/v2/try-on/results/{attempt_id}?token=no-result"
+            )
+            final_health = client.get("/health")
+            with client.websocket_connect("/ws") as final_socket:
+                final_socket.send_json(_hello())
+                final_ready = final_socket.receive_json()
+
+        clock_ticks = int(os.sysconf("SC_CLK_TCK"))
+        cpu_deltas = {
+            name: peak_usage[name]["cpuTicks"] - initial_usage[name]["cpuTicks"]
+            for name in tree
+        }
+        rss_peaks = {name: peak_usage[name]["rssKiB"] for name in tree}
+        observed_nice = {name: peak_usage[name]["nice"] for name in tree}
+        ping_distribution = _latency_distribution(ping_latencies)
+        core_distribution = _latency_distribution(core_latencies)
+        latency_limit = max(3.0, settings.PROFILE_PUSH_INTERVAL_MS / 1000.0 * 10)
+        pressure_evidence = {
+            "cpuSeconds": {
+                name: round(delta / clock_ticks, 3) for name, delta in cpu_deltas.items()
+            },
+            "rssPeakKiB": rss_peaks,
+            # Windows is the target priority boundary.  Linux is deliberately
+            # observation-only until a safe post-spawn priority policy exists.
+            "nice": {"main": os.getpriority(os.PRIO_PROCESS, 0), **observed_nice},
+            "pingLatencySeconds": ping_distribution,
+            "coreLatencySeconds": core_distribution,
+        }
+        print(json.dumps({"pressureEvidence": pressure_evidence}, sort_keys=True))
+
+        assert ready["payload"]["fastReady"] is True
+        assert ready["payload"]["visionBusinessReady"] is True
+        assert len(ping_latencies) >= 5
+        assert presence_count >= 2
+        assert profile_seen is True
+        assert ping_distribution["p95"] < latency_limit, ping_distribution
+        assert core_distribution["p95"] < latency_limit, core_distribution
+        assert core_statuses == [("/", 200), ("/health", 200)] * 4
+        assert all(delta >= clock_ticks // 5 for delta in cpu_deltas.values()), cpu_deltas
+        assert all(16 * 1024 <= rss <= 64 * 1024 for rss in rss_peaks.values()), rss_peaks
+        assert sum(rss_peaks.values()) <= 192 * 1024, rss_peaks
+        assert all(-20 <= nice <= 19 for nice in observed_nice.values()), observed_nice
+        assert terminal["type"] == "vision.try_on.attempt.canceled"
+        assert terminal["payload"] == {"attemptId": attempt_id, "reason": "user"}
+        assert final_pong["type"] == "vision.pong"
+        assert missing.status_code == 404
+        assert final_health.status_code == 200
+        assert final_ready["payload"]["fastReady"] is True
+        assert final_ready["payload"]["visionBusinessReady"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        camera_manager.release_all_cameras()
 
 
 def test_public_ai_replacement_joins_real_tree_before_next_worker_and_completes(
