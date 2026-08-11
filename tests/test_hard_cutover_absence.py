@@ -254,6 +254,8 @@ def _valid_png(data: bytes) -> bool:
         return False
     offset = 8
     saw_header = False
+    saw_image_data = False
+    image_data_ended = False
     while offset + 12 <= len(data):
         length = int.from_bytes(data[offset : offset + 4], "big")
         chunk_end = offset + 12 + length
@@ -272,8 +274,21 @@ def _valid_png(data: bytes) -> bool:
             if width == 0 or height == 0:
                 return False
             saw_header = True
+        elif chunk_type == b"IHDR":
+            return False
+        if chunk_type == b"IDAT":
+            if length == 0 or image_data_ended:
+                return False
+            saw_image_data = True
+        elif saw_image_data and chunk_type != b"IEND":
+            image_data_ended = True
         if chunk_type == b"IEND":
-            return length == 0 and saw_header and chunk_end == len(data)
+            return (
+                length == 0
+                and saw_header
+                and saw_image_data
+                and chunk_end == len(data)
+            )
         offset = chunk_end
     return False
 
@@ -304,25 +319,60 @@ def _valid_ico(data: bytes) -> bool:
             return False
         if image_offset + image_size > len(data):
             return False
+        image = data[image_offset : image_offset + image_size]
+        if not _valid_png(image) and not _valid_dib(image):
+            return False
     return True
+
+
+def _valid_dib(data: bytes) -> bool:
+    if len(data) < 12:
+        return False
+    header_size = int.from_bytes(data[:4], "little")
+    if header_size == 12:
+        width, height, planes, bit_count = struct.unpack_from("<HHHH", data, 4)
+        return (
+            width > 0
+            and height > 0
+            and planes == 1
+            and bit_count in {1, 4, 8, 16, 24, 32}
+        )
+    if header_size not in {40, 52, 56, 108, 124} or len(data) < header_size:
+        return False
+    width, height, planes, bit_count = struct.unpack_from("<iiHH", data, 4)
+    return (
+        width != 0
+        and height != 0
+        and planes == 1
+        and bit_count in {1, 4, 8, 16, 24, 32}
+    )
 
 
 def _valid_wav(data: bytes) -> bool:
     if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         return False
-    if int.from_bytes(data[4:8], "little") + 8 > len(data):
+    if int.from_bytes(data[4:8], "little") + 8 != len(data):
         return False
     offset = 12
-    chunks = set()
+    saw_format = False
+    saw_data = False
     while offset + 8 <= len(data):
         chunk_type = data[offset : offset + 4]
         length = int.from_bytes(data[offset + 4 : offset + 8], "little")
         chunk_end = offset + 8 + length
-        if chunk_end > len(data):
+        padded_end = chunk_end + (length & 1)
+        if padded_end > len(data):
             return False
-        chunks.add(chunk_type)
-        offset = chunk_end + (length & 1)
-    return offset == len(data) and {b"fmt ", b"data"}.issubset(chunks)
+        if chunk_type == b"fmt ":
+            if saw_format or length < 16:
+                return False
+            saw_format = True
+        elif chunk_type == b"data":
+            if not saw_format or saw_data or length == 0:
+                return False
+            saw_data = True
+        offset = padded_end
+    return offset == len(data) and saw_format and saw_data
 
 
 def _valid_mp3(data: bytes) -> bool:
@@ -890,6 +940,19 @@ def test_binary_allowlist_rejects_new_executable_and_manifest_mutations(tmp_path
 
 
 def test_binary_allowlist_rejects_executable_magic_mismatch_and_truncation(tmp_path):
+    source_png = (
+        ROOT / "fixtures/recorded-video/sources/person-man-front.png"
+    ).read_bytes()
+    png_parts = [source_png[:8]]
+    offset = 8
+    while offset < len(source_png):
+        length = int.from_bytes(source_png[offset : offset + 4], "big")
+        chunk_end = offset + 12 + length
+        if source_png[offset + 4 : offset + 8] != b"IDAT":
+            png_parts.append(source_png[offset:chunk_end])
+        offset = chunk_end
+    corrupt_crc = bytearray(source_png)
+    corrupt_crc[29] ^= 0x01
     disguised_payloads = {
         "pe": b"MZ\0pretend-png",
         "elf": b"\x7fELF\0pretend-png",
@@ -897,6 +960,8 @@ def test_binary_allowlist_rejects_executable_magic_mismatch_and_truncation(tmp_p
         "shebang": b"#!/bin/sh\nexit 0\n",
         "extension-mismatch": b"\xff\xd8not-a-png\xff\xd9",
         "truncated": b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR",
+        "no-idat": b"".join(png_parts),
+        "corrupt-crc": bytes(corrupt_crc),
     }
     for name, payload in disguised_payloads.items():
         root = tmp_path / name
