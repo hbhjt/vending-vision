@@ -14,6 +14,7 @@ SOURCE_APPROVAL = ROOT / "scripts" / "approve_candidate_source.py"
 VERIFY_INPUTS = ROOT / "scripts" / "verify_trusted_candidate_inputs.py"
 GENERATE_EVIDENCE = ROOT / "scripts" / "generate_trusted_candidate_evidence.py"
 TAG_RULESET = ROOT / "scripts" / "verify_release_tag_ruleset.py"
+TRUSTED_BUILDER_COMMIT = "be8fe434855b94f61511e8c6c926e02c54230a38"
 
 
 def _workflow_call_inputs(source: str) -> set[str]:
@@ -50,6 +51,7 @@ def test_trusted_signer_has_only_data_inputs_and_isolates_the_supplier_key():
     assert "--repo \"hbhjt/vending-vision\"" in workflow
     assert "--signer-repo" not in workflow
     assert "--deny-self-hosted-runners" in workflow
+    assert f'--signer-digest "{TRUSTED_BUILDER_COMMIT}"' in workflow
     assert "actions/checkout@v4" in workflow
     assert workflow.count("actions/checkout@v4") == 2
     assert "path: source" not in workflow
@@ -320,7 +322,7 @@ def test_trusted_signer_generates_bound_evidence_from_zip_and_approved_git_data(
                 "schemaVersion": "vending-vision-trusted-builder-evidence/v1",
                 "builderRepository": "hbhjt/vending-vision",
                 "builderWorkflow": ".github/workflows/trusted-ai-candidate-builder.yml",
-                "builderWorkflowSha": "fbb97d16f42b2c20a04831750c639fda6db1a3e9",
+                "builderWorkflowSha": TRUSTED_BUILDER_COMMIT,
                 "sourceCommit": source_commit,
                 "subjectSha256": identity["subjectSha256"],
                 "embeddedManifestSha256": identity["embeddedManifestSha256"],
