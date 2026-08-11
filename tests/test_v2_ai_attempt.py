@@ -525,20 +525,24 @@ def test_v2_ai_admission_rechecks_current_root_after_prepare_barrier_becomes_uns
     monkeypatch.setattr(vision_app, "_fast_attempt_registry", registry)
     monkeypatch.setattr(vision_app, "_ai_attempt_process_factory", _DeterministicAiChild)
     server, thread, reference = _serve_garment()
+    toggler_errors = []
 
     def unset_root_at_barrier():
-        registry.prepared.wait(timeout=2)
+        if not registry.prepared.wait(timeout=5):
+            toggler_errors.append("prepare barrier was not reached")
+            registry.release.set()
+            return
         monkeypatch.delenv("VEM_AI_MODEL_PACK", raising=False)
         registry.release.set()
 
     toggler = threading.Thread(target=unset_root_at_barrier)
-    toggler.start()
     try:
         attempt_id = str(uuid4())
         with TestClient(vision_app.app) as client:
             with client.websocket_connect("/ws") as socket:
                 socket.send_json(_hello())
                 assert socket.receive_json()["payload"]["aiReady"] is True
+                toggler.start()
                 start = _start(attempt_id, reference, mode="ai")
                 socket.send_json(start)
                 terminal = socket.receive_json()
@@ -554,9 +558,11 @@ def test_v2_ai_admission_rechecks_current_root_after_prepare_barrier_becomes_uns
         }
         assert replay == terminal
         assert _DeterministicAiChild.calls == 0
+        assert toggler_errors == []
     finally:
         registry.release.set()
-        toggler.join(timeout=2)
+        if toggler.ident is not None:
+            toggler.join(timeout=2)
         _DeterministicAiChild.calls = 0
         server.shutdown()
         server.server_close()
@@ -574,29 +580,35 @@ def test_v2_ai_admission_rechecks_current_root_after_prepare_barrier_becomes_val
     monkeypatch.setattr(vision_app, "_fast_attempt_registry", registry)
     monkeypatch.setattr(vision_app, "_ai_attempt_process_factory", _DeterministicAiChild)
     server, thread, reference = _serve_garment()
+    toggler_errors = []
 
     def restore_root_at_barrier():
-        registry.prepared.wait(timeout=2)
+        if not registry.prepared.wait(timeout=5):
+            toggler_errors.append("prepare barrier was not reached")
+            registry.release.set()
+            return
         monkeypatch.setenv("VEM_AI_MODEL_PACK", str(pack))
         registry.release.set()
 
     toggler = threading.Thread(target=restore_root_at_barrier)
-    toggler.start()
     try:
         attempt_id = str(uuid4())
         with TestClient(vision_app.app) as client:
             with client.websocket_connect("/ws") as socket:
                 socket.send_json(_hello())
                 assert socket.receive_json()["payload"]["aiReady"] is False
+                toggler.start()
                 socket.send_json(_start(attempt_id, reference, mode="ai"))
                 trace, terminal = _receive_until_terminal(socket)
 
         assert trace[0]["type"] == "vision.try_on.attempt.accepted"
         assert terminal["type"] == "vision.try_on.attempt.completed"
         assert _DeterministicAiChild.calls == 1
+        assert toggler_errors == []
     finally:
         registry.release.set()
-        toggler.join(timeout=2)
+        if toggler.ident is not None:
+            toggler.join(timeout=2)
         _DeterministicAiChild.calls = 0
         server.shutdown()
         server.server_close()

@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -54,8 +55,10 @@ def main() -> int:
     parser.add_argument(
         "--role", choices=("leader", "child", "grandchild"), required=True
     )
-    parser.add_argument("--mode", choices=("crash", "block"), required=True)
+    parser.add_argument("--mode", choices=("crash", "block", "success"), required=True)
     parser.add_argument("--pid-file", type=Path, required=True)
+    parser.add_argument("--success-png", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
     if args.role == "grandchild":
@@ -95,6 +98,13 @@ def main() -> int:
     os.replace(temporary, args.pid_file)
     if args.mode == "crash":
         return 17
+    if args.mode == "success":
+        if args.success_png is None or args.output is None:
+            raise RuntimeError("success mode requires input and output paths")
+        shutil.copyfile(args.success_png, args.output)
+        time.sleep(0.1)
+        _terminate_and_wait(child)
+        return 0
     _wait_forever()
     return 0
 

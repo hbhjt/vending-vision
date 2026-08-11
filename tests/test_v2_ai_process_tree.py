@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import cv2
@@ -75,7 +76,7 @@ def _envelope(message_type: str, payload: dict) -> dict:
     }
 
 
-def _hello() -> dict:
+def _hello(*additional_capabilities: str) -> dict:
     manifest = json.loads(
         (ROOT / "contracts/vem_vision_v2/manifest.json").read_text("utf-8")
     )
@@ -87,7 +88,7 @@ def _hello() -> dict:
             "schemaVersion": manifest["schemaVersion"],
             "bundleVersion": manifest["bundleVersion"],
             "contractDigest": manifest["bundleDigest"],
-            "capabilities": ["try_on_ai"],
+            "capabilities": ["try_on_ai", *additional_capabilities],
         },
     )
 
@@ -112,7 +113,15 @@ def _start(attempt_id: str, reference: str) -> dict:
     )
 
 
-def _configure_public_ai(monkeypatch, pack: Path, pid_file: Path, mode: str) -> None:
+def _configure_public_ai(
+    monkeypatch,
+    pack: Path,
+    pid_file: Path | None,
+    mode: str | None,
+    *,
+    command_by_attempt: dict[str, tuple[Path, str]] | None = None,
+    success_png: Path | None = None,
+) -> None:
     monkeypatch.setenv("VEM_AI_MODEL_PACK", str(pack))
     monkeypatch.setattr(
         vision_app,
@@ -151,17 +160,36 @@ def _configure_public_ai(monkeypatch, pack: Path, pid_file: Path, mode: str) -> 
         ),
     )
 
-    def test_worker_command(_model_pack, **_kwargs):
-        return [
+    def test_worker_command(_model_pack, **kwargs):
+        selected_pid_file = pid_file
+        selected_mode = mode
+        if command_by_attempt is not None:
+            output_png = str(kwargs["output_png"])
+            matches = [
+                command
+                for attempt_id, command in command_by_attempt.items()
+                if attempt_id in output_png
+            ]
+            assert len(matches) == 1
+            selected_pid_file, selected_mode = matches[0]
+        assert selected_pid_file is not None
+        assert selected_mode is not None
+        command = [
             sys.executable,
             str(WORKER),
             "--role",
             "leader",
             "--mode",
-            mode,
+            selected_mode,
             "--pid-file",
-            str(pid_file),
+            str(selected_pid_file),
         ]
+        if selected_mode == "success":
+            assert success_png is not None
+            command.extend(
+                ["--success-png", str(success_png), "--output", str(kwargs["output_png"])]
+            )
+        return command
 
     monkeypatch.setattr(
         ai_attempt_process_module, "ai_attempt_worker_command", test_worker_command
@@ -250,6 +278,188 @@ def _assert_staging_clear(attempt_id: str) -> None:
     while time.monotonic() < deadline and _staging_paths(attempt_id):
         time.sleep(0.025)
     assert _staging_paths(attempt_id) == []
+
+
+def _success_png(path: Path) -> None:
+    image = np.full((42, 54, 4), (25, 190, 75, 255), dtype=np.uint8)
+    encoded, payload = cv2.imencode(".png", image)
+    assert encoded
+    path.write_bytes(payload.tobytes())
+
+
+def test_public_ai_replacement_joins_real_tree_before_next_worker_and_completes(
+    tmp_path, monkeypatch
+):
+    pack = tmp_path / "test-owned-pack"
+    pack.mkdir()
+    first_id, second_id = str(uuid4()), str(uuid4())
+    first_pid_file = tmp_path / "first-tree.json"
+    second_pid_file = tmp_path / "second-tree.json"
+    success_png = tmp_path / "success.png"
+    _success_png(success_png)
+    _configure_public_ai(
+        monkeypatch,
+        pack,
+        None,
+        None,
+        command_by_attempt={
+            first_id: (first_pid_file, "block"),
+            second_id: (second_pid_file, "success"),
+        },
+        success_png=success_png,
+    )
+    server, thread, reference = _serve_garment()
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_hello())
+                assert socket.receive_json()["payload"]["aiReady"] is True
+                socket.send_json(_start(first_id, reference))
+                first_trace = _receive_until_generating(socket)
+                first_tree = _wait_pid_tree(first_pid_file)
+                assert all(_pid_alive(pid) for pid in first_tree.values())
+
+                socket.send_json(_start(second_id, reference))
+                replacement_trace = []
+                while True:
+                    message = socket.receive_json()
+                    replacement_trace.append(message)
+                    if (
+                        message["type"] == "vision.try_on.attempt.accepted"
+                        and message["payload"]["attemptId"] == second_id
+                    ):
+                        break
+
+                assert {
+                    name: pid
+                    for name, pid in first_tree.items()
+                    if _pid_exists(pid)
+                } == {}
+                second_trace = _receive_until_generating(socket)
+                second_tree = _wait_pid_tree(second_pid_file)
+                completion_trace, completed = _receive_until_terminal(socket)
+                _assert_tree_dead(second_tree)
+                socket.send_json(_envelope("vision.ping", {}))
+                late_messages = []
+                while True:
+                    message = socket.receive_json()
+                    if message["type"] == "vision.pong":
+                        break
+                    late_messages.append(message)
+
+            first_missing = client.get(
+                f"/v2/try-on/results/{first_id}?token=no-result"
+            )
+            result = completed["payload"]["result"]
+            parsed = urlsplit(result["reference"])
+            grant = f"{parsed.path}?{parsed.query}"
+            get = client.get(grant)
+            head = client.head(grant)
+
+        trace = first_trace + replacement_trace + second_trace + completion_trace
+        first_terminals = [
+            message
+            for message in trace + late_messages
+            if message["type"]
+            in {
+                "vision.try_on.attempt.completed",
+                "vision.try_on.attempt.failed",
+                "vision.try_on.attempt.canceled",
+            }
+            and message["payload"]["attemptId"] == first_id
+        ]
+        assert len(first_terminals) == 1
+        assert first_terminals[0]["type"] == "vision.try_on.attempt.canceled"
+        assert first_terminals[0]["payload"] == {
+            "attemptId": first_id,
+            "reason": "replaced",
+        }
+        assert completed["type"] == "vision.try_on.attempt.completed"
+        assert completed["payload"]["attemptId"] == second_id
+        assert first_missing.status_code == 404
+        assert get.status_code == 200
+        assert get.headers["content-type"] == "image/png"
+        assert head.status_code == 200
+        assert int(head.headers["content-length"]) == len(get.content)
+        _assert_staging_clear(first_id)
+        _assert_staging_clear(second_id)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_public_ai_timeout_kills_real_tree_without_result_and_keeps_public_ws_alive(
+    tmp_path, monkeypatch
+):
+    pack = tmp_path / "test-owned-pack"
+    pack.mkdir()
+    pid_file = tmp_path / "timeout-tree.json"
+    _configure_public_ai(monkeypatch, pack, pid_file, "block")
+    monkeypatch.setattr(vision_app, "_AI_ATTEMPT_TIMEOUT_SECONDS", 0.6)
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", True)
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 10)
+    monkeypatch.setattr(vision_app.settings, "MOCK_SCENARIO", "success")
+    server, thread, reference = _serve_garment()
+    attempt_id = str(uuid4())
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_hello("presence_status"))
+                assert socket.receive_json()["payload"]["aiReady"] is True
+                socket.send_json(_start(attempt_id, reference))
+                trace = _receive_until_generating(socket)
+                tree = _wait_pid_tree(pid_file)
+                assert all(_pid_alive(pid) for pid in tree.values())
+                tail, terminal = _receive_until_terminal(socket)
+                trace.extend(tail)
+                _assert_tree_dead(tree)
+                _assert_staging_clear(attempt_id)
+
+                socket.send_json(_envelope("vision.ping", {}))
+                pong = None
+                presence_seen = any(
+                    message["type"] == "vision.presence_status" for message in trace
+                )
+                while pong is None or not presence_seen:
+                    message = socket.receive_json()
+                    trace.append(message)
+                    if message["type"] == "vision.pong":
+                        pong = message
+                    if message["type"] == "vision.presence_status":
+                        presence_seen = True
+
+            missing = client.get(
+                f"/v2/try-on/results/{attempt_id}?token=no-result"
+            )
+
+        terminal_types = {
+            "vision.try_on.attempt.completed",
+            "vision.try_on.attempt.failed",
+            "vision.try_on.attempt.canceled",
+        }
+        attempt_terminals = [
+            message
+            for message in trace
+            if message["type"] in terminal_types
+            and message["payload"]["attemptId"] == attempt_id
+        ]
+        assert len(attempt_terminals) == 1
+        assert terminal["type"] == "vision.try_on.attempt.canceled"
+        assert terminal["payload"] == {
+            "attemptId": attempt_id,
+            "reason": "timeout",
+        }
+        assert all(
+            message["type"] != "vision.try_on.attempt.completed" for message in trace
+        )
+        assert missing.status_code == 404
+        assert pong is not None and pong["type"] == "vision.pong"
+        assert presence_seen is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def test_public_ai_leader_crash_kills_real_descendants_and_emits_one_failure(
