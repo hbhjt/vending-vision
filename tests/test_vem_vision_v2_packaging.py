@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import re
 import subprocess
 import sys
@@ -32,6 +33,7 @@ def test_frozen_spec_keeps_the_generated_v2_bundle_and_static_boundary_import():
     spec = (ROOT / "vending_vision.spec").read_text("utf-8")
 
     assert "CONTRACT_DATA_FILES" in spec
+    assert "OFFICIAL_AI_SOURCE_DATA_FILES" in spec
     assert '(CONTRACT_ROOT / "manifest.json", "contracts/vem_vision_v2")' in spec
     assert '(CONTRACT_ROOT / "__init__.py", "contracts/vem_vision_v2")' in spec
     assert '(CONTRACT_ROOT / "python" / "__init__.py", "contracts/vem_vision_v2/python")' in spec
@@ -74,10 +76,25 @@ def test_ai_runtime_packaging_includes_worker_code_but_excludes_official_weights
 
     worker_spec = (ROOT / "vending_vision_ai_worker.spec").read_text("utf-8")
     assert 'name="vending-vision-ai-worker"' in worker_spec
+    assert "OFFICIAL_AI_SOURCE_DATA_FILES" in worker_spec
     assert "collect_submodules(\"vision.vendor.catvton\")" in worker_spec
     assert "official-ai-model-pack-descriptor.json" in worker_spec
     assert "official-ai-source-descriptor.json" in worker_spec
     assert "model.safetensors" not in worker_spec
+
+
+def test_frozen_specs_materialize_source_descriptor_python_files_for_probe_hashing():
+    descriptor = json.loads((ROOT / "official-ai-source-descriptor.json").read_text("utf-8"))
+    source_paths = {entry["path"] for entry in descriptor["sources"] if entry["path"].endswith(".py")}
+    assert "vision/process_supervisor.py" in source_paths
+    assert "vision/ai_runtime_descriptor.py" in source_paths
+
+    for spec_name in ("vending_vision.spec", "vending_vision_ai_worker.spec"):
+        spec = (ROOT / spec_name).read_text("utf-8")
+        assert "OFFICIAL_AI_SOURCE_DATA_FILES" in spec
+        for path in source_paths:
+            if path.startswith("vision/"):
+                assert path in spec or "OFFICIAL_AI_SOURCE_DESCRIPTOR_PATH" in spec
 
 
 def test_official_ai_runtime_dependencies_are_separate_from_core_archive_lock():
@@ -96,8 +113,9 @@ def test_official_ai_runtime_dependencies_are_separate_from_core_archive_lock():
     assert "diffusers==0.29.2" not in core_requirements
 
     lock = (ROOT / "requirements-ai.lock.json").read_text("utf-8")
-    assert '"schemaVersion":"vem-ai-worker-wheelhouse/v1"' in lock
-    assert '"platform":"win_amd64"' in lock
+    assert '"schemaVersion":"vem-ai-worker-wheelhouse-release/v1"' in lock
+    assert '"target":"windows-x86_64"' in lock
+    assert '"wheels":[]' in lock
     assert '"schemaVersion":"vem-ai-runtime-descriptor/v1"' in runtime_descriptor
     assert '"python":"3.11.9"' in runtime_descriptor
     assert '"target":"windows-x86_64"' in runtime_descriptor
@@ -126,6 +144,7 @@ def test_vendored_catvton_closure_is_pinned_local_only_and_weight_free():
 
 def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     verifier = (ROOT / "scripts" / "verify_packaged_exe.py").read_text("utf-8")
+    launcher = (ROOT / "run_vision_server.py").read_text("utf-8")
 
     assert '"--verify-v2-contract-bundle"' in verifier
     assert '"--verify-v2-try-on-workers"' in verifier
@@ -143,6 +162,10 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     assert "_safe_process_log" in verifier
     assert "packaged_archive_entries" in verifier
     assert '"--verify-ai-worker-boundary"' in verifier
+    assert '"--probe-runtime"' in verifier
+    assert '"official-catvton-worker-runtime"' in verifier
+    assert '"--probe-runtime"' in launcher
+    assert "missing-pack" not in launcher
     assert '"AI runtime worker contract probe passed"' in verifier
     assert "--require-ai-worker" in verifier
     assert "PACKAGED_EXE_VERIFICATION=CORE_ONLY" in verifier
@@ -194,13 +217,43 @@ def test_packaged_verifier_ai_worker_layout_binds_descriptor_resources(tmp_path)
     assert len(result["sha256"]) == 64
 
 
+def test_packaged_verifier_rejects_worker_that_does_not_emit_runtime_probe_json(tmp_path):
+    from scripts.verify_packaged_exe import assert_ai_worker_layout, verify_ai_worker_runtime_probe
+
+    suffix = ".exe" if sys.platform == "win32" else ""
+    exe = tmp_path / "vending-vision" / f"vending-vision{suffix}"
+    worker = tmp_path / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}"
+    internal = worker.parent / "_internal"
+    exe.parent.mkdir()
+    internal.mkdir(parents=True)
+    exe.write_text("#!/usr/bin/env python3\nprint('not-json')\n", "utf-8")
+    worker.write_text("#!/usr/bin/env python3\nprint('not-json')\n", "utf-8")
+    worker.chmod(0o755)
+    for name in (
+        "official-ai-model-pack-descriptor.json",
+        "ai-runtime-descriptor.json",
+        "official-ai-source-descriptor.json",
+    ):
+        (internal / name).write_text("{}", "utf-8")
+
+    layout = assert_ai_worker_layout(exe, required=True)
+    try:
+        verify_ai_worker_runtime_probe(layout)
+    except AssertionError as exc:
+        assert "AI worker runtime probe failed" in str(exc)
+    else:
+        raise AssertionError("worker without runtime probe JSON must fail")
+
+
 def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     build = (ROOT / "scripts" / "build_exe.ps1").read_text("utf-8")
     workflow = (ROOT / ".github" / "workflows" / "publish-candidate.yml").read_text("utf-8")
 
     assert "AiWheelhouseDescriptor" in build
     assert "verify_ai_wheelhouse.py" in build
-    assert "requirements-ai.txt" in build
+    assert "requirements-ai-release.txt" in build
+    assert "--requirements-output" in build
+    assert "--require-hashes -r (Join-Path $Root \"requirements-ai.txt\")" not in build
     assert "vending_vision.spec" in build
     assert "vending_vision_ai_worker.spec" in build
     assert "vending-vision-ai-worker" in build
@@ -210,10 +263,10 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
 
     assert "AI_WHEELHOUSE" in workflow
     assert "verify_ai_wheelhouse.py" in workflow
-    assert "vending_vision_ai_worker.spec" in workflow
-    assert "--require-ai-worker" in workflow
-    assert "requirements-ai.txt" in workflow
+    assert "requirements-ai-release.txt" in workflow
     assert "pip download" not in workflow
+    assert workflow.count("scripts/build_exe.ps1") == 1
+    assert workflow.count("PyInstaller --clean --noconfirm") == 0
 
 
 def test_worker_probe_executes_production_observation_and_render_ipc():

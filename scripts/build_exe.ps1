@@ -20,6 +20,8 @@ function Invoke-Checked {
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Venv = Join-Path $Root ".venv-packaging"
 $Python = Join-Path $Venv "Scripts\python.exe"
+$BuildDir = Join-Path $Root "build"
+$AiReleaseRequirements = Join-Path $BuildDir "requirements-ai-release.txt"
 $ExpectedPythonVersion = (Get-Content (Join-Path $Root ".python-version") -Raw).Trim()
 if (-not (Test-Path -LiteralPath $Wheelhouse -PathType Container)) {
     throw "A pre-validated offline core wheelhouse is required: $Wheelhouse"
@@ -48,8 +50,9 @@ if (-not (Test-Path $Python)) {
 }
 
 Invoke-Checked $Python -m pip install --no-index --find-links $Wheelhouse --require-hashes -r (Join-Path $Root "requirements.txt")
-Invoke-Checked $Python (Join-Path $Root "scripts\verify_ai_wheelhouse.py") --descriptor $AiWheelhouseDescriptor --wheelhouse $AiWheelhouse
-Invoke-Checked $Python -m pip install --no-index --find-links $AiWheelhouse --require-hashes -r (Join-Path $Root "requirements-ai.txt")
+New-Item -ItemType Directory -Force $BuildDir | Out-Null
+Invoke-Checked $Python (Join-Path $Root "scripts\verify_ai_wheelhouse.py") --descriptor $AiWheelhouseDescriptor --wheelhouse $AiWheelhouse --runtime-descriptor (Join-Path $Root "ai-runtime-descriptor.json") --requirements-output $AiReleaseRequirements
+Invoke-Checked $Python -m pip install --no-index --find-links $AiWheelhouse --require-hashes -r $AiReleaseRequirements
 
 Invoke-Checked $Python -m PyInstaller --clean --noconfirm (Join-Path $Root "vending_vision.spec")
 Invoke-Checked $Python -m PyInstaller --clean --noconfirm (Join-Path $Root "vending_vision_ai_worker.spec")

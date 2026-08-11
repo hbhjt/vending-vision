@@ -188,9 +188,18 @@ class WindowsJobProcess:
                 self.api.assign_process_to_job(self.job, self.process_handle)
             except WindowsJobApiUnavailable:
                 self.api.terminate_process(self.process_handle, 1)
+                try:
+                    self.api.wait_process(self.process_handle, timeout=3.0)
+                except ProcessSupervisorError:
+                    pass
                 raise
             self._drainers = self.api.start_pipe_drainers(self.pipes, self.stdout, self.stderr)
-            self.api.resume_thread(self.thread_handle)
+            try:
+                self.api.resume_thread(self.thread_handle)
+            except WindowsJobApiUnavailable:
+                self.api.terminate_job(self.job, 1)
+                self.api.wait_active_processes_zero(self.job, timeout=3.0)
+                raise
             self.resumed = True
         except Exception:
             self.close()
@@ -327,6 +336,13 @@ class WindowsJobApi:
                 ("dwThreadId", wintypes.DWORD),
             ]
 
+        class SECURITY_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [
+                ("nLength", wintypes.DWORD),
+                ("lpSecurityDescriptor", ctypes.c_void_p),
+                ("bInheritHandle", wintypes.BOOL),
+            ]
+
         class JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
             _fields_ = [
                 ("TotalUserTime", ctypes.c_int64),
@@ -343,6 +359,7 @@ class WindowsJobApi:
         self.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
         self.STARTUPINFOW = STARTUPINFOW
         self.PROCESS_INFORMATION = PROCESS_INFORMATION
+        self.SECURITY_ATTRIBUTES = SECURITY_ATTRIBUTES
 
     def _declare_functions(self) -> None:
         ctypes = self.ctypes
@@ -354,7 +371,7 @@ class WindowsJobApi:
         k32.SetInformationJobObject.restype = wintypes.BOOL
         k32.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
         k32.QueryInformationJobObject.restype = wintypes.BOOL
-        k32.CreatePipe.argtypes = [ctypes.POINTER(wintypes.HANDLE), ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p, wintypes.DWORD]
+        k32.CreatePipe.argtypes = [ctypes.POINTER(wintypes.HANDLE), ctypes.POINTER(wintypes.HANDLE), ctypes.POINTER(self.SECURITY_ATTRIBUTES), wintypes.DWORD]
         k32.CreatePipe.restype = wintypes.BOOL
         k32.SetHandleInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]
         k32.SetHandleInformation.restype = wintypes.BOOL
@@ -413,9 +430,13 @@ class WindowsJobApi:
         stdout_write = self.wintypes.HANDLE()
         stderr_read = self.wintypes.HANDLE()
         stderr_write = self.wintypes.HANDLE()
-        if not self.kernel32.CreatePipe(self.ctypes.byref(stdout_read), self.ctypes.byref(stdout_write), None, 0):
+        attributes = self.SECURITY_ATTRIBUTES()
+        attributes.nLength = self.ctypes.sizeof(attributes)
+        attributes.lpSecurityDescriptor = None
+        attributes.bInheritHandle = True
+        if not self.kernel32.CreatePipe(self.ctypes.byref(stdout_read), self.ctypes.byref(stdout_write), self.ctypes.byref(attributes), 0):
             raise WindowsJobApiUnavailable("windows_pipe_create_failed")
-        if not self.kernel32.CreatePipe(self.ctypes.byref(stderr_read), self.ctypes.byref(stderr_write), None, 0):
+        if not self.kernel32.CreatePipe(self.ctypes.byref(stderr_read), self.ctypes.byref(stderr_write), self.ctypes.byref(attributes), 0):
             self.close_handle(stdout_read)
             self.close_handle(stdout_write)
             raise WindowsJobApiUnavailable("windows_pipe_create_failed")

@@ -85,6 +85,7 @@ class FakeWinApi:
         *,
         fail_set=False,
         fail_assign=False,
+        fail_resume=False,
         fail_terminate_job=False,
         active_sequence=None,
         stdout_chunks=None,
@@ -93,6 +94,7 @@ class FakeWinApi:
         self.calls = []
         self.fail_set = fail_set
         self.fail_assign = fail_assign
+        self.fail_resume = fail_resume
         self.fail_terminate_job = fail_terminate_job
         self.active_sequence = list(active_sequence or [0])
         self.stdout_chunks = list(stdout_chunks or [])
@@ -127,6 +129,8 @@ class FakeWinApi:
 
     def resume_thread(self, thread):
         self.calls.append(("resume", thread))
+        if self.fail_resume:
+            raise WindowsJobApiUnavailable("windows_resume_failed")
 
     def terminate_process(self, process, code):
         self.calls.append(("terminate_process", process, code))
@@ -198,9 +202,23 @@ def test_windows_job_failures_never_resume_and_close_handles(fail_set, fail_assi
     assert not any(call[0] == "resume" if isinstance(call, tuple) else False for call in api.calls)
     if fail_assign:
         assert ("terminate_process", 0x4_0000_0001, 1) in api.calls
+        assert ("wait_process", 0x4_0000_0001, 3.0) in api.calls
         assert ("close", 0x4_0000_0002) in api.calls
         assert ("close", 0x4_0000_0001) in api.calls
     assert ("close", 0x1_0000_0001) in api.calls
+
+
+def test_windows_resume_failure_terminates_assigned_job_and_waits_before_close():
+    api = FakeWinApi(fail_resume=True)
+    process = WindowsJobProcess(["worker.exe"], api=api)
+
+    with pytest.raises(WindowsJobApiUnavailable, match="windows_resume_failed"):
+        process.start()
+
+    assert ("terminate_job", 0x1_0000_0001, 1) in api.calls
+    assert ("wait_active_zero", 0x1_0000_0001, 3.0) in api.calls
+    assert ("close", 0x4_0000_0002) in api.calls
+    assert ("close", 0x4_0000_0001) in api.calls
 
 
 def test_windows_job_wait_returns_probe_stdout_json_and_bounded_10mb_tails():
@@ -220,6 +238,19 @@ def test_windows_job_wait_returns_probe_stdout_json_and_bounded_10mb_tails():
     assert len(result.stdout_tail) <= 64 * 1024
     assert len(result.stderr_tail) <= 64 * 1024
     assert any(call[0] == "start_drainers" for call in api.calls if isinstance(call, tuple))
+
+
+def test_windows_job_api_creates_inheritable_write_pipes_and_noninheritable_read_pipes():
+    source = (Path(__file__).parents[1] / "vision" / "process_supervisor.py").read_text("utf-8")
+
+    assert "class SECURITY_ATTRIBUTES" in source
+    assert "(\"bInheritHandle\", wintypes.BOOL)" in source
+    assert "attributes.bInheritHandle = True" in source
+    assert "CreatePipe(self.ctypes.byref(stdout_read), self.ctypes.byref(stdout_write), self.ctypes.byref(attributes), 0)" in source
+    assert "CreatePipe(self.ctypes.byref(stderr_read), self.ctypes.byref(stderr_write), self.ctypes.byref(attributes), 0)" in source
+    assert "SetHandleInformation(read_handle, HANDLE_FLAG_INHERIT, 0)" in source
+    assert "SetHandleInformation(stdout_write" not in source
+    assert "SetHandleInformation(stderr_write" not in source
 
 
 def test_windows_leader_exit_with_active_descendant_terminates_job_and_fails():

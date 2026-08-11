@@ -93,18 +93,23 @@ else:
     torch.Generator = Generator
     sys.modules["torch"] = torch
 
-for name in ("torchvision", "accelerate", "diffusers", "transformers", "safetensors"):
+for name in ("torchvision", "accelerate", "diffusers", "transformers", "safetensors", "scipy", "tqdm"):
     sys.modules.setdefault(name, types.ModuleType(name))
 
 import importlib.metadata
 _real_version = importlib.metadata.version
 def _mini_version(name):
-    if name in {"torch", "torchvision", "diffusers", "transformers"}:
+    if name in {"torch", "torchvision", "diffusers", "transformers", "accelerate", "safetensors", "scipy", "tqdm", "opencv-python-headless"}:
         return {
             "torch": "2.8.0",
             "torchvision": "0.23.0",
             "diffusers": "0.29.2",
             "transformers": "4.53.3",
+            "accelerate": "0.31.0",
+            "safetensors": "0.5.3",
+            "scipy": "1.16.1",
+            "tqdm": "4.67.1",
+            "opencv-python-headless": "4.12.0.88",
         }[name]
     return _real_version(name)
 importlib.metadata.version = _mini_version
@@ -266,6 +271,35 @@ def test_worker_probe_accepts_only_official_manifest_and_no_fake_arguments(tmp_p
     )
     assert fake.returncode != 0
     assert "--fake-worker" in fake.stderr
+
+
+def test_worker_runtime_probe_does_not_require_model_pack_and_reports_versions(tmp_path):
+    modules = tmp_path / "miniature-modules"
+    modules.mkdir()
+    write_miniature_catvton_modules(modules)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{modules}{os.pathsep}{ROOT}"
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "vision.ai_attempt_worker",
+            "--probe-runtime",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert probe.returncode == 0, f"{probe.stdout}{probe.stderr}"
+    payload = json.loads(probe.stdout)
+    assert payload["probe"] == "official-catvton-worker-runtime"
+    assert payload["torch"] == "2.8.0"
+    assert payload["catvtonSourceRevision"] == "3b795364a4d2f3b5adb365f39cdea376d20bc53c"
 
 
 def test_worker_probe_rejects_source_descriptor_tamper(tmp_path):

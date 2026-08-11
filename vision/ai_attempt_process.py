@@ -60,10 +60,24 @@ def ai_attempt_worker_command(
     return command
 
 
-def probe_ai_attempt_worker(model_pack: Path, *, timeout: float = 30.0) -> None:
-    result = asyncio.run(
-        run_supervised(ai_attempt_worker_command(model_pack, probe=True), timeout=timeout)
-    )
+def ai_runtime_worker_command() -> list[str]:
+    if getattr(sys, "frozen", False):
+        command = [str(ai_worker_executable_path())]
+    else:
+        command = [sys.executable, "-m", "vision.ai_attempt_worker"]
+    command.append("--probe-runtime")
+    return command
+
+
+def _assert_not_in_running_event_loop() -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise RuntimeError("official_ai_child_probe_requires_sync_context")
+
+
+def _validate_probe_result(result) -> None:
     if result.returncode != 0:
         raise RuntimeError("official_ai_child_probe_failed")
     try:
@@ -76,6 +90,45 @@ def probe_ai_attempt_worker(model_pack: Path, *, timeout: float = 30.0) -> None:
     for name in ("torch", "torchvision", "diffusers", "transformers"):
         if payload.get(name) != expected[name]:
             raise RuntimeError("official_ai_child_probe_failed")
+
+
+def _validate_runtime_probe_result(result) -> None:
+    if result.returncode != 0:
+        raise RuntimeError("official_ai_child_runtime_probe_failed")
+    try:
+        payload = json.loads(result.stdout_tail.decode("utf-8").strip().splitlines()[-1])
+    except (IndexError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError("official_ai_child_runtime_probe_failed") from exc
+    if payload.get("probe") != "official-catvton-worker-runtime":
+        raise RuntimeError("official_ai_child_runtime_probe_failed")
+    expected = expected_dependency_versions()
+    for name, version in expected.items():
+        if payload.get(name) != version:
+            raise RuntimeError("official_ai_child_runtime_probe_failed")
+
+
+async def probe_ai_attempt_worker_async(model_pack: Path, *, timeout: float = 30.0) -> None:
+    result = await run_supervised(ai_attempt_worker_command(model_pack, probe=True), timeout=timeout)
+    _validate_probe_result(result)
+
+
+def probe_ai_attempt_worker(model_pack: Path, *, timeout: float = 30.0) -> None:
+    _assert_not_in_running_event_loop()
+    result = asyncio.run(
+        run_supervised(ai_attempt_worker_command(model_pack, probe=True), timeout=timeout)
+    )
+    _validate_probe_result(result)
+
+
+async def probe_ai_runtime_worker_async(*, timeout: float = 30.0) -> None:
+    result = await run_supervised(ai_runtime_worker_command(), timeout=timeout)
+    _validate_runtime_probe_result(result)
+
+
+def probe_ai_runtime_worker(*, timeout: float = 30.0) -> None:
+    _assert_not_in_running_event_loop()
+    result = asyncio.run(run_supervised(ai_runtime_worker_command(), timeout=timeout))
+    _validate_runtime_probe_result(result)
 
 
 class AiAttemptProcess:

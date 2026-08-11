@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import unicodedata
 import hashlib
+import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -22,7 +23,7 @@ OFFICIAL_CATVTON_SOURCE_REVISION = "3b795364a4d2f3b5adb365f39cdea376d20bc53c"
 MANIFEST_NAME = "ai-model-manifest.json"
 MANIFEST_SCHEMA_VERSION = "vem-official-ai-model-pack-descriptor/v2"
 OFFICIAL_DESCRIPTOR_PATH = Path(__file__).resolve().parents[1] / "official-ai-model-pack-descriptor.json"
-_READINESS_CACHE: dict[tuple[object, ...], bool] = {}
+_READINESS_LOCK = threading.Lock()
 
 
 class AiModelPackError(RuntimeError):
@@ -36,6 +37,22 @@ class AiModelPack:
     upstream_revision: str
     files: tuple[dict, ...]
     descriptor: dict
+
+
+@dataclass(frozen=True)
+class OfficialAiReadinessSnapshot:
+    root: str | None
+    identity: tuple[object, ...] | None
+    ready: bool
+    diagnostic: str
+
+
+_READINESS_SNAPSHOT = OfficialAiReadinessSnapshot(
+    root=None,
+    identity=None,
+    ready=False,
+    diagnostic="ai_model_pack_missing",
+)
 
 
 def _digest(path: Path) -> str:
@@ -275,40 +292,84 @@ def verify_ai_model_pack(root: str | Path | None, *, descriptor: dict | None = N
     return AiModelPack(pack_root, primary["repository"], primary["revision"], tuple(files), manifest)
 
 
-def official_ai_readiness(root: str | Path | None) -> bool:
-    """Startup-only worker probe: no inference/model load and cached per pack."""
+def _readiness_identity(pack_root: Path, descriptor: dict) -> tuple[object, ...]:
+    return (
+        str(pack_root),
+        _quick_file_identity(pack_root / MANIFEST_NAME),
+        _pack_files_identity(pack_root, descriptor),
+        _quick_file_identity(OFFICIAL_DESCRIPTOR_PATH),
+        _source_worker_identity(),
+        digest_runtime_descriptor(),
+    )
+
+
+def _compute_official_ai_readiness_snapshot(root: str | Path | None) -> OfficialAiReadinessSnapshot:
+    """Heavy startup/selection verification path; never call from request handlers."""
     if not root:
-        return False
+        return OfficialAiReadinessSnapshot(
+            root=None,
+            identity=None,
+            ready=False,
+            diagnostic="ai_model_pack_missing",
+        )
     pack_root = Path(root).resolve()
     try:
-        manifest_identity = _quick_file_identity(pack_root / MANIFEST_NAME)
-        descriptor_identity = _quick_file_identity(OFFICIAL_DESCRIPTOR_PATH)
         descriptor = load_official_ai_model_pack_descriptor()
-        files_identity = _pack_files_identity(pack_root, descriptor)
-        worker_identity = _source_worker_identity()
-        runtime_descriptor_digest = digest_runtime_descriptor()
-    except OSError:
-        return False
-    cache_key = (
-        str(pack_root),
-        manifest_identity,
-        files_identity,
-        descriptor_identity,
-        worker_identity,
-        runtime_descriptor_digest,
-    )
-    cached = _READINESS_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    try:
+        identity = _readiness_identity(pack_root, descriptor)
         verify_ai_model_pack(pack_root, descriptor=descriptor)
         from vision.ai_attempt_process import probe_ai_attempt_worker
 
         probe_ai_attempt_worker(pack_root)
-        _READINESS_CACHE.clear()
-        _READINESS_CACHE[cache_key] = True
-        return True
-    except (AiModelPackError, ImportError, RuntimeError, OSError):
-        _READINESS_CACHE.clear()
-        _READINESS_CACHE[cache_key] = False
+        return OfficialAiReadinessSnapshot(
+            root=str(pack_root),
+            identity=identity,
+            ready=True,
+            diagnostic="ready",
+        )
+    except AiModelPackError as exc:
+        diagnostic = str(exc) or "ai_model_pack_invalid"
+    except (ImportError, RuntimeError, OSError) as exc:
+        diagnostic = str(exc) or exc.__class__.__name__
+    return OfficialAiReadinessSnapshot(
+        root=str(pack_root),
+        identity=None,
+        ready=False,
+        diagnostic=diagnostic,
+    )
+
+
+async def refresh_official_ai_readiness(root: str | Path | None) -> OfficialAiReadinessSnapshot:
+    """Refresh the official AI readiness cache off the event loop."""
+    global _READINESS_SNAPSHOT
+    snapshot = await __import__("asyncio").to_thread(_compute_official_ai_readiness_snapshot, root)
+    with _READINESS_LOCK:
+        _READINESS_SNAPSHOT = snapshot
+    return snapshot
+
+
+def official_ai_readiness_snapshot() -> OfficialAiReadinessSnapshot:
+    with _READINESS_LOCK:
+        return _READINESS_SNAPSHOT
+
+
+def official_ai_readiness(root: str | Path | None) -> bool:
+    """O(1) cached readiness getter for hello/admission hot paths."""
+    if not root:
         return False
+    try:
+        normalized_root = str(Path(root).resolve())
+    except OSError:
+        return False
+    snapshot = official_ai_readiness_snapshot()
+    return snapshot.ready and snapshot.root == normalized_root
+
+
+def reset_official_ai_readiness_cache_for_tests() -> None:
+    global _READINESS_SNAPSHOT
+    with _READINESS_LOCK:
+        _READINESS_SNAPSHOT = OfficialAiReadinessSnapshot(
+            root=None,
+            identity=None,
+            ready=False,
+            diagnostic="ai_model_pack_missing",
+        )

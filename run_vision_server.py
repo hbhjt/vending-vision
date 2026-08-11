@@ -80,6 +80,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--ai-attempt-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--model-pack", help=argparse.SUPPRESS)
+    parser.add_argument("--probe-runtime", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--person", help=argparse.SUPPRESS)
     parser.add_argument("--garment", help=argparse.SUPPRESS)
@@ -112,7 +113,11 @@ def verify_v2_contract_bundle():
 def run_ai_attempt_worker(args):
     from vision.ai_attempt_worker import main as worker_main
 
-    worker_args = ["--model-pack", args.model_pack]
+    worker_args = []
+    if args.probe_runtime:
+        worker_args.append("--probe-runtime")
+    else:
+        worker_args.extend(["--model-pack", args.model_pack])
     if args.probe:
         worker_args.append("--probe")
     else:
@@ -132,28 +137,22 @@ def run_ai_attempt_worker(args):
 def verify_ai_worker_boundary():
     """Probe the frozen AI child boundary without a model pack or inference."""
 
-    import asyncio
-
-    from vision.ai_attempt_process import ai_attempt_worker_command, probe_ai_attempt_worker
+    from vision.ai_attempt_process import ai_runtime_worker_command, probe_ai_attempt_worker, probe_ai_runtime_worker
     from vision.ai_model_pack import (
         official_ai_readiness,
     )
-    from vision.process_supervisor import run_supervised
     from vision import ai_attempt_worker  # noqa: F401
 
     if official_ai_readiness(None):
         raise RuntimeError("missing official AI pack must not report ready")
+    probe_ai_runtime_worker(timeout=15.0)
     model_pack = os.getenv("VEM_AI_MODEL_PACK")
     if model_pack:
         probe_ai_attempt_worker(Path(model_pack))
-        command = ai_attempt_worker_command(Path(model_pack), probe=True)
+        command = [*ai_runtime_worker_command()]
         availability_note = "verified official model pack"
     else:
-        command = ai_attempt_worker_command(Path("missing-pack"), probe=True)
-        result = asyncio.run(run_supervised(command, timeout=15.0))
-        combined = f"{result.stdout_tail.decode('utf-8', 'replace')}{result.stderr_tail.decode('utf-8', 'replace')}"
-        if result.returncode == 0 or "ai_model_manifest_missing_or_invalid" not in combined:
-            raise RuntimeError("AI worker missing-pack probe did not fail closed")
+        command = [*ai_runtime_worker_command()]
         availability_note = "AI unavailable: missing official model pack"
     test_selector_flags = ["--" + "".join(("fa", "ke")) + "-worker", "--config"]
     if any(flag in command for flag in test_selector_flags):

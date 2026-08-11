@@ -76,7 +76,7 @@ from vision.v2_contract_bundle import (
     parse_v2_client_message,
     parse_v2_server_message,
 )
-from vision.ai_model_pack import official_ai_readiness
+from vision.ai_model_pack import official_ai_readiness, refresh_official_ai_readiness
 from vision.ai_attempt_process import AiAttemptProcess
 
 
@@ -145,6 +145,12 @@ async def on_startup():
         # Acquisition stays fail-closed until the production observation
         # boundary can be prewarmed; ordinary Vision capability remains alive.
         logger.exception("Acquisition observer failed startup readiness")
+    try:
+        await refresh_official_ai_readiness(os.environ.get("VEM_AI_MODEL_PACK"))
+    except Exception:
+        # AI is optional for core/Fast readiness.  Refresh is owned by startup
+        # and the public hello/admission path only reads the O(1) cached value.
+        logger.exception("Official AI readiness refresh failed")
 
 
 @app.on_event("shutdown")

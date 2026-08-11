@@ -411,6 +411,36 @@ def assert_ai_worker_layout(exe_path, *, required):
     return {"path": worker, "sha256": digest}
 
 
+def verify_ai_worker_runtime_probe(ai_worker):
+    probe = subprocess.run(
+        [str(ai_worker["path"]), "--probe-runtime"],
+        cwd=str(ai_worker["path"].parent),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=30,
+    )
+    combined = f"{probe.stdout}{probe.stderr}"
+    assert_no_worker_resource_leak_output(combined)
+    try:
+        payload = json.loads(probe.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError) as exc:
+        raise AssertionError(f"AI worker runtime probe failed: {combined}") from exc
+    if (
+        probe.returncode != 0
+        or payload.get("probe") != "official-catvton-worker-runtime"
+        or payload.get("catvtonSourceRevision") != "3b795364a4d2f3b5adb365f39cdea376d20bc53c"
+        or payload.get("torch") != "2.8.0"
+        or payload.get("torchvision") != "0.23.0"
+        or payload.get("diffusers") != "0.29.2"
+        or payload.get("transformers") != "4.53.3"
+    ):
+        raise AssertionError(f"AI worker runtime probe failed: {combined}")
+    return payload
+
+
 def verify_plain_camera_maintenance_contract(base_url):
     """Exercise the real packaged adapter through plain loopback v2 routes."""
     read_status, contract = http_status_json(f"{base_url}/maintenance/cameras")
@@ -512,6 +542,7 @@ def main():
         "V2 try-on worker probe passed",
     )
     if ai_worker is not None:
+        verify_ai_worker_runtime_probe(ai_worker)
         run_packaged_probe(
             exe_path,
             "--verify-ai-worker-boundary",

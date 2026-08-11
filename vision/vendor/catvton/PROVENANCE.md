@@ -21,8 +21,6 @@ Upstream files:
 - model/utils.py sha256:9e5041c963126fba8053648cb0b52b2427eaf817c02bdd23421175e80c24eb7f
 - utils.py sha256:3d31693279cf9d217fc6efa9f7499d9a9bd58fb71e9b679dcad12a58cc2ab710
 
-Local patched files:
-- model/SCHP/__init__.py sha256:cda616223eeec347dd2b1b49cbf5099bea8ee2573bcd94ac4d6323ff7129485b
-- model/SCHP/networks/__init__.py sha256:7ab5d970dfbb0cf73f0e46e4d53af28084042ebc5896d03c91e6f794718baca7
-- model/pipeline.py sha256:573df2c3e4c8a65316f9e2ead03f3f74bb311bf937fdfad918307bc14813d1fd
-- model/utils.py sha256:804d69151f5ceef86aa2c1db587655c611700a56cea8b92a7582a77e9577ee15
+Local patched source hashes are not duplicated here.  The canonical runtime
+source hash allowlist is `official-ai-source-descriptor.json`, which is checked
+by the worker probe against the actual deployed source layout.

@@ -1,6 +1,9 @@
 import hashlib
 import json
 import os
+import asyncio
+import time
+from pathlib import Path
 
 import pytest
 
@@ -10,9 +13,17 @@ from vision.ai_model_pack import (
     create_ai_model_manifest,
     load_official_ai_model_pack_descriptor,
     official_ai_readiness,
+    refresh_official_ai_readiness,
+    reset_official_ai_readiness_cache_for_tests,
     verify_ai_model_pack,
 )
-from vision.source_provenance import OFFICIAL_SOURCE_DESCRIPTOR_PATH, verify_official_source_provenance
+from vision.source_provenance import (
+    OFFICIAL_SOURCE_DESCRIPTOR_PATH,
+    build_official_source_descriptor,
+    canonical_source_descriptor_json,
+    verify_official_source_provenance_at_root,
+    verify_official_source_provenance,
+)
 import vision.ai_model_pack as ai_model_pack_module
 
 
@@ -133,8 +144,10 @@ def test_official_readiness_runs_worker_probe_once_and_caches_by_pack_identity(t
 
     monkeypatch.setattr(ai_model_pack_module, "load_official_ai_model_pack_descriptor", lambda: descriptor)
     monkeypatch.setattr("vision.ai_attempt_process.probe_ai_attempt_worker", lambda pack: calls.append(pack))
-    ai_model_pack_module._READINESS_CACHE.clear()
+    reset_official_ai_readiness_cache_for_tests()
 
+    assert official_ai_readiness(tmp_path) is False
+    asyncio.run(refresh_official_ai_readiness(tmp_path))
     assert official_ai_readiness(tmp_path) is True
     assert official_ai_readiness(tmp_path) is True
     assert calls == [tmp_path.resolve()]
@@ -167,13 +180,66 @@ def test_official_readiness_cache_misses_when_weight_identity_changes(tmp_path, 
 
     monkeypatch.setattr(ai_model_pack_module, "load_official_ai_model_pack_descriptor", lambda: descriptor)
     monkeypatch.setattr("vision.ai_attempt_process.probe_ai_attempt_worker", lambda pack: calls.append(pack))
-    ai_model_pack_module._READINESS_CACHE.clear()
+    reset_official_ai_readiness_cache_for_tests()
 
+    asyncio.run(refresh_official_ai_readiness(tmp_path))
     assert official_ai_readiness(tmp_path) is True
     model.write_bytes(b"tampered!!")
     os.utime(model, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
+    asyncio.run(refresh_official_ai_readiness(tmp_path))
     assert official_ai_readiness(tmp_path) is False
+    assert calls == [tmp_path.resolve()]
+
+
+def test_official_readiness_refresh_runs_heavy_probe_off_loop_and_cache_read_is_o1(tmp_path, monkeypatch):
+    model = tmp_path / "mini" / "a.bin"
+    model.parent.mkdir()
+    model.write_bytes(b"mini-model")
+    descriptor = {
+        "schemaVersion": "vem-official-ai-model-pack-descriptor/v2",
+        "catvtonSourceRevision": "test-source",
+        "totalByteSize": model.stat().st_size,
+        "upstreams": [{"id": "mini", "repository": "example/mini", "revision": "abc"}],
+        "files": [
+            {
+                "path": "mini/a.bin",
+                "upstreamPath": "a.bin",
+                "upstream": "mini",
+                "role": "mini_weight",
+                "format": "bin",
+                "byteSize": model.stat().st_size,
+                "sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    (tmp_path / "ai-model-manifest.json").write_text(canonical_ai_model_manifest_json(descriptor), "utf-8")
+    calls = []
+
+    def slow_probe(pack):
+        calls.append(pack)
+        time.sleep(0.1)
+
+    monkeypatch.setattr(ai_model_pack_module, "load_official_ai_model_pack_descriptor", lambda: descriptor)
+    monkeypatch.setattr("vision.ai_attempt_process.probe_ai_attempt_worker", slow_probe)
+    reset_official_ai_readiness_cache_for_tests()
+
+    async def exercise():
+        gaps: list[float] = []
+
+        async def ticker():
+            last = time.perf_counter()
+            for _ in range(6):
+                await asyncio.sleep(0.02)
+                now = time.perf_counter()
+                gaps.append(now - last)
+                last = now
+
+        await asyncio.gather(refresh_official_ai_readiness(tmp_path), ticker())
+        assert max(gaps) < 0.08
+        assert official_ai_readiness(tmp_path) is True
+
+    asyncio.run(exercise())
     assert calls == [tmp_path.resolve()]
 
 
@@ -184,10 +250,36 @@ def test_official_source_descriptor_binds_tracked_worker_and_vendor_sources():
     assert descriptor["catvtonSourceRevision"] == "3b795364a4d2f3b5adb365f39cdea376d20bc53c"
     paths = {source["path"] for source in descriptor["sources"]}
     assert "vision/ai_attempt_worker.py" in paths
+    assert "vision/ai_attempt_process.py" in paths
+    assert "vision/process_supervisor.py" in paths
+    assert "vision/ai_runtime_descriptor.py" in paths
     assert "vision/catvton_preprocess.py" in paths
     assert "vision/catvton_pose_masks.py" in paths
     assert "vision/vendor/catvton/model/pipeline.py" in paths
+    assert canonical_source_descriptor_json(build_official_source_descriptor()) == OFFICIAL_SOURCE_DESCRIPTOR_PATH.read_text("utf-8").rstrip("\n")
     assert verify_official_source_provenance() is True
+
+
+def test_official_source_provenance_verifies_real_frozen_like_layout_and_detects_tamper(tmp_path):
+    descriptor = json.loads(OFFICIAL_SOURCE_DESCRIPTOR_PATH.read_text("utf-8"))
+    for source in descriptor["sources"]:
+        src = Path(__file__).parents[1] / source["path"]
+        dst = tmp_path / source["path"]
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(src.read_bytes())
+    (tmp_path / "official-ai-source-descriptor.json").write_text(
+        OFFICIAL_SOURCE_DESCRIPTOR_PATH.read_text("utf-8"),
+        "utf-8",
+    )
+
+    assert verify_official_source_provenance_at_root(tmp_path) is True
+
+    tampered = tmp_path / "vision" / "process_supervisor.py"
+    tampered.write_text(tampered.read_text("utf-8") + "\n# tamper\n", "utf-8")
+    assert verify_official_source_provenance_at_root(tmp_path) is False
+    tampered.write_bytes((Path(__file__).parents[1] / "vision" / "process_supervisor.py").read_bytes())
+    (tmp_path / "vision" / "ai_attempt_worker.py").unlink()
+    assert verify_official_source_provenance_at_root(tmp_path) is False
 
 
 @pytest.mark.parametrize("options", [{"extra": True}, {"corrupt": True}])

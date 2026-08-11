@@ -20,6 +20,7 @@ from vision.ai_model_pack import (
     OFFICIAL_CATVTON_SOURCE_REVISION,
     verify_ai_model_pack,
 )
+from vision.ai_runtime_descriptor import expected_dependency_versions
 from vision.source_provenance import verify_official_source_provenance
 
 _MAX_INPUT_BYTES = 20 * 1024 * 1024
@@ -88,7 +89,7 @@ def _garment_condition(garment_path: Path):
     return rgb, rgba
 
 
-def _probe_official_worker(pack_root: Path) -> dict[str, object]:
+def _probe_runtime_worker() -> dict[str, object]:
     import importlib.metadata
 
     import accelerate  # noqa: F401
@@ -96,8 +97,10 @@ def _probe_official_worker(pack_root: Path) -> dict[str, object]:
     import diffusers  # noqa: F401
     import numpy  # noqa: F401
     import safetensors  # noqa: F401
+    import scipy  # noqa: F401
     import torch  # noqa: F401
     import torchvision  # noqa: F401
+    import tqdm  # noqa: F401
     import transformers  # noqa: F401
     from PIL import Image  # noqa: F401
 
@@ -110,19 +113,28 @@ def _probe_official_worker(pack_root: Path) -> dict[str, object]:
     if not verify_official_source_provenance():
         raise CatVTONWorkerError("official_catvton_source_provenance_mismatch")
 
+    payload: dict[str, object] = {
+        "probe": "official-catvton-worker-runtime",
+        "catvtonSourceRevision": OFFICIAL_CATVTON_SOURCE_REVISION,
+    }
+    for name, expected in expected_dependency_versions().items():
+        actual = importlib.metadata.version(name)
+        if actual != expected:
+            raise CatVTONWorkerError(f"official_catvton_dependency_version:{name}")
+        payload[name] = actual
+    return payload
+
+
+def _probe_official_worker(pack_root: Path) -> dict[str, object]:
+    payload = _probe_runtime_worker()
     for relative in (
         "inpainting/scheduler/scheduler_config.json",
         "inpainting/unet/config.json",
         "vae/config.json",
     ):
         json.loads(_pack_path(pack_root, relative).read_text("utf-8"))
-    return {
-        "probe": "official-catvton-worker",
-        "torch": importlib.metadata.version("torch"),
-        "torchvision": importlib.metadata.version("torchvision"),
-        "diffusers": importlib.metadata.version("diffusers"),
-        "transformers": importlib.metadata.version("transformers"),
-    }
+    payload["probe"] = "official-catvton-worker"
+    return payload
 
 
 def _run_catvton_attempt(args: argparse.Namespace, pack_root: Path) -> dict[str, object]:
@@ -268,7 +280,8 @@ def _run_catvton_attempt(args: argparse.Namespace, pack_root: Path) -> dict[str,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-pack", required=True)
+    parser.add_argument("--model-pack")
+    parser.add_argument("--probe-runtime", action="store_true")
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--person")
     parser.add_argument("--garment")
@@ -280,6 +293,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
     _deny_downloads()
+    if args.probe_runtime:
+        try:
+            print(json.dumps(_probe_runtime_worker(), ensure_ascii=False, sort_keys=True))
+            return 0
+        except ModuleNotFoundError as exc:
+            print(f"official_catvton_dependency_missing:{exc.name}", file=sys.stderr)
+            return 2
+        except CatVTONWorkerError as exc:
+            print(exc.code, file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"official_catvton_runtime_probe_failed:{type(exc).__name__}", file=sys.stderr)
+            return 2
+    if not args.model_pack:
+        raise RuntimeError("official_catvton_model_pack_required")
     pack_root = Path(args.model_pack)
     try:
         verify_ai_model_pack(pack_root)

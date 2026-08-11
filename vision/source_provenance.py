@@ -9,6 +9,30 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 OFFICIAL_SOURCE_DESCRIPTOR_PATH = REPO_ROOT / "official-ai-source-descriptor.json"
 SOURCE_DESCRIPTOR_SCHEMA_VERSION = "vem-official-ai-source-descriptor/v1"
 OFFICIAL_CATVTON_SOURCE_REVISION = "3b795364a4d2f3b5adb365f39cdea376d20bc53c"
+OFFICIAL_SOURCE_PATHS = (
+    "run_ai_attempt_worker.py",
+    "vision/ai_attempt_process.py",
+    "vision/ai_attempt_worker.py",
+    "vision/ai_model_pack.py",
+    "vision/ai_runtime_descriptor.py",
+    "vision/catvton_pose_masks.py",
+    "vision/catvton_preprocess.py",
+    "vision/process_supervisor.py",
+    "vision/source_provenance.py",
+    "vision/vendor/catvton/LICENSE",
+    "vision/vendor/catvton/PROVENANCE.md",
+    "vision/vendor/catvton/__init__.py",
+    "vision/vendor/catvton/model/SCHP/__init__.py",
+    "vision/vendor/catvton/model/SCHP/networks/AugmentCE2P.py",
+    "vision/vendor/catvton/model/SCHP/networks/__init__.py",
+    "vision/vendor/catvton/model/SCHP/utils/__init__.py",
+    "vision/vendor/catvton/model/SCHP/utils/transforms.py",
+    "vision/vendor/catvton/model/__init__.py",
+    "vision/vendor/catvton/model/attn_processor.py",
+    "vision/vendor/catvton/model/pipeline.py",
+    "vision/vendor/catvton/model/utils.py",
+    "vision/vendor/catvton/utils.py",
+)
 
 
 class SourceProvenanceError(RuntimeError):
@@ -27,9 +51,24 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_official_source_descriptor() -> dict:
+def build_official_source_descriptor() -> dict:
+    sources = []
+    for relative in sorted(OFFICIAL_SOURCE_PATHS):
+        path = (REPO_ROOT / relative).resolve()
+        if REPO_ROOT not in path.parents or not path.is_file():
+            raise SourceProvenanceError("official_source_descriptor_source")
+        sources.append({"path": relative, "sha256": _sha256(path)})
+    return {
+        "catvtonSourceRevision": OFFICIAL_CATVTON_SOURCE_REVISION,
+        "schemaVersion": SOURCE_DESCRIPTOR_SCHEMA_VERSION,
+        "sources": sources,
+    }
+
+
+def load_official_source_descriptor(root: Path | None = None) -> dict:
+    descriptor_path = (root / "official-ai-source-descriptor.json") if root is not None else OFFICIAL_SOURCE_DESCRIPTOR_PATH
     try:
-        raw = OFFICIAL_SOURCE_DESCRIPTOR_PATH.read_text("utf-8")
+        raw = descriptor_path.read_text("utf-8")
         descriptor = json.loads(raw)
     except (OSError, ValueError) as exc:
         raise SourceProvenanceError("official_source_descriptor_missing_or_invalid") from exc
@@ -63,16 +102,21 @@ def load_official_source_descriptor() -> dict:
     return descriptor
 
 
-def verify_official_source_provenance() -> bool:
+def verify_official_source_provenance_at_root(root: str | Path) -> bool:
+    root_path = Path(root).resolve()
     try:
-        descriptor = load_official_source_descriptor()
+        descriptor = load_official_source_descriptor(root_path)
         for source in descriptor["sources"]:
-            path = (REPO_ROOT / source["path"]).resolve()
-            if REPO_ROOT not in path.parents or not path.is_file() or _sha256(path) != source["sha256"]:
+            path = (root_path / source["path"]).resolve()
+            if root_path not in path.parents or not path.is_file() or _sha256(path) != source["sha256"]:
                 return False
         return True
     except SourceProvenanceError:
         return False
+
+
+def verify_official_source_provenance() -> bool:
+    return verify_official_source_provenance_at_root(REPO_ROOT)
 
 
 def official_source_digest() -> str:
