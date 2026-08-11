@@ -61,7 +61,7 @@ jobs:
         run: |
           $artifact = Join-Path $PWD "candidate-input/${{ needs.trusted_builder.outputs.artifact_file }}"
           $bundle = Join-Path $PWD "candidate-input/${{ needs.trusted_builder.outputs.attestation_bundle_file }}"
-          gh attestation verify $artifact --bundle $bundle --repo "hbhjt/vending-vision" --signer-repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "fbb97d16f42b2c20a04831750c639fda6db1a3e9" --source-ref "${{ github.ref }}" --source-digest "${{ github.sha }}" --deny-self-hosted-runners
+          gh attestation verify $artifact --bundle $bundle --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "fbb97d16f42b2c20a04831750c639fda6db1a3e9" --source-ref "${{ github.ref }}" --source-digest "${{ github.sha }}" --deny-self-hosted-runners
           if ($LASTEXITCODE -ne 0) { throw "trusted builder attestation verification failed" }
       - uses: actions/setup-python@v5
         with:
@@ -83,89 +83,41 @@ jobs:
           & $VerifyPython trusted-verifier/scripts/verify_packaged_exe.py --require-ai-worker --candidate-artifact $artifact --trusted-subject-sha256 "${{ needs.trusted_builder.outputs.subject_sha256 }}" --expected-embedded-manifest-sha256 "${{ needs.trusted_builder.outputs.manifest_sha256 }}" --expected-source-commit "${{ github.sha }}" --extract-root (Join-Path $PWD "verified-candidate")
           if ($LASTEXITCODE -ne 0) { throw "fresh candidate verification failed" }
 
-  publish:
+  trusted_signer:
     needs: verify
+    permissions:
+      contents: read
+      attestations: read
+    uses: hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-signer.yml@14e97b96b57acf3e3f23442e0d80904a55565a59
+    with:
+      source_commit: ${{ github.sha }}
+      source_ref: ${{ github.ref }}
+      artifact_name: ${{ needs.verify.outputs.artifact_name }}
+      artifact_file: ${{ needs.verify.outputs.artifact_file }}
+      subject_sha256: ${{ needs.verify.outputs.subject_sha256 }}
+      manifest_sha256: ${{ needs.verify.outputs.manifest_sha256 }}
+      attestation_bundle_file: ${{ needs.verify.outputs.attestation_bundle_file }}
+      attestation_bundle_sha256: ${{ needs.verify.outputs.attestation_bundle_sha256 }}
+      builder_evidence_file: ${{ needs.verify.outputs.builder_evidence_file }}
+
+  publish:
+    needs: [verify, trusted_signer]
     runs-on: windows-latest
-    environment: experimental-candidate
     permissions:
       contents: write
-      attestations: read
     steps:
-      - name: Checkout immutable evidence implementation
-        uses: actions/checkout@v4
-        with:
-          repository: hbhjt/vending-vision
-          ref: fbb97d16f42b2c20a04831750c639fda6db1a3e9
-          path: trusted-evidence
-          persist-credentials: false
-      - name: Checkout exact release source
-        uses: actions/checkout@v4
-        with:
-          repository: hbhjt/vending-vision
-          ref: ${{ github.sha }}
-          path: source
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - name: Download attested candidate artifact
+        uses: actions/download-artifact@v4
         with:
           name: ${{ needs.verify.outputs.artifact_name }}
-          path: candidate-input
-      - name: Re-verify provenance before supplier signing
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $artifact = Join-Path $PWD "candidate-input/${{ needs.verify.outputs.artifact_file }}"
-          $bundle = Join-Path $PWD "candidate-input/${{ needs.verify.outputs.attestation_bundle_file }}"
-          gh attestation verify $artifact --bundle $bundle --repo "hbhjt/vending-vision" --signer-repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "fbb97d16f42b2c20a04831750c639fda6db1a3e9" --source-ref "${{ github.ref }}" --source-digest "${{ github.sha }}" --deny-self-hosted-runners
-          if ($LASTEXITCODE -ne 0) { throw "supplier signing provenance verification failed" }
-      - uses: actions/setup-python@v5
+          path: release
+      - name: Download supplier-signed evidence
+        uses: actions/download-artifact@v4
         with:
-          python-version-file: source/.python-version
-      - name: Generate installed evidence without supplier secrets
-        shell: pwsh
-        env:
-          CORE_WHEELHOUSE_URL: ${{ vars.CORE_WHEELHOUSE_URL }}
-          CORE_WHEELHOUSE_SHA256: ${{ vars.CORE_WHEELHOUSE_SHA256 }}
-          CORE_WHEELHOUSE_BYTES: ${{ vars.CORE_WHEELHOUSE_BYTES }}
-          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}
-        run: |
-          if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "supplier signer identity is invalid" }
-          python trusted-evidence/scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --expected-bytes $env:CORE_WHEELHOUSE_BYTES --destination evidence-wheelhouse
-          if ($LASTEXITCODE -ne 0) { throw "evidence wheelhouse materialization failed" }
-          python -m venv .venv-candidate-evidence
-          $EvidencePython = Join-Path $PWD ".venv-candidate-evidence\Scripts\python.exe"
-          & $EvidencePython -m pip install --disable-pip-version-check --no-index --find-links evidence-wheelhouse --require-hashes -r source/requirements.txt
-          if ($LASTEXITCODE -ne 0) { throw "evidence dependency install failed" }
-          $artifact = Join-Path $PWD "candidate-input/${{ needs.verify.outputs.artifact_file }}"
-          & $EvidencePython trusted-evidence/scripts/verify_packaged_exe.py --require-ai-worker --candidate-artifact $artifact --trusted-subject-sha256 "${{ needs.verify.outputs.subject_sha256 }}" --expected-embedded-manifest-sha256 "${{ needs.verify.outputs.manifest_sha256 }}" --expected-source-commit "${{ github.sha }}" --extract-root (Join-Path $PWD "verified-for-evidence")
-          if ($LASTEXITCODE -ne 0) { throw "supplier candidate verification failed" }
-          $version = "${{ github.ref_name }}" -replace '^v',''
-          New-Item -ItemType Directory -Force release | Out-Null
-          & $EvidencePython source/scripts/generate_candidate_evidence.py --bundle $artifact --candidate-manifest candidate-input/candidate-manifest.json --github-attestation "candidate-input/${{ needs.verify.outputs.attestation_bundle_file }}" --trusted-builder-evidence "candidate-input/${{ needs.verify.outputs.builder_evidence_file }}" --version $version --commit "${{ github.sha }}" --repository "hbhjt/vending-vision" --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY --requirements-lock source/requirements.txt --wheelhouse evidence-wheelhouse --python $EvidencePython --ai-requirements-lock source/requirements-ai.lock.json --ai-runtime-descriptor source/ai-runtime-descriptor.json --source-descriptor source/official-ai-source-descriptor.json --model-pack-descriptor source/official-ai-model-pack-descriptor.json --worker-executable verified-for-evidence/vending-vision-ai-worker/vending-vision-ai-worker.exe --output release
-          if ($LASTEXITCODE -ne 0) { throw "installed evidence generation failed" }
-          Copy-Item -LiteralPath $artifact -Destination release/
-          Copy-Item -LiteralPath candidate-input/candidate-manifest.json -Destination release/
-          Copy-Item -LiteralPath "candidate-input/${{ needs.verify.outputs.attestation_bundle_file }}" -Destination release/
-          Copy-Item -LiteralPath "candidate-input/${{ needs.verify.outputs.builder_evidence_file }}" -Destination release/
-      - name: Sign installed evidence with only the immutable signer implementation
-        shell: pwsh
-        env:
-          VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}
-          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:VISION_SUPPLIER_PRIVATE_KEY_PEM)) { throw "supplier private key is required" }
-          if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "supplier signer identity is invalid" }
-          $EvidencePython = Join-Path $PWD ".venv-candidate-evidence\Scripts\python.exe"
-          $key = Join-Path $env:RUNNER_TEMP "supplier-ed25519.pem"
-          try {
-            [IO.File]::WriteAllText($key, $env:VISION_SUPPLIER_PRIVATE_KEY_PEM)
-            & $EvidencePython trusted-evidence/scripts/sign_candidate_evidence.py --candidate-dir release --private-key $key --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY
-            if ($LASTEXITCODE -ne 0) { throw "installed evidence signing failed" }
-          } finally {
-            Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue
-          }
-      - name: Publish immutable prerelease
+          name: ${{ needs.trusted_signer.outputs.signed_evidence_artifact_name }}
+          path: release
+      - name: Publish immutable prerelease only after trusted signing
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" release/* --prerelease --verify-tag --title "Vending Vision ${{ github.ref_name }}" --notes "Built and attested by immutable trusted builder fbb97d16f42b2c20a04831750c639fda6db1a3e9, independently verified, then supplier-signed in the protected environment."
+        run: gh release create "${{ github.ref_name }}" release/* --prerelease --verify-tag --title "Vending Vision ${{ github.ref_name }}" --notes "Built and attested by immutable trusted builder fbb97d16f42b2c20a04831750c639fda6db1a3e9, independently verified, source-approved and supplier-signed by immutable trusted signer 14e97b96b57acf3e3f23442e0d80904a55565a59."

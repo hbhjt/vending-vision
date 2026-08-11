@@ -380,6 +380,7 @@ def test_packaged_verifier_rejects_worker_that_does_not_emit_runtime_probe_json(
 def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     build = (ROOT / "scripts" / "build_exe.ps1").read_text("utf-8")
     builder = (ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder.yml").read_text("utf-8")
+    signer = (ROOT / ".github" / "workflows" / "trusted-ai-candidate-signer.yml").read_text("utf-8")
     publisher = (ROOT / ".github" / "workflows" / "publish-candidate.yml").read_text("utf-8")
 
     assert "AiWheelhouseDescriptor" in build
@@ -433,6 +434,7 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "secrets:" not in builder
 
     assert "trusted-ai-candidate-builder.yml@fbb97d16f42b2c20a04831750c639fda6db1a3e9" in publisher
+    assert "trusted-ai-candidate-signer.yml@14e97b96b57acf3e3f23442e0d80904a55565a59" in publisher
     assert "scripts/build_exe.ps1" not in publisher
     assert "actions/attest-build-provenance" not in publisher
     assert "needs: trusted_builder" in publisher
@@ -440,7 +442,7 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert publisher.count("runs-on: windows-latest") == 2
     assert "actions/download-artifact@v4" in publisher
     assert "gh attestation verify" in publisher
-    assert "--signer-repo \"hbhjt/vending-vision\"" in publisher
+    assert "--signer-repo" not in publisher
     assert "--signer-workflow \"hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml\"" in publisher
     assert "--signer-digest \"fbb97d16f42b2c20a04831750c639fda6db1a3e9\"" in publisher
     assert "--source-ref" in publisher
@@ -451,8 +453,10 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "--expected-source-commit" in publisher
     assert "--extract-root" in publisher
     assert "--require-ai-worker" in publisher
-    assert "environment: experimental-candidate" in publisher
-    assert "--trusted-builder-evidence" in publisher
+    assert "environment: experimental-candidate" in signer
+    assert "--trusted-builder-evidence" in signer
+    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" in signer
+    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in publisher
     assert "--expected-candidate-manifest-sha256" not in publisher
 
 

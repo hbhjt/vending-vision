@@ -4,16 +4,38 @@ import argparse
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 
 
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 TRUSTED_BUILDER_COMMIT = "fbb97d16f42b2c20a04831750c639fda6db1a3e9"
 TRUSTED_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-ALLOWED_INPUTS = {
+TRUSTED_SIGNER_COMMIT = "14e97b96b57acf3e3f23442e0d80904a55565a59"
+TRUSTED_SIGNER_PATH = ".github/workflows/trusted-ai-candidate-signer.yml"
+BUILDER_INPUTS = {
     "source_commit",
     "core_wheelhouse_url",
     "core_wheelhouse_sha256",
     "core_wheelhouse_bytes",
+}
+SIGNER_INPUTS = {
+    "source_commit",
+    "source_ref",
+    "artifact_name",
+    "artifact_file",
+    "subject_sha256",
+    "manifest_sha256",
+    "attestation_bundle_file",
+    "attestation_bundle_sha256",
+    "builder_evidence_file",
+}
+TRUSTED_SIGNER_FILES = {
+    TRUSTED_SIGNER_PATH,
+    "scripts/approve_candidate_source.py",
+    "scripts/candidate_artifact_manifest.py",
+    "scripts/generate_trusted_candidate_evidence.py",
+    "scripts/sign_candidate_evidence.py",
+    "scripts/verify_trusted_candidate_inputs.py",
 }
 
 
@@ -40,33 +62,119 @@ def _job_block(source: str, job: str) -> str:
     return match.group(0)
 
 
-def _assert_builder_is_commit_a(builder: Path, repository_root: Path) -> None:
+def _assert_files_are_immutable(
+    *, commit: str, paths: dict[str, Path], repository_root: Path, label: str
+) -> None:
     ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", TRUSTED_BUILDER_COMMIT, "HEAD"],
+        ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
         cwd=repository_root,
         capture_output=True,
         check=False,
     )
-    _require(ancestor.returncode == 0, "trusted_builder_commit_not_in_history")
-    committed = subprocess.run(
-        ["git", "show", f"{TRUSTED_BUILDER_COMMIT}:{TRUSTED_BUILDER_PATH}"],
-        cwd=repository_root,
-        capture_output=True,
-        check=False,
-    )
-    _require(committed.returncode == 0, "trusted_builder_commit_file_missing")
-    _require(builder.read_bytes() == committed.stdout, "trusted_builder_bytes_changed_after_commit_a")
+    _require(ancestor.returncode == 0, f"{label}_commit_not_in_history")
+    for relative, path in paths.items():
+        committed = subprocess.run(
+            ["git", "show", f"{commit}:{relative}"],
+            cwd=repository_root,
+            capture_output=True,
+            check=False,
+        )
+        _require(committed.returncode == 0, f"{label}_commit_file_missing:{relative}")
+        _require(path.read_bytes() == committed.stdout, f"{label}_bytes_changed:{relative}")
+
+
+def _assert_gh_attestation_flags_parse(repository_root: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="trusted-gh-policy-") as temporary:
+        missing = Path(temporary) / "missing-candidate.zip"
+        completed = subprocess.run(
+            [
+                "gh", "attestation", "verify", str(missing),
+                "--bundle", str(Path(temporary) / "missing-bundle.json"),
+                "--repo", TRUSTED_REPOSITORY,
+                "--signer-workflow", f"{TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}",
+                "--signer-digest", TRUSTED_BUILDER_COMMIT,
+                "--source-ref", "refs/tags/v0.0.0-rc.0",
+                "--source-digest", "0" * 40,
+                "--deny-self-hosted-runners",
+            ],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    output = (completed.stdout + completed.stderr).lower()
+    _require(completed.returncode != 0, "gh_missing_fixture_unexpectedly_verified")
+    _require("failed to open local artifact" in output or "no such file" in output, "gh_policy_parse_failure_reason")
+    _require("mutually exclusive" not in output and "cannot be used together" not in output, "gh_policy_mutually_exclusive_flags")
 
 
 def check_trusted_candidate_workflows(
-    *, builder: Path, publisher: Path, repository_root: Path
+    *, builder: Path, signer: Path, publisher: Path, repository_root: Path
 ) -> None:
     builder_source = builder.read_text("utf-8")
+    signer_source = signer.read_text("utf-8")
     publisher_source = publisher.read_text("utf-8")
-    _assert_builder_is_commit_a(builder, repository_root)
-    _require(_workflow_call_inputs(builder_source) == ALLOWED_INPUTS, "trusted_builder_input_allowlist")
+    _assert_files_are_immutable(
+        commit=TRUSTED_BUILDER_COMMIT,
+        paths={TRUSTED_BUILDER_PATH: builder},
+        repository_root=repository_root,
+        label="trusted_builder",
+    )
+    _assert_files_are_immutable(
+        commit=TRUSTED_SIGNER_COMMIT,
+        paths={
+            relative: signer if relative == TRUSTED_SIGNER_PATH else repository_root / relative
+            for relative in TRUSTED_SIGNER_FILES
+        },
+        repository_root=repository_root,
+        label="trusted_signer",
+    )
+    _require(_workflow_call_inputs(builder_source) == BUILDER_INPUTS, "trusted_builder_input_allowlist")
     for forbidden in ("secrets:", "artifact_path", "worker_path", "predicate", "custom_command"):
         _require(forbidden not in builder_source, f"trusted_builder_forbidden_input:{forbidden}")
+
+    _require(_workflow_call_inputs(signer_source) == SIGNER_INPUTS, "trusted_signer_input_allowlist")
+    for forbidden in (
+        "source_path", "artifact_path", "custom_command", "predicate", "private_key",
+    ):
+        _require(forbidden not in signer_source, f"trusted_signer_forbidden_input:{forbidden}")
+    signer_job = _job_block(signer_source, "sign")
+    for fragment in (
+        "runs-on: windows-latest",
+        "environment: experimental-candidate",
+        "repository: ${{ job.workflow_repository }}",
+        "ref: ${{ job.workflow_sha }}",
+        "path: trusted-signer",
+        "actions/download-artifact@v4",
+        "gh attestation verify",
+        f'--repo "{TRUSTED_REPOSITORY}"',
+        f'--signer-workflow "{TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}"',
+        f'--signer-digest "{TRUSTED_BUILDER_COMMIT}"',
+        '--source-ref "${{ inputs.source_ref }}"',
+        '--source-digest "${{ inputs.source_commit }}"',
+        "--deny-self-hosted-runners",
+        "https://github.com/hbhjt/vending-vision.git",
+        "+refs/heads/main:refs/remotes/origin/main",
+        "trusted-signer/scripts/approve_candidate_source.py",
+        "--protected-main refs/remotes/origin/main",
+        "trusted-signer/scripts/verify_trusted_candidate_inputs.py",
+        "trusted-signer/scripts/generate_trusted_candidate_evidence.py",
+        "trusted-signer/scripts/sign_candidate_evidence.py",
+        "VISION_SUPPLIER_PRIVATE_KEY_PEM",
+    ):
+        _require(fragment in signer_job, f"trusted_signer_policy:{fragment}")
+    _require("--signer-repo" not in signer_job, "trusted_signer_mutually_exclusive_repo_flags")
+    _require(signer_job.count("actions/checkout@v4") == 1, "trusted_signer_checkout_count")
+    for forbidden in ("path: source", "actions/setup-python", "source/scripts", ".spec", ".exe"):
+        _require(forbidden not in signer_job, f"trusted_signer_candidate_execution:{forbidden}")
+    python_commands = re.findall(r"(?m)^\s+(python\s+[^\r\n]+)$", signer_job)
+    _require(bool(python_commands), "trusted_signer_python_commands_missing")
+    _require(all("python trusted-signer/scripts/" in command for command in python_commands), "trusted_signer_executes_untrusted_python")
+    secret_step = re.search(r"(?ms)^      - name: Sign evidence.*?(?=^      - name:)", signer_job)
+    _require(secret_step is not None, "trusted_signer_secret_step_missing")
+    assert secret_step is not None
+    _require("trusted-signer/scripts/sign_candidate_evidence.py" in secret_step.group(0), "trusted_signer_secret_script")
+    _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in signer_job[: secret_step.start()], "trusted_signer_secret_exposed_early")
 
     trusted_call = (
         f"uses: {TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}@{TRUSTED_BUILDER_COMMIT}"
@@ -79,7 +187,7 @@ def check_trusted_candidate_workflows(
     _require(with_match is not None, "publisher_builder_inputs_missing")
     assert with_match is not None
     caller_inputs = set(re.findall(r"(?m)^      ([a-z][a-z0-9_]*):", with_match.group("body")))
-    _require(caller_inputs == ALLOWED_INPUTS, "publisher_builder_input_allowlist")
+    _require(caller_inputs == BUILDER_INPUTS, "publisher_builder_input_allowlist")
 
     for forbidden in (
         "actions/attest-build-provenance",
@@ -95,7 +203,6 @@ def check_trusted_candidate_workflows(
         "actions/download-artifact@v4",
         "gh attestation verify",
         f'--repo "{TRUSTED_REPOSITORY}"',
-        f'--signer-repo "{TRUSTED_REPOSITORY}"',
         f'--signer-workflow "{TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}"',
         f'--signer-digest "{TRUSTED_BUILDER_COMMIT}"',
         '--source-digest "${{ github.sha }}"',
@@ -105,35 +212,47 @@ def check_trusted_candidate_workflows(
     )
     for fragment in required_verifier_fragments:
         _require(fragment in verify, f"publisher_verify_policy:{fragment}")
+    _require("--signer-repo" not in verify, "publisher_verify_mutually_exclusive_repo_flags")
     _require(verify.index("gh attestation verify") < verify.index("--require-ai-worker"), "publisher_attestation_before_probe")
 
+    trusted_signer_call = (
+        f"uses: {TRUSTED_REPOSITORY}/{TRUSTED_SIGNER_PATH}@{TRUSTED_SIGNER_COMMIT}"
+    )
+    _require(publisher_source.count(trusted_signer_call) == 1, "publisher_literal_signer_pin")
+    signer_call = _job_block(publisher_source, "trusted_signer")
+    _require("needs: verify" in signer_call, "publisher_signer_requires_verify")
+    _require(trusted_signer_call in signer_call, "publisher_signer_job_pin")
+    _require("${{" not in next(line for line in signer_call.splitlines() if "uses:" in line), "publisher_mutable_signer_pin")
+    signer_with = re.search(r"(?ms)^    with:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:|\Z)", signer_call)
+    _require(signer_with is not None, "publisher_signer_inputs_missing")
+    assert signer_with is not None
+    signer_caller_inputs = set(re.findall(r"(?m)^      ([a-z][a-z0-9_]*):", signer_with.group("body")))
+    _require(signer_caller_inputs == SIGNER_INPUTS, "publisher_signer_input_allowlist")
+
     publish = _job_block(publisher_source, "publish")
-    _require("needs: verify" in publish, "publisher_requires_fresh_verify")
-    _require("environment: experimental-candidate" in publish, "publisher_secret_environment")
-    _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" in publish, "publisher_supplier_key_missing")
-    _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in publisher_source[: publisher_source.index("  publish:\n")], "supplier_key_before_publish")
-    secret_step_match = re.search(
-        r"(?ms)^      - name: Sign installed evidence.*?(?=^      - name:)", publish
-    )
-    _require(secret_step_match is not None, "supplier_signing_step_missing")
-    assert secret_step_match is not None
-    secret_step = secret_step_match.group(0)
-    _require(
-        "trusted-evidence/scripts/sign_candidate_evidence.py" in secret_step,
-        "supplier_signer_not_from_commit_a",
-    )
-    _require("source/scripts" not in secret_step, "supplier_key_exposed_to_source_script")
+    _require("needs: [verify, trusted_signer]" in publish, "publisher_requires_trusted_signer")
+    _require(publish.count("actions/download-artifact@v4") == 2, "publisher_downloads_candidate_and_evidence")
+    _require("gh release create" in publish, "publisher_release_step_missing")
+    for forbidden in (
+        "VISION_SUPPLIER_PRIVATE_KEY_PEM", "actions/checkout", "python ",
+        "generate_candidate_evidence.py", "sign_candidate_evidence.py", "environment:",
+    ):
+        _require(forbidden not in publish, f"publisher_forbidden_capability:{forbidden}")
+    _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in publisher_source, "publisher_supplier_key_present")
+    _assert_gh_attestation_flags_parse(repository_root)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--builder", required=True, type=Path)
+    parser.add_argument("--signer", required=True, type=Path)
     parser.add_argument("--publisher", required=True, type=Path)
     parser.add_argument("--repository-root", required=True, type=Path)
     args = parser.parse_args()
     try:
         check_trusted_candidate_workflows(
             builder=args.builder.resolve(),
+            signer=args.signer.resolve(),
             publisher=args.publisher.resolve(),
             repository_root=args.repository_root.resolve(),
         )
