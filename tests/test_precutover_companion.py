@@ -580,10 +580,10 @@ def test_final_proof_link_failure_cleans_prepared_and_private_state(tmp_path, mo
     fixture = build_fixture(tmp_path)
     output = tmp_path / "proof.json"
 
-    def fail_link(_source, _destination):
+    def fail_link(_api, _source_descriptor, _parent_descriptor, _name):
         raise OSError("injected proof link failure")
 
-    monkeypatch.setattr(companion.os, "link", fail_link)
+    monkeypatch.setattr(companion._PosixLinkApi, "link_fd", fail_link)
 
     with pytest.raises(OSError, match="injected proof link failure"):
         invoke_fixture(fixture, tmp_path, output)
@@ -625,12 +625,12 @@ def test_failure_after_final_link_rolls_back_only_this_invocation(tmp_path, monk
     original_fsync_parent = companion._fsync_parent
     calls = 0
 
-    def fail_first_fsync(path):
+    def fail_first_fsync(path, *, descriptor=None):
         nonlocal calls
         calls += 1
         if calls == 1:
             raise OSError("injected parent fsync failure")
-        return original_fsync_parent(path)
+        return original_fsync_parent(path, descriptor=descriptor)
 
     monkeypatch.setattr(companion, "_fsync_parent", fail_first_fsync)
 
@@ -679,15 +679,16 @@ def test_prepared_proof_is_fenced_while_inputs_close_and_private_state_cleans(
 def test_prepared_proof_link_rejects_an_instant_source_identity_swap(tmp_path, monkeypatch):
     fixture = build_fixture(tmp_path)
     output = tmp_path / "proof.json"
-    original_link = companion.os.link
+    original_link = companion._PosixLinkApi.link_fd
 
-    def swap_source_after_link(source, destination):
-        original_link(source, destination)
-        replacement = Path(source).with_name(f".{Path(source).name}.replacement")
+    def swap_source_after_link(api, source_descriptor, parent_descriptor, name):
+        original_link(api, source_descriptor, parent_descriptor, name)
+        source = Path(os.readlink(f"/proc/self/fd/{source_descriptor}"))
+        replacement = source.with_name(f".{source.name}.replacement")
         replacement.write_bytes(b"swapped after link\n")
         os.replace(replacement, source)
 
-    monkeypatch.setattr(companion.os, "link", swap_source_after_link)
+    monkeypatch.setattr(companion._PosixLinkApi, "link_fd", swap_source_after_link)
 
     with pytest.raises(RuntimeError, match="precutover_integrity"):
         invoke_fixture(fixture, tmp_path, output)
@@ -756,3 +757,62 @@ def test_windows_prepared_closehandle_false_rolls_back_the_linked_final(tmp_path
 
     assert not final.exists()
     assert not temporary.exists()
+
+
+def test_posix_prepared_temp_replace_after_verify_before_link_leaves_no_final(
+    tmp_path, monkeypatch
+):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+    original_verify = companion._PreparedProof.verify
+    verify_calls = 0
+
+    def replace_after_publish_verify(prepared):
+        nonlocal verify_calls
+        original_verify(prepared)
+        verify_calls += 1
+        if verify_calls == 2:
+            replacement = prepared.path.with_name(f".{prepared.path.name}.replacement")
+            replacement.write_bytes(b"replaced after verify before link\n")
+            os.replace(replacement, prepared.path)
+
+    monkeypatch.setattr(companion._PreparedProof, "verify", replace_after_publish_verify)
+
+    with pytest.raises(RuntimeError, match="precutover_integrity"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert verify_calls >= 2
+    assert not output.exists()
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))
+
+
+def test_posix_linkat_uses_held_source_fd_parent_dirfd_and_empty_path_flag(tmp_path):
+    class FakeLibc:
+        def __init__(self):
+            self.calls = []
+
+        def linkat(self, *arguments):
+            self.calls.append(arguments)
+            return 0
+
+    libc = FakeLibc()
+    api = companion._PosixLinkApi(libc)
+    source = tmp_path / "prepared.tmp"
+    source.write_bytes(b"proof")
+    source_descriptor = os.open(source, os.O_RDONLY)
+    parent_descriptor = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        api.link_fd(source_descriptor, parent_descriptor, "proof.json")
+        assert libc.calls == [
+            (
+                source_descriptor,
+                b"",
+                parent_descriptor,
+                b"proof.json",
+                companion._PosixLinkApi.AT_EMPTY_PATH,
+            )
+        ]
+    finally:
+        os.close(parent_descriptor)
+        os.close(source_descriptor)

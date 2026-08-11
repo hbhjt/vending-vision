@@ -6,6 +6,7 @@ import asyncio
 from contextlib import ExitStack
 import ctypes
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -261,6 +262,85 @@ class _PosixChangeMonitor:
         if self._descriptor >= 0:
             os.close(self._descriptor)
             self._descriptor = -1
+
+
+class _PosixLinkApi:
+    AT_FDCWD = -100
+    AT_SYMLINK_FOLLOW = 0x400
+    AT_EMPTY_PATH = 0x1000
+
+    def __init__(self, libc=None):
+        if not sys.platform.startswith("linux"):
+            raise RuntimeError("precutover_integrity_linkat_unsupported")
+        if libc is None:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.linkat.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+            ]
+            libc.linkat.restype = ctypes.c_int
+        self._libc = libc
+
+    @staticmethod
+    def parent_identity(value: os.stat_result) -> tuple[int, ...]:
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid)
+
+    def open_parent(self, path: Path) -> tuple[int, tuple[int, ...]]:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        current = path.stat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or self.parent_identity(opened) != self.parent_identity(current)
+        ):
+            os.close(descriptor)
+            raise RuntimeError("precutover_integrity_parent_identity")
+        return descriptor, self.parent_identity(opened)
+
+    def link_fd(self, source_descriptor: int, parent_descriptor: int, name: str) -> None:
+        if not name or name in {".", ".."} or "/" in name or "\\" in name or "\x00" in name:
+            raise RuntimeError("precutover_integrity_final_name")
+        source = os.fstat(source_descriptor)
+        if not stat.S_ISREG(source.st_mode) or source.st_nlink != 1:
+            raise RuntimeError("precutover_integrity_linkat_source")
+        encoded_name = os.fsencode(name)
+        if self._libc.linkat(
+            source_descriptor,
+            b"",
+            parent_descriptor,
+            encoded_name,
+            self.AT_EMPTY_PATH,
+        ) == 0:
+            return
+        error = ctypes.get_errno()
+        if error not in {errno.EPERM, errno.EINVAL, errno.ENOENT}:
+            raise OSError(error, os.strerror(error), name)
+        proc_path = f"/proc/self/fd/{source_descriptor}"
+        try:
+            if _stable_hardlink_identity(os.stat(proc_path)) != _stable_hardlink_identity(
+                os.fstat(source_descriptor)
+            ):
+                raise RuntimeError("precutover_integrity_proc_fd_identity")
+        except OSError as exc:
+            raise RuntimeError("precutover_integrity_linkat_unsupported") from exc
+        if self._libc.linkat(
+            self.AT_FDCWD,
+            os.fsencode(proc_path),
+            parent_descriptor,
+            encoded_name,
+            self.AT_SYMLINK_FOLLOW,
+        ) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), name)
 
 
 @dataclass(frozen=True)
@@ -625,6 +705,16 @@ class _PreparedProof:
         self._closed = False
         self._linked = False
 
+    @property
+    def descriptor(self) -> int:
+        if self._descriptor is None:
+            raise RuntimeError("precutover_integrity_prepared_descriptor")
+        return self._descriptor
+
+    @property
+    def is_windows(self) -> bool:
+        return self._windows_handle is not None
+
     def verify(self) -> None:
         if self._closed:
             raise RuntimeError("precutover_integrity_prepared_closed")
@@ -642,7 +732,7 @@ class _PreparedProof:
         ):
             raise RuntimeError("precutover_integrity_prepared_changed")
 
-    def verify_link(self, final_path: Path) -> None:
+    def verify_link(self, final_path: Path, *, parent_descriptor: int | None = None) -> None:
         if not self._linked:
             if self._fence is not None:
                 self._fence.accept_hardlink()
@@ -655,15 +745,35 @@ class _PreparedProof:
         else:
             self.verify()
         try:
-            final = final_path.lstat()
+            final = (
+                os.stat(final_path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+                if parent_descriptor is not None
+                else final_path.lstat()
+            )
         except OSError as exc:
             raise RuntimeError("precutover_integrity_final_missing") from exc
-        held = self.path.stat()
+        held = (
+            os.fstat(self.descriptor)
+            if parent_descriptor is not None
+            else self.path.stat()
+        )
+        if parent_descriptor is not None:
+            final_descriptor = os.open(
+                final_path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+            try:
+                final_digest = _fd_sha256(final_descriptor)
+            finally:
+                os.close(final_descriptor)
+        else:
+            final_digest = _sha256(final_path)
         if (
             (final.st_dev, final.st_ino, final.st_mode)
             != (held.st_dev, held.st_ino, held.st_mode)
             or final.st_size != self._expectation.byte_size
-            or _sha256(final_path) != self._expectation.sha256
+            or final_digest != self._expectation.sha256
         ):
             raise RuntimeError("precutover_integrity_final_identity")
         self.verify()
@@ -757,7 +867,10 @@ def _prepare_exclusive(path: Path, value: dict, *, before_close) -> _PreparedPro
         raise failure
 
 
-def _fsync_parent(path: Path) -> None:
+def _fsync_parent(path: Path, *, descriptor: int | None = None) -> None:
+    if descriptor is not None:
+        os.fsync(descriptor)
+        return
     if os.name == "nt":
         return
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -769,19 +882,39 @@ def _fsync_parent(path: Path) -> None:
 
 def _publish_prepared(prepared: _PreparedProof, path: Path) -> None:
     created = False
-    temporary_stat = prepared.path.lstat()
+    posix_api = None
+    parent_descriptor = None
+    parent_identity = None
+    if os.name != "nt" and not prepared.is_windows:
+        posix_api = _PosixLinkApi()
+        parent_descriptor, parent_identity = posix_api.open_parent(path.parent)
+        temporary_stat = os.fstat(prepared.descriptor)
+    else:
+        temporary_stat = prepared.path.lstat()
     created_identity = (temporary_stat.st_dev, temporary_stat.st_ino, temporary_stat.st_mode)
     failure = None
     try:
         prepared.verify()
-        os.link(prepared.path, path)
+        if posix_api is not None:
+            posix_api.link_fd(prepared.descriptor, parent_descriptor, path.name)
+        else:
+            if not prepared.is_windows:
+                raise RuntimeError("precutover_integrity_windows_prepared_handle")
+            # The CREATE_NEW handle remains open with FILE_SHARE_READ only, so
+            # CreateHardLinkW (via os.link) cannot select a replaced path.
+            os.link(prepared.path, path)
         created = True
-        prepared.verify_link(path)
-        _fsync_parent(path.parent)
-        prepared.verify_link(path)
+        prepared.verify_link(path, parent_descriptor=parent_descriptor)
+        _fsync_parent(path.parent, descriptor=parent_descriptor)
+        prepared.verify_link(path, parent_descriptor=parent_descriptor)
         prepared.close()
         _unlink_owned(prepared.path)
-        _fsync_parent(path.parent)
+        _fsync_parent(path.parent, descriptor=parent_descriptor)
+        if posix_api is not None and posix_api.parent_identity(path.parent.stat()) != parent_identity:
+            raise RuntimeError("precutover_integrity_parent_changed")
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+            parent_descriptor = None
         return
     except Exception as exc:
         failure = exc
@@ -791,14 +924,25 @@ def _publish_prepared(prepared: _PreparedProof, path: Path) -> None:
         failure = failure or exc
     try:
         if created:
-            current = path.lstat()
+            current = (
+                os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+                if parent_descriptor is not None
+                else path.lstat()
+            )
             if (current.st_dev, current.st_ino, current.st_mode) == created_identity:
-                _unlink_owned(path)
-                _fsync_parent(path.parent)
+                if parent_descriptor is not None:
+                    os.unlink(path.name, dir_fd=parent_descriptor)
+                else:
+                    _unlink_owned(path)
+                _fsync_parent(path.parent, descriptor=parent_descriptor)
     except FileNotFoundError:
         pass
     finally:
-        _unlink_owned(prepared.path)
+        try:
+            _unlink_owned(prepared.path)
+        finally:
+            if parent_descriptor is not None:
+                os.close(parent_descriptor)
     raise failure
 
 
