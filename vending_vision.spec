@@ -30,6 +30,8 @@ datas = [
     (str(ROOT / "config"), "config"),
     (str(ROOT / "dashboard"), "dashboard"),
     (str(ROOT / "models"), "models"),
+    (str(ROOT / "official-ai-model-pack-descriptor.json"), "."),
+    (str(ROOT / "ai-runtime-descriptor.json"), "."),
     *[(str(source), destination) for source, destination in CONTRACT_DATA_FILES],
 ]
 datas += collect_data_files("mediapipe")
@@ -45,8 +47,12 @@ hiddenimports = [
     "vision.acquisition_observer",
     "vision.worker_self_check",
     "vision.ai_model_pack",
+    "vision.ai_runtime_descriptor",
     "vision.ai_attempt_worker",
     "vision.ai_attempt_process",
+    "vision.process_supervisor",
+    "vision.catvton_pose_masks",
+    "vision.catvton_preprocess",
     "contracts.vem_vision_v2.python.vision_v2_models",
     "uvicorn.lifespan.on",
     "uvicorn.loops.auto",
@@ -93,6 +99,10 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Delivery layout contract: build `vending_vision_ai_worker.spec` alongside
+# this main runtime and place the resulting `vending-vision-ai-worker` onedir
+# next to `vending-vision`.  The main runtime supervises that artifact-relative
+# worker executable per probe/attempt; model weights stay outside both archives.
 pyz = PYZ(a.pure)
 
 exe = EXE(

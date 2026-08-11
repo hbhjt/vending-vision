@@ -1,0 +1,1 @@
+{"platform":"win_amd64","python":"cp311","requirements":["torch==2.8.0","torchvision==0.23.0","diffusers==0.29.2","transformers==4.53.3","accelerate==0.31.0","safetensors==0.5.3","scipy==1.16.1","tqdm==4.67.1","opencv-python-headless==4.12.0.88"],"schemaVersion":"vem-ai-worker-wheelhouse/v1","source":"release-provided-wheelhouse-required","wheels":[]}

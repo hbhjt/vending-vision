@@ -492,6 +492,16 @@ def _prepare_ai_result(
     return _prepare_fast_result(attempt_id, image)
 
 
+async def _read_ai_output_bytes(output_png: Path) -> bytes:
+    try:
+        size = output_png.stat().st_size
+    except OSError as exc:
+        raise RuntimeError("ai_result_missing") from exc
+    if size > _FAST_RESULT_MAX_BYTES:
+        raise RuntimeError("ai_result_too_large")
+    return await asyncio.to_thread(output_png.read_bytes)
+
+
 def _validate_ai_private_staging(staging_dir: Path, output_png: Path) -> None:
     root = staging_dir.resolve()
     output = output_png.resolve(strict=False)
@@ -1700,11 +1710,12 @@ async def run_v2_ai_attempt(
                     garment_png=garment_png,
                     output_png=output_png,
                     timeout=_AI_ATTEMPT_TIMEOUT_SECONDS,
+                    template=garment_source.template,
                 ),
                 timeout=_AI_ATTEMPT_TIMEOUT_SECONDS,
             )
             _validate_ai_private_staging(staging_dir, output_png)
-            output = output_png.read_bytes()
+            output = await _read_ai_output_bytes(output_png)
             stored_result, result = _prepare_ai_result(
                 attempt_id,
                 output,
@@ -2001,6 +2012,7 @@ async def reject_v2_fast_attempt_for_backpressure(
         if parsed.type != "vision.try_on.attempt.start":
             raise ValueError("invalid_v2_boundary_message")
         attempt_id = parsed.payload.attemptId
+        mode = parsed.payload.mode
     except (V2ContractBundleUnavailable, ValueError):
         async with send_lock:
             await send_error(
@@ -2013,7 +2025,10 @@ async def reject_v2_fast_attempt_for_backpressure(
         return
     terminal = _generated_v2_envelope(
         "vision.try_on.attempt.failed",
-        {"attemptId": attempt_id, "reason": "fast_unavailable"},
+        {
+            "attemptId": attempt_id,
+            "reason": "ai_unavailable" if mode == "ai" else "fast_unavailable",
+        },
     )
     admission = await _fast_attempt_registry.join_pending_or_reject(
         attempt_id=attempt_id,

@@ -1,0 +1,21 @@
+# Official CatVTON attempt-child runtime dependencies.
+#
+# This file is intentionally separate from the core Vision runtime lock.  The
+# 4.5GB model pack/weights are installed and verified outside the PyInstaller
+# runtime archive; these Python dependencies are installed into the Python
+# environment that runs `vision.ai_attempt_worker` on the Issue10/11 installed
+# VM path.  Customer attempts still run with `HF_HUB_OFFLINE=1`,
+# `TRANSFORMERS_OFFLINE=1`, and `local_files_only=True`.
+#
+# CPU target:
+#   python -m pip install "torch==2.8.0" torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+torch==2.8.0
+torchvision==0.23.0
+diffusers==0.29.2
+transformers==4.53.3
+accelerate==0.31.0
+safetensors==0.5.3
+scipy==1.16.1
+tqdm==4.67.1
+opencv-python-headless==4.12.0.88

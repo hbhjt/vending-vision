@@ -20,6 +20,21 @@ AI 模型是独立的 `vending-vision-ai-models.zip`，绝不嵌入 runtime ZIP�
 代码和轻量 worker import，不加载完整模型或推理；顾客启动禁止下载。缺 pack
 只使 AI readiness 为 false，Fast 与核心 Vision 仍可用。
 
+官方 CatVTON worker 作为独立 `vending-vision-ai-worker.exe` onedir 与主
+runtime 同 ZIP 交付，但不是服务、不是相机 owner、也不常驻。主 Vision 只按
+attempt/probe 通过 supervisor 启动该 artifact-relative worker；source/dev 才使用
+当前 Python 的 `vision.ai_attempt_worker` module。AI 依赖使用独立
+`requirements-ai.txt` 的 exact direct versions，并由 `requirements-ai.lock.json`
+描述 Windows x64 release wheelhouse；`scripts/verify_ai_wheelhouse.py` 在缺少
+release-provided wheel manifest 时 fail closed，现场不得临时 pip install。不要把
+torch/diffusers/SCHP 运行依赖或 4.5GB 权重折进核心 Vision hash lock，也不要把
+权重打入任一 PyInstaller archive。正式 attempt child 使用 `VEM_AI_MODEL_PACK`
+指向的 verified pack、vendored CatVTON source、`HF_HUB_OFFLINE=1`、
+`TRANSFORMERS_OFFLINE=1` 和 CatVTON `local_files_only=True`；startup probe 只
+import torch/torchvision/diffusers/accelerate/safetensors/PIL/numpy/cv2 与 vendored
+CatVTON/SCHP，解析 3 个 JSON，不 `torch.load`、不 `from_pretrained`、不推理。
+失败时只让 AI readiness/attempt failclosed。
+
 CI 会验证 runtime ZIP 根目录包含 `vending-vision.exe` 和 manifest，fixture ZIP
 包含 `recorded-video/top.mp4`、`front.mp4`、expected manifest 与
 `vision-artifact.json`；

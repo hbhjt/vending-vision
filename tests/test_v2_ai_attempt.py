@@ -92,6 +92,32 @@ def _start(attempt_id, reference, *, mode):
     )
 
 
+class _CollectingWebSocket:
+    def __init__(self):
+        self.messages = []
+
+    async def send_json(self, message):
+        self.messages.append(message)
+
+
+def test_v2_ai_backpressure_rejects_with_ai_unavailable_not_fast_unavailable():
+    attempt_id = str(uuid4())
+    socket = _CollectingWebSocket()
+    asyncio.run(
+        vision_app.reject_v2_fast_attempt_for_backpressure(
+            socket,
+            asyncio.Lock(),
+            _start(attempt_id, "http://127.0.0.1/garment.png?token=t", mode="ai"),
+        )
+    )
+
+    assert socket.messages[-1]["type"] == "vision.try_on.attempt.failed"
+    assert socket.messages[-1]["payload"] == {
+        "attemptId": attempt_id,
+        "reason": "ai_unavailable",
+    }
+
+
 def _write_official_pack(root: Path):
     model = root / "CatVTON" / "attention.safetensors"
     model.parent.mkdir(parents=True)
@@ -156,11 +182,12 @@ class _DeterministicAiChild:
         self.model_pack = Path(model_pack)
         self.closed = False
 
-    async def run(self, *, person_png: Path, garment_png: Path, output_png: Path, timeout: float):
+    async def run(self, *, person_png: Path, garment_png: Path, output_png: Path, timeout: float, template: str = "tshirt_short_sleeve"):
         type(self).calls += 1
         assert self.model_pack.exists()
         assert person_png.exists()
         assert garment_png.read_bytes() == _GarmentHandler.payload
+        assert template in {"tshirt_short_sleeve", "tshirt_long_sleeve"}
         output_png.write_bytes(_png_bytes((5, 80, 140, 255), size=(64, 64)))
 
     async def close(self):
@@ -185,7 +212,7 @@ class _BlockingAiChild:
         self.output_path = None
         type(self).instances.append(self)
 
-    async def run(self, *, person_png: Path, garment_png: Path, output_png: Path, timeout: float):
+    async def run(self, *, person_png: Path, garment_png: Path, output_png: Path, timeout: float, template: str = "tshirt_short_sleeve"):
         self.loop = asyncio.get_running_loop()
         self._run_release = asyncio.Event()
         self.staging_dir = output_png.parent
@@ -237,7 +264,7 @@ class _OutputValidationAiChild:
         self.escape_path = None
         type(self).instances.append(self)
 
-    async def run(self, *, person_png: Path, garment_png: Path, output_png: Path, timeout: float):
+    async def run(self, *, person_png: Path, garment_png: Path, output_png: Path, timeout: float, template: str = "tshirt_short_sleeve"):
         self.staging_dir = output_png.parent
         mode = type(self).mode
         if mode == "undecodable":
@@ -280,8 +307,9 @@ class _OutputValidationAiChild:
         self.tree_dead = True
 
 
-def _configure_stage1_runtime(monkeypatch, pack: Path):
+def _configure_stage1_runtime(monkeypatch, pack: Path, *, ai_ready: bool = True):
     monkeypatch.setenv("VEM_AI_MODEL_PACK", str(pack))
+    monkeypatch.setattr(vision_app, "official_ai_readiness", lambda value: bool(ai_ready and value == str(pack)))
     monkeypatch.setattr(vision_app, "_ai_attempt_execution_lock", asyncio.Lock())
     monkeypatch.setattr(
         vision_app,
@@ -449,7 +477,7 @@ def test_v2_ai_attempt_uses_official_boundary_not_fast_and_publishes_tokenized_r
 def test_v2_fast_attempt_never_calls_ai_boundary(tmp_path, monkeypatch):
     pack = tmp_path / "pack"
     _write_official_pack(pack)
-    _configure_stage1_runtime(monkeypatch, pack)
+    _configure_stage1_runtime(monkeypatch, pack, ai_ready=False)
     monkeypatch.setattr(vision_app, "_fast_render_broker", _CountingFastBroker())
 
     ai_calls = []
@@ -488,7 +516,7 @@ def test_v2_ai_unready_fails_closed_before_acquisition_child_or_staging_while_fa
     pack = tmp_path / "pack"
     _write_official_pack(pack)
     (pack / "CatVTON" / "attention.safetensors").write_bytes(b"tampered")
-    _configure_stage1_runtime(monkeypatch, pack)
+    _configure_stage1_runtime(monkeypatch, pack, ai_ready=False)
     monkeypatch.setattr(vision_app, "_fast_render_broker", _CountingFastBroker())
     observe_calls = []
 
@@ -566,7 +594,7 @@ def test_v2_hello_ai_readiness_comes_only_from_verified_official_pack_without_af
     pack = tmp_path / "pack"
     if case not in {"missing", "test-fake-env"}:
         _write_official_pack(pack)
-    _configure_stage1_runtime(monkeypatch, pack)
+    _configure_stage1_runtime(monkeypatch, pack, ai_ready=False)
 
     if case == "corrupt":
         (pack / "ai-model-manifest.json").write_text("{not json", "utf-8")
@@ -871,6 +899,20 @@ def test_v2_ai_invalid_private_staging_outputs_fail_without_result_or_orphan(
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_ai_sparse_oversize_output_is_rejected_before_reading(monkeypatch, tmp_path):
+    output = tmp_path / "output.png"
+    with output.open("wb") as handle:
+        handle.truncate(vision_app._FAST_RESULT_MAX_BYTES + 1)
+
+    def fail_if_read(_path):
+        raise AssertionError("oversize AI output must be rejected from stat before read_bytes")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_if_read)
+
+    with pytest.raises(RuntimeError, match="ai_result_too_large"):
+        asyncio.run(vision_app._read_ai_output_bytes(output))
 
 
 def test_v2_ai_completed_terminal_encode_failure_has_no_orphan_result(

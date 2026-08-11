@@ -479,7 +479,7 @@ def main():
     run_packaged_probe(
         exe_path,
         "--verify-ai-worker-boundary",
-        "AI official worker boundary probe passed",
+        "AI runtime worker contract probe passed",
     )
     ensure_port_available(args.port)
     managed_port = args.port + 1

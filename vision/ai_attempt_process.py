@@ -2,11 +2,28 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
-import signal
-import subprocess
 import sys
 from pathlib import Path
+
+from vision.ai_runtime_descriptor import expected_dependency_versions
+from vision.process_supervisor import ProcessSupervisorError, run_supervised
+
+
+def ai_worker_executable_path() -> Path:
+    """Return the artifact-relative frozen worker executable path."""
+    executable = Path(sys.executable).resolve()
+    suffix = ".exe" if os.name == "nt" else ""
+    candidates = [
+        executable.with_name(f"vending-vision-ai-worker{suffix}"),
+        executable.parent / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}",
+        executable.parent.parent / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError("official_ai_worker_executable_missing")
 
 
 def ai_attempt_worker_command(
@@ -16,9 +33,10 @@ def ai_attempt_worker_command(
     person_png: Path | None = None,
     garment_png: Path | None = None,
     output_png: Path | None = None,
+    template: str = "tshirt_short_sleeve",
 ) -> list[str]:
     if getattr(sys, "frozen", False):
-        command = [sys.executable, "--ai-attempt-worker"]
+        command = [str(ai_worker_executable_path())]
     else:
         command = [sys.executable, "-m", "vision.ai_attempt_worker"]
     command.extend(["--model-pack", str(model_pack)])
@@ -35,38 +53,49 @@ def ai_attempt_worker_command(
                 str(garment_png),
                 "--output",
                 str(output_png),
+                "--template",
+                template,
             ]
         )
     return command
 
 
+def probe_ai_attempt_worker(model_pack: Path, *, timeout: float = 30.0) -> None:
+    result = asyncio.run(
+        run_supervised(ai_attempt_worker_command(model_pack, probe=True), timeout=timeout)
+    )
+    if result.returncode != 0:
+        raise RuntimeError("official_ai_child_probe_failed")
+    try:
+        payload = json.loads(result.stdout_tail.decode("utf-8").strip().splitlines()[-1])
+    except (IndexError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError("official_ai_child_probe_failed") from exc
+    expected = expected_dependency_versions()
+    for name in ("torch", "torchvision", "diffusers", "transformers"):
+        if payload.get(name) != expected[name]:
+            raise RuntimeError("official_ai_child_probe_failed")
+
+
 class AiAttemptProcess:
     def __init__(self, model_pack: Path):
         self._model_pack = model_pack
-        self._process: subprocess.Popen | None = None
+        self._running = False
 
     async def probe(self, timeout: float = 10.0) -> None:
-        if self._process is not None:
+        if self._running:
             raise RuntimeError("ai_attempt_child_already_running")
-        kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
-        if os.name == "nt":
-            # CREATE_NEW_PROCESS_GROUP is paired with taskkill /T below.  The
-            # Windows installed wrapper additionally places this group in its
-            # Job Object; the worker is never a resident service and runs
-            # below the core Vision runtime priority.
-            kwargs["creationflags"] = windows_ai_child_creation_flags(subprocess)
-        else:
-            kwargs["start_new_session"] = True
-        self._process = subprocess.Popen(
-            ai_attempt_worker_command(self._model_pack, probe=True),
-            **kwargs,
-        )
+        self._running = True
         try:
-            code = await asyncio.wait_for(asyncio.to_thread(self._process.wait), timeout)
-            if code != 0:
+            result = await run_supervised(
+                ai_attempt_worker_command(self._model_pack, probe=True),
+                timeout=timeout,
+            )
+            if result.returncode != 0:
                 raise RuntimeError("official_ai_child_failed")
+        except ProcessSupervisorError as exc:
+            raise RuntimeError("official_ai_child_failed") from exc
         finally:
-            await self.close()
+            self._running = False
 
     async def run(
         self,
@@ -75,46 +104,33 @@ class AiAttemptProcess:
         garment_png: Path,
         output_png: Path,
         timeout: float,
+        template: str = "tshirt_short_sleeve",
     ) -> None:
-        if self._process is not None:
+        if self._running:
             raise RuntimeError("ai_attempt_child_already_running")
-        kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
-        if os.name == "nt":
-            kwargs["creationflags"] = windows_ai_child_creation_flags(subprocess)
-        else:
-            kwargs["start_new_session"] = True
-        self._process = subprocess.Popen(
-            ai_attempt_worker_command(
-                self._model_pack,
-                person_png=person_png,
-                garment_png=garment_png,
-                output_png=output_png,
-            ),
-            **kwargs,
-        )
+        self._running = True
         try:
-            code = await asyncio.wait_for(asyncio.to_thread(self._process.wait), timeout)
-            if code != 0:
+            result = await run_supervised(
+                ai_attempt_worker_command(
+                    self._model_pack,
+                    person_png=person_png,
+                    garment_png=garment_png,
+                    output_png=output_png,
+                    template=template,
+                ),
+                timeout=timeout,
+            )
+            if result.returncode != 0:
                 raise RuntimeError("official_ai_child_failed")
             if not output_png.is_file():
                 raise RuntimeError("official_ai_child_missing_output")
+        except ProcessSupervisorError as exc:
+            raise RuntimeError("official_ai_child_failed") from exc
         finally:
-            await self.close()
+            self._running = False
 
     async def close(self) -> None:
-        process, self._process = self._process, None
-        if process is None or process.poll() is not None:
-            return
-        if os.name == "nt":
-            await asyncio.to_thread(subprocess.run, ["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, check=False)
-        else:
-            os.killpg(process.pid, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(asyncio.to_thread(process.wait), 2.0)
-        except asyncio.TimeoutError:
-            if os.name != "nt":
-                os.killpg(process.pid, signal.SIGKILL)
-            await asyncio.to_thread(process.wait)
+        self._running = False
 
 
 def windows_ai_child_creation_flags(subprocess_module) -> int:

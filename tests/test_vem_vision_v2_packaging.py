@@ -44,6 +44,7 @@ def test_frozen_spec_keeps_the_generated_v2_bundle_and_static_boundary_import():
     assert '"vision.ai_model_pack"' in spec
     assert '"vision.ai_attempt_worker"' in spec
     assert '"vision.ai_attempt_process"' in spec
+    assert '"vision.catvton_preprocess"' in spec
     assert '"contracts.vem_vision_v2.python.vision_v2_models"' in spec
 
 
@@ -54,15 +55,71 @@ def test_ai_runtime_packaging_includes_worker_code_but_excludes_official_weights
 
     assert '"vision.ai_attempt_worker"' in spec
     assert '"vision.ai_attempt_process"' in spec
+    assert '"vision.catvton_pose_masks"' in spec
+    assert '"vision.catvton_preprocess"' in spec
+    assert "vending_vision_ai_worker.spec" in spec
     assert '"--ai-attempt-worker"' in launcher
     assert '"--verify-ai-worker-boundary"' in launcher
-    assert "AI official worker boundary probe passed" in launcher
+    assert "AI runtime worker contract probe passed" in launcher
     assert "vending-vision-ai-models.zip" in packaging
     assert "VEM_AI_MODEL_PACK" in packaging
     assert "不加载完整模型或推理" in packaging
     assert "顾客启动禁止下载" in packaging
+    assert "requirements-ai.txt" in packaging
+    assert "requirements-ai.lock.json" in packaging
+    assert "local_files_only=True" in packaging
     assert "safetensors" not in spec.lower()
-    assert "CatVTON" not in spec
+    assert "model.safetensors" not in spec
+
+    worker_spec = (ROOT / "vending_vision_ai_worker.spec").read_text("utf-8")
+    assert 'name="vending-vision-ai-worker"' in worker_spec
+    assert "collect_submodules(\"vision.vendor.catvton\")" in worker_spec
+    assert "official-ai-model-pack-descriptor.json" in worker_spec
+    assert "model.safetensors" not in worker_spec
+
+
+def test_official_ai_runtime_dependencies_are_separate_from_core_archive_lock():
+    requirements = (ROOT / "requirements-ai.txt").read_text("utf-8")
+    core_requirements = (ROOT / "requirements.txt").read_text("utf-8")
+    runtime_descriptor = (ROOT / "ai-runtime-descriptor.json").read_text("utf-8")
+
+    assert "torch==2.8.0" in requirements
+    assert "torchvision==0.23.0" in requirements
+    assert "diffusers==0.29.2" in requirements
+    assert "transformers==4.53.3" in requirements
+    assert "accelerate==0.31.0" in requirements
+    assert ">=" not in requirements
+    assert "opencv-python-headless" in requirements
+    assert "torch==2.8.0" not in core_requirements
+    assert "diffusers==0.29.2" not in core_requirements
+
+    lock = (ROOT / "requirements-ai.lock.json").read_text("utf-8")
+    assert '"schemaVersion":"vem-ai-worker-wheelhouse/v1"' in lock
+    assert '"platform":"win_amd64"' in lock
+    assert '"schemaVersion":"vem-ai-runtime-descriptor/v1"' in runtime_descriptor
+    assert '"python":"3.11.9"' in runtime_descriptor
+    assert '"target":"windows-x86_64"' in runtime_descriptor
+    assert '"workerExecutable":"vending-vision-ai-worker/vending-vision-ai-worker.exe"' in runtime_descriptor
+
+
+def test_vendored_catvton_closure_is_pinned_local_only_and_weight_free():
+    vendor = ROOT / "vision" / "vendor" / "catvton"
+    provenance = (vendor / "PROVENANCE.md").read_text("utf-8")
+    source = "\n".join(path.read_text("utf-8") for path in vendor.rglob("*.py"))
+
+    assert "3b795364a4d2f3b5adb365f39cdea376d20bc53c" in provenance
+    assert (vendor / "model" / "pipeline.py").is_file()
+    assert (vendor / "model" / "attn_processor.py").is_file()
+    assert (vendor / "model" / "utils.py").is_file()
+    assert (vendor / "model" / "SCHP" / "networks" / "AugmentCE2P.py").is_file()
+    assert "from model." not in source
+    assert "import model." not in source
+    assert "snapshot_download" not in source
+    assert "local_files_only=True" in source
+    assert "stabilityai/sd-vae-ft-mse" not in (vendor / "model" / "pipeline.py").read_text("utf-8")
+    assert not list(vendor.rglob("*.safetensors"))
+    assert not list(vendor.rglob("*.pth"))
+    assert not list(vendor.rglob("*.bin"))
 
 
 def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
@@ -84,7 +141,7 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     assert "_safe_process_log" in verifier
     assert "packaged_archive_entries" in verifier
     assert '"--verify-ai-worker-boundary"' in verifier
-    assert '"AI official worker boundary probe passed"' in verifier
+    assert '"AI runtime worker contract probe passed"' in verifier
     assert "assert_hard_cutover_archive_absence(exe_path)" in verifier
     assert "retired modules remain in packaged archive" in verifier
     assert "retired_try_on_route" in verifier

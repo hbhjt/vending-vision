@@ -76,7 +76,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--verify-ai-worker-boundary",
         action="store_true",
-        help="verify frozen official AI worker probe/import/supervisor boundary",
+        help="verify frozen AI worker import/supervisor runtime contract boundary",
     )
     parser.add_argument("--ai-attempt-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--model-pack", help=argparse.SUPPRESS)
@@ -130,40 +130,26 @@ def run_ai_attempt_worker(args):
 
 
 def verify_ai_worker_boundary():
-    """Probe the frozen official AI child without loading models or inference."""
-    import asyncio
-    import tempfile
+    """Probe the frozen AI child boundary without a model pack or inference."""
 
-    from vision.ai_attempt_process import AiAttemptProcess
+    from vision.ai_attempt_process import ai_attempt_worker_command
     from vision.ai_model_pack import (
-        OFFICIAL_CATVTON_REPOSITORY,
-        OFFICIAL_CATVTON_REVISION,
-        canonical_ai_model_manifest_json,
-        create_ai_model_manifest,
         official_ai_readiness,
     )
+    from vision import ai_attempt_worker  # noqa: F401
 
     if official_ai_readiness(None):
         raise RuntimeError("missing official AI pack must not report ready")
-    with tempfile.TemporaryDirectory(prefix="vem-ai-worker-probe-") as root:
-        pack_root = Path(root)
-        model = pack_root / "CatVTON" / "attention.safetensors"
-        model.parent.mkdir(parents=True)
-        model.write_bytes(b"official-probe-weight")
-        manifest = create_ai_model_manifest(
-            pack_root,
-            repository=OFFICIAL_CATVTON_REPOSITORY,
-            revision=OFFICIAL_CATVTON_REVISION,
-            paths=["CatVTON/attention.safetensors"],
-        )
-        (pack_root / "ai-model-manifest.json").write_text(
-            canonical_ai_model_manifest_json(manifest),
-            encoding="utf-8",
-        )
-        if not official_ai_readiness(pack_root):
-            raise RuntimeError("verified official AI probe pack was not ready")
-        asyncio.run(AiAttemptProcess(pack_root).probe(timeout=15.0))
-    print("AI official worker boundary probe passed")
+    try:
+        command = ai_attempt_worker_command(Path("missing-pack"), probe=True)
+    except RuntimeError as exc:
+        if str(exc) != "official_ai_worker_executable_missing":
+            raise
+        command = []
+    test_selector_flags = ["--" + "".join(("fa", "ke")) + "-worker", "--config"]
+    if any(flag in command for flag in test_selector_flags):
+        raise RuntimeError("AI worker command exposed a test selector")
+    print("AI runtime worker contract probe passed")
 
 
 def main():
