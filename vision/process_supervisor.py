@@ -520,7 +520,7 @@ class WindowsJobApi:
         si.hStdOutput = pipes["stdout_write"]
         si.hStdError = pipes["stderr_write"]
         cmdline = _subprocess.list2cmdline(command)
-        flags = 0x00000004 | 0x08000000 | 0x00004000
+        flags = 0x00000004 | 0x00000200 | 0x08000000 | 0x00004000
         ok = self.kernel32.CreateProcessW(
             None,
             ctypes.create_unicode_buffer(cmdline),

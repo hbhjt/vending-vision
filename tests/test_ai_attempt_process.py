@@ -10,7 +10,6 @@ from vision.ai_attempt_process import (
     ai_attempt_worker_command,
     probe_ai_attempt_worker,
     probe_ai_attempt_worker_async,
-    windows_ai_child_creation_flags,
 )
 import vision.ai_attempt_process as ai_attempt_process_module
 
@@ -28,17 +27,6 @@ def test_nonofficial_child_probe_fails_closed_and_joins_before_return(tmp_path):
     else:
         raise AssertionError("nonofficial probe pack must fail closed")
     assert child._running is False
-
-
-def test_windows_production_ai_child_uses_group_and_low_priority_boundary():
-    class WindowsSubprocess:
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
-
-    flags = windows_ai_child_creation_flags(WindowsSubprocess)
-
-    assert flags & WindowsSubprocess.CREATE_NEW_PROCESS_GROUP
-    assert flags & WindowsSubprocess.BELOW_NORMAL_PRIORITY_CLASS
 
 
 def test_frozen_official_ai_child_uses_packaged_worker_entrypoint(monkeypatch, tmp_path):

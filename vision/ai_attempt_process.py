@@ -186,10 +186,3 @@ class AiAttemptProcess:
 
     async def close(self) -> None:
         self._running = False
-
-
-def windows_ai_child_creation_flags(subprocess_module) -> int:
-    return (
-        subprocess_module.CREATE_NEW_PROCESS_GROUP
-        | subprocess_module.BELOW_NORMAL_PRIORITY_CLASS
-    )

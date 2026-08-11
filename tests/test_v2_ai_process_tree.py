@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import math
 import os
 import sys
 import tempfile
@@ -216,7 +217,7 @@ def _serve_garment():
 def _receive_until_generating(socket) -> list[dict]:
     trace = []
     while True:
-        message = socket.receive_json()
+        message = _receive_json_deadline(socket)
         trace.append(message)
         if (
             message["type"] == "vision.try_on.attempt.generating"
@@ -228,7 +229,7 @@ def _receive_until_generating(socket) -> list[dict]:
 def _receive_until_terminal(socket) -> tuple[list[dict], dict]:
     trace = []
     while True:
-        message = socket.receive_json()
+        message = _receive_json_deadline(socket)
         trace.append(message)
         if message["type"] in {
             "vision.try_on.attempt.completed",
@@ -286,6 +287,80 @@ def _assert_staging_clear(attempt_id: str) -> None:
     assert _staging_paths(attempt_id) == []
 
 
+def _call_with_deadline(operation, *, timeout: float, cleanup, label: str):
+    completed = threading.Event()
+    results = []
+    errors = []
+
+    def run():
+        try:
+            results.append(operation())
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=run, name=f"deadline-{label}")
+    worker.start()
+    if not completed.wait(timeout):
+        cleanup()
+        worker.join(timeout)
+        if worker.is_alive():
+            raise AssertionError(f"{label} deadline cleanup did not join")
+        raise AssertionError(f"{label} deadline exceeded")
+    worker.join()
+    if errors:
+        raise errors[0]
+    return results[0]
+
+
+def _receive_json_deadline(socket, *, timeout: float = 3.0):
+    return _call_with_deadline(
+        socket.receive_json,
+        timeout=timeout,
+        cleanup=socket.close,
+        label="websocket receive",
+    )
+
+
+def _http_get_deadline(client, path: str, *, timeout: float = 3.0):
+    return _call_with_deadline(
+        lambda: client.get(path),
+        timeout=timeout,
+        cleanup=client.close,
+        label=f"HTTP GET {path}",
+    )
+
+
+def test_operation_deadline_closes_and_joins_before_failing():
+    release = threading.Event()
+    finished = threading.Event()
+    cleanup_calls = []
+
+    def blocked_operation():
+        release.wait()
+        finished.set()
+
+    def cleanup():
+        cleanup_calls.append("close")
+        release.set()
+
+    with pytest.raises(AssertionError, match="fixture deadline exceeded"):
+        _call_with_deadline(
+            blocked_operation,
+            timeout=0.02,
+            cleanup=cleanup,
+            label="fixture",
+        )
+
+    assert cleanup_calls == ["close"]
+    assert finished.is_set()
+    assert not any(
+        thread.name == "deadline-fixture" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
 def _process_usage(pid: int) -> dict[str, int]:
     stat = (Path("/proc") / str(pid) / "stat").read_text("utf-8")
     fields = stat[stat.rfind(")") + 2 :].split()
@@ -302,13 +377,20 @@ def _process_usage(pid: int) -> dict[str, int]:
 
 def _latency_distribution(samples: list[float]) -> dict[str, float]:
     ordered = sorted(samples)
-    p95_index = min(len(ordered) - 1, max(0, int(len(ordered) * 0.95) - 1))
+    p95_index = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * 0.95) - 1))
     return {
         "min": ordered[0],
         "median": ordered[len(ordered) // 2],
         "p95": ordered[p95_index],
         "max": ordered[-1],
     }
+
+
+def test_latency_distribution_uses_nearest_rank_for_small_samples():
+    distribution = _latency_distribution([0.01] * 7 + [9.0])
+
+    assert distribution["max"] == 9.0
+    assert distribution["p95"] == 9.0
 
 
 def _success_png(path: Path) -> None:
@@ -363,6 +445,7 @@ def _configure_recorded_presence(monkeypatch, tmp_path: Path) -> tuple[dict, str
 def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_live(
     tmp_path, monkeypatch
 ):
+    production_get_runtime_status = vision_app.get_runtime_status
     pack = tmp_path / "test-owned-pack"
     pack.mkdir()
     pid_file = tmp_path / "pressure-tree.json"
@@ -376,20 +459,7 @@ def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_l
     _configure_recorded_presence(monkeypatch, tmp_path)
     monkeypatch.setattr(settings, "PROFILE_PUSH_ENABLED", True)
     monkeypatch.setattr(settings, "PROFILE_PUSH_INTERVAL_MS", 300)
-    monkeypatch.setattr(
-        vision_app,
-        "get_runtime_status",
-        lambda: {
-            "cameraReady": True,
-            "modelReady": True,
-            "fastRenderReady": True,
-            "fastPoseReady": True,
-            "acquisitionObserverReady": True,
-            "ageGenderReady": True,
-            "ageGenderMode": "test-owned",
-            "check": {"checks": {}},
-        },
-    )
+    monkeypatch.setattr(vision_app, "get_runtime_status", production_get_runtime_status)
     server, thread, reference = _serve_garment()
     attempt_id = str(uuid4())
     try:
@@ -403,7 +473,8 @@ def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_l
                         "ambient_light",
                     )
                 )
-                ready = socket.receive_json()
+                ready = _receive_json_deadline(socket)
+                initial_health = _http_get_deadline(client, "/health")
                 socket.send_json(_start(attempt_id, reference))
                 trace = _receive_until_generating(socket)
                 tree = _wait_pid_tree(pid_file)
@@ -442,7 +513,7 @@ def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_l
                     try:
                         for path in ("/", "/health") * 4:
                             started = time.monotonic()
-                            response = client.get(path)
+                            response = _http_get_deadline(client, path)
                             core_latencies.append(time.monotonic() - started)
                             core_statuses.append((path, response.status_code))
                     except Exception as exc:
@@ -466,7 +537,7 @@ def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_l
                     started = time.monotonic()
                     socket.send_json(_envelope("vision.ping", {}))
                     while True:
-                        message = socket.receive_json()
+                        message = _receive_json_deadline(socket)
                         trace.append(message)
                         if message["type"] == "vision.pong":
                             ping_latencies.append(time.monotonic() - started)
@@ -508,19 +579,20 @@ def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_l
                 _assert_staging_clear(attempt_id)
                 socket.send_json(_envelope("vision.ping", {}))
                 while True:
-                    message = socket.receive_json()
+                    message = _receive_json_deadline(socket)
                     trace.append(message)
                     if message["type"] == "vision.pong":
                         final_pong = message
                         break
 
-            missing = client.get(
+            missing = _http_get_deadline(
+                client,
                 f"/v2/try-on/results/{attempt_id}?token=no-result"
             )
-            final_health = client.get("/health")
+            final_health = _http_get_deadline(client, "/health")
             with client.websocket_connect("/ws") as final_socket:
                 final_socket.send_json(_hello())
-                final_ready = final_socket.receive_json()
+                final_ready = _receive_json_deadline(final_socket)
 
         clock_ticks = int(os.sysconf("SC_CLK_TCK"))
         cpu_deltas = {
@@ -531,7 +603,7 @@ def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_l
         observed_nice = {name: peak_usage[name]["nice"] for name in tree}
         ping_distribution = _latency_distribution(ping_latencies)
         core_distribution = _latency_distribution(core_latencies)
-        latency_limit = max(3.0, settings.PROFILE_PUSH_INTERVAL_MS / 1000.0 * 10)
+        latency_limit = settings.PROFILE_PUSH_INTERVAL_MS / 1000.0 * 10
         pressure_evidence = {
             "cpuSeconds": {
                 name: round(delta / clock_ticks, 3) for name, delta in cpu_deltas.items()
@@ -547,11 +619,27 @@ def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_l
 
         assert ready["payload"]["fastReady"] is True
         assert ready["payload"]["visionBusinessReady"] is True
+        assert {
+            key: initial_health.json()[key]
+            for key in ("status", "cameraReady", "modelReady", "aiReady")
+        } == {
+            key: final_health.json()[key]
+            for key in ("status", "cameraReady", "modelReady", "aiReady")
+        } == {
+            "status": "ok",
+            "cameraReady": True,
+            "modelReady": True,
+            "aiReady": True,
+        }
         assert len(ping_latencies) >= 5
         assert presence_count >= 2
         assert profile_seen is True
+        assert all(0 <= sample < latency_limit for sample in ping_latencies), ping_latencies
+        assert all(0 <= sample < latency_limit for sample in core_latencies), core_latencies
         assert ping_distribution["p95"] < latency_limit, ping_distribution
+        assert ping_distribution["max"] < latency_limit, ping_distribution
         assert core_distribution["p95"] < latency_limit, core_distribution
+        assert core_distribution["max"] < latency_limit, core_distribution
         assert core_statuses == [("/", 200), ("/health", 200)] * 4
         assert all(delta >= clock_ticks // 5 for delta in cpu_deltas.values()), cpu_deltas
         assert all(16 * 1024 <= rss <= 64 * 1024 for rss in rss_peaks.values()), rss_peaks

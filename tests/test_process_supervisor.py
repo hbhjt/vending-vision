@@ -1,6 +1,8 @@
 import asyncio
+import ctypes
 import os
 import sys
+from ctypes import wintypes
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,7 @@ import pytest
 from vision.process_supervisor import (
     LinuxProcessTree,
     ProcessSupervisorError,
+    WindowsJobApi,
     WindowsJobApiUnavailable,
     WindowsJobProcess,
     run_supervised,
@@ -255,6 +258,92 @@ def test_windows_job_api_creates_inheritable_write_pipes_and_noninheritable_read
     assert "SetHandleInformation(read_handle, HANDLE_FLAG_INHERIT, 0)" in source
     assert "SetHandleInformation(stdout_write" not in source
     assert "SetHandleInformation(stderr_write" not in source
+
+
+def _production_ctypes_api(kernel32):
+    api = object.__new__(WindowsJobApi)
+    api.ctypes = ctypes
+    api.wintypes = wintypes
+    api.kernel32 = kernel32
+    api._define_structures()
+    return api
+
+
+def test_production_ctypes_job_sets_kill_on_close_and_below_normal_priority():
+    captured = {}
+
+    class Kernel:
+        @staticmethod
+        def SetInformationJobObject(job, info_class, info_pointer, info_size):
+            info = ctypes.cast(
+                info_pointer,
+                ctypes.POINTER(api.JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+            ).contents
+            captured["job"] = job
+            captured["class"] = info_class
+            captured["size"] = info_size
+            captured["limitFlags"] = info.BasicLimitInformation.LimitFlags
+            captured["priorityClass"] = info.BasicLimitInformation.PriorityClass
+            return True
+
+    api = _production_ctypes_api(Kernel())
+
+    api.set_kill_on_close_and_low_priority(0x1234)
+
+    assert captured["job"] == 0x1234
+    assert captured["class"] == 9
+    assert captured["size"] == ctypes.sizeof(
+        api.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    )
+    assert captured["limitFlags"] & 0x00002000
+    assert captured["limitFlags"] & 0x00000020
+    assert captured["priorityClass"] == 0x00004000
+
+
+def test_production_ctypes_create_process_uses_suspended_group_and_below_normal():
+    captured = {"closed": []}
+
+    class Kernel:
+        @staticmethod
+        def CreateProcessW(
+            _application,
+            _command_line,
+            _process_attributes,
+            _thread_attributes,
+            _inherit_handles,
+            creation_flags,
+            _environment,
+            _cwd,
+            _startup_info,
+            process_info,
+        ):
+            captured["creationFlags"] = creation_flags
+            info = ctypes.cast(
+                process_info, ctypes.POINTER(api.PROCESS_INFORMATION)
+            ).contents
+            info.hProcess = 0x4001
+            info.hThread = 0x4002
+            info.dwProcessId = 4321
+            return True
+
+    api = _production_ctypes_api(Kernel())
+    api.close_handle = lambda handle: captured["closed"].append(handle)
+    pipes = {
+        "stdout_read": 0x2001,
+        "stdout_write": 0x2002,
+        "stderr_read": 0x3001,
+        "stderr_write": 0x3002,
+    }
+
+    created = api.create_process_suspended(["worker.exe", "--probe"], pipes)
+
+    flags = captured["creationFlags"]
+    assert flags & 0x00000004  # CREATE_SUSPENDED
+    assert flags & 0x00000200  # CREATE_NEW_PROCESS_GROUP
+    assert flags & 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
+    assert created["pid"] == 4321
+    assert pipes["stdout_write"] is None
+    assert pipes["stderr_write"] is None
 
 
 def test_windows_leader_exit_with_active_descendant_terminates_job_and_fails():
