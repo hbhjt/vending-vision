@@ -11,7 +11,11 @@ import os
 import socket
 import sys
 
-from vision.ai_model_pack import verify_ai_model_pack
+from vision.ai_model_pack import (
+    OFFICIAL_CATVTON_REPOSITORY,
+    OFFICIAL_CATVTON_REVISION,
+    verify_ai_model_pack,
+)
 
 
 def _deny_downloads() -> None:
@@ -27,16 +31,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-pack", required=True)
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--person")
+    parser.add_argument("--garment")
+    parser.add_argument("--output")
     args = parser.parse_args(argv)
     _deny_downloads()
     pack = verify_ai_model_pack(args.model_pack)
-    if pack.upstream_repository != "zhengchong/CatVTON":
+    if (
+        pack.upstream_repository != OFFICIAL_CATVTON_REPOSITORY
+        or pack.upstream_revision != OFFICIAL_CATVTON_REVISION
+    ):
         raise RuntimeError("official_catvton_identity_required")
     # This deliberately stops at imports in ordinary startup/probe.  No model
-    # is loaded by Vision startup and no fake child can claim official ready.
+    # is loaded by Vision startup and only the verified official worker can
+    # claim official readiness.
     if args.probe:
         print("official-catvton-worker-configured")
         return 0
+    if not (args.person and args.garment and args.output):
+        raise RuntimeError("official_catvton_attempt_paths_required")
     raise RuntimeError("official_catvton_inference_requires_installed_vm_pack")
 
 

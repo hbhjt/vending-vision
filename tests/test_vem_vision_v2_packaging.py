@@ -41,7 +41,28 @@ def test_frozen_spec_keeps_the_generated_v2_bundle_and_static_boundary_import():
     assert '(str(ROOT / "contracts"), "contracts")' not in spec
     assert '"vision.v2_contract_bundle"' in spec
     assert '"vision.worker_self_check"' in spec
+    assert '"vision.ai_model_pack"' in spec
+    assert '"vision.ai_attempt_worker"' in spec
+    assert '"vision.ai_attempt_process"' in spec
     assert '"contracts.vem_vision_v2.python.vision_v2_models"' in spec
+
+
+def test_ai_runtime_packaging_includes_worker_code_but_excludes_official_weights():
+    spec = (ROOT / "vending_vision.spec").read_text("utf-8")
+    packaging = (ROOT / "docs" / "PACKAGING.md").read_text("utf-8")
+    launcher = (ROOT / "run_vision_server.py").read_text("utf-8")
+
+    assert '"vision.ai_attempt_worker"' in spec
+    assert '"vision.ai_attempt_process"' in spec
+    assert '"--ai-attempt-worker"' in launcher
+    assert '"--verify-ai-worker-boundary"' in launcher
+    assert "AI official worker boundary probe passed" in launcher
+    assert "vending-vision-ai-models.zip" in packaging
+    assert "VEM_AI_MODEL_PACK" in packaging
+    assert "不加载完整模型或推理" in packaging
+    assert "顾客启动禁止下载" in packaging
+    assert "safetensors" not in spec.lower()
+    assert "CatVTON" not in spec
 
 
 def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
@@ -62,6 +83,8 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     assert "assert_result_query_not_logged" in verifier
     assert "_safe_process_log" in verifier
     assert "packaged_archive_entries" in verifier
+    assert '"--verify-ai-worker-boundary"' in verifier
+    assert '"AI official worker boundary probe passed"' in verifier
     assert "assert_hard_cutover_archive_absence(exe_path)" in verifier
     assert "retired modules remain in packaged archive" in verifier
     assert "retired_try_on_route" in verifier

@@ -20,6 +20,8 @@ import ipaddress
 import os
 import re
 import secrets
+import shutil
+import tempfile
 import threading
 from datetime import datetime
 from json import JSONDecodeError
@@ -75,6 +77,7 @@ from vision.v2_contract_bundle import (
     parse_v2_server_message,
 )
 from vision.ai_model_pack import official_ai_readiness
+from vision.ai_attempt_process import AiAttemptProcess
 
 
 app = FastAPI(
@@ -88,6 +91,7 @@ _FAST_RESULT_MAX_BYTES = 16 * 1024 * 1024
 _FAST_RESULT_MAX_COUNT = 1000
 _FAST_RESULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 _FAST_ATTEMPT_TIMEOUT_SECONDS = 15
+_AI_ATTEMPT_TIMEOUT_SECONDS = 60
 _FAST_ATTEMPT_MAX_TASKS = 2
 _FAST_TERMINAL_SEND_TIMEOUT_SECONDS = 0.25
 _fast_runtime = FastTryOnRuntime()
@@ -101,6 +105,8 @@ _fast_attempt_task_slots = asyncio.Semaphore(_FAST_ATTEMPT_MAX_TASKS)
 _fast_render_broker = FastRenderBroker()
 _acquisition_previews = AcquisitionPreviewStore()
 _acquisition_observer: AcquisitionObservationWorker | None = None
+_ai_attempt_process_factory = AiAttemptProcess
+_ai_attempt_execution_lock = asyncio.Lock()
 _ACQUISITION_STABLE_FRAMES = 3
 _ACQUISITION_POLL_SECONDS = 0.05
 
@@ -476,6 +482,29 @@ def _prepare_fast_result(attempt_id: str, image: bytes) -> tuple[dict, dict]:
     }
     public = {key: value for key, value in stored.items() if key not in {"token", "bytes"}}
     return stored, public
+
+
+def _prepare_ai_result(
+    attempt_id: str, image: bytes, *, person_png: bytes, garment_png: bytes
+) -> tuple[dict, dict]:
+    if image == person_png or image == garment_png:
+        raise RuntimeError("ai_result_reused_input")
+    return _prepare_fast_result(attempt_id, image)
+
+
+def _validate_ai_private_staging(staging_dir: Path, output_png: Path) -> None:
+    root = staging_dir.resolve()
+    output = output_png.resolve(strict=False)
+    if output.parent != root or output_png.is_symlink():
+        raise RuntimeError("ai_staging_output_path_invalid")
+    expected = {"person.png", "garment.png", "output.png"}
+    actual = {path.name for path in staging_dir.iterdir()}
+    if actual != expected:
+        raise RuntimeError("ai_staging_unexpected_files")
+    for name in expected:
+        path = staging_dir / name
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("ai_staging_file_invalid")
 
 
 def _generated_v2_envelope(message_type: str, payload: dict) -> dict:
@@ -1510,6 +1539,226 @@ async def _release_acquisition_resources(
     return errors
 
 
+async def run_v2_ai_attempt(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    payload: dict,
+    owned_fast_attempt_receipts: set[AttemptReceipt],
+    connection_closed: asyncio.Event,
+) -> None:
+    """Run one attempt-scoped official AI child after the shared acquisition path."""
+    attempt_id = payload["attemptId"]
+    model_pack = os.environ.get("VEM_AI_MODEL_PACK")
+    ai_ready = bool(
+        official_ai_readiness(model_pack)
+        and _acquisition_observer_ready()
+    )
+    unavailable_terminal = _generated_v2_envelope(
+        "vision.try_on.attempt.failed",
+        {"attemptId": attempt_id, "reason": "ai_unavailable"},
+    )
+    canceled_terminal = _generated_v2_envelope(
+        "vision.try_on.attempt.canceled",
+        {"attemptId": attempt_id, "reason": "replaced"},
+    )
+    accepted = (
+        _generated_v2_envelope(
+            "vision.try_on.attempt.accepted", {"attemptId": attempt_id, "mode": "ai"}
+        )
+        if ai_ready
+        else None
+    )
+    preparation = await _fast_attempt_registry.prepare_admission(
+        attempt_id=attempt_id,
+        websocket=websocket,
+        send_lock=send_lock,
+        task=asyncio.current_task(),
+        canceled_terminal=canceled_terminal,
+        owner_receipts=owned_fast_attempt_receipts,
+    )
+    for transition in preparation.transitions:
+        await _publish_fast_transition(transition)
+    await _ai_attempt_execution_lock.acquire()
+    try:
+        admission = await _fast_attempt_registry.commit_prepared_admission(
+            preparation,
+            accepted=accepted,
+            generating=None,
+            unavailable_terminal=unavailable_terminal,
+            readiness=lambda: bool(official_ai_readiness(model_pack) and _acquisition_observer_ready()),
+        )
+        if not admission.is_owner:
+            for replay_message in admission.replay:
+                await _send_json_bounded(websocket, send_lock, replay_message)
+            return
+
+        receipt = admission.receipt
+        assert receipt is not None
+        if connection_closed.is_set():
+            await _publish_fast_transition(
+                await _fast_attempt_registry.cancel_owner_and_join(receipt)
+            )
+            return
+
+        lease_token = f"try-on:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}"
+        lease_acquired = False
+        staging_dir: Path | None = None
+        ai_child = None
+        stored_result = None
+        try:
+            for replay_message in admission.replay:
+                await _send_json_bounded(websocket, send_lock, replay_message)
+            await _acquire_front_io_until(asyncio.get_running_loop().time() + _FAST_ATTEMPT_TIMEOUT_SECONDS)
+            try:
+                owner = acquire_front_camera(
+                    "try_on_attempt", reason=f"try_on_acquisition:{attempt_id}", lease_token=lease_token
+                )
+            finally:
+                release_front_camera_io_lock()
+            if not owner.get("ok"):
+                raise GarmentFetchError(owner.get("error") or "front_camera_busy")
+            lease_acquired = True
+
+            stable_frames = 0
+            last_guidance = None
+            captured_frame = None
+            deadline = asyncio.get_running_loop().time() + _FAST_ATTEMPT_TIMEOUT_SECONDS
+            preview_token = None
+            while asyncio.get_running_loop().time() < deadline:
+                remaining = max(0.001, deadline - asyncio.get_running_loop().time())
+                frame, _source = await _read_attempt_front_frame(
+                    receipt, timeout=remaining, lease_token=lease_token
+                )
+                observation = await _get_acquisition_observer().observe(frame, timeout=remaining)
+                jpeg = observation.jpeg
+                if preview_token is None:
+                    preview_token = await _acquisition_previews.open(attempt_id, jpeg)
+                else:
+                    await _acquisition_previews.update(attempt_id, preview_token, jpeg)
+                occupancy, aligned = observation.occupancy, observation.aligned
+                stable_frames = stable_frames + 1 if occupancy == "single" and aligned else 0
+                stable = stable_frames >= _ACQUISITION_STABLE_FRAMES
+                acquiring = _acquiring_message(attempt_id, preview_token, occupancy, aligned, stable)
+                if acquiring["payload"]["guidance"] != last_guidance:
+                    await _publish_fast_transition(
+                        await _fast_attempt_registry.publish_nonterminal(receipt, acquiring)
+                    )
+                    last_guidance = acquiring["payload"]["guidance"]
+                manual = await _fast_attempt_registry.take_manual_capture_request(receipt)
+                if occupancy == "single" and aligned and (stable or manual):
+                    captured_frame = frame.copy()
+                    break
+                await asyncio.sleep(_ACQUISITION_POLL_SECONDS)
+            if captured_frame is None:
+                raise asyncio.TimeoutError()
+
+            cleanup_errors = await _release_acquisition_resources(receipt, lease_token)
+            lease_acquired = False
+            if cleanup_errors:
+                raise RuntimeError("acquisition_cleanup_failed")
+            await _publish_fast_transition(
+                await _fast_attempt_registry.publish_nonterminal(
+                    receipt,
+                    _generated_v2_envelope(
+                        "vision.try_on.attempt.generating",
+                        {"attemptId": attempt_id, "stage": "preparing"},
+                    ),
+                )
+            )
+
+            garment_source = await asyncio.wait_for(
+                _fast_runtime.fetch_garment(
+                    payload["garment"], await _fast_attempt_registry.cancel_event_for(receipt)
+                ),
+                timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
+            )
+            staging_dir = Path(tempfile.mkdtemp(prefix=f"vem-ai-attempt-{attempt_id}-"))
+            person_png = staging_dir / "person.png"
+            garment_png = staging_dir / "garment.png"
+            output_png = staging_dir / "output.png"
+            ok, encoded_person = cv2.imencode(".png", captured_frame)
+            if not ok:
+                raise RuntimeError("ai_person_encode_failed")
+            person_bytes = encoded_person.tobytes()
+            person_png.write_bytes(person_bytes)
+            garment_png.write_bytes(garment_source.png_bytes)
+
+            await _publish_fast_transition(
+                await _fast_attempt_registry.publish_nonterminal(
+                    receipt,
+                    _generated_v2_envelope(
+                        "vision.try_on.attempt.generating",
+                        {"attemptId": attempt_id, "stage": "generating"},
+                    ),
+                )
+            )
+            ai_child = _ai_attempt_process_factory(Path(model_pack))
+            await _run_owned_attempt_step(
+                receipt,
+                ai_child.run(
+                    person_png=person_png,
+                    garment_png=garment_png,
+                    output_png=output_png,
+                    timeout=_AI_ATTEMPT_TIMEOUT_SECONDS,
+                ),
+                timeout=_AI_ATTEMPT_TIMEOUT_SECONDS,
+            )
+            _validate_ai_private_staging(staging_dir, output_png)
+            output = output_png.read_bytes()
+            stored_result, result = _prepare_ai_result(
+                attempt_id,
+                output,
+                person_png=person_bytes,
+                garment_png=garment_source.png_bytes,
+            )
+            terminal = _generated_v2_envelope(
+                "vision.try_on.attempt.completed", {"attemptId": attempt_id, "result": result}
+            )
+        except GarmentFetchError as error:
+            terminal = _generated_v2_envelope(
+                "vision.try_on.attempt.canceled"
+                if str(error) == "attempt_canceled"
+                else "vision.try_on.attempt.failed",
+                {"attemptId": attempt_id, "reason": "replaced"}
+                if str(error) == "attempt_canceled"
+                else {"attemptId": attempt_id, "reason": "garment_rejected"},
+            )
+        except asyncio.TimeoutError:
+            terminal = _generated_v2_envelope(
+                "vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "timeout"}
+            )
+        except asyncio.CancelledError:
+            terminal = _generated_v2_envelope(
+                "vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "replaced"}
+            )
+        except Exception:
+            logger.exception("AI attempt failed attemptId=%s", attempt_id)
+            terminal = _generated_v2_envelope(
+                "vision.try_on.attempt.failed",
+                {"attemptId": attempt_id, "reason": "ai_failed"},
+            )
+        finally:
+            if ai_child is not None:
+                try:
+                    await ai_child.close()
+                except Exception:
+                    logger.exception("AI child cleanup failed attemptId=%s", attempt_id)
+            if lease_acquired:
+                await _release_acquisition_resources(receipt, lease_token)
+            if staging_dir is not None:
+                await asyncio.to_thread(shutil.rmtree, staging_dir, ignore_errors=True)
+            await _get_acquisition_observer().wait_idle()
+
+        if terminal.get("type") != "vision.try_on.attempt.completed":
+            stored_result = None
+        transition = await _fast_attempt_registry.commit_terminal_transition(
+            receipt, terminal, stored_result
+        )
+        if transition is not None:
+            await _publish_fast_transition(transition)
+    finally:
+        _ai_attempt_execution_lock.release()
+
 async def run_v2_fast_attempt(
     websocket: WebSocket,
     send_lock: asyncio.Lock,
@@ -1545,17 +1794,13 @@ async def run_v2_fast_attempt(
         and _acquisition_observer_ready()
     )
     attempt_id = payload["attemptId"]
-    # An AI selection can never silently route through Fast.  Until the
-    # official attempt child is ready it receives only the AI-specific
-    # terminal, leaving Fast and ordinary Vision independent.
     if payload["mode"] != "fast":
-        await _send_json_bounded(
+        await run_v2_ai_attempt(
             websocket,
             send_lock,
-            _generated_v2_envelope(
-                "vision.try_on.attempt.failed",
-                {"attemptId": attempt_id, "reason": "ai_unavailable"},
-            ),
+            payload,
+            owned_fast_attempt_receipts,
+            connection_closed,
         )
         return
     unavailable_terminal = _generated_v2_envelope(

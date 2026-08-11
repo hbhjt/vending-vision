@@ -476,6 +476,11 @@ def main():
         "--verify-v2-try-on-workers",
         "V2 try-on worker probe passed",
     )
+    run_packaged_probe(
+        exe_path,
+        "--verify-ai-worker-boundary",
+        "AI official worker boundary probe passed",
+    )
     ensure_port_available(args.port)
     managed_port = args.port + 1
     ensure_port_available(managed_port)

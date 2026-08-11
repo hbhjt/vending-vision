@@ -73,6 +73,17 @@ def parse_args(argv=None):
         action="store_true",
         help="verify frozen V2 try-on worker spawn and shared IPC boundaries",
     )
+    parser.add_argument(
+        "--verify-ai-worker-boundary",
+        action="store_true",
+        help="verify frozen official AI worker probe/import/supervisor boundary",
+    )
+    parser.add_argument("--ai-attempt-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--model-pack", help=argparse.SUPPRESS)
+    parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--person", help=argparse.SUPPRESS)
+    parser.add_argument("--garment", help=argparse.SUPPRESS)
+    parser.add_argument("--output", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -98,11 +109,71 @@ def verify_v2_contract_bundle():
     raise RuntimeError("V2 contract bundle accepted its rejected fixture")
 
 
+def run_ai_attempt_worker(args):
+    from vision.ai_attempt_worker import main as worker_main
+
+    worker_args = ["--model-pack", args.model_pack]
+    if args.probe:
+        worker_args.append("--probe")
+    else:
+        worker_args.extend(
+            [
+                "--person",
+                args.person,
+                "--garment",
+                args.garment,
+                "--output",
+                args.output,
+            ]
+        )
+    raise SystemExit(worker_main(worker_args))
+
+
+def verify_ai_worker_boundary():
+    """Probe the frozen official AI child without loading models or inference."""
+    import asyncio
+    import tempfile
+
+    from vision.ai_attempt_process import AiAttemptProcess
+    from vision.ai_model_pack import (
+        OFFICIAL_CATVTON_REPOSITORY,
+        OFFICIAL_CATVTON_REVISION,
+        canonical_ai_model_manifest_json,
+        create_ai_model_manifest,
+        official_ai_readiness,
+    )
+
+    if official_ai_readiness(None):
+        raise RuntimeError("missing official AI pack must not report ready")
+    with tempfile.TemporaryDirectory(prefix="vem-ai-worker-probe-") as root:
+        pack_root = Path(root)
+        model = pack_root / "CatVTON" / "attention.safetensors"
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"official-probe-weight")
+        manifest = create_ai_model_manifest(
+            pack_root,
+            repository=OFFICIAL_CATVTON_REPOSITORY,
+            revision=OFFICIAL_CATVTON_REVISION,
+            paths=["CatVTON/attention.safetensors"],
+        )
+        (pack_root / "ai-model-manifest.json").write_text(
+            canonical_ai_model_manifest_json(manifest),
+            encoding="utf-8",
+        )
+        if not official_ai_readiness(pack_root):
+            raise RuntimeError("verified official AI probe pack was not ready")
+        asyncio.run(AiAttemptProcess(pack_root).probe(timeout=15.0))
+    print("AI official worker boundary probe passed")
+
+
 def main():
     """主入口函数：配置环境并启动 uvicorn 服务器。"""
     # PyInstaller 多进程支持
     multiprocessing.freeze_support()
     args = parse_args()
+    if args.ai_attempt_worker:
+        run_ai_attempt_worker(args)
+        return
     if args.verify_v2_contract_bundle:
         verify_v2_contract_bundle()
         return
@@ -111,6 +182,9 @@ def main():
 
         verify_v2_try_on_workers()
         print("V2 try-on worker probe passed")
+        return
+    if args.verify_ai_worker_boundary:
+        verify_ai_worker_boundary()
         return
     configure_workdir()
     # 抑制 TensorFlow/MediaPipe 的冗余日志输出
