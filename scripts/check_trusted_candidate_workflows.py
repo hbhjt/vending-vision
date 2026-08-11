@@ -6,6 +6,8 @@ import re
 import subprocess
 import tempfile
 
+from workflow_yaml import WorkflowYamlError, workflow_run_scalars
+
 
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 TRUSTED_BUILDER_COMMIT = "be8fe434855b94f61511e8c6c926e02c54230a38"
@@ -63,15 +65,8 @@ def _job_block(source: str, job: str) -> str:
     return match.group(0)
 
 
-def _run_blocks(source: str) -> list[str]:
-    return re.findall(
-        r"(?ms)^\s+run: \|\n(?P<body>.*?)(?=^\s+- name:|^\s+- uses:|^  [a-zA-Z0-9_-]+:|\Z)",
-        source,
-    )
-
-
 def _assert_no_untrusted_run_expressions(source: str, label: str) -> None:
-    blocks = _run_blocks(source)
+    blocks = workflow_run_scalars(source)
     _require(bool(blocks), f"{label}_run_blocks_missing")
     for block in blocks:
         _require("${{ inputs." not in block, f"{label}_raw_workflow_input_in_run")
@@ -311,7 +306,7 @@ def main() -> int:
             publisher=args.publisher.resolve(),
             repository_root=args.repository_root.resolve(),
         )
-    except (OSError, StopIteration, TrustPolicyError) as exc:
+    except (OSError, StopIteration, TrustPolicyError, WorkflowYamlError) as exc:
         print(f"TRUSTED_CANDIDATE_WORKFLOW_POLICY=FAIL:{exc}")
         return 1
     print("TRUSTED_CANDIDATE_WORKFLOW_POLICY=PASS")

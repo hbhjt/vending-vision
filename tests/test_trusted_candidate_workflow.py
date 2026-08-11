@@ -5,6 +5,8 @@ import re
 import subprocess
 import sys
 
+import pytest
+
 
 ROOT = Path(__file__).parents[1]
 TRUSTED_BUILDER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder.yml"
@@ -19,13 +21,6 @@ def _workflow_call_inputs(source: str) -> set[str]:
     match = re.search(r"(?ms)^  workflow_call:\n    inputs:\n(?P<body>.*?)(?=^    outputs:)", source)
     assert match, "trusted builder must declare workflow_call inputs and outputs"
     return set(re.findall(r"(?m)^      ([a-z][a-z0-9_]*):$", match.group("body")))
-
-
-def _run_blocks(source: str) -> list[str]:
-    return re.findall(
-        r"(?ms)^\s+run: \|\n(?P<body>.*?)(?=^\s+- name:|^\s+- uses:|^  [a-zA-Z0-9_-]+:|\Z)",
-        source,
-    )
 
 
 def test_trusted_builder_has_a_closed_raw_material_interface_and_owns_attestation():
@@ -43,11 +38,6 @@ def test_trusted_builder_has_a_closed_raw_material_interface_and_owns_attestatio
     assert "repository: hbhjt/vending-vision" in workflow
     assert "ref: ${{ inputs.source_commit }}" in workflow
     assert "path: source" in workflow
-    run_blocks = _run_blocks(workflow)
-    assert run_blocks
-    assert all("${{ inputs." not in block for block in run_blocks)
-    assert all("${{ github.event.inputs" not in block for block in run_blocks)
-    assert all("${{ needs." not in block for block in run_blocks)
     input_lines = [line.strip() for line in workflow.splitlines() if "${{ inputs." in line]
     assert input_lines
     assert all(
@@ -218,3 +208,137 @@ def test_policy_rejects_publisher_needs_output_shell_injection_without_execution
     assert completed.returncode != 0
     assert "publisher_raw_needs_output_in_run" in completed.stdout
     assert not marker.exists()
+
+
+def test_policy_rejects_chomped_literal_run_scalar_injection(tmp_path):
+    mutated_publisher = tmp_path / "publish-candidate.yml"
+    mutated_publisher.write_text(
+        PUBLISHER.read_text("utf-8")
+        + '\n      - name: Chomped literal injection\n'
+          '        shell: pwsh\n'
+          '        run: |-\n'
+          '          Write-Output "${{ needs.verify.outputs.subject_sha256 }}"\n',
+        "utf-8",
+    )
+
+    completed = _check_policy(mutated_publisher)
+
+    assert completed.returncode != 0
+    assert "publisher_raw_needs_output_in_run" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("target", "scalar", "expression", "expected_error"),
+    [
+        (
+            "builder",
+            "|-",
+            "${{ inputs.source_commit }}",
+            "trusted_builder_raw_workflow_input_in_run",
+        ),
+        (
+            "signer",
+            "|+",
+            "${{ github.event.inputs.source_ref }}",
+            "trusted_signer_raw_event_input_in_run",
+        ),
+        (
+            "publisher",
+            ">-",
+            "${{ needs.verify.outputs.subject_sha256 }}",
+            "publisher_raw_needs_output_in_run",
+        ),
+        (
+            "builder",
+            ">+",
+            "${{ needs.probe.outputs.value }}",
+            "trusted_builder_raw_needs_output_in_run",
+        ),
+        (
+            "signer",
+            "inline",
+            "${{ inputs.source_commit }}",
+            "trusted_signer_raw_workflow_input_in_run",
+        ),
+        (
+            "publisher",
+            "inline",
+            "${{ github.event.inputs.source_ref }}",
+            "publisher_raw_event_input_in_run",
+        ),
+        (
+            "publisher",
+            "inline",
+            "${{ needs.verify.outputs.subject_sha256 }}",
+            "publisher_raw_needs_output_in_run",
+        ),
+    ],
+)
+def test_policy_rejects_untrusted_expressions_in_every_legal_run_scalar_form(
+    tmp_path, target, scalar, expression, expected_error
+):
+    sources = {
+        "builder": TRUSTED_BUILDER.read_text("utf-8"),
+        "signer": TRUSTED_SIGNER.read_text("utf-8"),
+        "publisher": PUBLISHER.read_text("utf-8"),
+    }
+    if scalar == "inline":
+        injected = f"        run: 'Write-Output \"{expression}\"'\n"
+    else:
+        injected = f'        run: {scalar}\n          Write-Output "{expression}"\n'
+    mutated = tmp_path / f"{target}-{scalar.replace('|', 'literal').replace('>', 'folded')}.yml"
+    mutated.write_text(
+        sources[target]
+        + "\n      - name: AST policy injection probe\n"
+          "        shell: pwsh\n"
+        + injected,
+        "utf-8",
+    )
+
+    kwargs = {target: mutated} if target in {"builder", "signer"} else {}
+    completed = _check_policy(mutated if target == "publisher" else PUBLISHER, **kwargs)
+
+    assert completed.returncode != 0
+    assert expected_error in completed.stdout
+
+
+def test_policy_enumerates_nested_steps_across_multiple_jobs(tmp_path):
+    mutated_publisher = tmp_path / "publish-candidate.yml"
+    mutated_publisher.write_text(
+        PUBLISHER.read_text("utf-8")
+        + "\n  nested_policy_probe:\n"
+          "    runs-on: windows-latest\n"
+          "    steps:\n"
+          "      - name: Nested folded injection\n"
+          "        shell: pwsh\n"
+          "        run: >-\n"
+          '          Write-Output "${{ github.event.inputs.source_ref }}"\n',
+        "utf-8",
+    )
+
+    completed = _check_policy(mutated_publisher)
+
+    assert completed.returncode != 0
+    assert "publisher_raw_event_input_in_run" in completed.stdout
+
+
+def test_policy_allows_workflow_expressions_in_non_run_env_and_with_fields(tmp_path):
+    mutated_publisher = tmp_path / "publish-candidate.yml"
+    mutated_publisher.write_text(
+        PUBLISHER.read_text("utf-8")
+        + "\n      - name: Allowed expression transport\n"
+          "        shell: pwsh\n"
+          "        env:\n"
+          "          FROM_INPUT: ${{ inputs.source_commit }}\n"
+          "          FROM_NEEDS: ${{ needs.verify.outputs.subject_sha256 }}\n"
+          "        run: Write-Output $env:FROM_INPUT\n"
+          "      - name: Allowed action input transport\n"
+          "        uses: actions/github-script@v7\n"
+          "        with:\n"
+          "          script: ${{ github.event.inputs.source_ref }}\n",
+        "utf-8",
+    )
+
+    completed = _check_policy(mutated_publisher)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
