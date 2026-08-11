@@ -412,6 +412,60 @@ def test_prior_join_outcome_is_consumed_before_pending_admission_recheck(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("initially_ready", "ready_at_commit"),
+    [(True, False), (False, True)],
+)
+def test_prepared_admission_atomically_binds_active_state_to_resolved_accepted(
+    initially_ready, ready_at_commit
+):
+    async def scenario():
+        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        attempt_id = str(uuid4())
+        accepted = _message(
+            "vision.try_on.attempt.accepted", attempt_id, "accepted"
+        )
+        unavailable = _message(
+            "vision.try_on.attempt.failed", attempt_id, "unavailable"
+        )
+        current = {"ready": initially_ready}
+        preparation = await registry.prepare_admission(
+            attempt_id=attempt_id,
+            websocket=object(),
+            send_lock=asyncio.Lock(),
+            task=asyncio.current_task(),
+        )
+
+        current["ready"] = ready_at_commit
+        admission = await registry.commit_prepared_admission(
+            preparation,
+            accepted=None,
+            generating=None,
+            unavailable_terminal=unavailable,
+            accepted_resolver=lambda: accepted if current["ready"] else None,
+        )
+        replay = await registry.admit(
+            attempt_id=attempt_id,
+            websocket=object(),
+            send_lock=asyncio.Lock(),
+            task=asyncio.current_task(),
+            accepted=None,
+            generating=None,
+        )
+
+        if ready_at_commit:
+            assert admission.is_owner
+            assert admission.replay == [accepted]
+            assert replay.replay == [accepted]
+            await registry.cancel_owner_and_join(admission.receipt)
+        else:
+            assert not admission.is_owner
+            assert admission.replay == [unavailable]
+            assert replay.replay == [unavailable]
+
+    asyncio.run(scenario())
+
+
 def test_cancelled_pending_owner_keeps_cleanup_barrier_until_prior_task_ends():
     async def scenario():
         registry = FastAttemptRegistry(terminal_ttl_seconds=60)

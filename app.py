@@ -1575,11 +1575,6 @@ async def run_v2_ai_attempt(
 ) -> None:
     """Run one attempt-scoped official AI child after the shared acquisition path."""
     attempt_id = payload["attemptId"]
-    model_pack = os.environ.get("VEM_AI_MODEL_PACK")
-    ai_ready = bool(
-        official_ai_readiness_snapshot(model_pack).ready
-        and _acquisition_observer_ready()
-    )
     unavailable_terminal = _generated_v2_envelope(
         "vision.try_on.attempt.failed",
         {"attemptId": attempt_id, "reason": "ai_unavailable"},
@@ -1588,13 +1583,21 @@ async def run_v2_ai_attempt(
         "vision.try_on.attempt.canceled",
         {"attemptId": attempt_id, "reason": "replaced"},
     )
-    accepted = (
-        _generated_v2_envelope(
-            "vision.try_on.attempt.accepted", {"attemptId": attempt_id, "mode": "ai"}
+    admitted_model_pack: Path | None = None
+
+    def resolve_current_ai_accepted() -> dict | None:
+        nonlocal admitted_model_pack
+        current_root = os.environ.get("VEM_AI_MODEL_PACK")
+        snapshot = official_ai_readiness_snapshot(current_root)
+        if not snapshot.ready or not _acquisition_observer_ready() or not current_root:
+            admitted_model_pack = None
+            return None
+        admitted_model_pack = Path(current_root)
+        return _generated_v2_envelope(
+            "vision.try_on.attempt.accepted",
+            {"attemptId": attempt_id, "mode": "ai"},
         )
-        if ai_ready
-        else None
-    )
+
     preparation = await _fast_attempt_registry.prepare_admission(
         attempt_id=attempt_id,
         websocket=websocket,
@@ -1609,13 +1612,10 @@ async def run_v2_ai_attempt(
     try:
         admission = await _fast_attempt_registry.commit_prepared_admission(
             preparation,
-            accepted=accepted,
+            accepted=None,
             generating=None,
             unavailable_terminal=unavailable_terminal,
-            readiness=lambda: bool(
-                official_ai_readiness_snapshot(model_pack).ready
-                and _acquisition_observer_ready()
-            ),
+            accepted_resolver=resolve_current_ai_accepted,
         )
         if not admission.is_owner:
             for replay_message in admission.replay:
@@ -1624,6 +1624,7 @@ async def run_v2_ai_attempt(
 
         receipt = admission.receipt
         assert receipt is not None
+        assert admitted_model_pack is not None
         if connection_closed.is_set():
             await _publish_fast_transition(
                 await _fast_attempt_registry.cancel_owner_and_join(receipt)
@@ -1722,7 +1723,7 @@ async def run_v2_ai_attempt(
                     ),
                 )
             )
-            ai_child = _ai_attempt_process_factory(Path(model_pack))
+            ai_child = _ai_attempt_process_factory(admitted_model_pack)
             await _run_owned_attempt_step(
                 receipt,
                 ai_child.run(

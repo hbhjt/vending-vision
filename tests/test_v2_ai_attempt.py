@@ -186,6 +186,25 @@ class _CountingFastBroker:
         return None
 
 
+class _PrepareBarrierRegistry(vision_app.FastAttemptRegistry):
+    def __init__(self):
+        super().__init__(
+            terminal_ttl_seconds=vision_app._FAST_RESULT_TTL_SECONDS,
+            result_max_count=vision_app._FAST_RESULT_MAX_COUNT,
+            result_max_bytes=vision_app._FAST_RESULT_MAX_TOTAL_BYTES,
+            result_single_max_bytes=vision_app._FAST_RESULT_MAX_BYTES,
+        )
+        self.prepared = threading.Event()
+        self.release = threading.Event()
+
+    async def prepare_admission(self, **kwargs):
+        preparation = await super().prepare_admission(**kwargs)
+        self.prepared.set()
+        while not self.release.is_set():
+            await asyncio.sleep(0.005)
+        return preparation
+
+
 class _DeterministicAiChild:
     calls = 0
 
@@ -490,6 +509,94 @@ def test_v2_ai_attempt_uses_official_boundary_not_fast_and_publishes_tokenized_r
         assert fast.calls == 0
         assert _DeterministicAiChild.calls == 1
     finally:
+        _DeterministicAiChild.calls = 0
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_v2_ai_admission_rechecks_current_root_after_prepare_barrier_becomes_unset(
+    tmp_path, monkeypatch
+):
+    pack = tmp_path / "pack"
+    _write_official_pack(pack)
+    _configure_stage1_runtime(monkeypatch, pack)
+    registry = _PrepareBarrierRegistry()
+    monkeypatch.setattr(vision_app, "_fast_attempt_registry", registry)
+    monkeypatch.setattr(vision_app, "_ai_attempt_process_factory", _DeterministicAiChild)
+    server, thread, reference = _serve_garment()
+
+    def unset_root_at_barrier():
+        registry.prepared.wait(timeout=2)
+        monkeypatch.delenv("VEM_AI_MODEL_PACK", raising=False)
+        registry.release.set()
+
+    toggler = threading.Thread(target=unset_root_at_barrier)
+    toggler.start()
+    try:
+        attempt_id = str(uuid4())
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_hello())
+                assert socket.receive_json()["payload"]["aiReady"] is True
+                start = _start(attempt_id, reference, mode="ai")
+                socket.send_json(start)
+                terminal = socket.receive_json()
+                socket.send_json(start)
+                replay = socket.receive_json()
+
+        assert terminal == {
+            "protocol": "vem.vision.v2",
+            "type": "vision.try_on.attempt.failed",
+            "messageId": terminal["messageId"],
+            "timestamp": terminal["timestamp"],
+            "payload": {"attemptId": attempt_id, "reason": "ai_unavailable"},
+        }
+        assert replay == terminal
+        assert _DeterministicAiChild.calls == 0
+    finally:
+        registry.release.set()
+        toggler.join(timeout=2)
+        _DeterministicAiChild.calls = 0
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_v2_ai_admission_rechecks_current_root_after_prepare_barrier_becomes_valid(
+    tmp_path, monkeypatch
+):
+    pack = tmp_path / "pack"
+    _write_official_pack(pack)
+    _configure_stage1_runtime(monkeypatch, pack)
+    monkeypatch.delenv("VEM_AI_MODEL_PACK", raising=False)
+    registry = _PrepareBarrierRegistry()
+    monkeypatch.setattr(vision_app, "_fast_attempt_registry", registry)
+    monkeypatch.setattr(vision_app, "_ai_attempt_process_factory", _DeterministicAiChild)
+    server, thread, reference = _serve_garment()
+
+    def restore_root_at_barrier():
+        registry.prepared.wait(timeout=2)
+        monkeypatch.setenv("VEM_AI_MODEL_PACK", str(pack))
+        registry.release.set()
+
+    toggler = threading.Thread(target=restore_root_at_barrier)
+    toggler.start()
+    try:
+        attempt_id = str(uuid4())
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_hello())
+                assert socket.receive_json()["payload"]["aiReady"] is False
+                socket.send_json(_start(attempt_id, reference, mode="ai"))
+                trace, terminal = _receive_until_terminal(socket)
+
+        assert trace[0]["type"] == "vision.try_on.attempt.accepted"
+        assert terminal["type"] == "vision.try_on.attempt.completed"
+        assert _DeterministicAiChild.calls == 1
+    finally:
+        registry.release.set()
+        toggler.join(timeout=2)
         _DeterministicAiChild.calls = 0
         server.shutdown()
         server.server_close()

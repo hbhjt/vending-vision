@@ -313,9 +313,20 @@ class FastAttemptRegistry:
         accepted: dict | None,
         generating: dict | None,
         unavailable_terminal: dict,
-        readiness: Callable[[], bool],
+        readiness: Callable[[], bool] | None = None,
+        accepted_resolver: Callable[[], dict | None] | None = None,
     ) -> AttemptAdmission:
         """Join outside the gate, then atomically publish ready active state."""
+        if readiness is None and accepted_resolver is None:
+            raise ValueError("admission readiness resolver is required")
+
+        def resolve_accepted() -> tuple[bool, dict | None]:
+            if accepted_resolver is not None:
+                resolved = accepted_resolver()
+                return resolved is not None, resolved
+            assert readiness is not None
+            return readiness(), accepted
+
         if preparation.resolved:
             return AttemptAdmission(None, preparation.replay)
         if preparation.wait_event is not None:
@@ -404,13 +415,13 @@ class FastAttemptRegistry:
             not preparation.resolved
             and preparation.wait_event is None
             and preparation.join_task is not None
-            and accepted is not None
+            and (accepted is not None or accepted_resolver is not None)
         ):
             readiness_deadline = (
                 asyncio.get_running_loop().time() + _PENDING_READINESS_WAIT_SECONDS
             )
             while (
-                not readiness()
+                not resolve_accepted()[0]
                 and asyncio.get_running_loop().time() < readiness_deadline
             ):
                 await asyncio.sleep(_PENDING_READINESS_POLL_SECONDS)
@@ -436,7 +447,8 @@ class FastAttemptRegistry:
                     )
                 raise RuntimeError("Fast admission reservation was lost")
 
-            if not readiness():
+            is_ready, committed_accepted = resolve_accepted()
+            if not is_ready:
                 self._terminals[preparation.attempt_id] = self._new_terminal(
                     unavailable_terminal
                 )
@@ -459,7 +471,7 @@ class FastAttemptRegistry:
                 owner_receipts=pending.owner_receipts,
                 owner_subscriber_key=pending.owner_subscriber_key,
                 subscribers=pending.subscribers,
-                accepted=copy.deepcopy(accepted),
+                accepted=copy.deepcopy(committed_accepted),
                 latest_status=copy.deepcopy(generating),
                 canceled_terminal=pending.canceled_terminal,
             )
@@ -469,7 +481,7 @@ class FastAttemptRegistry:
                 receipt,
                 [
                     copy.deepcopy(message)
-                    for message in (accepted, generating)
+                    for message in (committed_accepted, generating)
                     if message
                 ],
             )
