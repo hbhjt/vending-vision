@@ -78,7 +78,8 @@ def test_fast_result_store_expiry_is_complete_and_reads_do_not_renew_or_reorder(
     asyncio.run(scenario())
 
 
-def test_terminal_commit_failure_has_one_failed_terminal_and_no_orphan_grant():
+@pytest.mark.parametrize("mode,reason", [("fast", "fast_failed"), ("ai", "ai_failed")])
+def test_terminal_commit_failure_has_one_mode_correct_failed_terminal_and_no_orphan_grant(mode, reason):
     async def scenario():
         registry = FastAttemptRegistry(
             terminal_ttl_seconds=60,
@@ -88,7 +89,7 @@ def test_terminal_commit_failure_has_one_failed_terminal_and_no_orphan_grant():
         accepted = {
             "type": "vision.try_on.attempt.accepted",
             "messageId": "accepted",
-            "payload": {"attemptId": attempt_id, "mode": "fast"},
+            "payload": {"attemptId": attempt_id, "mode": mode},
         }
         completed = {
             "type": "vision.try_on.attempt.completed",
@@ -112,7 +113,7 @@ def test_terminal_commit_failure_has_one_failed_terminal_and_no_orphan_grant():
         assert transition.message["type"] == "vision.try_on.attempt.failed"
         assert transition.message["payload"] == {
             "attemptId": attempt_id,
-            "reason": "fast_failed",
+            "reason": reason,
         }
         assert await registry.get_result(attempt_id, "secret") is None
 

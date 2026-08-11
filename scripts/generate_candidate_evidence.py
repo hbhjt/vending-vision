@@ -55,6 +55,7 @@ def evidence_ref(path, **extra):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bundle", required=True)
+    parser.add_argument("--candidate-manifest")
     parser.add_argument("--version", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--repository", required=True)
@@ -70,6 +71,7 @@ def main():
         raise SystemExit("signer identity must be spki-sha256:<64 lowercase hex>")
 
     bundle = Path(args.bundle).resolve()
+    candidate_manifest = Path(args.candidate_manifest).resolve() if args.candidate_manifest else None
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     model_manifest = json.loads((ROOT / "models/model-manifest.json").read_text(encoding="utf-8"))
@@ -127,6 +129,7 @@ def main():
                 "resolvedDependencies": [
                     {"uri": f"git+https://github.com/{args.repository}@{args.commit}", "digest": {"gitCommit": args.commit}},
                     {"uri": "legacy-bundle:vending-vision.zip", "digest": {"sha256": model_manifest["sourceArtifact"]["digest"].split(":", 1)[1]}},
+                    *([{"uri": f"candidate-manifest:{candidate_manifest.name}", "digest": {"sha256": digest_file(candidate_manifest).split(":", 1)[1]}}] if candidate_manifest else []),
                 ],
             },
             "runDetails": {
@@ -150,6 +153,7 @@ def main():
             "extractor": {"contractVersion": "vem-vision-extractor/v1", "handler": "zip-safe-v1"},
         },
         "entrypoint": {"command": "vending-vision/vending-vision.exe", "arguments": ["--no-browser"]},
+        **({"candidateManifest": evidence_ref(candidate_manifest, schemaVersion="vending-vision-candidate-artifact/v2")} if candidate_manifest else {}),
         "lifecycle": {"requiresInteractiveSession": True, "shutdownTimeoutMs": 10000},
         "configuration": {"format": "json", "schemaVersion": "vending-vision-site-config/v1", "argument": "--config"},
         "health": {"port": 7892, "path": "/health", "expectedStatus": 200, "timeoutMs": 30000},

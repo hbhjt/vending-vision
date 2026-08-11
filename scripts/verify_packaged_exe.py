@@ -17,6 +17,12 @@ from pathlib import Path
 
 import websockets
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.candidate_artifact_manifest import LAYOUT, SCHEMA, canonical_json
+
 
 CONTRACT_ROOT = Path(__file__).resolve().parents[1] / "contracts" / "vem_vision_v2"
 PROFILE_FIELDS = {
@@ -58,6 +64,9 @@ def parse_args():
         nargs="?",
         default="dist/vending-vision/vending-vision.exe",
     )
+    parser.add_argument("--candidate-manifest")
+    parser.add_argument("--candidate-artifact")
+    parser.add_argument("--expected-candidate-manifest-sha256")
     parser.add_argument("--port", type=int, default=17892)
     parser.add_argument("--startup-timeout", type=float, default=45.0)
     parser.add_argument("--expected-version")
@@ -402,6 +411,7 @@ def assert_ai_worker_layout(exe_path, *, required):
     required_resources = [
         internal / "official-ai-model-pack-descriptor.json",
         internal / "ai-runtime-descriptor.json",
+        internal / "requirements-ai.lock.json",
         internal / "official-ai-source-descriptor.json",
     ]
     missing = [str(path) for path in required_resources if not path.is_file()]
@@ -409,6 +419,43 @@ def assert_ai_worker_layout(exe_path, *, required):
         raise AssertionError(f"missing packaged AI worker resources: {missing}")
     digest = __import__("hashlib").sha256(worker.read_bytes()).hexdigest()
     return {"path": worker, "sha256": digest}
+
+
+def verify_candidate_artifact_manifest(
+    exe_path: Path,
+    manifest_path: Path,
+    artifact_path: Path,
+    expected_manifest_sha256: str,
+):
+    import hashlib
+
+    raw = manifest_path.read_text("utf-8")
+    manifest = json.loads(raw)
+    if canonical_json(manifest) != raw.rstrip("\n"):
+        raise AssertionError("candidate artifact manifest is not canonical")
+    if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != expected_manifest_sha256:
+        raise AssertionError("candidate artifact manifest outer digest mismatch")
+    expected_fields = {
+        "schemaVersion", "artifactSha256", "layout", "mainExecutableSha256",
+        "workerExecutableSha256", "runtimeDescriptorSha256",
+        "aiWheelhouseManifestSha256", "sourceDescriptorSha256", "modelPackDescriptorSha256",
+    }
+    if set(manifest) != expected_fields or manifest["schemaVersion"] != SCHEMA or manifest["layout"] != LAYOUT:
+        raise AssertionError("candidate artifact manifest shape mismatch")
+    dist_root = exe_path.parent.parent
+    bound_paths = {
+        "mainExecutableSha256": dist_root / LAYOUT["mainExecutable"],
+        "workerExecutableSha256": dist_root / LAYOUT["workerExecutable"],
+        "runtimeDescriptorSha256": dist_root / LAYOUT["workerInternal"] / "ai-runtime-descriptor.json",
+        "aiWheelhouseManifestSha256": dist_root / LAYOUT["workerInternal"] / "requirements-ai.lock.json",
+        "sourceDescriptorSha256": dist_root / LAYOUT["workerInternal"] / "official-ai-source-descriptor.json",
+        "modelPackDescriptorSha256": dist_root / LAYOUT["workerInternal"] / "official-ai-model-pack-descriptor.json",
+        "artifactSha256": artifact_path,
+    }
+    for field, path in bound_paths.items():
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != manifest[field]:
+            raise AssertionError(f"candidate artifact manifest file digest mismatch: {field}")
+    return {"path": bound_paths["workerExecutableSha256"], "sha256": manifest["workerExecutableSha256"]}
 
 
 def verify_ai_worker_runtime_probe(ai_worker):
@@ -432,8 +479,8 @@ def verify_ai_worker_runtime_probe(ai_worker):
         probe.returncode != 0
         or payload.get("probe") != "official-catvton-worker-runtime"
         or payload.get("catvtonSourceRevision") != "3b795364a4d2f3b5adb365f39cdea376d20bc53c"
-        or payload.get("torch") != "2.8.0"
-        or payload.get("torchvision") != "0.23.0"
+        or payload.get("torch") != "2.8.0+cpu"
+        or payload.get("torchvision") != "0.23.0+cpu"
         or payload.get("diffusers") != "0.29.2"
         or payload.get("transformers") != "4.53.3"
     ):
@@ -530,7 +577,16 @@ def main():
         raise FileNotFoundError(exe_path)
 
     assert_bundled_resources(exe_path)
-    ai_worker = assert_ai_worker_layout(exe_path, required=args.require_ai_worker)
+    ai_worker = None
+    if args.require_ai_worker:
+        if not all((args.candidate_manifest, args.candidate_artifact, args.expected_candidate_manifest_sha256)):
+            raise AssertionError("full AI verification requires candidate manifest, artifact, and outer digest")
+        ai_worker = verify_candidate_artifact_manifest(
+            exe_path,
+            Path(args.candidate_manifest).resolve(),
+            Path(args.candidate_artifact).resolve(),
+            args.expected_candidate_manifest_sha256,
+        )
     run_packaged_probe(
         exe_path,
         "--verify-v2-contract-bundle",

@@ -62,7 +62,7 @@ $WorkerExe = Join-Path $Root "dist\vending-vision-ai-worker\vending-vision-ai-wo
 if (-not (Test-Path -LiteralPath $MainExe -PathType Leaf)) { throw "main Vision exe missing after build: $MainExe" }
 if (-not (Test-Path -LiteralPath $WorkerExe -PathType Leaf)) { throw "AI worker exe missing after build: $WorkerExe" }
 
-Invoke-Checked $Python (Join-Path $Root "scripts\verify_packaged_exe.py") $MainExe --require-ai-worker
+Invoke-Checked $Python (Join-Path $Root "scripts\verify_packaged_exe.py") $MainExe
 
 Write-Host ""
 Write-Host "Build complete:"

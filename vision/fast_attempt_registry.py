@@ -683,13 +683,14 @@ class FastAttemptRegistry:
             return self._active.receipt.attempt_id if self._active is not None else None
 
     @staticmethod
-    def _result_failure_message(message: dict) -> dict:
-        """Map an unpublishable completion to the one stable Fast failure."""
+    def _result_failure_message(message: dict, active: ActiveAttempt) -> dict:
+        """Map an unpublishable completion without crossing Fast/AI semantics."""
         failure = dict(message)
+        mode = active.accepted.get("payload", {}).get("mode") if active.accepted else None
         failure["type"] = "vision.try_on.attempt.failed"
         failure["payload"] = {
             "attemptId": message.get("payload", {}).get("attemptId"),
-            "reason": "fast_failed",
+            "reason": "ai_failed" if mode == "ai" else "fast_failed",
         }
         return failure
 
@@ -710,7 +711,7 @@ class FastAttemptRegistry:
                     active.receipt.attempt_id, result
                 )
             except ResultAdmissionError:
-                canonical = self._result_failure_message(message)
+                canonical = self._result_failure_message(message, active)
             else:
                 admitted_result = admission.entry
                 # Store admission has already committed NEW.  Retire every

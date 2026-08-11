@@ -101,8 +101,8 @@ _real_version = importlib.metadata.version
 def _mini_version(name):
     if name in {"torch", "torchvision", "diffusers", "transformers", "accelerate", "safetensors", "scipy", "tqdm", "opencv-python-headless"}:
         return {
-            "torch": "2.8.0",
-            "torchvision": "0.23.0",
+            "torch": "2.8.0+cpu",
+            "torchvision": "0.23.0+cpu",
             "diffusers": "0.29.2",
             "transformers": "4.53.3",
             "accelerate": "0.31.0",
@@ -251,7 +251,7 @@ def test_worker_probe_accepts_only_official_manifest_and_no_fake_arguments(tmp_p
     assert probe.returncode == 0, f"{probe.stdout}{probe.stderr}"
     probe_payload = json.loads(probe.stdout)
     assert probe_payload["probe"] == "official-catvton-worker"
-    assert probe_payload["torch"] == "2.8.0"
+    assert probe_payload["torch"] == "2.8.0+cpu"
 
     fake = subprocess.run(
         [
@@ -298,8 +298,20 @@ def test_worker_runtime_probe_does_not_require_model_pack_and_reports_versions(t
     assert probe.returncode == 0, f"{probe.stdout}{probe.stderr}"
     payload = json.loads(probe.stdout)
     assert payload["probe"] == "official-catvton-worker-runtime"
-    assert payload["torch"] == "2.8.0"
+    assert payload["torch"] == "2.8.0+cpu"
     assert payload["catvtonSourceRevision"] == "3b795364a4d2f3b5adb365f39cdea376d20bc53c"
+
+    legacy_probe = subprocess.run(
+        [sys.executable, "run_vision_server.py", "--ai-attempt-worker", "--probe-runtime"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert legacy_probe.returncode == 0, f"{legacy_probe.stdout}{legacy_probe.stderr}"
+    assert json.loads(legacy_probe.stdout)["probe"] == "official-catvton-worker-runtime"
 
 
 def test_worker_probe_rejects_source_descriptor_tamper(tmp_path):

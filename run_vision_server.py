@@ -113,11 +113,9 @@ def verify_v2_contract_bundle():
 def run_ai_attempt_worker(args):
     from vision.ai_attempt_worker import main as worker_main
 
-    worker_args = []
     if args.probe_runtime:
-        worker_args.append("--probe-runtime")
-    else:
-        worker_args.extend(["--model-pack", args.model_pack])
+        raise SystemExit(worker_main(["--probe-runtime"]))
+    worker_args = ["--model-pack", args.model_pack]
     if args.probe:
         worker_args.append("--probe")
     else:

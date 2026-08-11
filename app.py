@@ -76,7 +76,11 @@ from vision.v2_contract_bundle import (
     parse_v2_client_message,
     parse_v2_server_message,
 )
-from vision.ai_model_pack import official_ai_readiness, refresh_official_ai_readiness
+from vision.ai_model_pack import (
+    official_ai_readiness,
+    refresh_official_ai_readiness,
+    shutdown_official_ai_readiness_refresh,
+)
 from vision.ai_attempt_process import AiAttemptProcess
 
 
@@ -149,13 +153,14 @@ async def on_startup():
         await refresh_official_ai_readiness(os.environ.get("VEM_AI_MODEL_PACK"))
     except Exception:
         # AI is optional for core/Fast readiness.  Refresh is owned by startup
-        # and the public hello/admission path only reads the O(1) cached value.
+        # and the public hello/admission path only performs bounded stat checks.
         logger.exception("Official AI readiness refresh failed")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     """服务关闭事件：停止后台工作线程并释放所有摄像头资源。"""
+    await shutdown_official_ai_readiness_refresh()
     for task in (_presence_worker_task, _profile_worker_task):
         if task is not None and not task.done():
             task.cancel()

@@ -30,53 +30,43 @@ jobs:
         with:
           python-version-file: ".python-version"
           cache: pip
-      - name: 展开 release-provided 核心 wheel 闭包
+      - name: 下载、校验并安全展开核心 wheel 闭包
         shell: pwsh
         env:
-          CORE_WHEELHOUSE_ARCHIVE: ${{ vars.CORE_WHEELHOUSE_ARCHIVE }}
+          CORE_WHEELHOUSE_URL: ${{ vars.CORE_WHEELHOUSE_URL }}
+          CORE_WHEELHOUSE_SHA256: ${{ vars.CORE_WHEELHOUSE_SHA256 }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:CORE_WHEELHOUSE_ARCHIVE)) { throw "CORE_WHEELHOUSE_ARCHIVE is required" }
-          if (-not (Test-Path -LiteralPath $env:CORE_WHEELHOUSE_ARCHIVE -PathType Leaf)) { throw "CORE_WHEELHOUSE_ARCHIVE does not exist" }
-          New-Item -ItemType Directory -Force wheelhouse | Out-Null
-          tar -xf $env:CORE_WHEELHOUSE_ARCHIVE -C wheelhouse
-      - name: 下载并校验 AI worker wheel 闭包
+          if ($env:CORE_WHEELHOUSE_URL -notmatch '^https://') { throw "CORE_WHEELHOUSE_URL must be HTTPS" }
+          if ($env:CORE_WHEELHOUSE_SHA256 -notmatch '^[a-fA-F0-9]{64}$') { throw "CORE_WHEELHOUSE_SHA256 is required" }
+          python scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --destination wheelhouse
+      - name: 从仓库锁定清单下载并校验 AI worker wheel 闭包
         shell: pwsh
-        env:
-          AI_WHEELHOUSE_ARCHIVE: ${{ vars.AI_WHEELHOUSE_ARCHIVE }}
-          AI_WHEELHOUSE_DESCRIPTOR: ${{ vars.AI_WHEELHOUSE_DESCRIPTOR }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:AI_WHEELHOUSE_ARCHIVE)) { throw "AI_WHEELHOUSE_ARCHIVE is required" }
-          if ([string]::IsNullOrWhiteSpace($env:AI_WHEELHOUSE_DESCRIPTOR)) { throw "AI_WHEELHOUSE_DESCRIPTOR is required" }
-          if (-not (Test-Path -LiteralPath $env:AI_WHEELHOUSE_ARCHIVE -PathType Leaf)) { throw "AI_WHEELHOUSE_ARCHIVE does not exist" }
-          New-Item -ItemType Directory -Force ai-wheelhouse | Out-Null
-          tar -xf $env:AI_WHEELHOUSE_ARCHIVE -C ai-wheelhouse
-          Copy-Item -LiteralPath $env:AI_WHEELHOUSE_DESCRIPTOR -Destination ai-wheelhouse-release.json
-          python scripts/verify_ai_wheelhouse.py --descriptor ai-wheelhouse-release.json --wheelhouse ai-wheelhouse --runtime-descriptor ai-runtime-descriptor.json --requirements-output build/requirements-ai-release.txt
+          python scripts/materialize_ai_wheelhouse.py --descriptor requirements-ai.lock.json --runtime-descriptor ai-runtime-descriptor.json --destination ai-wheelhouse
+          python scripts/verify_ai_wheelhouse.py --descriptor requirements-ai.lock.json --wheelhouse ai-wheelhouse --runtime-descriptor ai-runtime-descriptor.json --requirements-output build/requirements-ai-release.txt
       - name: 离线安装、校验精确源码和模型
         shell: pwsh
         run: |
           python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
           python -m pip install --no-index --find-links ai-wheelhouse --require-hashes -r build/requirements-ai-release.txt
           python scripts/dependency_lock.py --wheelhouse wheelhouse --python python --target-sys-platform win32
-          python scripts/verify_ai_wheelhouse.py --descriptor ai-wheelhouse-release.json --wheelhouse ai-wheelhouse --runtime-descriptor ai-runtime-descriptor.json --requirements-output build/requirements-ai-release.txt
+          python scripts/verify_ai_wheelhouse.py --descriptor requirements-ai.lock.json --wheelhouse ai-wheelhouse --runtime-descriptor ai-runtime-descriptor.json --requirements-output build/requirements-ai-release.txt
           python -m pytest -q
           python -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
       - name: 构建带版本的 Windows bundle
         shell: pwsh
         run: |
           python scripts/set_release_version.py $env:VISION_RELEASE_VERSION
-          ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse") -AiWheelhouse (Join-Path $PWD "ai-wheelhouse") -AiWheelhouseDescriptor (Join-Path $PWD "ai-wheelhouse-release.json")
+          ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse") -AiWheelhouse (Join-Path $PWD "ai-wheelhouse") -AiWheelhouseDescriptor (Join-Path $PWD "requirements-ai.lock.json")
           New-Item -ItemType Directory -Force candidate | Out-Null
           $artifact = "candidate/vending-vision-$env:VISION_RELEASE_VERSION-windows-x86_64.zip"
           Compress-Archive -Path dist/vending-vision,dist/vending-vision-ai-worker -DestinationPath $artifact -CompressionLevel Optimal
-          $manifest = @{
-            schemaVersion = "vending-vision-candidate-artifact/v1"
-            artifactSha256 = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
-            workerExecutable = "vending-vision-ai-worker/vending-vision-ai-worker.exe"
-            runtimeDescriptorSha256 = (Get-FileHash ai-runtime-descriptor.json -Algorithm SHA256).Hash.ToLowerInvariant()
-            aiWheelhouseManifestSha256 = (Get-FileHash ai-wheelhouse-release.json -Algorithm SHA256).Hash.ToLowerInvariant()
-          } | ConvertTo-Json -Depth 4 -Compress
-          Set-Content -LiteralPath candidate/vending-vision-$env:VISION_RELEASE_VERSION-windows-x86_64.manifest.json -Value $manifest -Encoding utf8NoBOM
+          $manifest = "candidate/vending-vision-$env:VISION_RELEASE_VERSION-windows-x86_64.manifest.json"
+          $manifestDigest = (python scripts/candidate_artifact_manifest.py --dist-root dist --artifact $artifact --output $manifest).Trim()
+          if ($manifestDigest -notmatch '^[a-f0-9]{64}$') { throw "candidate manifest digest missing" }
+          python scripts/verify_packaged_exe.py dist/vending-vision/vending-vision.exe --require-ai-worker --candidate-manifest $manifest --candidate-artifact $artifact --expected-candidate-manifest-sha256 $manifestDigest
+          "VISION_CANDIDATE_MANIFEST=$manifest" >> $env:GITHUB_ENV
+          "VISION_CANDIDATE_MANIFEST_SHA256=$manifestDigest" >> $env:GITHUB_ENV
       - name: 生成并签署供应方证据
         shell: pwsh
         env:
@@ -89,7 +79,7 @@ jobs:
           try {
             [IO.File]::WriteAllText($key, $env:VISION_SUPPLIER_PRIVATE_KEY_PEM)
             $bundle = Get-ChildItem candidate/vending-vision-*-windows-x86_64.zip | Select-Object -First 1
-            python scripts/generate_candidate_evidence.py --bundle $bundle.FullName --version $env:VISION_RELEASE_VERSION --commit "${{ github.sha }}" --repository "${{ github.repository }}" --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY --requirements-lock requirements.txt --wheelhouse wheelhouse --python python --output candidate
+            python scripts/generate_candidate_evidence.py --bundle $bundle.FullName --candidate-manifest $env:VISION_CANDIDATE_MANIFEST --version $env:VISION_RELEASE_VERSION --commit "${{ github.sha }}" --repository "${{ github.repository }}" --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY --requirements-lock requirements.txt --wheelhouse wheelhouse --python python --output candidate
             python scripts/sign_candidate_evidence.py --candidate-dir candidate --private-key $key --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY
           } finally {
             Remove-Item $key -Force -ErrorAction SilentlyContinue

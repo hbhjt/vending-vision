@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import json
 import re
 import subprocess
@@ -102,8 +103,8 @@ def test_official_ai_runtime_dependencies_are_separate_from_core_archive_lock():
     core_requirements = (ROOT / "requirements.txt").read_text("utf-8")
     runtime_descriptor = (ROOT / "ai-runtime-descriptor.json").read_text("utf-8")
 
-    assert "torch==2.8.0" in requirements
-    assert "torchvision==0.23.0" in requirements
+    assert "torch==2.8.0+cpu" in requirements
+    assert "torchvision==0.23.0+cpu" in requirements
     assert "diffusers==0.29.2" in requirements
     assert "transformers==4.53.3" in requirements
     assert "accelerate==0.31.0" in requirements
@@ -115,7 +116,8 @@ def test_official_ai_runtime_dependencies_are_separate_from_core_archive_lock():
     lock = (ROOT / "requirements-ai.lock.json").read_text("utf-8")
     assert '"schemaVersion":"vem-ai-worker-wheelhouse-release/v1"' in lock
     assert '"target":"windows-x86_64"' in lock
-    assert '"wheels":[]' in lock
+    assert '"wheels":[' in lock
+    assert '"torch-2.8.0+cpu-cp311-cp311-win_amd64.whl"' in lock
     assert '"schemaVersion":"vem-ai-runtime-descriptor/v1"' in runtime_descriptor
     assert '"python":"3.11.9"' in runtime_descriptor
     assert '"target":"windows-x86_64"' in runtime_descriptor
@@ -207,6 +209,7 @@ def test_packaged_verifier_ai_worker_layout_binds_descriptor_resources(tmp_path)
     for name in (
         "official-ai-model-pack-descriptor.json",
         "ai-runtime-descriptor.json",
+        "requirements-ai.lock.json",
         "official-ai-source-descriptor.json",
     ):
         (internal / name).write_text("{}", "utf-8")
@@ -215,6 +218,49 @@ def test_packaged_verifier_ai_worker_layout_binds_descriptor_resources(tmp_path)
 
     assert result["path"] == worker
     assert len(result["sha256"]) == 64
+
+
+def test_candidate_manifest_rejects_exact_json_fake_before_spawn_and_rewrite_without_outer_digest(tmp_path):
+    from scripts.candidate_artifact_manifest import canonical_json, write_candidate_artifact_manifest
+    from scripts.verify_packaged_exe import verify_candidate_artifact_manifest
+
+    dist = tmp_path / "dist"
+    main = dist / "vending-vision" / "vending-vision.exe"
+    worker = dist / "vending-vision-ai-worker" / "vending-vision-ai-worker.exe"
+    internal = worker.parent / "_internal"
+    main.parent.mkdir(parents=True)
+    internal.mkdir(parents=True)
+    main.write_bytes(b"main")
+    worker.write_bytes(b"real-worker")
+    for name in (
+        "ai-runtime-descriptor.json", "requirements-ai.lock.json",
+        "official-ai-source-descriptor.json", "official-ai-model-pack-descriptor.json",
+    ):
+        (internal / name).write_bytes(name.encode("ascii"))
+    artifact = tmp_path / "candidate.zip"
+    artifact.write_bytes(b"candidate-archive")
+    manifest_path = tmp_path / "candidate.manifest.json"
+    expected = write_candidate_artifact_manifest(dist, artifact, manifest_path)
+
+    verify_candidate_artifact_manifest(main, manifest_path, artifact, expected)
+
+    worker.write_text('{"probe":"official-catvton-worker-runtime","torch":"2.8.0+cpu"}\n', "utf-8")
+    try:
+        verify_candidate_artifact_manifest(main, manifest_path, artifact, expected)
+    except AssertionError as exc:
+        assert "workerExecutableSha256" in str(exc)
+    else:
+        raise AssertionError("exact JSON fake must fail before runtime spawn")
+
+    rewritten = json.loads(manifest_path.read_text("utf-8"))
+    rewritten["workerExecutableSha256"] = hashlib.sha256(worker.read_bytes()).hexdigest()
+    manifest_path.write_text(canonical_json(rewritten), "utf-8")
+    try:
+        verify_candidate_artifact_manifest(main, manifest_path, artifact, expected)
+    except AssertionError as exc:
+        assert "outer digest mismatch" in str(exc)
+    else:
+        raise AssertionError("self-rewritten manifest must not replace outer expected digest")
 
 
 def test_packaged_verifier_rejects_worker_that_does_not_emit_runtime_probe_json(tmp_path):
@@ -232,6 +278,7 @@ def test_packaged_verifier_rejects_worker_that_does_not_emit_runtime_probe_json(
     for name in (
         "official-ai-model-pack-descriptor.json",
         "ai-runtime-descriptor.json",
+        "requirements-ai.lock.json",
         "official-ai-source-descriptor.json",
     ):
         (internal / name).write_text("{}", "utf-8")
@@ -257,15 +304,27 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "vending_vision.spec" in build
     assert "vending_vision_ai_worker.spec" in build
     assert "vending-vision-ai-worker" in build
-    assert "--require-ai-worker" in build
+    assert "--require-ai-worker" not in build
     assert "pip install --no-index" in build
     assert "pip download" not in build
 
-    assert "AI_WHEELHOUSE" in workflow
+    assert "ai-wheelhouse" in workflow
+    assert "materialize_ai_wheelhouse.py" in workflow
+    assert "requirements-ai.lock.json" in workflow
+    assert "AI_WHEELHOUSE_ARCHIVE" not in workflow
+    assert "AI_WHEELHOUSE_DESCRIPTOR" not in workflow
+    assert "CORE_WHEELHOUSE_URL" in workflow
+    assert "CORE_WHEELHOUSE_SHA256" in workflow
+    assert "download_verified_archive.py" in workflow
+    assert "CORE_WHEELHOUSE_ARCHIVE" not in workflow
     assert "verify_ai_wheelhouse.py" in workflow
     assert "requirements-ai-release.txt" in workflow
     assert "pip download" not in workflow
     assert workflow.count("scripts/build_exe.ps1") == 1
+    assert "candidate_artifact_manifest.py" in workflow
+    assert "--expected-candidate-manifest-sha256" in workflow
+    assert "--require-ai-worker" in workflow
+    assert "--candidate-manifest" in workflow
     assert workflow.count("PyInstaller --clean --noconfirm") == 0
 
 

@@ -162,6 +162,8 @@ class WindowsJobProcess:
     non-Windows CI.
     """
 
+    _cleanup_blocked = False
+
     def __init__(self, command: list[str], *, api=None):
         self.command = command
         self.api = api or WindowsJobApi()
@@ -174,8 +176,15 @@ class WindowsJobProcess:
         self.stderr = StreamTail()
         self.pipes = None
         self._drainers = []
+        self._dead_proven = False
+
+    @classmethod
+    def reset_cleanup_block_for_tests(cls) -> None:
+        cls._cleanup_blocked = False
 
     def start(self) -> None:
+        if self.__class__._cleanup_blocked:
+            raise ProcessSupervisorError("windows_previous_cleanup_unproven")
         self.job = self.api.create_job()
         try:
             self.pipes = self.api.create_pipes()
@@ -187,9 +196,8 @@ class WindowsJobProcess:
             try:
                 self.api.assign_process_to_job(self.job, self.process_handle)
             except WindowsJobApiUnavailable:
-                self.api.terminate_process(self.process_handle, 1)
                 try:
-                    self.api.wait_process(self.process_handle, timeout=3.0)
+                    self.api.terminate_process(self.process_handle, 1)
                 except ProcessSupervisorError:
                     pass
                 raise
@@ -197,8 +205,10 @@ class WindowsJobProcess:
             try:
                 self.api.resume_thread(self.thread_handle)
             except WindowsJobApiUnavailable:
-                self.api.terminate_job(self.job, 1)
-                self.api.wait_active_processes_zero(self.job, timeout=3.0)
+                try:
+                    self.api.terminate_job(self.job, 1)
+                except ProcessSupervisorError:
+                    pass
                 raise
             self.resumed = True
         except Exception:
@@ -210,10 +220,35 @@ class WindowsJobProcess:
             try:
                 self.api.terminate_job(self.job, 1)
                 self.api.wait_active_processes_zero(self.job, timeout=3.0)
+                if self.process_handle is not None:
+                    self.api.wait_process(self.process_handle, timeout=3.0)
+                self._dead_proven = True
             except ProcessSupervisorError:
-                if self.pid is not None:
-                    self.api.taskkill_fallback(self.pid)
+                self._fallback_and_prove_dead()
                 raise
+
+    def _fallback_and_prove_dead(self) -> bool:
+        if self.pid is not None:
+            try:
+                self.api.taskkill_fallback(self.pid)
+            except Exception:
+                pass
+        leader_dead = self.process_handle is None
+        active_zero = self.job is None
+        if self.process_handle is not None:
+            try:
+                self.api.wait_process(self.process_handle, timeout=3.0)
+                leader_dead = True
+            except ProcessSupervisorError:
+                leader_dead = False
+        if self.job is not None:
+            try:
+                self.api.wait_active_processes_zero(self.job, timeout=3.0)
+                active_zero = True
+            except ProcessSupervisorError:
+                active_zero = False
+        self._dead_proven = leader_dead and active_zero
+        return self._dead_proven
 
     def wait(self, timeout: float) -> SupervisedResult:
         if self.process_handle is None:
@@ -221,14 +256,23 @@ class WindowsJobProcess:
         try:
             code = self.api.wait_process(self.process_handle, timeout=timeout)
         except ProcessSupervisorError:
-            self.terminate_tree()
+            try:
+                self.api.terminate_job(self.job, 1)
+            except ProcessSupervisorError:
+                pass
+            self._fallback_and_prove_dead()
             raise
         self.api.finish_pipe_drainers(self._drainers, timeout=3.0)
         try:
             self.api.wait_active_processes_zero(self.job, timeout=3.0)
         except Exception as exc:
-            self.terminate_tree()
+            try:
+                self.api.terminate_job(self.job, 1)
+            except ProcessSupervisorError:
+                pass
+            self._fallback_and_prove_dead()
             raise ProcessSupervisorError("windows_job_descendants_alive") from exc
+        self._dead_proven = True
         return SupervisedResult(
             code,
             self.stdout.bytes(),
@@ -237,7 +281,12 @@ class WindowsJobProcess:
             self.stderr.total,
         )
 
-    def close(self) -> None:
+    def close(self) -> bool:
+        if self.process_handle is not None and not self._dead_proven:
+            self._fallback_and_prove_dead()
+        if self.process_handle is not None and not self._dead_proven:
+            self.__class__._cleanup_blocked = True
+            return False
         try:
             if self.job is not None:
                 self.api.close_handle(self.job)
@@ -252,6 +301,7 @@ class WindowsJobProcess:
             self.thread_handle = None
             self.process_handle = None
             self.pipes = None
+        return True
 
 
 class WindowsJobApi:
@@ -540,10 +590,12 @@ class WindowsJobApi:
             raise WindowsJobApiUnavailable("windows_resume_failed")
 
     def terminate_process(self, process, code: int) -> None:
-        self.kernel32.TerminateProcess(process, code)
+        if not self.kernel32.TerminateProcess(process, code):
+            raise ProcessSupervisorError("windows_process_terminate_failed")
 
     def terminate_job(self, job, code: int) -> None:
-        self.kernel32.TerminateJobObject(job, code)
+        if not self.kernel32.TerminateJobObject(job, code):
+            raise ProcessSupervisorError("windows_job_terminate_failed")
 
     def wait_active_processes_zero(self, job, *, timeout: float) -> None:
         deadline = time.monotonic() + timeout
@@ -594,7 +646,8 @@ async def run_supervised(command: list[str], *, timeout: float) -> SupervisedRes
         try:
             return await asyncio.to_thread(supervisor.wait, timeout)
         finally:
-            await asyncio.to_thread(supervisor.close)
+            if not await asyncio.to_thread(supervisor.close):
+                raise ProcessSupervisorError("windows_cleanup_unproven")
     await supervisor.start()
     try:
         return await supervisor.wait(timeout)

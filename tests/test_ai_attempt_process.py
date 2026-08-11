@@ -3,6 +3,8 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from vision.ai_attempt_process import (
     AiAttemptProcess,
     ai_attempt_worker_command,
@@ -86,11 +88,39 @@ def test_startup_probe_rejects_worker_dependency_version_mismatch(monkeypatch, t
         raise AssertionError("dependency mismatch must fail closed")
 
 
+def test_runtime_probe_uses_pep440_specifier_for_cpu_local_version(monkeypatch):
+    async def fake_run_supervised(_command, *, timeout):
+        return SimpleNamespace(
+            returncode=0,
+            stdout_tail=b'{"probe":"official-catvton-worker-runtime","torch":"2.8.0+cpu"}\n',
+        )
+
+    monkeypatch.setattr(ai_attempt_process_module, "run_supervised", fake_run_supervised)
+    monkeypatch.setattr(
+        ai_attempt_process_module,
+        "expected_dependency_requirements",
+        lambda: {"torch": "torch==2.8.0+cpu"},
+        raising=False,
+    )
+
+    asyncio.run(ai_attempt_process_module.probe_ai_runtime_worker_async())
+
+    async def wrong_run_supervised(_command, *, timeout):
+        return SimpleNamespace(
+            returncode=0,
+            stdout_tail=b'{"probe":"official-catvton-worker-runtime","torch":"9.9.0+cpu"}\n',
+        )
+
+    monkeypatch.setattr(ai_attempt_process_module, "run_supervised", wrong_run_supervised)
+    with pytest.raises(RuntimeError, match="official_ai_child_runtime_probe_failed"):
+        asyncio.run(ai_attempt_process_module.probe_ai_runtime_worker_async())
+
+
 def test_startup_probe_has_async_api_and_sync_wrapper_rejects_running_loop(monkeypatch, tmp_path):
     async def fake_run_supervised(_command, *, timeout):
         return SimpleNamespace(
             returncode=0,
-            stdout_tail=b'{"probe":"official-catvton-worker","torch":"2.8.0","torchvision":"0.23.0","diffusers":"0.29.2","transformers":"4.53.3"}\n',
+            stdout_tail=b'{"probe":"official-catvton-worker","torch":"2.8.0+cpu","torchvision":"0.23.0+cpu","diffusers":"0.29.2","transformers":"4.53.3"}\n',
         )
 
     monkeypatch.setattr(ai_attempt_process_module, "run_supervised", fake_run_supervised)

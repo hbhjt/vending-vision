@@ -39,6 +39,8 @@ datas = [
     (str(ROOT / "models"), "models"),
     (str(ROOT / "official-ai-model-pack-descriptor.json"), "."),
     (str(ROOT / "ai-runtime-descriptor.json"), "."),
+    (str(ROOT / "requirements-ai.txt"), "."),
+    (str(ROOT / "requirements-ai.lock.json"), "."),
     (str(ROOT / "official-ai-source-descriptor.json"), "."),
     *[(str(source), destination) for source, destination in CONTRACT_DATA_FILES],
     *OFFICIAL_AI_SOURCE_DATA_FILES,

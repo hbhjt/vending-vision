@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import asyncio
 import threading
@@ -116,6 +117,15 @@ def test_v2_ai_backpressure_rejects_with_ai_unavailable_not_fast_unavailable():
         "attemptId": attempt_id,
         "reason": "ai_unavailable",
     }
+
+
+def test_ai_parent_validation_and_result_failure_paths_never_emit_fast_failed():
+    ai_source = inspect.getsource(vision_app.run_v2_ai_attempt)
+    backpressure_source = inspect.getsource(vision_app.reject_v2_fast_attempt_for_backpressure)
+
+    assert '"fast_failed"' not in ai_source
+    assert '"ai_failed"' in ai_source
+    assert '"ai_unavailable" if mode == "ai"' in backpressure_source
 
 
 def _write_official_pack(root: Path):

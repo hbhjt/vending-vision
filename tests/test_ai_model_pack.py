@@ -13,8 +13,10 @@ from vision.ai_model_pack import (
     create_ai_model_manifest,
     load_official_ai_model_pack_descriptor,
     official_ai_readiness,
+    official_ai_readiness_snapshot,
     refresh_official_ai_readiness,
     reset_official_ai_readiness_cache_for_tests,
+    shutdown_official_ai_readiness_refresh,
     verify_ai_model_pack,
 )
 from vision.source_provenance import (
@@ -192,7 +194,7 @@ def test_official_readiness_cache_misses_when_weight_identity_changes(tmp_path, 
     assert calls == [tmp_path.resolve()]
 
 
-def test_official_readiness_refresh_runs_heavy_probe_off_loop_and_cache_read_is_o1(tmp_path, monkeypatch):
+def test_official_readiness_refresh_runs_heavy_probe_off_loop_and_cache_read_is_stat_only(tmp_path, monkeypatch):
     model = tmp_path / "mini" / "a.bin"
     model.parent.mkdir()
     model.write_bytes(b"mini-model")
@@ -241,6 +243,97 @@ def test_official_readiness_refresh_runs_heavy_probe_off_loop_and_cache_read_is_
 
     asyncio.run(exercise())
     assert calls == [tmp_path.resolve()]
+
+
+def test_ready_pack_hot_identity_change_fails_immediately_and_refreshes_once_off_loop(tmp_path, monkeypatch):
+    model = tmp_path / "mini" / "a.bin"
+    model.parent.mkdir()
+    model.write_bytes(b"mini-model")
+    descriptor = {
+        "schemaVersion": "vem-official-ai-model-pack-descriptor/v2",
+        "catvtonSourceRevision": "test-source",
+        "totalByteSize": model.stat().st_size,
+        "upstreams": [{"id": "mini", "repository": "example/mini", "revision": "abc"}],
+        "files": [{
+            "path": "mini/a.bin", "upstreamPath": "a.bin", "upstream": "mini",
+            "role": "mini_weight", "format": "bin", "byteSize": model.stat().st_size,
+            "sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+        }],
+    }
+    (tmp_path / "ai-model-manifest.json").write_text(canonical_ai_model_manifest_json(descriptor), "utf-8")
+    monkeypatch.setattr(ai_model_pack_module, "load_official_ai_model_pack_descriptor", lambda: descriptor)
+    monkeypatch.setattr("vision.ai_attempt_process.probe_ai_attempt_worker", lambda _pack: None)
+    reset_official_ai_readiness_cache_for_tests()
+    asyncio.run(refresh_official_ai_readiness(tmp_path))
+    assert official_ai_readiness(tmp_path) is True
+
+    original_stat = model.stat()
+    model.write_bytes(b"evil-model")
+    os.utime(model, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    original_compute = ai_model_pack_module._compute_official_ai_readiness_snapshot
+    refresh_calls = []
+
+    def slow_compute(root):
+        refresh_calls.append(root)
+        time.sleep(0.1)
+        return original_compute(root)
+
+    monkeypatch.setattr(ai_model_pack_module, "_compute_official_ai_readiness_snapshot", slow_compute)
+
+    async def exercise():
+        assert official_ai_readiness(tmp_path) is False
+        assert official_ai_readiness(tmp_path) is False
+        gaps = []
+
+        async def ticker():
+            last = time.perf_counter()
+            for _ in range(6):
+                await asyncio.sleep(0.02)
+                now = time.perf_counter()
+                gaps.append(now - last)
+                last = now
+
+        await asyncio.gather(ticker(), shutdown_official_ai_readiness_refresh())
+        assert max(gaps) < 0.08
+        assert official_ai_readiness(tmp_path) is False
+
+    asyncio.run(exercise())
+    assert refresh_calls == [str(tmp_path.resolve())]
+
+
+def test_ready_pack_selection_change_atomically_replaces_snapshot(tmp_path, monkeypatch):
+    roots = [tmp_path / "one", tmp_path / "two"]
+    descriptor = None
+    for root in roots:
+        model = root / "mini" / "a.bin"
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"mini-model")
+        descriptor = {
+            "schemaVersion": "vem-official-ai-model-pack-descriptor/v2",
+            "catvtonSourceRevision": "test-source",
+            "totalByteSize": model.stat().st_size,
+            "upstreams": [{"id": "mini", "repository": "example/mini", "revision": "abc"}],
+            "files": [{
+                "path": "mini/a.bin", "upstreamPath": "a.bin", "upstream": "mini",
+                "role": "mini_weight", "format": "bin", "byteSize": model.stat().st_size,
+                "sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+            }],
+        }
+        (root / "ai-model-manifest.json").write_text(canonical_ai_model_manifest_json(descriptor), "utf-8")
+    monkeypatch.setattr(ai_model_pack_module, "load_official_ai_model_pack_descriptor", lambda: descriptor)
+    monkeypatch.setattr("vision.ai_attempt_process.probe_ai_attempt_worker", lambda _pack: None)
+    reset_official_ai_readiness_cache_for_tests()
+
+    async def exercise():
+        await refresh_official_ai_readiness(roots[0])
+        assert official_ai_readiness(roots[0]) is True
+        assert official_ai_readiness(roots[1]) is False
+        assert official_ai_readiness_snapshot().root == str(roots[1].resolve())
+        assert official_ai_readiness_snapshot().ready is False
+        await shutdown_official_ai_readiness_refresh()
+        assert official_ai_readiness(roots[1]) is True
+
+    asyncio.run(exercise())
 
 
 def test_official_source_descriptor_binds_tracked_worker_and_vendor_sources():

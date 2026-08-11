@@ -7,11 +7,16 @@ import json
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
+from urllib.parse import unquote, urlsplit
 
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from vision.ai_runtime_descriptor import load_ai_runtime_descriptor
 
@@ -47,10 +52,13 @@ def _parse_wheel_filename(path: Path) -> dict[str, str]:
 
 
 def _normalise_requirement(value: str) -> str:
-    if "==" not in value:
+    try:
+        requirement = Requirement(value)
+    except ValueError as exc:
+        raise WheelhouseError("ai_wheelhouse_requirement") from exc
+    if requirement.url or requirement.extras or requirement.marker or not requirement.specifier:
         raise WheelhouseError("ai_wheelhouse_requirement")
-    name, version = value.split("==", 1)
-    return f"{canonicalize_name(name)}=={version}"
+    return f"{canonicalize_name(requirement.name)}{requirement.specifier}"
 
 
 def _target_marker_environment(descriptor: dict) -> dict[str, str]:
@@ -59,7 +67,7 @@ def _target_marker_environment(descriptor: dict) -> dict[str, str]:
         env.update(
             {
                 "implementation_name": "cpython",
-                "platform_machine": "AMD64",
+                "platform_machine": "x86_64",
                 "platform_system": "Windows",
                 "python_full_version": descriptor["python"],
                 "python_version": ".".join(descriptor["python"].split(".")[:2]),
@@ -79,6 +87,8 @@ def _wheel_tag_compatible(tags: str, descriptor: dict) -> bool:
         if platform_tag not in {"win_amd64", "any"}:
             return False
         python_ok = python_tag in {"py3", "py2.py3", "cp311"}
+        if abi_tag == "abi3" and python_tag.startswith("cp") and python_tag[2:].isdigit():
+            python_ok = int(python_tag[2:]) <= 311
         abi_ok = abi_tag in {"none", "abi3", "cp311"}
         return python_ok and abi_ok
     return False
@@ -118,6 +128,7 @@ def build_ai_wheelhouse_descriptor(
     requirements: list[str],
     python: str = "cp311",
     platform: str = "win_amd64",
+    download_urls: dict[str, str] | None = None,
 ) -> dict:
     wheels = []
     seen: set[str] = set()
@@ -128,6 +139,10 @@ def build_ai_wheelhouse_descriptor(
         if parsed["name"] in seen:
             raise WheelhouseError("ai_wheelhouse_duplicate")
         seen.add(parsed["name"])
+        if download_urls is None or path.name not in download_urls:
+            raise WheelhouseError("ai_wheelhouse_download_url_required")
+        url = download_urls[path.name]
+        source = _validate_download_url(url, path.name)
         wheels.append(
             {
                 **parsed,
@@ -136,6 +151,8 @@ def build_ai_wheelhouse_descriptor(
                 "sha256": _digest(path),
                 "direct": parsed["name"] in direct_names,
                 "transitive": parsed["name"] not in direct_names,
+                "url": url,
+                "source": source,
             }
         )
     if not wheels:
@@ -144,16 +161,30 @@ def build_ai_wheelhouse_descriptor(
         "schemaVersion": "vem-ai-worker-wheelhouse-release/v1",
         "target": "windows-x86_64" if platform == "win_amd64" else platform,
         "python": "3.11.9" if python == "cp311" else python,
-        "source": "release-provided-wheelhouse",
+        "source": "pip-report-locked-wheelhouse",
         "directRequirements": sorted(_normalise_requirement(requirement) for requirement in requirements),
         "wheels": wheels,
     }
 
 
+def _validate_download_url(url: str, file_name: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise WheelhouseError("ai_wheelhouse_download_url")
+    if unquote(PurePosixPath(parsed.path).name) != file_name:
+        raise WheelhouseError("ai_wheelhouse_download_identity")
+    host = (parsed.hostname or "").lower()
+    if host == "files.pythonhosted.org":
+        return "pypi"
+    if host in {"download.pytorch.org", "download-r2.pytorch.org"}:
+        return "pytorch-cpu"
+    raise WheelhouseError("ai_wheelhouse_download_source")
+
+
 def _load_runtime_descriptor(path: Path | None) -> dict:
     if path is None:
         return load_ai_runtime_descriptor()
-    return json.loads(path.read_text("utf-8"))
+    return load_ai_runtime_descriptor(path)
 
 
 def _validate_release_descriptor(descriptor: dict, runtime_descriptor: dict) -> list[dict]:
@@ -161,6 +192,8 @@ def _validate_release_descriptor(descriptor: dict, runtime_descriptor: dict) -> 
         raise WheelhouseError("ai_wheelhouse_descriptor_shape")
     if descriptor["schemaVersion"] != "vem-ai-worker-wheelhouse-release/v1":
         raise WheelhouseError("ai_wheelhouse_descriptor_schema")
+    if descriptor["source"] != "pip-report-locked-wheelhouse":
+        raise WheelhouseError("ai_wheelhouse_descriptor_source")
     if descriptor["target"] != runtime_descriptor["target"] or descriptor["python"] != runtime_descriptor["python"]:
         raise WheelhouseError("ai_wheelhouse_target_mismatch")
     expected_direct = sorted(_normalise_requirement(requirement) for requirement in runtime_descriptor["directRequirements"])
@@ -196,6 +229,8 @@ def verify_ai_wheelhouse(
     if canonical_json(descriptor) != raw.rstrip("\n"):
         raise WheelhouseError("ai_wheelhouse_descriptor_noncanonical")
     runtime_descriptor = _load_runtime_descriptor(runtime_descriptor_path)
+    if _digest(descriptor_path) != runtime_descriptor["requirementsAiLockSha256"]:
+        raise WheelhouseError("ai_wheelhouse_runtime_lock_mismatch")
     wheels = _validate_release_descriptor(descriptor, runtime_descriptor)
     seen: set[str] = set()
     seen_names: set[str] = set()
@@ -206,8 +241,10 @@ def verify_ai_wheelhouse(
         if path.is_file()
     }
     for wheel in wheels:
-        if set(wheel) != {"fileName", "name", "version", "tags", "byteSize", "sha256", "direct", "transitive"}:
+        if set(wheel) != {"fileName", "name", "version", "tags", "byteSize", "sha256", "direct", "transitive", "url", "source"}:
             raise WheelhouseError("ai_wheelhouse_entry_shape")
+        if not isinstance(wheel["direct"], bool) or not isinstance(wheel["transitive"], bool) or wheel["direct"] == wheel["transitive"]:
+            raise WheelhouseError("ai_wheelhouse_entry_role")
         relative = wheel["fileName"]
         pure = PurePosixPath(relative)
         if pure.is_absolute() or ".." in pure.parts or "\\" in relative or ":" in relative or pure.as_posix() != relative:
@@ -221,6 +258,8 @@ def verify_ai_wheelhouse(
             raise WheelhouseError("ai_wheelhouse_wheel_name")
         if not _wheel_tag_compatible(wheel["tags"], descriptor):
             raise WheelhouseError("ai_wheelhouse_target_mismatch")
+        if _validate_download_url(wheel["url"], relative) != wheel["source"]:
+            raise WheelhouseError("ai_wheelhouse_download_source")
         if relative in seen or wheel["name"] in seen_names:
             raise WheelhouseError("ai_wheelhouse_duplicate")
         seen.add(relative)
@@ -242,6 +281,11 @@ def verify_ai_wheelhouse(
     wheel_direct_names = {wheel["name"] for wheel in wheels if wheel["direct"] and not wheel["transitive"]}
     if wheel_direct_names != direct_names:
         raise WheelhouseError("ai_wheelhouse_direct_requirements_mismatch")
+    for requirement_text in descriptor["directRequirements"]:
+        requirement = Requirement(requirement_text)
+        wheel = by_name[canonicalize_name(requirement.name)]
+        if not _requirement_satisfied(requirement, wheel):
+            raise WheelhouseError("ai_wheelhouse_direct_version_mismatch")
     actual = all_files
     expected = {wheel["fileName"] for wheel in wheels}
     if actual != expected:
@@ -279,6 +323,7 @@ def main() -> int:
     parser.add_argument("--wheelhouse", required=True)
     parser.add_argument("--runtime-descriptor", default=None)
     parser.add_argument("--requirements-output", default=None)
+    parser.add_argument("--pip-report", default=None)
     args = parser.parse_args()
     if args.build_descriptor:
         requirements = [
@@ -286,9 +331,18 @@ def main() -> int:
             for line in Path("requirements-ai.txt").read_text("utf-8").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
+        if not args.pip_report:
+            raise WheelhouseError("ai_wheelhouse_pip_report_required")
+        report = json.loads(Path(args.pip_report).read_text("utf-8"))
+        download_urls = {}
+        for install in report.get("install", []):
+            url = install["download_info"]["url"]
+            file_name = unquote(PurePosixPath(urlsplit(url).path).name)
+            download_urls[file_name] = url
         descriptor = build_ai_wheelhouse_descriptor(
             Path(args.wheelhouse).resolve(),
             requirements=requirements,
+            download_urls=download_urls,
         )
         Path(args.descriptor).write_text(canonical_json(descriptor), "utf-8")
     verify_ai_wheelhouse(

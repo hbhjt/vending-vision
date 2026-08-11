@@ -8,10 +8,10 @@
 # `TRANSFORMERS_OFFLINE=1`, and `local_files_only=True`.
 #
 # CPU target:
-#   python -m pip install "torch==2.8.0" torchvision --index-url https://download.pytorch.org/whl/cpu
+#   python -m pip install "torch==2.8.0+cpu" "torchvision==0.23.0+cpu" --index-url https://download.pytorch.org/whl/cpu
 #
-torch==2.8.0
-torchvision==0.23.0
+torch==2.8.0+cpu
+torchvision==0.23.0+cpu
 diffusers==0.29.2
 transformers==4.53.3
 accelerate==0.31.0

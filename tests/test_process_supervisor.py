@@ -87,6 +87,7 @@ class FakeWinApi:
         fail_assign=False,
         fail_resume=False,
         fail_terminate_job=False,
+        fail_wait_process=False,
         active_sequence=None,
         stdout_chunks=None,
         stderr_chunks=None,
@@ -96,6 +97,7 @@ class FakeWinApi:
         self.fail_assign = fail_assign
         self.fail_resume = fail_resume
         self.fail_terminate_job = fail_terminate_job
+        self.fail_wait_process = fail_wait_process
         self.active_sequence = list(active_sequence or [0])
         self.stdout_chunks = list(stdout_chunks or [])
         self.stderr_chunks = list(stderr_chunks or [])
@@ -148,6 +150,8 @@ class FakeWinApi:
 
     def wait_process(self, process, *, timeout):
         self.calls.append(("wait_process", process, timeout))
+        if self.fail_wait_process:
+            raise ProcessSupervisorError("supervised_process_timeout")
         return 0
 
     def start_pipe_drainers(self, pipes, stdout, stderr):
@@ -273,6 +277,47 @@ def test_windows_job_api_terminate_failure_uses_bounded_taskkill_fallback():
         process.terminate_tree()
 
     assert ("taskkill_fallback", 123, 3) in api.calls
+
+
+def test_windows_stubborn_job_keeps_handles_and_blocks_next_attempt_when_death_unproven():
+    WindowsJobProcess.reset_cleanup_block_for_tests()
+    api = FakeWinApi(
+        fail_terminate_job=True,
+        fail_wait_process=True,
+        active_sequence=[1, 1, 1],
+    )
+    process = WindowsJobProcess(["worker.exe"], api=api)
+    process.start()
+
+    with pytest.raises(ProcessSupervisorError, match="windows_job_terminate_failed"):
+        process.terminate_tree()
+
+    assert process.close() is False
+    assert process.job == 0x1_0000_0001
+    assert process.process_handle == 0x4_0000_0001
+    assert not any(call[0] == "close" for call in api.calls if isinstance(call, tuple))
+    with pytest.raises(ProcessSupervisorError, match="windows_previous_cleanup_unproven"):
+        WindowsJobProcess(["next.exe"], api=FakeWinApi()).start()
+    WindowsJobProcess.reset_cleanup_block_for_tests()
+
+
+def test_ctypes_job_api_checks_false_terminate_bool_results():
+    class Kernel:
+        @staticmethod
+        def TerminateProcess(_process, _code):
+            return False
+
+        @staticmethod
+        def TerminateJobObject(_job, _code):
+            return False
+
+    api = object.__new__(__import__("vision.process_supervisor", fromlist=["WindowsJobApi"]).WindowsJobApi)
+    api.kernel32 = Kernel()
+
+    with pytest.raises(ProcessSupervisorError, match="windows_process_terminate_failed"):
+        api.terminate_process(1, 1)
+    with pytest.raises(ProcessSupervisorError, match="windows_job_terminate_failed"):
+        api.terminate_job(1, 1)
 
 
 def test_taskkill_fallback_is_bounded_devnull_command():

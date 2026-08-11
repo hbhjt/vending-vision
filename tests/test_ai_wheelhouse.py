@@ -5,6 +5,8 @@ import zipfile
 
 import pytest
 
+from vision.ai_runtime_descriptor import AiRuntimeDescriptorError, load_ai_runtime_descriptor
+
 from scripts.verify_ai_wheelhouse import (
     WheelhouseError,
     build_ai_wheelhouse_descriptor,
@@ -40,10 +42,28 @@ def _wheel_entry(path, *, direct, transitive):
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "direct": direct,
         "transitive": transitive,
+        "url": f"https://files.pythonhosted.org/packages/test/{path.name}",
+        "source": "pypi",
     }
 
 
 def _runtime_descriptor(path, direct_requirements):
+    requirements_path = path.parent / "requirements-ai.txt"
+    lock_path = path.parent / "requirements-ai.lock.json"
+    requirements_path.write_text("\n".join(direct_requirements) + "\n", "utf-8")
+    lock_path.write_text(
+        canonical_json(
+            {
+                "schemaVersion": "vem-ai-worker-wheelhouse-release/v1",
+                "target": "windows-x86_64",
+                "python": "3.11.9",
+                "source": "pip-report-locked-wheelhouse",
+                "directRequirements": direct_requirements,
+                "wheels": [{"placeholder": True}],
+            }
+        ),
+        "utf-8",
+    )
     path.write_text(
         canonical_json(
             {
@@ -51,8 +71,8 @@ def _runtime_descriptor(path, direct_requirements):
                 "target": "windows-x86_64",
                 "python": "3.11.9",
                 "directRequirements": direct_requirements,
-                "requirementsAiSha256": "0" * 64,
-                "requirementsAiLockSha256": "1" * 64,
+                "requirementsAiSha256": hashlib.sha256(requirements_path.read_bytes()).hexdigest(),
+                "requirementsAiLockSha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
                 "workerLayout": {"workerExecutable": "vending-vision-ai-worker/vending-vision-ai-worker.exe"},
             }
         ),
@@ -61,12 +81,45 @@ def _runtime_descriptor(path, direct_requirements):
     return path
 
 
+def _bind_runtime_lock(runtime_descriptor, release_descriptor):
+    raw = release_descriptor.read_text("utf-8")
+    runtime_descriptor.with_name("requirements-ai.lock.json").write_text(raw, "utf-8")
+    value = json.loads(runtime_descriptor.read_text("utf-8"))
+    value["requirementsAiLockSha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    runtime_descriptor.write_text(canonical_json(value), "utf-8")
+
+
+def test_runtime_descriptor_rejects_requirements_or_lock_tamper(tmp_path):
+    descriptor_path = _runtime_descriptor(tmp_path / "ai-runtime-descriptor.json", ["torch==2.8.0+cpu"])
+
+    load_ai_runtime_descriptor(descriptor_path)
+
+    (tmp_path / "requirements-ai.txt").write_text("torch==9.9.0+cpu\n", "utf-8")
+    with pytest.raises(AiRuntimeDescriptorError, match="ai_runtime_requirements_digest"):
+        load_ai_runtime_descriptor(descriptor_path)
+
+    descriptor_path = _runtime_descriptor(descriptor_path, ["torch==2.8.0+cpu"])
+    lock = json.loads((tmp_path / "requirements-ai.lock.json").read_text("utf-8"))
+    lock["directRequirements"] = ["torch==9.9.0+cpu"]
+    (tmp_path / "requirements-ai.lock.json").write_text(canonical_json(lock), "utf-8")
+    with pytest.raises(AiRuntimeDescriptorError, match="ai_runtime_lock_digest"):
+        load_ai_runtime_descriptor(descriptor_path)
+
+    descriptor = json.loads(descriptor_path.read_text("utf-8"))
+    descriptor["requirementsAiLockSha256"] = hashlib.sha256(
+        (tmp_path / "requirements-ai.lock.json").read_bytes()
+    ).hexdigest()
+    descriptor_path.write_text(canonical_json(descriptor), "utf-8")
+    with pytest.raises(AiRuntimeDescriptorError, match="ai_runtime_lock_semantics"):
+        load_ai_runtime_descriptor(descriptor_path)
+
+
 def _release_descriptor(path, *, direct_requirements, wheels):
     descriptor = {
         "schemaVersion": "vem-ai-worker-wheelhouse-release/v1",
         "python": "3.11.9",
         "target": "windows-x86_64",
-        "source": "release-provided-wheelhouse",
+        "source": "pip-report-locked-wheelhouse",
         "directRequirements": direct_requirements,
         "wheels": wheels,
     }
@@ -84,36 +137,39 @@ def test_wheelhouse_descriptor_builder_records_exact_wheels_and_rejects_extra(tm
     descriptor = build_ai_wheelhouse_descriptor(
         wheelhouse,
         requirements=["torch==2.8.0", "diffusers==0.29.2"],
+        download_urls={
+            first.name: f"https://download.pytorch.org/whl/cpu/{first.name}",
+            second.name: f"https://files.pythonhosted.org/packages/test/{second.name}",
+        },
     )
     descriptor_path = tmp_path / "descriptor.json"
     descriptor_path.write_text(canonical_json(descriptor), "utf-8")
-    runtime_descriptor = tmp_path / "runtime.json"
-    runtime_descriptor.write_text(
-        canonical_json(
-            {
-                "schemaVersion": "vem-ai-runtime-descriptor/v1",
-                "target": "windows-x86_64",
-                "python": "3.11.9",
-                "directRequirements": ["torch==2.8.0", "diffusers==0.29.2"],
-                "requirementsAiSha256": "0" * 64,
-                "requirementsAiLockSha256": "1" * 64,
-                "workerLayout": {"workerExecutable": "vending-vision-ai-worker/vending-vision-ai-worker.exe"},
-            }
-        ),
-        "utf-8",
+    runtime_descriptor = _runtime_descriptor(
+        tmp_path / "runtime.json", ["torch==2.8.0", "diffusers==0.29.2"]
     )
+    _bind_runtime_lock(runtime_descriptor, descriptor_path)
 
     verify_ai_wheelhouse(descriptor_path, wheelhouse, runtime_descriptor_path=runtime_descriptor)
+
+    descriptor["wheels"][0]["url"] = f"https://download.pytorch.org/locked/{first.name}"
+    descriptor_path.write_text(canonical_json(descriptor), "utf-8")
+    with pytest.raises(WheelhouseError, match="ai_wheelhouse_runtime_lock_mismatch"):
+        verify_ai_wheelhouse(descriptor_path, wheelhouse, runtime_descriptor_path=runtime_descriptor)
+    descriptor_path.write_text(
+        runtime_descriptor.with_name("requirements-ai.lock.json").read_text("utf-8"), "utf-8"
+    )
 
     (wheelhouse / "extra-1.0.0-py3-none-any.whl").write_bytes(b"extra")
     with pytest.raises(WheelhouseError, match="ai_wheelhouse_extra_or_missing"):
         verify_ai_wheelhouse(descriptor_path, wheelhouse, runtime_descriptor_path=runtime_descriptor)
 
 
-def test_empty_tracked_ai_wheelhouse_descriptor_fails_closed():
+def test_tracked_ai_wheelhouse_descriptor_is_complete_and_nonempty():
     descriptor = json.loads(open("requirements-ai.lock.json", encoding="utf-8").read())
 
-    assert descriptor["wheels"] == []
+    assert len(descriptor["wheels"]) == 34
+    assert all(wheel["url"].startswith("https://") for wheel in descriptor["wheels"])
+    assert all(wheel["byteSize"] > 0 and len(wheel["sha256"]) == 64 for wheel in descriptor["wheels"])
 
 
 def test_release_wheelhouse_generates_hashed_requirements_from_descriptor(tmp_path):
@@ -131,6 +187,7 @@ def test_release_wheelhouse_generates_hashed_requirements_from_descriptor(tmp_pa
     )
     descriptor_path = tmp_path / "wheelhouse-release.json"
     requirements_path = tmp_path / "requirements-ai-release.txt"
+    _bind_runtime_lock(runtime_descriptor, descriptor_path)
 
     verify_ai_wheelhouse(
         descriptor_path,
@@ -146,12 +203,55 @@ def test_release_wheelhouse_generates_hashed_requirements_from_descriptor(tmp_pa
     assert generate_hashed_requirements(descriptor, wheelhouse) == requirements_path.read_text("utf-8")
 
 
+def test_release_wheelhouse_rejects_direct_wheel_outside_pep440_specifier(tmp_path):
+    wheelhouse = tmp_path / "wheelhouse"
+    wrong = _write_wheel(wheelhouse / "torch-9.9.0+cpu-cp311-cp311-win_amd64.whl")
+    runtime_descriptor = _runtime_descriptor(tmp_path / "runtime.json", ["torch==2.8.0+cpu"])
+    _release_descriptor(
+        tmp_path / "wheelhouse-release.json",
+        direct_requirements=["torch==2.8.0+cpu"],
+        wheels=[_wheel_entry(wrong, direct=True, transitive=False)],
+    )
+    _bind_runtime_lock(runtime_descriptor, tmp_path / "wheelhouse-release.json")
+
+    with pytest.raises(WheelhouseError, match="ai_wheelhouse_direct_version_mismatch"):
+        verify_ai_wheelhouse(
+            tmp_path / "wheelhouse-release.json",
+            wheelhouse,
+            runtime_descriptor_path=runtime_descriptor,
+        )
+
+
+def test_release_descriptor_rejects_wrong_source_and_nonboolean_roles(tmp_path):
+    wheelhouse = tmp_path / "wheelhouse"
+    wheel = _write_wheel(wheelhouse / "demo-1.0.0-py3-none-any.whl")
+    runtime = _runtime_descriptor(tmp_path / "runtime.json", ["demo==1.0.0"])
+    descriptor_path = tmp_path / "release.json"
+    descriptor = _release_descriptor(
+        descriptor_path,
+        direct_requirements=["demo==1.0.0"],
+        wheels=[_wheel_entry(wheel, direct=True, transitive=False)],
+    )
+    descriptor["source"] = "release-provided-wheelhouse"
+    descriptor_path.write_text(canonical_json(descriptor), "utf-8")
+    _bind_runtime_lock(runtime, descriptor_path)
+    with pytest.raises(WheelhouseError, match="ai_wheelhouse_descriptor_source"):
+        verify_ai_wheelhouse(descriptor_path, wheelhouse, runtime_descriptor_path=runtime)
+
+    descriptor["source"] = "pip-report-locked-wheelhouse"
+    descriptor["wheels"][0]["direct"] = 1
+    descriptor_path.write_text(canonical_json(descriptor), "utf-8")
+    _bind_runtime_lock(runtime, descriptor_path)
+    with pytest.raises(WheelhouseError, match="ai_wheelhouse_entry_role"):
+        verify_ai_wheelhouse(descriptor_path, wheelhouse, runtime_descriptor_path=runtime)
+
+
 def test_release_wheelhouse_rejects_wrong_target_or_untracked_direct_requirement(tmp_path):
     wheelhouse = tmp_path / "wheelhouse"
     wheelhouse.mkdir()
     wheel = wheelhouse / "torch-2.8.0-cp311-cp311-manylinux_x86_64.whl"
     _write_wheel(wheel)
-    runtime_descriptor = _runtime_descriptor(tmp_path / "runtime.json", ["torch==2.8.0", "diffusers==0.29.2"])
+    runtime_descriptor = _runtime_descriptor(tmp_path / "runtime.json", ["torch==2.8.0"])
     descriptor = {
         **_release_descriptor(
             tmp_path / "wheelhouse-release.json",
@@ -162,6 +262,7 @@ def test_release_wheelhouse_rejects_wrong_target_or_untracked_direct_requirement
     }
     descriptor_path = tmp_path / "wheelhouse-release.json"
     descriptor_path.write_text(canonical_json(descriptor), "utf-8")
+    _bind_runtime_lock(runtime_descriptor, descriptor_path)
 
     with pytest.raises(WheelhouseError, match="ai_wheelhouse_target_mismatch"):
         verify_ai_wheelhouse(descriptor_path, wheelhouse, runtime_descriptor_path=runtime_descriptor)
@@ -183,6 +284,7 @@ def test_release_wheelhouse_requires_marker_evaluated_transitive_closure(tmp_pat
         direct_requirements=["rootpkg==1.0.0"],
         wheels=[_wheel_entry(root, direct=True, transitive=False), _wheel_entry(linux_only, direct=False, transitive=True)],
     )
+    _bind_runtime_lock(runtime_descriptor, tmp_path / "wheelhouse-release.json")
 
     with pytest.raises(WheelhouseError, match="ai_wheelhouse_missing_dependency"):
         verify_ai_wheelhouse(tmp_path / "wheelhouse-release.json", wheelhouse, runtime_descriptor_path=runtime_descriptor)
@@ -190,6 +292,7 @@ def test_release_wheelhouse_requires_marker_evaluated_transitive_closure(tmp_pat
     needed = _write_wheel(wheelhouse / "neededdep-2.0.0-py3-none-any.whl")
     descriptor["wheels"].append(_wheel_entry(needed, direct=False, transitive=True))
     (tmp_path / "wheelhouse-release.json").write_text(canonical_json(descriptor), "utf-8")
+    _bind_runtime_lock(runtime_descriptor, tmp_path / "wheelhouse-release.json")
     with pytest.raises(WheelhouseError, match="ai_wheelhouse_extra_unrelated"):
         verify_ai_wheelhouse(tmp_path / "wheelhouse-release.json", wheelhouse, runtime_descriptor_path=runtime_descriptor)
 
@@ -204,6 +307,7 @@ def test_release_wheelhouse_rejects_sdist_wrong_abi_and_duplicate_distribution(t
         direct_requirements=["rootpkg==1.0.0"],
         wheels=[_wheel_entry(root, direct=True, transitive=False)],
     )
+    _bind_runtime_lock(runtime_descriptor, tmp_path / "wheelhouse-release.json")
 
     with pytest.raises(WheelhouseError, match="ai_wheelhouse_extra_or_missing"):
         verify_ai_wheelhouse(tmp_path / "wheelhouse-release.json", wheelhouse, runtime_descriptor_path=runtime_descriptor)
@@ -216,6 +320,7 @@ def test_release_wheelhouse_rejects_sdist_wrong_abi_and_duplicate_distribution(t
         direct_requirements=["rootpkg==1.0.0"],
         wheels=[_wheel_entry(root, direct=True, transitive=False)],
     )
+    _bind_runtime_lock(runtime_descriptor, tmp_path / "wheelhouse-release.json")
     with pytest.raises(WheelhouseError, match="ai_wheelhouse_target_mismatch"):
         verify_ai_wheelhouse(tmp_path / "wheelhouse-release.json", wheelhouse, runtime_descriptor_path=runtime_descriptor)
 
@@ -228,5 +333,6 @@ def test_release_wheelhouse_rejects_sdist_wrong_abi_and_duplicate_distribution(t
         wheels=[_wheel_entry(root, direct=True, transitive=False), _wheel_entry(duplicate, direct=True, transitive=False)],
     )
     (tmp_path / "wheelhouse-release.json").write_text(canonical_json(descriptor), "utf-8")
+    _bind_runtime_lock(runtime_descriptor, tmp_path / "wheelhouse-release.json")
     with pytest.raises(WheelhouseError, match="ai_wheelhouse_duplicate"):
         verify_ai_wheelhouse(tmp_path / "wheelhouse-release.json", wheelhouse, runtime_descriptor_path=runtime_descriptor)

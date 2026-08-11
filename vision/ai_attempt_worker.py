@@ -20,7 +20,7 @@ from vision.ai_model_pack import (
     OFFICIAL_CATVTON_SOURCE_REVISION,
     verify_ai_model_pack,
 )
-from vision.ai_runtime_descriptor import expected_dependency_versions
+from vision.ai_runtime_descriptor import dependency_version_satisfies, expected_dependency_requirements
 from vision.source_provenance import verify_official_source_provenance
 
 _MAX_INPUT_BYTES = 20 * 1024 * 1024
@@ -117,9 +117,9 @@ def _probe_runtime_worker() -> dict[str, object]:
         "probe": "official-catvton-worker-runtime",
         "catvtonSourceRevision": OFFICIAL_CATVTON_SOURCE_REVISION,
     }
-    for name, expected in expected_dependency_versions().items():
+    for name, requirement in expected_dependency_requirements().items():
         actual = importlib.metadata.version(name)
-        if actual != expected:
+        if not dependency_version_satisfies(requirement, actual):
             raise CatVTONWorkerError(f"official_catvton_dependency_version:{name}")
         payload[name] = actual
     return payload

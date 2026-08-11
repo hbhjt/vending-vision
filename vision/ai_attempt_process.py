@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from vision.ai_runtime_descriptor import expected_dependency_versions
+from vision.ai_runtime_descriptor import dependency_version_satisfies, expected_dependency_requirements
 from vision.process_supervisor import ProcessSupervisorError, run_supervised
 
 
@@ -86,9 +86,9 @@ def _validate_probe_result(result) -> None:
         raise RuntimeError("official_ai_child_probe_failed") from exc
     if payload.get("probe") != "official-catvton-worker":
         raise RuntimeError("official_ai_child_probe_failed")
-    expected = expected_dependency_versions()
+    expected = expected_dependency_requirements()
     for name in ("torch", "torchvision", "diffusers", "transformers"):
-        if payload.get(name) != expected[name]:
+        if not dependency_version_satisfies(expected[name], payload.get(name)):
             raise RuntimeError("official_ai_child_probe_failed")
 
 
@@ -101,9 +101,9 @@ def _validate_runtime_probe_result(result) -> None:
         raise RuntimeError("official_ai_child_runtime_probe_failed") from exc
     if payload.get("probe") != "official-catvton-worker-runtime":
         raise RuntimeError("official_ai_child_runtime_probe_failed")
-    expected = expected_dependency_versions()
-    for name, version in expected.items():
-        if payload.get(name) != version:
+    expected = expected_dependency_requirements()
+    for name, requirement in expected.items():
+        if not dependency_version_satisfies(requirement, payload.get(name)):
             raise RuntimeError("official_ai_child_runtime_probe_failed")
 
 
