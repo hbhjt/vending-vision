@@ -11,6 +11,7 @@ import pytest
 
 from scripts.ai_model_pack_release import build_model_pack_zip
 from scripts.candidate_artifact_manifest import write_candidate_archive
+import vision.precutover_companion as companion
 from vision.ai_model_pack import canonical_ai_model_manifest_json
 from vision.precutover_companion import (
     _ExpectedFile,
@@ -489,3 +490,108 @@ def test_held_descriptor_hash_has_a_windows_compatible_fallback(tmp_path, monkey
         assert _fd_sha256(descriptor) == sha256(path)
     finally:
         os.close(descriptor)
+
+
+def test_handle_close_failure_after_proof_preparation_leaves_no_final_proof(
+    tmp_path, monkeypatch
+):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+    original_close = _IntegrityFence.close
+    failed = False
+
+    def fail_one_close(fence):
+        nonlocal failed
+        original_close(fence)
+        if not failed:
+            failed = True
+            raise RuntimeError("precutover_integrity_handle_close")
+
+    monkeypatch.setattr(companion._IntegrityFence, "close", fail_one_close)
+
+    with pytest.raises(RuntimeError, match="precutover_integrity_handle_close"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))
+
+
+def test_preexisting_proof_is_preserved_by_exclusive_publish(tmp_path):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+    output.write_bytes(b"operator-owned proof\n")
+
+    with pytest.raises(RuntimeError, match="precutover_report_path"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert output.read_bytes() == b"operator-owned proof\n"
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))
+
+
+def test_final_proof_link_failure_cleans_prepared_and_private_state(tmp_path, monkeypatch):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+
+    def fail_link(_source, _destination):
+        raise OSError("injected proof link failure")
+
+    monkeypatch.setattr(companion.os, "link", fail_link)
+
+    with pytest.raises(OSError, match="injected proof link failure"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))
+
+
+def test_private_cleanup_failure_cannot_publish_and_finally_retries_cleanup(
+    tmp_path, monkeypatch
+):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+    original_rmtree = companion.shutil.rmtree
+    failed = False
+
+    def fail_first_private_cleanup(path, *args, **kwargs):
+        nonlocal failed
+        if Path(path).name.startswith(".precutover-") and not failed:
+            failed = True
+            raise OSError("injected private cleanup failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(companion.shutil, "rmtree", fail_first_private_cleanup)
+
+    with pytest.raises(OSError, match="injected private cleanup failure"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert failed
+    assert not output.exists()
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))
+
+
+def test_failure_after_final_link_rolls_back_only_this_invocation(tmp_path, monkeypatch):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+    original_fsync_parent = companion._fsync_parent
+    calls = 0
+
+    def fail_first_fsync(path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected parent fsync failure")
+        return original_fsync_parent(path)
+
+    monkeypatch.setattr(companion, "_fsync_parent", fail_first_fsync)
+
+    with pytest.raises(OSError, match="injected parent fsync failure"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert calls == 2
+    assert not output.exists()
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))

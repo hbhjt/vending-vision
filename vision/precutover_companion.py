@@ -490,19 +490,67 @@ def verify_frozen_worker_archive(worker: Path) -> None:
         raise RuntimeError("precutover_worker_archive_modules")
 
 
-def _write_exclusive(path: Path, value: dict, *, before_link) -> None:
+def _unlink_owned(path: Path) -> None:
+    failure = None
+    for _attempt in range(2):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            failure = exc
+    raise failure
+
+
+def _prepare_exclusive(path: Path, value: dict, *, before_close) -> Path:
     if not path.is_absolute() or path.exists() or path.parent.resolve() != path.parent:
         raise RuntimeError("precutover_report_path")
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
     try:
-        with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(_canonical(value) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
-        before_link()
-        os.link(temporary, path)
+        before_close()
+        return temporary
+    except Exception:
+        _unlink_owned(temporary)
+        raise
+
+
+def _fsync_parent(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
     finally:
-        temporary.unlink(missing_ok=True)
+        os.close(descriptor)
+
+
+def _publish_prepared(temporary: Path, path: Path) -> None:
+    created = False
+    temporary_stat = temporary.lstat()
+    created_identity = (temporary_stat.st_dev, temporary_stat.st_ino, temporary_stat.st_mode)
+    try:
+        os.link(temporary, path)
+        created = True
+        _unlink_owned(temporary)
+        _fsync_parent(path.parent)
+    except Exception:
+        if created:
+            try:
+                current = path.lstat()
+                if (current.st_dev, current.st_ino, current.st_mode) == created_identity:
+                    _unlink_owned(path)
+                    _fsync_parent(path.parent)
+            except FileNotFoundError:
+                pass
+        raise
 
 
 def verify_precutover(
@@ -596,6 +644,7 @@ def verify_precutover(
         ),
     ]
     private_root = Path(tempfile.mkdtemp(prefix=".precutover-", dir=private_parent))
+    prepared_report: Path | None = None
     try:
         with ExitStack() as leases:
             fences = [leases.enter_context(_IntegrityFence(source_expectations))]
@@ -806,10 +855,27 @@ def verify_precutover(
                 "schemaVersion": PROOF_SCHEMA,
             }
             verify_all()
-            _write_exclusive(report_output, report, before_link=verify_all)
-            return report
-    finally:
+            prepared_report = _prepare_exclusive(
+                report_output, report, before_close=verify_all
+            )
         shutil.rmtree(private_root)
+        _publish_prepared(prepared_report, report_output)
+        prepared_report = None
+        return report
+    finally:
+        cleanup_failure = None
+        if prepared_report is not None:
+            try:
+                _unlink_owned(prepared_report)
+            except Exception as exc:
+                cleanup_failure = exc
+        if private_root.exists():
+            try:
+                shutil.rmtree(private_root)
+            except Exception as exc:
+                cleanup_failure = cleanup_failure or exc
+        if cleanup_failure is not None:
+            raise cleanup_failure
 
 
 def main(argv: list[str] | None = None) -> int:
