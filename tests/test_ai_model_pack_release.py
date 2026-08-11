@@ -12,6 +12,7 @@ from scripts.ai_model_pack_release import (
     install_model_pack_zip,
     verify_model_pack_zip,
 )
+from scripts.precutover_ai_model_pack import verify_and_install_model_pack
 from vision.ai_model_pack import (
     MANIFEST_NAME,
     AiModelPackError,
@@ -71,6 +72,34 @@ def test_model_pack_zip_build_is_deterministic_and_verifiable(tmp_path):
             assert info.date_time == (1980, 1, 1, 0, 0, 0)
             assert info.extra == b""
             assert info.comment == b""
+
+
+def test_precutover_proof_requires_actual_archive_and_installs_verified_bytes(tmp_path):
+    source = tmp_path / "source"
+    descriptor = mini_descriptor(source)
+    archive = tmp_path / "model-pack.zip"
+    archive_sha = build_model_pack_zip(source, archive, descriptor)
+    descriptor_text = canonical_ai_model_manifest_json(descriptor)
+    descriptor_path = tmp_path / "official-ai-model-pack-descriptor.json"
+    descriptor_path.write_text(descriptor_text, "utf-8")
+
+    report = verify_and_install_model_pack(
+        archive=archive,
+        descriptor_path=descriptor_path,
+        expected_archive_byte_size=archive.stat().st_size,
+        expected_archive_sha256=archive_sha,
+        expected_descriptor_sha256=hashlib.sha256(
+            descriptor_text.encode("utf-8"),
+        ).hexdigest(),
+        install_root=tmp_path / "private-install",
+    )
+
+    assert report["archive"] == {
+        "byteSize": archive.stat().st_size,
+        "sha256": archive_sha,
+    }
+    assert report["descriptor"]["catvtonSourceRevision"] == "mini-source"
+    assert Path(report["installedPack"]).is_dir()
 
 
 def test_model_pack_zip_checker_streams_each_entry_and_rejects_same_size_tamper(tmp_path):
