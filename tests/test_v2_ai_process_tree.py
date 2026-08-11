@@ -13,9 +13,12 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import anyio
 import cv2
+import httpx
 import numpy as np
 import pytest
+from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
 
 import app as vision_app
@@ -287,77 +290,109 @@ def _assert_staging_clear(attempt_id: str) -> None:
     assert _staging_paths(attempt_id) == []
 
 
-def _call_with_deadline(operation, *, timeout: float, cleanup, label: str):
-    completed = threading.Event()
-    results = []
-    errors = []
-
-    def run():
-        try:
-            results.append(operation())
-        except BaseException as exc:
-            errors.append(exc)
-        finally:
-            completed.set()
-
-    worker = threading.Thread(target=run, name=f"deadline-{label}")
-    worker.start()
-    if not completed.wait(timeout):
-        cleanup()
-        worker.join(timeout)
-        if worker.is_alive():
-            raise AssertionError(f"{label} deadline cleanup did not join")
-        raise AssertionError(f"{label} deadline exceeded")
-    worker.join()
-    if errors:
-        raise errors[0]
-    return results[0]
-
-
 def _receive_json_deadline(socket, *, timeout: float = 3.0):
-    return _call_with_deadline(
-        socket.receive_json,
-        timeout=timeout,
-        cleanup=socket.close,
-        label="websocket receive",
-    )
+    portal = getattr(socket, "portal", None)
+    receive_stream = getattr(socket, "_send_rx", None)
+    raise_on_close = getattr(socket, "_raise_on_close", None)
+    if portal is None or receive_stream is None or raise_on_close is None:
+        raise AssertionError("unsupported Starlette WebSocketTestSession boundary")
+
+    async def receive_message():
+        with anyio.fail_after(timeout):
+            return await receive_stream.receive()
+
+    try:
+        message = portal.call(receive_message)
+    except TimeoutError as exc:
+        raise TimeoutError("websocket receive deadline exceeded") from exc
+    raise_on_close(message)
+    return json.loads(message["text"])
 
 
 def _http_get_deadline(client, path: str, *, timeout: float = 3.0):
-    return _call_with_deadline(
-        lambda: client.get(path),
-        timeout=timeout,
-        cleanup=client.close,
-        label=f"HTTP GET {path}",
+    portal = getattr(client, "portal", None)
+    if portal is None:
+        raise AssertionError("TestClient deadline request requires an active portal")
+
+    async def get():
+        transport = httpx.ASGITransport(app=client.app)
+        with anyio.fail_after(timeout):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url=str(client.base_url),
+                headers=client.headers,
+                cookies=client.cookies,
+                follow_redirects=True,
+            ) as async_client:
+                return await async_client.get(path)
+
+    try:
+        return portal.call(get)
+    except TimeoutError as exc:
+        raise TimeoutError(f"HTTP GET {path} deadline exceeded") from exc
+
+
+def _deadline_probe_app(exits: dict[str, int]) -> FastAPI:
+    probe = FastAPI()
+
+    @probe.websocket("/ws")
+    async def silent(socket: WebSocket):
+        await socket.accept()
+        try:
+            await socket.receive()
+        finally:
+            exits["websocket"] += 1
+
+    @probe.get("/blocked")
+    async def blocked():
+        try:
+            await anyio.sleep_forever()
+        finally:
+            exits["http"] += 1
+
+    @probe.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    return probe
+
+
+def test_real_public_websocket_receive_deadline_cancels_without_residue():
+    exits = {"websocket": 0, "http": 0}
+    app = _deadline_probe_app(exits)
+
+    with TestClient(app) as client:
+        for expected_exits in range(1, 6):
+            with client.websocket_connect("/ws") as socket:
+                started = time.monotonic()
+                with pytest.raises(TimeoutError, match="websocket receive deadline"):
+                    _receive_json_deadline(socket, timeout=0.05)
+                assert time.monotonic() - started < 0.5
+            assert exits["websocket"] == expected_exits
+        assert client.get("/health").json() == {"status": "ok"}
+
+    assert exits["websocket"] == 5
+    assert not any(
+        thread.name.startswith("deadline-") for thread in threading.enumerate()
     )
 
 
-def test_operation_deadline_closes_and_joins_before_failing():
-    release = threading.Event()
-    finished = threading.Event()
-    cleanup_calls = []
+def test_real_blocked_http_deadline_cancels_and_keeps_client_usable():
+    exits = {"websocket": 0, "http": 0}
+    app = _deadline_probe_app(exits)
 
-    def blocked_operation():
-        release.wait()
-        finished.set()
+    with TestClient(app) as client:
+        for expected_exits in range(1, 6):
+            started = time.monotonic()
+            with pytest.raises(TimeoutError, match="HTTP GET /blocked deadline"):
+                _http_get_deadline(client, "/blocked", timeout=0.05)
+            assert time.monotonic() - started < 0.5
+            assert exits["http"] == expected_exits
+        assert client.get("/health").json() == {"status": "ok"}
 
-    def cleanup():
-        cleanup_calls.append("close")
-        release.set()
-
-    with pytest.raises(AssertionError, match="fixture deadline exceeded"):
-        _call_with_deadline(
-            blocked_operation,
-            timeout=0.02,
-            cleanup=cleanup,
-            label="fixture",
-        )
-
-    assert cleanup_calls == ["close"]
-    assert finished.is_set()
+    assert exits["http"] == 5
     assert not any(
-        thread.name == "deadline-fixture" and thread.is_alive()
-        for thread in threading.enumerate()
+        thread.name.startswith("deadline-") for thread in threading.enumerate()
     )
 
 
