@@ -18,14 +18,18 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as vision_app
+from vision import camera_manager, presence_runtime
 import vision.ai_attempt_process as ai_attempt_process_module
 from vision.ai_attempt_process import AiAttemptProcess
 from vision.ai_model_pack import OfficialAiReadinessSnapshot
+from vision.config import settings
+from vision.profile_state import get_occupancy_gate, reset_active_track
 
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux process-group tracer")
 ROOT = Path(__file__).parents[1]
 WORKER = Path(__file__).with_name("ai_process_tree_worker.py")
+RECORDED_FIXTURES = ROOT / "fixtures" / "recorded-video"
 
 
 class _GarmentHandler(BaseHTTPRequestHandler):
@@ -287,6 +291,48 @@ def _success_png(path: Path) -> None:
     path.write_bytes(payload.tobytes())
 
 
+def _configure_recorded_presence(monkeypatch, tmp_path: Path) -> tuple[dict, str]:
+    manifest = json.loads(
+        (RECORDED_FIXTURES / "expected-results.json").read_text("utf-8")
+    )
+    top = manifest["recordings"]["top"]
+    front = manifest["recordings"]["manFront"]
+    top_config = {
+        "role": "presence",
+        "source": "recorded_video",
+        "video_path": str(RECORDED_FIXTURES / top["file"]),
+        "loop": top["loop"],
+        "rotate": 0,
+    }
+    front_config = {
+        "role": "profile_fast_try_on",
+        "source": "recorded_video",
+        "video_path": str(RECORDED_FIXTURES / front["file"]),
+        "loop": front["loop"],
+        "rotate": 0,
+    }
+    managed = {
+        "schemaVersion": "vending-vision-site-config/v1",
+        "host": "127.0.0.1",
+        "port": 7892,
+        "allowed_origins": ["http://127.0.0.1:7892"],
+        "cameras": {"top": top_config, "front": front_config},
+    }
+    managed_bytes = (json.dumps(managed, indent=2) + "\n").encode("utf-8")
+    managed_path = tmp_path / "recorded-site.json"
+    managed_path.write_bytes(managed_bytes)
+    monkeypatch.setenv("VISION_CONFIG_FILE", str(managed_path))
+    monkeypatch.setattr(settings, "TOP_CAMERA_CONFIG", top_config)
+    monkeypatch.setattr(settings, "FRONT_CAMERA_CONFIG", front_config)
+    monkeypatch.setattr(presence_runtime, "_runtime", None)
+    gate = get_occupancy_gate()
+    for _ in range(settings.PROFILE_OCCUPANCY_RESET_ABSENT_FRAMES):
+        gate.mark_absent()
+    reset_active_track()
+    camera_manager.release_all_cameras()
+    return manifest, hashlib.sha256(managed_bytes).hexdigest()
+
+
 def test_public_ai_replacement_joins_real_tree_before_next_worker_and_completes(
     tmp_path, monkeypatch
 ):
@@ -460,6 +506,194 @@ def test_public_ai_timeout_kills_real_tree_without_result_and_keeps_public_ws_al
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_public_ai_disconnect_joins_real_tree_and_replays_only_disconnect_terminal(
+    tmp_path, monkeypatch
+):
+    pack = tmp_path / "test-owned-pack"
+    pack.mkdir()
+    pid_file = tmp_path / "disconnect-tree.json"
+    _configure_public_ai(monkeypatch, pack, pid_file, "block")
+    server, thread, reference = _serve_garment()
+    attempt_id = str(uuid4())
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_hello())
+                assert socket.receive_json()["payload"]["aiReady"] is True
+                socket.send_json(_start(attempt_id, reference))
+                _receive_until_generating(socket)
+                tree = _wait_pid_tree(pid_file)
+                assert all(_pid_alive(pid) for pid in tree.values())
+                socket.close()
+
+            _assert_tree_dead(tree)
+            _assert_staging_clear(attempt_id)
+            missing = client.get(
+                f"/v2/try-on/results/{attempt_id}?token=no-result"
+            )
+
+            with client.websocket_connect("/ws") as replay_socket:
+                replay_socket.send_json(_hello())
+                ready = replay_socket.receive_json()
+                replay_socket.send_json(_envelope("vision.ping", {}))
+                pong_before = replay_socket.receive_json()
+                replay_socket.send_json(_start(attempt_id, reference))
+                replay = replay_socket.receive_json()
+                replay_socket.send_json(_envelope("vision.ping", {}))
+                late_messages = []
+                while True:
+                    message = replay_socket.receive_json()
+                    if message["type"] == "vision.pong":
+                        pong_after = message
+                        break
+                    late_messages.append(message)
+
+        assert ready["type"] == "vision.ready"
+        assert pong_before["type"] == "vision.pong"
+        assert replay["type"] == "vision.try_on.attempt.canceled"
+        assert replay["payload"] == {
+            "attemptId": attempt_id,
+            "reason": "disconnect",
+        }
+        assert all(
+            message["type"]
+            not in {
+                "vision.try_on.attempt.completed",
+                "vision.try_on.attempt.failed",
+                "vision.try_on.attempt.canceled",
+            }
+            for message in late_messages
+        )
+        assert pong_after["type"] == "vision.pong"
+        assert missing.status_code == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_public_recorded_departure_cancels_real_ai_tree_and_keeps_core_live(
+    tmp_path, monkeypatch
+):
+    pack = tmp_path / "test-owned-pack"
+    pack.mkdir()
+    pid_file = tmp_path / "departure-tree.json"
+    _configure_public_ai(monkeypatch, pack, pid_file, "block")
+    manifest, managed_config_sha = _configure_recorded_presence(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "PROFILE_PUSH_ENABLED", True)
+    monkeypatch.setattr(settings, "PROFILE_PUSH_INTERVAL_MS", 167)
+    server, thread, reference = _serve_garment()
+    attempt_id = str(uuid4())
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(
+                    _hello(
+                        "profile_push",
+                        "presence_status",
+                        "person_departed",
+                        "ambient_light",
+                    )
+                )
+                ready = socket.receive_json()
+                assert ready["payload"]["aiReady"] is True
+                socket.send_json(_start(attempt_id, reference))
+                trace = _receive_until_generating(socket)
+                tree = _wait_pid_tree(pid_file)
+                assert all(_pid_alive(pid) for pid in tree.values())
+
+                canceled = next(
+                    (
+                        message
+                        for message in trace
+                        if message["type"] == "vision.try_on.attempt.canceled"
+                    ),
+                    None,
+                )
+                departure = next(
+                    (
+                        message
+                        for message in trace
+                        if message["type"] == "vision.person_departed"
+                    ),
+                    None,
+                )
+                profile_seen = any(
+                    message["type"] == "vision.profile_result" for message in trace
+                )
+                post_cancel_presence = False
+                while (
+                    canceled is None
+                    or departure is None
+                    or not profile_seen
+                    or not post_cancel_presence
+                ):
+                    message = socket.receive_json()
+                    trace.append(message)
+                    if message["type"] == "vision.try_on.attempt.canceled":
+                        canceled = message
+                    elif message["type"] == "vision.person_departed":
+                        departure = message
+                    elif message["type"] == "vision.profile_result":
+                        profile_seen = True
+                    elif (
+                        canceled is not None
+                        and message["type"] == "vision.presence_status"
+                    ):
+                        post_cancel_presence = True
+
+                _assert_tree_dead(tree)
+                _assert_staging_clear(attempt_id)
+                socket.send_json(_envelope("vision.ping", {}))
+                while True:
+                    message = socket.receive_json()
+                    trace.append(message)
+                    if message["type"] == "vision.pong":
+                        pong = message
+                        break
+
+            missing = client.get(
+                f"/v2/try-on/results/{attempt_id}?token=no-result"
+            )
+            core = client.get("/")
+
+        assert canceled is not None
+        assert canceled["payload"] == {
+            "attemptId": attempt_id,
+            "reason": "departure",
+        }
+        terminals = [
+            message
+            for message in trace
+            if message["type"]
+            in {
+                "vision.try_on.attempt.completed",
+                "vision.try_on.attempt.failed",
+                "vision.try_on.attempt.canceled",
+            }
+            and message["payload"]["attemptId"] == attempt_id
+        ]
+        assert terminals == [canceled]
+        assert departure is not None
+        source_frame = departure["payload"]["sourceFrame"]
+        assert source_frame["adapter"] == "recorded_video"
+        assert source_frame["role"] == "top"
+        assert source_frame["fixtureSha256"] == manifest["recordings"]["top"]["sha256"]
+        assert source_frame["configSha256"] == managed_config_sha
+        assert source_frame["synthetic"] is False
+        assert source_frame["relabeled"] is False
+        assert profile_seen is True
+        assert post_cancel_presence is True
+        assert pong["type"] == "vision.pong"
+        assert missing.status_code == 404
+        assert core.status_code == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        camera_manager.release_all_cameras()
 
 
 def test_public_ai_leader_crash_kills_real_descendants_and_emits_one_failure(
