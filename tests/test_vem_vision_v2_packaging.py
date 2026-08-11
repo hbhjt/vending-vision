@@ -2,8 +2,12 @@ from pathlib import Path
 import hashlib
 import json
 import re
+import stat
 import subprocess
 import sys
+import zipfile
+
+import pytest
 
 
 ROOT = Path(__file__).parents[1]
@@ -170,6 +174,13 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     assert "missing-pack" not in launcher
     assert '"AI runtime worker contract probe passed"' in verifier
     assert "--require-ai-worker" in verifier
+    assert "--trusted-subject-sha256" in verifier
+    assert "--expected-embedded-manifest-sha256" in verifier
+    assert "--expected-source-commit" in verifier
+    assert "--extract-root" in verifier
+    assert "verify_candidate_archive" in verifier
+    assert "--candidate-manifest" not in verifier
+    assert "--expected-candidate-manifest-sha256" not in verifier
     assert "PACKAGED_EXE_VERIFICATION=CORE_ONLY" in verifier
     assert "PACKAGED_EXE_VERIFICATION=PASS" in verifier
     assert "assert_ai_worker_layout" in verifier
@@ -220,9 +231,8 @@ def test_packaged_verifier_ai_worker_layout_binds_descriptor_resources(tmp_path)
     assert len(result["sha256"]) == 64
 
 
-def test_candidate_manifest_rejects_exact_json_fake_before_spawn_and_rewrite_without_outer_digest(tmp_path):
-    from scripts.candidate_artifact_manifest import canonical_json, write_candidate_artifact_manifest
-    from scripts.verify_packaged_exe import verify_candidate_artifact_manifest
+def test_candidate_archive_rejects_self_manifested_exact_json_fake_without_external_trust(tmp_path):
+    from scripts.candidate_artifact_manifest import verify_candidate_archive, write_candidate_archive
 
     dist = tmp_path / "dist"
     main = dist / "vending-vision" / "vending-vision.exe"
@@ -238,29 +248,104 @@ def test_candidate_manifest_rejects_exact_json_fake_before_spawn_and_rewrite_wit
     ):
         (internal / name).write_bytes(name.encode("ascii"))
     artifact = tmp_path / "candidate.zip"
-    artifact.write_bytes(b"candidate-archive")
     manifest_path = tmp_path / "candidate.manifest.json"
-    expected = write_candidate_artifact_manifest(dist, artifact, manifest_path)
+    trusted = write_candidate_archive(dist, artifact, manifest_path, source_commit="a" * 40)
+    repeated_artifact = tmp_path / "candidate-repeat.zip"
+    repeated_manifest = tmp_path / "candidate-repeat.manifest.json"
+    repeated = write_candidate_archive(
+        dist, repeated_artifact, repeated_manifest, source_commit="a" * 40
+    )
+    assert repeated == trusted
+    assert repeated_artifact.read_bytes() == artifact.read_bytes()
 
-    verify_candidate_artifact_manifest(main, manifest_path, artifact, expected)
+    verified = verify_candidate_archive(
+        artifact,
+        tmp_path / "verified-real",
+        expected_subject_sha256=trusted["subjectSha256"],
+        expected_manifest_sha256=trusted["embeddedManifestSha256"],
+        expected_source_commit="a" * 40,
+    )
+    assert verified["workerExecutable"].read_bytes() == b"real-worker"
 
     worker.write_text('{"probe":"official-catvton-worker-runtime","torch":"2.8.0+cpu"}\n', "utf-8")
-    try:
-        verify_candidate_artifact_manifest(main, manifest_path, artifact, expected)
-    except AssertionError as exc:
-        assert "workerExecutableSha256" in str(exc)
-    else:
-        raise AssertionError("exact JSON fake must fail before runtime spawn")
+    fake_artifact = tmp_path / "candidate-fake.zip"
+    fake_manifest = tmp_path / "candidate-fake.manifest.json"
+    fake = write_candidate_archive(dist, fake_artifact, fake_manifest, source_commit="a" * 40)
 
-    rewritten = json.loads(manifest_path.read_text("utf-8"))
-    rewritten["workerExecutableSha256"] = hashlib.sha256(worker.read_bytes()).hexdigest()
-    manifest_path.write_text(canonical_json(rewritten), "utf-8")
-    try:
-        verify_candidate_artifact_manifest(main, manifest_path, artifact, expected)
-    except AssertionError as exc:
-        assert "outer digest mismatch" in str(exc)
-    else:
-        raise AssertionError("self-rewritten manifest must not replace outer expected digest")
+    with pytest.raises(AssertionError, match="trusted subject digest mismatch"):
+        verify_candidate_archive(
+            fake_artifact,
+            tmp_path / "fake-subject",
+            expected_subject_sha256=trusted["subjectSha256"],
+            expected_manifest_sha256=trusted["embeddedManifestSha256"],
+            expected_source_commit="a" * 40,
+        )
+    with pytest.raises(AssertionError, match="embedded manifest digest mismatch"):
+        verify_candidate_archive(
+            fake_artifact,
+            tmp_path / "fake-manifest",
+            expected_subject_sha256=fake["subjectSha256"],
+            expected_manifest_sha256=trusted["embeddedManifestSha256"],
+            expected_source_commit="a" * 40,
+        )
+
+    not_zip = tmp_path / "not.zip"
+    not_zip.write_bytes(b"not-a-zip")
+    with pytest.raises(AssertionError, match="candidate artifact is not a ZIP"):
+        verify_candidate_archive(
+            not_zip,
+            tmp_path / "not-zip",
+            expected_subject_sha256=hashlib.sha256(not_zip.read_bytes()).hexdigest(),
+            expected_manifest_sha256=trusted["embeddedManifestSha256"],
+            expected_source_commit="a" * 40,
+        )
+
+    tampered = tmp_path / "candidate-payload-tampered.zip"
+    with zipfile.ZipFile(artifact) as source, zipfile.ZipFile(tampered, "w") as output:
+        for info in source.infolist():
+            payload = source.read(info)
+            if info.filename.endswith("vending-vision-ai-worker.exe"):
+                payload = b"evil-worker"
+            output.writestr(info, payload)
+    with pytest.raises(AssertionError, match="payload digest mismatch"):
+        verify_candidate_archive(
+            tampered,
+            tmp_path / "tampered-payload",
+            expected_subject_sha256=hashlib.sha256(tampered.read_bytes()).hexdigest(),
+            expected_manifest_sha256=trusted["embeddedManifestSha256"],
+            expected_source_commit="a" * 40,
+        )
+
+
+@pytest.mark.parametrize("case", ["traversal", "symlink", "special", "collision", "compressed"])
+def test_candidate_archive_safe_extract_rejects_unsafe_zip_entries(tmp_path, case):
+    from scripts.candidate_artifact_manifest import verify_candidate_archive
+
+    artifact = tmp_path / f"{case}.zip"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        if case == "traversal":
+            archive.writestr("../escape.exe", b"bad")
+        elif case in {"symlink", "special"}:
+            info = zipfile.ZipInfo("unsafe")
+            info.create_system = 3
+            mode = stat.S_IFLNK if case == "symlink" else stat.S_IFIFO
+            info.external_attr = (mode | 0o777) << 16
+            archive.writestr(info, b"target")
+        elif case == "collision":
+            archive.writestr("Demo.exe", b"one")
+            archive.writestr("demo.exe", b"two")
+        else:
+            archive.writestr("compressed.bin", b"zip-bomb-shape", compress_type=zipfile.ZIP_DEFLATED)
+
+    with pytest.raises(AssertionError, match="candidate archive"):
+        verify_candidate_archive(
+            artifact,
+            tmp_path / "extracted",
+            expected_subject_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            expected_manifest_sha256="0" * 64,
+            expected_source_commit="a" * 40,
+        )
+    assert not (tmp_path / "extracted").exists()
 
 
 def test_packaged_verifier_rejects_worker_that_does_not_emit_runtime_probe_json(tmp_path):
@@ -297,15 +382,29 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     workflow = (ROOT / ".github" / "workflows" / "publish-candidate.yml").read_text("utf-8")
 
     assert "AiWheelhouseDescriptor" in build
+    assert '".venv-packaging-core"' in build
+    assert '".venv-packaging-ai"' in build
+    assert "bootstrap_build_envs.py" in build
+    assert "render_ai_build_requirements.py" in build
+    assert "requirements-ai-build-tools.txt" in build
     assert "verify_ai_wheelhouse.py" in build
     assert "requirements-ai-release.txt" in build
     assert "--requirements-output" in build
-    assert "--require-hashes -r (Join-Path $Root \"requirements-ai.txt\")" not in build
+    assert "--python $CorePython --target-sys-platform win32" in build
+    assert "Invoke-Checked $AiPython" in build
+    assert "Invoke-Checked $CorePython" in build
+    assert "$AiPython -m pip install" in build
+    assert "--require-hashes --no-deps -r $AiBuildRequirements" in build
+    assert "run_ai_attempt_worker.py" in build
+    assert '"--probe-runtime"' in build
     assert "vending_vision.spec" in build
     assert "vending_vision_ai_worker.spec" in build
     assert "vending-vision-ai-worker" in build
     assert "--require-ai-worker" not in build
-    assert "pip install --no-index" in build
+    assert "$CoreDist" in build
+    assert "$AiDist" in build
+    assert "Copy-Item -LiteralPath (Join-Path $CoreDist \"vending-vision\")" in build
+    assert "Copy-Item -LiteralPath (Join-Path $AiDist \"vending-vision-ai-worker\")" in build
     assert "pip download" not in build
 
     assert "ai-wheelhouse" in workflow
@@ -315,16 +414,42 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "AI_WHEELHOUSE_DESCRIPTOR" not in workflow
     assert "CORE_WHEELHOUSE_URL" in workflow
     assert "CORE_WHEELHOUSE_SHA256" in workflow
+    assert "CORE_WHEELHOUSE_BYTES" in workflow
+    assert "--expected-bytes $env:CORE_WHEELHOUSE_BYTES" in workflow
     assert "download_verified_archive.py" in workflow
     assert "CORE_WHEELHOUSE_ARCHIVE" not in workflow
-    assert "verify_ai_wheelhouse.py" in workflow
     assert "requirements-ai-release.txt" in workflow
+    assert "--requirements-output build/requirements-ai-release.txt" in workflow
+    assert "python -m pip install" not in workflow
+    assert "dependency_lock.py" not in workflow
+    assert "verify_ai_wheelhouse.py" not in workflow
     assert "pip download" not in workflow
     assert workflow.count("scripts/build_exe.ps1") == 1
+    assert ".venv-packaging-core" in workflow
+    assert ".venv-packaging-ai" in workflow
     assert "candidate_artifact_manifest.py" in workflow
-    assert "--expected-candidate-manifest-sha256" in workflow
+    assert "--manifest-output" in workflow
+    assert "--source-commit" in workflow
+    assert "Compress-Archive" not in workflow
+    assert "actions/attest-build-provenance@v4" in workflow
+    assert "subject-path:" in workflow
+    assert "id-token: write" in workflow
+    assert "attestations: write" in workflow
+    assert "verify:" in workflow
+    assert "needs: build" in workflow
+    assert workflow.count("runs-on: windows-latest") >= 2
+    assert "actions/download-artifact@v4" in workflow
+    assert "gh attestation verify" in workflow
+    assert "--signer-repo" in workflow
+    assert "--signer-workflow" in workflow
+    assert "--source-ref" in workflow
+    assert "--source-digest" in workflow
+    assert "--trusted-subject-sha256" in workflow
+    assert "--expected-embedded-manifest-sha256" in workflow
+    assert "--expected-source-commit" in workflow
+    assert "--extract-root" in workflow
     assert "--require-ai-worker" in workflow
-    assert "--candidate-manifest" in workflow
+    assert "--expected-candidate-manifest-sha256" not in workflow
     assert workflow.count("PyInstaller --clean --noconfirm") == 0
 
 

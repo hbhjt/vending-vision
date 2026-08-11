@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.candidate_artifact_manifest import LAYOUT, SCHEMA, canonical_json
+from scripts.candidate_artifact_manifest import LAYOUT, verify_candidate_archive
 
 
 CONTRACT_ROOT = Path(__file__).resolve().parents[1] / "contracts" / "vem_vision_v2"
@@ -64,9 +64,11 @@ def parse_args():
         nargs="?",
         default="dist/vending-vision/vending-vision.exe",
     )
-    parser.add_argument("--candidate-manifest")
     parser.add_argument("--candidate-artifact")
-    parser.add_argument("--expected-candidate-manifest-sha256")
+    parser.add_argument("--trusted-subject-sha256")
+    parser.add_argument("--expected-embedded-manifest-sha256")
+    parser.add_argument("--expected-source-commit")
+    parser.add_argument("--extract-root")
     parser.add_argument("--port", type=int, default=17892)
     parser.add_argument("--startup-timeout", type=float, default=45.0)
     parser.add_argument("--expected-version")
@@ -421,43 +423,6 @@ def assert_ai_worker_layout(exe_path, *, required):
     return {"path": worker, "sha256": digest}
 
 
-def verify_candidate_artifact_manifest(
-    exe_path: Path,
-    manifest_path: Path,
-    artifact_path: Path,
-    expected_manifest_sha256: str,
-):
-    import hashlib
-
-    raw = manifest_path.read_text("utf-8")
-    manifest = json.loads(raw)
-    if canonical_json(manifest) != raw.rstrip("\n"):
-        raise AssertionError("candidate artifact manifest is not canonical")
-    if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != expected_manifest_sha256:
-        raise AssertionError("candidate artifact manifest outer digest mismatch")
-    expected_fields = {
-        "schemaVersion", "artifactSha256", "layout", "mainExecutableSha256",
-        "workerExecutableSha256", "runtimeDescriptorSha256",
-        "aiWheelhouseManifestSha256", "sourceDescriptorSha256", "modelPackDescriptorSha256",
-    }
-    if set(manifest) != expected_fields or manifest["schemaVersion"] != SCHEMA or manifest["layout"] != LAYOUT:
-        raise AssertionError("candidate artifact manifest shape mismatch")
-    dist_root = exe_path.parent.parent
-    bound_paths = {
-        "mainExecutableSha256": dist_root / LAYOUT["mainExecutable"],
-        "workerExecutableSha256": dist_root / LAYOUT["workerExecutable"],
-        "runtimeDescriptorSha256": dist_root / LAYOUT["workerInternal"] / "ai-runtime-descriptor.json",
-        "aiWheelhouseManifestSha256": dist_root / LAYOUT["workerInternal"] / "requirements-ai.lock.json",
-        "sourceDescriptorSha256": dist_root / LAYOUT["workerInternal"] / "official-ai-source-descriptor.json",
-        "modelPackDescriptorSha256": dist_root / LAYOUT["workerInternal"] / "official-ai-model-pack-descriptor.json",
-        "artifactSha256": artifact_path,
-    }
-    for field, path in bound_paths.items():
-        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != manifest[field]:
-            raise AssertionError(f"candidate artifact manifest file digest mismatch: {field}")
-    return {"path": bound_paths["workerExecutableSha256"], "sha256": manifest["workerExecutableSha256"]}
-
-
 def verify_ai_worker_runtime_probe(ai_worker):
     probe = subprocess.run(
         [str(ai_worker["path"]), "--probe-runtime"],
@@ -569,24 +534,39 @@ def verify_managed_production_surface(exe_path, *, port, startup_timeout, temp_d
 def main():
     args = parse_args()
     root = Path(__file__).resolve().parents[1]
-    exe_path = Path(args.exe)
-    if not exe_path.is_absolute():
-        exe_path = root / exe_path
-    exe_path = exe_path.resolve()
-    if not exe_path.is_file():
-        raise FileNotFoundError(exe_path)
-
-    assert_bundled_resources(exe_path)
     ai_worker = None
     if args.require_ai_worker:
-        if not all((args.candidate_manifest, args.candidate_artifact, args.expected_candidate_manifest_sha256)):
-            raise AssertionError("full AI verification requires candidate manifest, artifact, and outer digest")
-        ai_worker = verify_candidate_artifact_manifest(
-            exe_path,
-            Path(args.candidate_manifest).resolve(),
+        if not all(
+            (
+                args.candidate_artifact,
+                args.trusted_subject_sha256,
+                args.expected_embedded_manifest_sha256,
+                args.expected_source_commit,
+                args.extract_root,
+            )
+        ):
+            raise AssertionError("full AI verification requires externally trusted candidate subject and manifest")
+        verified = verify_candidate_archive(
             Path(args.candidate_artifact).resolve(),
-            args.expected_candidate_manifest_sha256,
+            Path(args.extract_root).resolve(),
+            expected_subject_sha256=args.trusted_subject_sha256,
+            expected_manifest_sha256=args.expected_embedded_manifest_sha256,
+            expected_source_commit=args.expected_source_commit,
         )
+        exe_path = verified["mainExecutable"]
+        ai_worker = assert_ai_worker_layout(exe_path, required=True)
+        expected_worker_sha256 = verified["manifest"]["bindings"]["workerExecutable"]["sha256"]
+        if ai_worker["sha256"] != expected_worker_sha256:
+            raise AssertionError("verified worker digest changed after extraction")
+    else:
+        exe_path = Path(args.exe)
+        if not exe_path.is_absolute():
+            exe_path = root / exe_path
+        exe_path = exe_path.resolve()
+        if not exe_path.is_file():
+            raise FileNotFoundError(exe_path)
+
+    assert_bundled_resources(exe_path)
     run_packaged_probe(
         exe_path,
         "--verify-v2-contract-bundle",

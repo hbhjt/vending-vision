@@ -1,6 +1,9 @@
 import hashlib
 import io
+from pathlib import Path
 import stat
+import subprocess
+import sys
 import tarfile
 import zipfile
 
@@ -40,7 +43,10 @@ def test_verified_archive_download_extracts_only_digest_bound_safe_members(tmp_p
         return _Response(payload, url)
 
     destination = tmp_path / "wheelhouse"
-    download_verified_archive(url, hashlib.sha256(payload).hexdigest(), destination, opener=opener)
+    download_verified_archive(
+        url, hashlib.sha256(payload).hexdigest(), destination,
+        expected_bytes=len(payload), opener=opener,
+    )
 
     assert (destination / "demo.whl").read_bytes() == b"wheel"
 
@@ -54,7 +60,10 @@ def test_verified_archive_rejects_traversal_without_publishing_destination(tmp_p
 
     destination = tmp_path / "wheelhouse"
     with pytest.raises(ArchiveError, match="archive_unsafe_path"):
-        download_verified_archive(url, hashlib.sha256(payload).hexdigest(), destination, opener=opener)
+        download_verified_archive(
+            url, hashlib.sha256(payload).hexdigest(), destination,
+            expected_bytes=len(payload), opener=opener,
+        )
 
     assert not destination.exists()
     assert not (tmp_path / "escape.whl").exists()
@@ -93,7 +102,58 @@ def test_verified_archive_rejects_symlink_special_collision_and_size(tmp_path, c
             url,
             hashlib.sha256(payload).hexdigest(),
             tmp_path / "wheelhouse",
+            expected_bytes=len(payload),
             opener=opener,
             max_extracted_bytes=4 if case == "oversize" else 1024,
         )
+    assert not (tmp_path / "wheelhouse").exists()
+
+
+def test_archive_downloader_imports_in_clean_stdlib_only_python(tmp_path):
+    clean_venv = tmp_path / "clean-python"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(clean_venv)],
+        check=True,
+    )
+    clean_python = clean_venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    script = Path(__file__).parents[1] / "scripts" / "download_verified_archive.py"
+
+    completed = subprocess.run(
+        [str(clean_python), str(script), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_archive_downloader_aborts_oversized_stream_before_writing_chunk(tmp_path, monkeypatch):
+    url = "https://example.invalid/core-wheelhouse.zip"
+    payload = b"expected-plus-one"
+    writes = []
+    real_open = Path.open
+
+    class Sink(io.BytesIO):
+        def write(self, value):
+            writes.append(len(value))
+            return super().write(value)
+
+    def guarded_open(path, mode="r", *args, **kwargs):
+        if path.name == "payload.archive" and mode == "xb":
+            return Sink()
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    with pytest.raises(ArchiveError, match="archive_download_size"):
+        download_verified_archive(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            tmp_path / "wheelhouse",
+            expected_bytes=len(payload) - 1,
+            max_download_bytes=len(payload) + 10,
+            opener=lambda _request, timeout: _Response(payload, url),
+        )
+
+    assert writes == []
     assert not (tmp_path / "wheelhouse").exists()

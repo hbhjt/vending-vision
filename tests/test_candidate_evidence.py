@@ -25,6 +25,45 @@ ROOT = Path(__file__).resolve().parents[1]
 SIGNER = "spki-sha256:" + "a" * 64
 
 
+def _ai_evidence_args(tmp_path):
+    worker = tmp_path / "vending-vision-ai-worker.exe"
+    worker.write_bytes(b"stage23-worker")
+    runtime = ROOT / "ai-runtime-descriptor.json"
+    lock = ROOT / "requirements-ai.lock.json"
+    source = ROOT / "official-ai-source-descriptor.json"
+    model = ROOT / "official-ai-model-pack-descriptor.json"
+    bindings = {
+        name: {"path": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        for name, path in {
+            "workerExecutable": worker,
+            "runtimeDescriptor": runtime,
+            "aiLock": lock,
+            "sourceDescriptor": source,
+            "modelPackDescriptor": model,
+        }.items()
+    }
+    manifest = tmp_path / "candidate.manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {"schemaVersion": "vending-vision-candidate-artifact/v3", "bindings": bindings},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "utf-8",
+    )
+    github_attestation = tmp_path / "github-attestation.json"
+    github_attestation.write_text('{"verifiedBy":"stage23-test"}', "utf-8")
+    return [
+        "--candidate-manifest", str(manifest),
+        "--github-attestation", str(github_attestation),
+        "--ai-requirements-lock", str(lock),
+        "--ai-runtime-descriptor", str(runtime),
+        "--source-descriptor", str(source),
+        "--model-pack-descriptor", str(model),
+        "--worker-executable", str(worker),
+    ]
+
+
 def test_release_lock_contains_hashes_for_full_runtime_and_packaging_closure():
     packages = read_hash_locked_requirements(ROOT / "requirements.txt")
 
@@ -81,6 +120,7 @@ def test_candidate_cli_bootstraps_repo_imports_for_help_and_full_generation(tmp_
             str(wheelhouse),
             "--python",
             sys.executable,
+            *_ai_evidence_args(tmp_path),
             "--output",
             str(output),
         ],
@@ -139,15 +179,20 @@ def test_candidate_sbom_covers_the_actual_win32_locked_closure(tmp_path, monkeyp
             "generate_candidate_evidence.py", "--bundle", str(bundle), "--version", "0.2.1-rc.1",
             "--commit", "b" * 40, "--repository", "hbhjt/vending-vision",
             "--signer-identity", SIGNER, "--wheelhouse", str(tmp_path), "--output", str(tmp_path / "candidate"),
+            *_ai_evidence_args(tmp_path),
         ],
     )
 
     generate_candidate_evidence.main()
 
-    packages = json.loads((tmp_path / "candidate" / "vision-sbom.spdx.json").read_text(encoding="utf-8"))["packages"]
+    all_packages = json.loads((tmp_path / "candidate" / "vision-sbom.spdx.json").read_text(encoding="utf-8"))["packages"]
+    packages = [item for item in all_packages if item.get("comment") == "scope=core-runtime"]
+    ai_packages = [item for item in all_packages if item.get("comment") == "scope=ai-worker-runtime"]
     sbom_licenses = {item["name"].lower(): item["licenseDeclared"] for item in packages}
     assert len(packages) == 62
     assert sbom_licenses == {normalized: LICENSE_OVERRIDES[normalized] for normalized in windows_lock}
+    assert len(ai_packages) == 34
+    assert {item["name"] for item in ai_packages} >= {"torch", "torchvision", "diffusers", "transformers"}
     descriptor = json.loads((tmp_path / "candidate" / "vision-release-descriptor.json").read_text(encoding="utf-8"))
     manifest = json.loads((ROOT / "contracts" / "vem_vision_v2" / "manifest.json").read_text(encoding="utf-8"))
     assert descriptor["protocol"] == {
@@ -157,6 +202,25 @@ def test_candidate_sbom_covers_the_actual_win32_locked_closure(tmp_path, monkeyp
         "contractDigest": manifest["bundleDigest"],
         "webSocketPath": "/ws",
     }
+    assert descriptor["candidateManifest"]["schemaVersion"] == "vending-vision-candidate-artifact/v3"
+    assert descriptor["githubArtifactAttestation"]["format"] == "sigstore-bundle"
+    assert set(descriptor["aiRuntime"]) == {
+        "requirementsLock", "runtimeDescriptor", "sourceDescriptor",
+        "modelPackDescriptor", "workerExecutable",
+    }
+    supplier_attestation = json.loads(
+        (tmp_path / "candidate" / "vision-artifact-attestation.json").read_text("utf-8")
+    )
+    assert supplier_attestation["candidateManifestDigest"] == descriptor["candidateManifest"]["digest"]
+    assert supplier_attestation["githubArtifactAttestationDigest"] == descriptor["githubArtifactAttestation"]["digest"]
+    assert supplier_attestation["workerExecutableDigest"] == descriptor["aiRuntime"]["workerExecutable"]["digest"]
+    provenance = json.loads((tmp_path / "candidate" / "vision-provenance.json").read_text("utf-8"))
+    dependency_uris = {
+        item["uri"]
+        for item in provenance["predicate"]["buildDefinition"]["resolvedDependencies"]
+    }
+    assert any(uri.startswith("github-attestation:") for uri in dependency_uris)
+    assert any(uri.startswith("ai-worker:") for uri in dependency_uris)
 
 
 def test_win32_marked_lock_selects_a_complete_offline_wheel_closure(tmp_path):
@@ -187,9 +251,10 @@ def test_windows_ci_and_candidate_publish_force_the_win32_offline_closure():
     assert (ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.11.9"
     assert ci.count("--target-sys-platform win32") == 1
     assert "python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt" in ci
-    assert "python scripts/dependency_lock.py --wheelhouse wheelhouse --python python --target-sys-platform win32" in publish
-    assert publish.index("--target-sys-platform win32") < publish.index("./scripts/build_exe.ps1")
-    assert "python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt" in publish
+    assert "dependency_lock.py" not in publish
+    assert "python -m pip install" not in publish
+    assert publish.count("./scripts/build_exe.ps1") == 1
+    assert ".venv-packaging-core" in publish
 
 
 def test_reviewed_license_facts_match_the_locked_cffi_and_pillow_wheel_metadata():
@@ -235,6 +300,7 @@ def test_candidate_sbom_uses_hash_locked_installed_wheels_and_real_gpl_license(t
             str(wheelhouse),
             "--python",
             sys.executable,
+            *_ai_evidence_args(tmp_path),
             "--output",
             str(output),
         ],
@@ -243,7 +309,10 @@ def test_candidate_sbom_uses_hash_locked_installed_wheels_and_real_gpl_license(t
     generate_candidate_evidence.main()
 
     sbom = json.loads((output / "vision-sbom.spdx.json").read_text(encoding="utf-8"))
-    package = next(item for item in sbom["packages"] if item["name"] == "cv2-enumerate-cameras")
+    package = next(
+        item for item in sbom["packages"]
+        if item["name"] == "cv2-enumerate-cameras" and item.get("comment") == "scope=core-runtime"
+    )
     assert package["licenseDeclared"] == "GPL-3.0-or-later"
     assert package["licenseConcluded"] == "GPL-3.0-or-later"
     assert package["checksums"] == [{"algorithm": "SHA256", "checksumValue": wheel_hash}]
@@ -273,12 +342,17 @@ def test_candidate_sbom_declares_and_concludes_the_reviewed_cffi_and_pillow_fact
             "generate_candidate_evidence.py", "--bundle", str(bundle), "--version", "0.2.1-rc.1",
             "--commit", "b" * 40, "--repository", "hbhjt/vending-vision",
             "--signer-identity", SIGNER, "--wheelhouse", str(tmp_path), "--output", str(tmp_path / "candidate"),
+            *_ai_evidence_args(tmp_path),
         ],
     )
 
     generate_candidate_evidence.main()
 
-    packages = json.loads((tmp_path / "candidate" / "vision-sbom.spdx.json").read_text(encoding="utf-8"))["packages"]
+    packages = [
+        item
+        for item in json.loads((tmp_path / "candidate" / "vision-sbom.spdx.json").read_text(encoding="utf-8"))["packages"]
+        if item.get("comment") == "scope=core-runtime"
+    ]
     facts = {item["name"].lower(): (item["licenseDeclared"], item["licenseConcluded"]) for item in packages}
     assert facts == {"cffi": ("MIT-0", "MIT-0"), "pillow": ("MIT-CMU", "MIT-CMU")}
 

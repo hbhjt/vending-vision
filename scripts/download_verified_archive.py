@@ -18,6 +18,7 @@ class ArchiveError(RuntimeError):
 
 
 _MAX_EXTRACTED_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024
 
 
 def _safe_relative(name: str) -> PurePosixPath:
@@ -99,7 +100,9 @@ def download_verified_archive(
     sha256: str,
     destination: Path,
     *,
+    expected_bytes: int,
     opener=urlopen,
+    max_download_bytes: int = _MAX_DOWNLOAD_BYTES,
     max_extracted_bytes: int = _MAX_EXTRACTED_BYTES,
 ) -> None:
     parsed = urlsplit(url)
@@ -109,6 +112,14 @@ def download_verified_archive(
         int(sha256, 16)
     except ValueError as exc:
         raise ArchiveError("archive_sha256") from exc
+    if (
+        type(expected_bytes) is not int
+        or expected_bytes <= 0
+        or type(max_download_bytes) is not int
+        or max_download_bytes <= 0
+        or expected_bytes > max_download_bytes
+    ):
+        raise ArchiveError("archive_download_size")
     if destination.exists():
         raise ArchiveError("archive_destination_exists")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -123,9 +134,15 @@ def download_verified_archive(
             if response.geturl() != url:
                 raise ArchiveError("archive_redirect_identity")
             with archive_path.open("xb") as output:
+                downloaded = 0
                 for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                    if downloaded + len(chunk) > expected_bytes or downloaded + len(chunk) > max_download_bytes:
+                        raise ArchiveError("archive_download_size")
                     output.write(chunk)
                     digest.update(chunk)
+                    downloaded += len(chunk)
+        if downloaded != expected_bytes:
+            raise ArchiveError("archive_download_size")
         if digest.hexdigest() != sha256.lower():
             raise ArchiveError("archive_digest")
         _extract_archive(archive_path, extracted, max_extracted_bytes=max_extracted_bytes)
@@ -138,9 +155,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--sha256", required=True)
+    parser.add_argument("--expected-bytes", required=True, type=int)
     parser.add_argument("--destination", required=True)
     args = parser.parse_args()
-    download_verified_archive(args.url, args.sha256, Path(args.destination).resolve())
+    download_verified_archive(
+        args.url,
+        args.sha256,
+        Path(args.destination).resolve(),
+        expected_bytes=args.expected_bytes,
+    )
     print("Verified archive extracted")
     return 0
 

@@ -6,18 +6,29 @@ on:
       - "v*.*.*-rc.*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  candidate:
+  build:
     runs-on: windows-latest
     environment: experimental-candidate
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+      artifact-name: ${{ steps.bundle.outputs.artifact-name }}
+      artifact-file: ${{ steps.bundle.outputs.artifact-file }}
+      subject-sha256: ${{ steps.bundle.outputs.subject-sha256 }}
+      manifest-sha256: ${{ steps.bundle.outputs.manifest-sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           lfs: true
       - name: 校验受保护 RC 来源
+        id: source
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}" -replace '^v',''
@@ -26,6 +37,7 @@ jobs:
           git merge-base --is-ancestor HEAD origin/main
           if ($LASTEXITCODE -ne 0) { throw "Candidate tag must point to merged main" }
           "VISION_RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          "version=$version" >> $env:GITHUB_OUTPUT
       - uses: actions/setup-python@v5
         with:
           python-version-file: ".python-version"
@@ -35,62 +47,129 @@ jobs:
         env:
           CORE_WHEELHOUSE_URL: ${{ vars.CORE_WHEELHOUSE_URL }}
           CORE_WHEELHOUSE_SHA256: ${{ vars.CORE_WHEELHOUSE_SHA256 }}
+          CORE_WHEELHOUSE_BYTES: ${{ vars.CORE_WHEELHOUSE_BYTES }}
         run: |
           if ($env:CORE_WHEELHOUSE_URL -notmatch '^https://') { throw "CORE_WHEELHOUSE_URL must be HTTPS" }
           if ($env:CORE_WHEELHOUSE_SHA256 -notmatch '^[a-fA-F0-9]{64}$') { throw "CORE_WHEELHOUSE_SHA256 is required" }
-          python scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --destination wheelhouse
+          if ($env:CORE_WHEELHOUSE_BYTES -notmatch '^[1-9][0-9]*$') { throw "CORE_WHEELHOUSE_BYTES is required" }
+          python scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --expected-bytes $env:CORE_WHEELHOUSE_BYTES --destination wheelhouse
       - name: 从仓库锁定清单下载并校验 AI worker wheel 闭包
         shell: pwsh
         run: |
-          python scripts/materialize_ai_wheelhouse.py --descriptor requirements-ai.lock.json --runtime-descriptor ai-runtime-descriptor.json --destination ai-wheelhouse
-          python scripts/verify_ai_wheelhouse.py --descriptor requirements-ai.lock.json --wheelhouse ai-wheelhouse --runtime-descriptor ai-runtime-descriptor.json --requirements-output build/requirements-ai-release.txt
-      - name: 离线安装、校验精确源码和模型
-        shell: pwsh
-        run: |
-          python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
-          python -m pip install --no-index --find-links ai-wheelhouse --require-hashes -r build/requirements-ai-release.txt
-          python scripts/dependency_lock.py --wheelhouse wheelhouse --python python --target-sys-platform win32
-          python scripts/verify_ai_wheelhouse.py --descriptor requirements-ai.lock.json --wheelhouse ai-wheelhouse --runtime-descriptor ai-runtime-descriptor.json --requirements-output build/requirements-ai-release.txt
-          python -m pytest -q
-          python -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
-      - name: 构建带版本的 Windows bundle
+          python scripts/materialize_ai_wheelhouse.py --descriptor requirements-ai.lock.json --runtime-descriptor ai-runtime-descriptor.json --destination ai-wheelhouse --requirements-output build/requirements-ai-release.txt
+      - name: 构建隔离的 Windows runtime
         shell: pwsh
         run: |
           python scripts/set_release_version.py $env:VISION_RELEASE_VERSION
           ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse") -AiWheelhouse (Join-Path $PWD "ai-wheelhouse") -AiWheelhouseDescriptor (Join-Path $PWD "requirements-ai.lock.json")
+      - name: 生成确定性候选 ZIP 和嵌入清单
+        id: bundle
+        shell: pwsh
+        run: |
+          $CorePython = Join-Path $PWD ".venv-packaging-core\Scripts\python.exe"
+          $AiPython = Join-Path $PWD ".venv-packaging-ai\Scripts\python.exe"
+          if (-not (Test-Path -LiteralPath $CorePython -PathType Leaf)) { throw "isolated core Python missing" }
+          if (-not (Test-Path -LiteralPath $AiPython -PathType Leaf)) { throw "isolated AI Python missing" }
           New-Item -ItemType Directory -Force candidate | Out-Null
-          $artifact = "candidate/vending-vision-$env:VISION_RELEASE_VERSION-windows-x86_64.zip"
-          Compress-Archive -Path dist/vending-vision,dist/vending-vision-ai-worker -DestinationPath $artifact -CompressionLevel Optimal
+          $artifactName = "vending-vision-$env:VISION_RELEASE_VERSION-windows-x86_64.zip"
+          $artifact = "candidate/$artifactName"
           $manifest = "candidate/vending-vision-$env:VISION_RELEASE_VERSION-windows-x86_64.manifest.json"
-          $manifestDigest = (python scripts/candidate_artifact_manifest.py --dist-root dist --artifact $artifact --output $manifest).Trim()
-          if ($manifestDigest -notmatch '^[a-f0-9]{64}$') { throw "candidate manifest digest missing" }
-          python scripts/verify_packaged_exe.py dist/vending-vision/vending-vision.exe --require-ai-worker --candidate-manifest $manifest --candidate-artifact $artifact --expected-candidate-manifest-sha256 $manifestDigest
+          $result = (& $CorePython scripts/candidate_artifact_manifest.py --dist-root dist --artifact $artifact --manifest-output $manifest --source-commit "${{ github.sha }}") | ConvertFrom-Json
+          if ($result.subjectSha256 -notmatch '^[a-f0-9]{64}$') { throw "candidate subject digest missing" }
+          if ($result.embeddedManifestSha256 -notmatch '^[a-f0-9]{64}$') { throw "embedded manifest digest missing" }
+          "artifact-name=vending-vision-$env:VISION_RELEASE_VERSION-candidate" >> $env:GITHUB_OUTPUT
+          "artifact-file=$artifactName" >> $env:GITHUB_OUTPUT
+          "subject-sha256=$($result.subjectSha256)" >> $env:GITHUB_OUTPUT
+          "manifest-sha256=$($result.embeddedManifestSha256)" >> $env:GITHUB_OUTPUT
+          "VISION_CANDIDATE_ARTIFACT=$artifact" >> $env:GITHUB_ENV
           "VISION_CANDIDATE_MANIFEST=$manifest" >> $env:GITHUB_ENV
-          "VISION_CANDIDATE_MANIFEST_SHA256=$manifestDigest" >> $env:GITHUB_ENV
+      - name: 生成 GitHub artifact provenance attestation
+        id: attest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.VISION_CANDIDATE_ARTIFACT }}
       - name: 生成并签署供应方证据
         shell: pwsh
         env:
           VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}
           VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}
+          GITHUB_ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:VISION_SUPPLIER_PRIVATE_KEY_PEM)) { throw "VISION_SUPPLIER_PRIVATE_KEY_PEM is required" }
           if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "VISION_SUPPLIER_SIGNER_IDENTITY is invalid" }
+          if (-not (Test-Path -LiteralPath $env:GITHUB_ATTESTATION_BUNDLE -PathType Leaf)) { throw "GitHub attestation bundle missing" }
+          $CorePython = Join-Path $PWD ".venv-packaging-core\Scripts\python.exe"
+          $attestationCopy = "candidate/github-build-provenance.sigstore.json"
+          Copy-Item -LiteralPath $env:GITHUB_ATTESTATION_BUNDLE -Destination $attestationCopy
           $key = Join-Path $env:RUNNER_TEMP supplier-ed25519.pem
           try {
             [IO.File]::WriteAllText($key, $env:VISION_SUPPLIER_PRIVATE_KEY_PEM)
-            $bundle = Get-ChildItem candidate/vending-vision-*-windows-x86_64.zip | Select-Object -First 1
-            python scripts/generate_candidate_evidence.py --bundle $bundle.FullName --candidate-manifest $env:VISION_CANDIDATE_MANIFEST --version $env:VISION_RELEASE_VERSION --commit "${{ github.sha }}" --repository "${{ github.repository }}" --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY --requirements-lock requirements.txt --wheelhouse wheelhouse --python python --output candidate
-            python scripts/sign_candidate_evidence.py --candidate-dir candidate --private-key $key --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY
+            & $CorePython scripts/generate_candidate_evidence.py --bundle $env:VISION_CANDIDATE_ARTIFACT --candidate-manifest $env:VISION_CANDIDATE_MANIFEST --github-attestation $attestationCopy --version $env:VISION_RELEASE_VERSION --commit "${{ github.sha }}" --repository "${{ github.repository }}" --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY --requirements-lock requirements.txt --wheelhouse wheelhouse --python $CorePython --ai-requirements-lock requirements-ai.lock.json --ai-runtime-descriptor ai-runtime-descriptor.json --source-descriptor official-ai-source-descriptor.json --model-pack-descriptor official-ai-model-pack-descriptor.json --worker-executable dist/vending-vision-ai-worker/vending-vision-ai-worker.exe --output candidate
+            if ($LASTEXITCODE -ne 0) { throw "candidate evidence generation failed" }
+            & $CorePython scripts/sign_candidate_evidence.py --candidate-dir candidate --private-key $key --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY
+            if ($LASTEXITCODE -ne 0) { throw "candidate evidence signing failed" }
           } finally {
             Remove-Item $key -Force -ErrorAction SilentlyContinue
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: vending-vision-${{ env.VISION_RELEASE_VERSION }}-candidate
+          name: ${{ steps.bundle.outputs.artifact-name }}
           path: candidate/*
           if-no-files-found: error
+
+  verify:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: candidate-input
+      - name: 验证 GitHub 外部 artifact attestation
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $artifact = Join-Path $PWD "candidate-input/${{ needs.build.outputs.artifact-file }}"
+          gh attestation verify $artifact --repo "${{ github.repository }}" --signer-repo "${{ github.repository }}" --signer-workflow "${{ github.repository }}/.github/workflows/publish-candidate.yml" --source-ref "${{ github.ref }}" --source-digest "${{ github.sha }}"
+          if ($LASTEXITCODE -ne 0) { throw "GitHub artifact attestation verification failed" }
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+      - name: 准备 fresh verifier 依赖并安全验证候选
+        shell: pwsh
+        env:
+          CORE_WHEELHOUSE_URL: ${{ vars.CORE_WHEELHOUSE_URL }}
+          CORE_WHEELHOUSE_SHA256: ${{ vars.CORE_WHEELHOUSE_SHA256 }}
+          CORE_WHEELHOUSE_BYTES: ${{ vars.CORE_WHEELHOUSE_BYTES }}
+        run: |
+          python scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --expected-bytes $env:CORE_WHEELHOUSE_BYTES --destination verifier-wheelhouse
+          python -m venv .venv-candidate-verifier
+          $VerifyPython = Join-Path $PWD ".venv-candidate-verifier\Scripts\python.exe"
+          & $VerifyPython -m pip install --disable-pip-version-check --no-index --find-links verifier-wheelhouse --require-hashes -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "verifier dependency install failed" }
+          $artifact = Join-Path $PWD "candidate-input/${{ needs.build.outputs.artifact-file }}"
+          & $VerifyPython scripts/verify_packaged_exe.py --require-ai-worker --candidate-artifact $artifact --trusted-subject-sha256 "${{ needs.build.outputs.subject-sha256 }}" --expected-embedded-manifest-sha256 "${{ needs.build.outputs.manifest-sha256 }}" --expected-source-commit "${{ github.sha }}" --extract-root (Join-Path $PWD "verified-candidate")
+          if ($LASTEXITCODE -ne 0) { throw "fresh candidate verification failed" }
+
+  publish:
+    needs: [build, verify]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: candidate
       - name: 发布不可变 prerelease
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" candidate/* --prerelease --verify-tag --title "Vending Vision $env:VISION_RELEASE_VERSION" --notes "Experimental Vision Candidate Release. Built independently by Vision. VEM conformance and approval run downstream against this exact tag and bundle digest."
+        run: gh release create "${{ github.ref_name }}" candidate/* --prerelease --verify-tag --title "Vending Vision ${{ needs.build.outputs.version }}" --notes "Experimental Vision Candidate Release. GitHub artifact attestation and an independent fresh-runner full verification are required before publication."
