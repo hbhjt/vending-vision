@@ -13,6 +13,7 @@ SIGNER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-signer.yml"
 SOURCE_APPROVAL = ROOT / "scripts" / "approve_candidate_source.py"
 VERIFY_INPUTS = ROOT / "scripts" / "verify_trusted_candidate_inputs.py"
 GENERATE_EVIDENCE = ROOT / "scripts" / "generate_trusted_candidate_evidence.py"
+TAG_RULESET = ROOT / "scripts" / "verify_release_tag_ruleset.py"
 
 
 def _workflow_call_inputs(source: str) -> set[str]:
@@ -30,31 +31,56 @@ def test_trusted_signer_has_only_data_inputs_and_isolates_the_supplier_key():
         "source_commit",
         "source_ref",
         "artifact_name",
-        "artifact_file",
         "subject_sha256",
         "manifest_sha256",
-        "attestation_bundle_file",
         "attestation_bundle_sha256",
-        "builder_evidence_file",
     }
-    assert "environment: experimental-candidate" in workflow
-    assert "runs-on: windows-latest" in workflow
+    verify = workflow[workflow.index("  verify_evidence:\n"):workflow.index("  sign_evidence:\n")]
+    sign = workflow[workflow.index("  sign_evidence:\n"):]
+    assert workflow.count("runs-on: windows-latest") == 2
+    assert "environment:" not in verify
+    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in verify
+    assert "environment: experimental-candidate" in sign
+    assert "needs: verify_evidence" in sign
+    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" in sign
     assert "repository: ${{ job.workflow_repository }}" in workflow
     assert "ref: ${{ job.workflow_sha }}" in workflow
     assert "path: trusted-signer" in workflow
     assert "source_commit" in workflow and "source_ref" in workflow
-    assert '"${{ inputs.source_commit }}" -cne "${{ github.sha }}"' in workflow
-    assert '"${{ inputs.source_ref }}" -cne "${{ github.ref }}"' in workflow
     assert "--repo \"hbhjt/vending-vision\"" in workflow
     assert "--signer-repo" not in workflow
     assert "--deny-self-hosted-runners" in workflow
-    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" in workflow
     assert "actions/checkout@v4" in workflow
-    assert workflow.count("actions/checkout@v4") == 1
+    assert workflow.count("actions/checkout@v4") == 2
     assert "path: source" not in workflow
     assert "actions/setup-python" not in workflow
+    assert "scripts/evidence_artifact.py" in workflow
+    assert "--expected-digest $env:UNSIGNED_EVIDENCE_SHA256" in sign
+    assert "scripts/verify_trusted_script_set.py" in sign
+    assert "candidate-input" not in sign
+    assert "verified-candidate" not in sign
+    assert "source-approval" not in sign
+    assert ".venv" not in sign
+    assert "& $env:TRUSTED_PYTHON" in sign
+    assert "--openssl $env:TRUSTED_OPENSSL" in sign
+    input_lines = [line.strip() for line in workflow.splitlines() if "${{ inputs." in line]
+    assert input_lines
+    assert all(
+        re.fullmatch(r"[A-Z][A-Z0-9_]*: \$\{\{ inputs\.[a-z][a-z0-9_]* \}\}", line)
+        for line in input_lines
+    )
+    run_blocks = re.findall(
+        r"(?ms)^\s+run: \|\n(?P<body>.*?)(?=^\s+- name:|^\s+- uses:|^  [a-z_]+:|\Z)",
+        workflow,
+    )
+    assert run_blocks
+    assert all("${{ inputs." not in block for block in run_blocks)
+    assert all("${{ github.event.inputs" not in block for block in run_blocks)
     for forbidden in (
         "artifact_path",
+        "artifact_file",
+        "attestation_bundle_file",
+        "builder_evidence_file",
         "source_path",
         "custom_command",
         "predicate",
@@ -130,6 +156,89 @@ def test_source_approval_rejects_an_attested_commit_outside_protected_main(tmp_p
         check=False,
     )
     assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+
+
+def test_source_ref_injection_is_data_and_cannot_execute(tmp_path):
+    marker = tmp_path / "injected"
+    malicious_ref = f'refs/tags/v0.2.1-rc.1";touch {marker};#'
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SOURCE_APPROVAL),
+            "--git-dir",
+            str(ROOT / ".git"),
+            "--source-commit",
+            "a" * 40,
+            "--source-ref",
+            malicious_ref,
+            "--protected-main",
+            "main",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "not an RC tag" in completed.stdout
+    assert not marker.exists()
+
+
+def test_unsigned_evidence_digest_survives_only_an_exact_cross_job_copy(tmp_path):
+    from scripts.evidence_artifact import DOCUMENTS, seal, verify
+
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    for name in DOCUMENTS:
+        (evidence / name).write_text(json.dumps({"name": name}), "utf-8")
+
+    digest = seal(evidence, "unsigned")
+    verify(evidence, "unsigned", digest)
+    (evidence / DOCUMENTS[0]).write_text("tampered", "utf-8")
+
+    try:
+        verify(evidence, "unsigned", digest)
+    except AssertionError as exc:
+        assert "payload binding mismatch" in str(exc)
+    else:
+        raise AssertionError("tampered cross-job evidence was accepted")
+
+
+def test_release_tag_ruleset_fails_closed_without_active_non_bypass_update_and_delete_rules(tmp_path):
+    protected = {
+        "id": 27,
+        "target": "tag",
+        "enforcement": "active",
+        "bypass_actors": [],
+        "conditions": {
+            "ref_name": {
+                "include": ["refs/tags/v*.*.*-rc.*"],
+                "exclude": [],
+            }
+        },
+        "rules": [{"type": "update"}, {"type": "deletion"}],
+    }
+    fixture = tmp_path / "rulesets.json"
+
+    for value, accepted in (([], False), ([{**protected, "rules": []}], False), ([protected], True)):
+        fixture.write_text(json.dumps(value), "utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(TAG_RULESET),
+                "--rulesets",
+                str(fixture),
+                "--repository",
+                "hbhjt/vending-vision",
+                "--source-ref",
+                "refs/tags/v0.2.1-rc.1",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert (completed.returncode == 0) is accepted, completed.stdout
 
 
 def test_trusted_signer_generates_bound_evidence_from_zip_and_approved_git_data(tmp_path):

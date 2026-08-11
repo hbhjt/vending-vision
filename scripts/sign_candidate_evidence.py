@@ -23,9 +23,9 @@ def canonical_bytes(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def signer_public_key(private_key):
+def signer_public_key(private_key, openssl):
     return subprocess.run(
-        ["openssl", "pkey", "-in", str(private_key), "-pubout", "-outform", "DER"],
+        [str(openssl), "pkey", "-in", str(private_key), "-pubout", "-outform", "DER"],
         check=True,
         capture_output=True,
     ).stdout
@@ -35,7 +35,7 @@ def signer_identity(public_key_der):
     return "spki-sha256:" + hashlib.sha256(public_key_der).hexdigest()
 
 
-def sign_document(role, document, private_key, expected_identity, public_key_der):
+def sign_document(role, document, private_key, expected_identity, public_key_der, openssl):
     document_digest = "sha256:" + hashlib.sha256(document.read_bytes()).hexdigest()
     statement = canonical_bytes({"role": role, "digest": document_digest})
     with tempfile.TemporaryDirectory() as temporary_directory:
@@ -43,7 +43,7 @@ def sign_document(role, document, private_key, expected_identity, public_key_der
         statement_path.write_bytes(statement)
         signature = subprocess.run(
             [
-                "openssl",
+                str(openssl),
                 "pkeyutl",
                 "-sign",
                 "-rawin",
@@ -73,13 +73,17 @@ def main():
     parser.add_argument("--candidate-dir", required=True)
     parser.add_argument("--private-key", required=True)
     parser.add_argument("--signer-identity", required=True)
+    parser.add_argument("--openssl", required=True)
     args = parser.parse_args()
 
     candidate_dir = Path(args.candidate_dir).resolve()
     private_key = Path(args.private_key).resolve()
+    openssl = Path(args.openssl).resolve()
+    if not openssl.is_file():
+        raise SystemExit("absolute OpenSSL executable is required")
     if not SIGNER_IDENTITY.fullmatch(args.signer_identity):
         raise SystemExit("signer identity must be spki-sha256:<64 lowercase hex>")
-    public_key_der = signer_public_key(private_key)
+    public_key_der = signer_public_key(private_key, openssl)
     actual_identity = signer_identity(public_key_der)
     if actual_identity != args.signer_identity:
         raise SystemExit("supplier key identity mismatch")
@@ -94,6 +98,7 @@ def main():
             private_key,
             actual_identity,
             public_key_der,
+            openssl,
         )
         write_json(candidate_dir / f"{file_name}.sig.json", envelope)
 

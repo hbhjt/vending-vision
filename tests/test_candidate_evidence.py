@@ -468,6 +468,8 @@ def test_candidate_signatures_match_vem_role_digest_contract(tmp_path):
             str(private_key),
             "--signer-identity",
             identity,
+            "--openssl",
+            shutil.which("openssl"),
         ],
         check=True,
     )
