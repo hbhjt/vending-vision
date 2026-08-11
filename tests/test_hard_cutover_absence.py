@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 import re
 import stat
+import struct
 import subprocess
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -235,6 +237,223 @@ def _load_binary_allowlist(
     return approved
 
 
+EXECUTABLE_MAGICS = (
+    b"MZ",
+    b"\x7fELF",
+    b"\xfe\xed\xfa\xce",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+)
+
+
+def _valid_png(data: bytes) -> bool:
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+    offset = 8
+    saw_header = False
+    while offset + 12 <= len(data):
+        length = int.from_bytes(data[offset : offset + 4], "big")
+        chunk_end = offset + 12 + length
+        if chunk_end > len(data):
+            return False
+        chunk_type = data[offset + 4 : offset + 8]
+        chunk_data = data[offset + 8 : offset + 8 + length]
+        expected_crc = int.from_bytes(data[offset + 8 + length : chunk_end], "big")
+        actual_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+        if expected_crc != actual_crc:
+            return False
+        if not saw_header:
+            if chunk_type != b"IHDR" or length != 13:
+                return False
+            width, height = struct.unpack(">II", chunk_data[:8])
+            if width == 0 or height == 0:
+                return False
+            saw_header = True
+        if chunk_type == b"IEND":
+            return length == 0 and saw_header and chunk_end == len(data)
+        offset = chunk_end
+    return False
+
+
+def _valid_jpeg(data: bytes) -> bool:
+    return (
+        len(data) >= 4
+        and data.startswith(b"\xff\xd8")
+        and data.rfind(b"\xff\xd9") >= 2
+    )
+
+
+def _valid_ico(data: bytes) -> bool:
+    if len(data) < 6:
+        return False
+    reserved, image_type, count = struct.unpack_from("<HHH", data)
+    if (
+        reserved != 0
+        or image_type != 1
+        or count == 0
+        or len(data) < 6 + count * 16
+    ):
+        return False
+    for index in range(count):
+        offset = 6 + index * 16
+        image_size, image_offset = struct.unpack_from("<II", data, offset + 8)
+        if image_size == 0 or image_offset < 6 + count * 16:
+            return False
+        if image_offset + image_size > len(data):
+            return False
+    return True
+
+
+def _valid_wav(data: bytes) -> bool:
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return False
+    if int.from_bytes(data[4:8], "little") + 8 > len(data):
+        return False
+    offset = 12
+    chunks = set()
+    while offset + 8 <= len(data):
+        chunk_type = data[offset : offset + 4]
+        length = int.from_bytes(data[offset + 4 : offset + 8], "little")
+        chunk_end = offset + 8 + length
+        if chunk_end > len(data):
+            return False
+        chunks.add(chunk_type)
+        offset = chunk_end + (length & 1)
+    return offset == len(data) and {b"fmt ", b"data"}.issubset(chunks)
+
+
+def _valid_mp3(data: bytes) -> bool:
+    if data.startswith(b"ID3"):
+        if len(data) < 10 or any(byte & 0x80 for byte in data[6:10]):
+            return False
+        tag_size = sum(
+            byte << shift
+            for byte, shift in zip(data[6:10], (21, 14, 7, 0), strict=True)
+        )
+        return tag_size + 10 <= len(data)
+    if len(data) < 4 or data[0] != 0xFF or data[1] & 0xE0 != 0xE0:
+        return False
+    version = (data[1] >> 3) & 0x03
+    layer = (data[1] >> 1) & 0x03
+    bitrate = (data[2] >> 4) & 0x0F
+    sample_rate = (data[2] >> 2) & 0x03
+    return version != 1 and layer != 0 and bitrate not in {0, 15} and sample_rate != 3
+
+
+def _valid_ogg(data: bytes) -> bool:
+    if len(data) < 27 or data[:4] != b"OggS" or data[4] != 0:
+        return False
+    segment_count = data[26]
+    if len(data) < 27 + segment_count:
+        return False
+    payload_size = sum(data[27 : 27 + segment_count])
+    return 27 + segment_count + payload_size <= len(data)
+
+
+def _valid_mp4(data: bytes) -> bool:
+    offset = 0
+    box_count = 0
+    while offset + 8 <= len(data):
+        size = int.from_bytes(data[offset : offset + 4], "big")
+        box_type = data[offset + 4 : offset + 8]
+        header_size = 8
+        if size == 1:
+            if offset + 16 > len(data):
+                return False
+            size = int.from_bytes(data[offset + 8 : offset + 16], "big")
+            header_size = 16
+        elif size == 0:
+            size = len(data) - offset
+        if size < header_size or offset + size > len(data):
+            return False
+        if box_count == 0:
+            if box_type != b"ftyp" or size < header_size + 8:
+                return False
+            compatible_size = size - header_size - 8
+            if compatible_size % 4:
+                return False
+        box_count += 1
+        offset += size
+    return box_count > 0 and offset == len(data)
+
+
+def _valid_webp(data: bytes) -> bool:
+    if len(data) < 20 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return False
+    if int.from_bytes(data[4:8], "little") + 8 != len(data):
+        return False
+    offset = 12
+    saw_image = False
+    while offset + 8 <= len(data):
+        chunk_type = data[offset : offset + 4]
+        length = int.from_bytes(data[offset + 4 : offset + 8], "little")
+        chunk_end = offset + 8 + length
+        if chunk_end > len(data):
+            return False
+        saw_image |= chunk_type in {b"VP8 ", b"VP8L", b"VP8X"}
+        offset = chunk_end + (length & 1)
+    return saw_image and offset == len(data)
+
+
+def _read_varint(data: bytes, offset: int) -> tuple[int, int] | None:
+    value = 0
+    for index in range(10):
+        if offset + index >= len(data):
+            return None
+        byte = data[offset + index]
+        value |= (byte & 0x7F) << (index * 7)
+        if byte & 0x80 == 0:
+            return value, offset + index + 1
+    return None
+
+
+def _valid_onnx(data: bytes) -> bool:
+    if not data or data[0] != 0x08:
+        return False
+    decoded = _read_varint(data, 1)
+    return decoded is not None and 0 < decoded[0] < 1_000
+
+
+def _valid_caffemodel(data: bytes) -> bool:
+    if not data or data[0] != 0x0A:
+        return False
+    decoded = _read_varint(data, 1)
+    if decoded is None:
+        return False
+    length, offset = decoded
+    name = data[offset : offset + length]
+    return (
+        0 < length <= 256
+        and len(name) == length
+        and all(32 <= byte < 127 for byte in name)
+    )
+
+
+def _binary_format_is_valid(path: str, data: bytes) -> bool:
+    if data.startswith(b"#!") or any(
+        data.startswith(magic) for magic in EXECUTABLE_MAGICS
+    ):
+        return False
+    validators = {
+        ".caffemodel": _valid_caffemodel,
+        ".ico": _valid_ico,
+        ".jpeg": _valid_jpeg,
+        ".jpg": _valid_jpeg,
+        ".mp3": _valid_mp3,
+        ".mp4": _valid_mp4,
+        ".ogg": _valid_ogg,
+        ".onnx": _valid_onnx,
+        ".png": _valid_png,
+        ".wav": _valid_wav,
+        ".webp": _valid_webp,
+    }
+    validator = validators.get(Path(path).suffix.lower())
+    return validator is not None and validator(data)
+
+
 def find_violations(
     root: Path,
 ) -> list[str]:
@@ -266,8 +485,17 @@ def find_violations(
             violations.append(f"{path}: tracked-worktree-type-mismatch")
             continue
         raw_source = path.read_bytes()
+        relative_path = path.relative_to(root).as_posix()
+        if relative_path in approved_binary:
+            actual_binary[relative_path] = {
+                "gitMode": git_mode,
+                "sha256": hashlib.sha256(raw_source).hexdigest(),
+            }
+            if not _binary_format_is_valid(relative_path, raw_source):
+                violations.append(f"{path}: binary-format-invalid")
+            continue
         if b"\0" in raw_source:
-            actual_binary[path.relative_to(root).as_posix()] = {
+            actual_binary[relative_path] = {
                 "gitMode": git_mode,
                 "sha256": hashlib.sha256(raw_source).hexdigest(),
             }
@@ -275,7 +503,7 @@ def find_violations(
         try:
             source = raw_source.decode("utf-8", errors="strict")
         except UnicodeDecodeError:
-            actual_binary[path.relative_to(root).as_posix()] = {
+            actual_binary[relative_path] = {
                 "gitMode": git_mode,
                 "sha256": hashlib.sha256(raw_source).hexdigest(),
             }
@@ -517,7 +745,9 @@ def test_binary_allowlist_binds_exact_binary_set_and_identity(tmp_path):
     approved_root.mkdir()
     _init_guard_repo(approved_root)
     relative_path = "fixtures/recorded-video/approved.png"
-    payload = b"approved\0fixture"
+    payload = (
+        ROOT / "fixtures/recorded-video/sources/person-man-front.png"
+    ).read_bytes()
     binary = approved_root / relative_path
     binary.parent.mkdir(parents=True)
     binary.write_bytes(payload)
@@ -529,7 +759,7 @@ def test_binary_allowlist_binds_exact_binary_set_and_identity(tmp_path):
 
     assert find_violations(approved_root) == []
 
-    binary.write_bytes(b"tampered\0fixture")
+    binary.write_bytes(payload[:-1] + bytes([payload[-1] ^ 0x01]))
     assert f"{binary}: binary-identity-mismatch" in find_violations(approved_root)
 
     deleted_root = tmp_path / "deleted"
@@ -657,3 +887,59 @@ def test_binary_allowlist_rejects_new_executable_and_manifest_mutations(tmp_path
         violation.endswith(": binary-allowlist-invalid")
         for violation in find_violations(noncanonical_root)
     )
+
+
+def test_binary_allowlist_rejects_executable_magic_mismatch_and_truncation(tmp_path):
+    disguised_payloads = {
+        "pe": b"MZ\0pretend-png",
+        "elf": b"\x7fELF\0pretend-png",
+        "mach-o": b"\xfe\xed\xfa\xcf\0pretend-png",
+        "shebang": b"#!/bin/sh\nexit 0\n",
+        "extension-mismatch": b"\xff\xd8not-a-png\xff\xd9",
+        "truncated": b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR",
+    }
+    for name, payload in disguised_payloads.items():
+        root = tmp_path / name
+        root.mkdir()
+        _init_guard_repo(root)
+        relative_path = "fixtures/recorded-video/disguised.png"
+        disguised = root / relative_path
+        disguised.parent.mkdir(parents=True)
+        disguised.write_bytes(payload)
+        _write_binary_allowlist(
+            root,
+            [_recorded_fixture_entry(relative_path, payload)],
+        )
+        subprocess.run(["git", "add", relative_path], cwd=root, check=True)
+
+        assert f"{disguised}: binary-format-invalid" in find_violations(root)
+
+
+def test_binary_allowlist_assets_decode_with_production_opencv_loaders():
+    import cv2
+
+    manifest = json.loads((ROOT / BINARY_ALLOWLIST_NAME).read_text("utf-8"))
+    for entry in manifest["entries"]:
+        path = ROOT / entry["path"]
+        suffix = path.suffix.lower()
+        if suffix == ".mp4":
+            capture = cv2.VideoCapture(str(path))
+            try:
+                opened, frame = capture.read()
+                assert opened and frame is not None, path
+            finally:
+                capture.release()
+        elif suffix == ".png":
+            assert cv2.imread(str(path), cv2.IMREAD_UNCHANGED) is not None, path
+        elif suffix == ".onnx":
+            assert not cv2.dnn.readNetFromONNX(str(path)).empty(), path
+        elif suffix == ".caffemodel":
+            definition = path.with_name(
+                path.name.replace("_net.caffemodel", "_deploy.prototxt")
+            )
+            assert not cv2.dnn.readNetFromCaffe(
+                str(definition),
+                str(path),
+            ).empty(), path
+        else:
+            raise AssertionError(f"missing production decoder for {path}")
