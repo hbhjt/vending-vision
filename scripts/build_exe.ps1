@@ -32,6 +32,7 @@ $AiPython = Join-Path $AiVenv "Scripts\python.exe"
 $BuildDir = Join-Path $Root "build"
 $CoreWork = Join-Path $BuildDir "pyinstaller-core"
 $AiWork = Join-Path $BuildDir "pyinstaller-ai"
+$CompanionWork = Join-Path $BuildDir "pyinstaller-precutover-companion"
 $CoreDist = Join-Path $BuildDir "dist-core"
 $AiDist = Join-Path $BuildDir "dist-ai"
 $FinalDist = Join-Path $Root "dist"
@@ -63,7 +64,7 @@ foreach ($Environment in @($CoreVenv, $AiVenv)) {
         Remove-Item -LiteralPath $Environment -Recurse -Force
     }
 }
-foreach ($Output in @($CoreWork, $AiWork, $CoreDist, $AiDist, $FinalDist)) {
+foreach ($Output in @($CoreWork, $AiWork, $CompanionWork, $CoreDist, $AiDist, $FinalDist)) {
     if (Test-Path -LiteralPath $Output) {
         Remove-Item -LiteralPath $Output -Recurse -Force
     }
@@ -84,6 +85,7 @@ if (-not (Test-Path -LiteralPath $AiPython -PathType Leaf)) { throw "AI build Py
 Invoke-Checked $CorePython (Join-Path $ToolRoot "scripts\dependency_lock.py") --requirements-lock (Join-Path $Root "requirements.txt") --wheelhouse $Wheelhouse --python $CorePython --target-sys-platform win32
 Invoke-Checked $CorePython -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
 Invoke-Checked $CorePython -m PyInstaller --clean --noconfirm --workpath $CoreWork --distpath $CoreDist (Join-Path $Root "vending_vision.spec")
+Invoke-Checked $CorePython -m PyInstaller --clean --noconfirm --workpath $CompanionWork --distpath $CoreDist (Join-Path $ToolRoot "vending_vision_precutover_verifier.spec")
 
 Invoke-Checked $AiPython -m pip install --disable-pip-version-check --no-index --find-links $Wheelhouse --require-hashes --no-deps -r $AiBuildRequirements
 Invoke-Checked $AiPython (Join-Path $ToolRoot "scripts\verify_ai_wheelhouse.py") --descriptor $AiWheelhouseDescriptor --wheelhouse $AiWheelhouse --runtime-descriptor (Join-Path $Root "ai-runtime-descriptor.json") --requirements-output $AiReleaseRequirements
@@ -96,8 +98,39 @@ Copy-Item -LiteralPath (Join-Path $AiDist "vending-vision-ai-worker") -Destinati
 
 $MainExe = Join-Path $FinalDist "vending-vision\vending-vision.exe"
 $WorkerExe = Join-Path $FinalDist "vending-vision-ai-worker\vending-vision-ai-worker.exe"
+$CompanionRoot = Join-Path $CoreDist "vending-vision-precutover-verifier"
+$CompanionExe = Join-Path $CompanionRoot "vending-vision-precutover-verifier.exe"
 if (-not (Test-Path -LiteralPath $MainExe -PathType Leaf)) { throw "main Vision exe missing after build: $MainExe" }
 if (-not (Test-Path -LiteralPath $WorkerExe -PathType Leaf)) { throw "AI worker exe missing after build: $WorkerExe" }
+if (-not (Test-Path -LiteralPath $CompanionExe -PathType Leaf)) { throw "pre-cutover companion missing after build: $CompanionExe" }
+Invoke-Checked $CompanionExe --help
+
+$CompanionSourceCommit = (& git -C $ToolRoot rev-parse HEAD).Trim()
+if ($CompanionSourceCommit -notmatch '^[a-f0-9]{40}$') { throw "trusted companion source commit is unavailable" }
+$PythonVersion = (& $CorePython -c "import platform; print(platform.python_version())").Trim()
+$PyInstallerVersion = (& $CorePython -c "import PyInstaller; print(PyInstaller.__version__)").Trim()
+$CompanionOutput = Join-Path $BuildDir "precutover-companion"
+New-Item -ItemType Directory -Force $CompanionOutput | Out-Null
+Invoke-Checked $CorePython (Join-Path $ToolRoot "scripts\precutover_companion_descriptor.py") build `
+    --root $CompanionRoot `
+    --source-commit $CompanionSourceCommit `
+    --python-version $PythonVersion `
+    --pyinstaller-version $PyInstallerVersion `
+    --runner-image $(if ($env:ImageOS) { $env:ImageOS } else { "local-windows" }) `
+    --runner-image-version $(if ($env:ImageVersion) { $env:ImageVersion } else { "local" }) `
+    --descriptor-output (Join-Path $CompanionOutput "precutover-companion-descriptor.json") `
+    --archive-output (Join-Path $CompanionOutput "vending-vision-precutover-verifier.zip")
+$CompanionArchive = Join-Path $CompanionOutput "vending-vision-precutover-verifier.zip"
+$CompanionDescriptor = Join-Path $CompanionOutput "precutover-companion-descriptor.json"
+$CompanionArchiveSha = (Get-FileHash -LiteralPath $CompanionArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+$CompanionDescriptorSha = (Get-FileHash -LiteralPath $CompanionDescriptor -Algorithm SHA256).Hash.ToLowerInvariant()
+$CompanionVerifyRoot = Join-Path $BuildDir "precutover-companion-verified"
+Invoke-Checked $CorePython (Join-Path $ToolRoot "scripts\precutover_companion_descriptor.py") verify `
+    --archive $CompanionArchive `
+    --destination $CompanionVerifyRoot `
+    --expected-sha256 $CompanionArchiveSha `
+    --expected-descriptor-sha256 $CompanionDescriptorSha
+Remove-Item -LiteralPath $CompanionVerifyRoot -Recurse -Force
 
 Invoke-Checked $CorePython (Join-Path $ToolRoot "scripts\verify_packaged_exe.py") $MainExe
 
@@ -105,3 +138,4 @@ Write-Host ""
 Write-Host "Build complete:"
 Write-Host $MainExe
 Write-Host $WorkerExe
+Write-Host $CompanionExe

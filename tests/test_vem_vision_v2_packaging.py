@@ -88,6 +88,54 @@ def test_ai_runtime_packaging_includes_worker_code_but_excludes_official_weights
     assert "model.safetensors" not in worker_spec
 
 
+def test_windows_pre_cutover_companion_is_a_separate_self_contained_build_artifact():
+    from scripts.workflow_yaml import load_workflow_yaml, workflow_run_scalars
+
+    spec_path = ROOT / "vending_vision_precutover_verifier.spec"
+    entrypoint = ROOT / "run_precutover_verifier.py"
+    build = (ROOT / "scripts" / "build_exe.ps1").read_text("utf-8")
+    builder = (
+        ROOT / ".github/workflows/trusted-precutover-companion-builder.yml"
+    ).read_text("utf-8")
+
+    assert spec_path.is_file(), "missing independent pre-cutover verifier spec"
+    assert entrypoint.is_file(), "missing frozen pre-cutover verifier entrypoint"
+    spec = spec_path.read_text("utf-8")
+    assert 'name="vending-vision-precutover-verifier"' in spec
+    assert 'str(ROOT / "run_precutover_verifier.py")' in spec
+    assert "collect_submodules(\"torch\")" not in spec
+    assert "vending_vision_precutover_verifier.spec" in build
+    assert '(Join-Path $ToolRoot "vending_vision_precutover_verifier.spec")' in build
+    assert "git -C $ToolRoot rev-parse HEAD" in build
+    assert "vending-vision-precutover-verifier" in build
+    assert "precutover-companion-descriptor.json" in build
+    assert "Invoke-Checked $CompanionExe --help" in build
+    assert '"scripts\\precutover_companion_descriptor.py") verify' in build
+    assert "vending-vision-precutover-verifier" in builder
+    assert "precutover-companion-provenance.sigstore.json" in builder
+    assert "archive_sha256" in builder
+    assert "descriptor_sha256" in builder
+    assert "attestation_bundle_sha256" in builder
+    assert "actions/attest-build-provenance@v4" in builder
+    assert "repository: ${{ job.workflow_repository }}" in builder
+    assert "ref: ${{ job.workflow_sha }}" in builder
+    assert "path: source" not in builder
+    assert "candidate-manifest" not in builder
+    assert "vending-vision-ai-worker" not in builder
+    assert "--require-hashes" in builder
+    workflow = load_workflow_yaml(builder)
+    assert set(workflow["on"]["workflow_call"]["inputs"]) == {
+        "core_wheelhouse_url",
+        "core_wheelhouse_sha256",
+        "core_wheelhouse_bytes",
+    }
+    assert all("${{" not in command for command in workflow_run_scalars(builder))
+    assert "$CorePython -m PyInstaller" in build
+    assert "Copy-Item -LiteralPath $CompanionRoot" not in build
+    companion_cli = (ROOT / "vision/precutover_companion.py").read_text("utf-8")
+    assert 'parser.add_argument("--python"' not in companion_cli
+
+
 def test_frozen_specs_materialize_source_descriptor_python_files_for_probe_hashing():
     descriptor = json.loads((ROOT / "official-ai-source-descriptor.json").read_text("utf-8"))
     source_paths = {entry["path"] for entry in descriptor["sources"] if entry["path"].endswith(".py")}
