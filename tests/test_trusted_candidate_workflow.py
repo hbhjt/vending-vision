@@ -21,6 +21,13 @@ def _workflow_call_inputs(source: str) -> set[str]:
     return set(re.findall(r"(?m)^      ([a-z][a-z0-9_]*):$", match.group("body")))
 
 
+def _run_blocks(source: str) -> list[str]:
+    return re.findall(
+        r"(?ms)^\s+run: \|\n(?P<body>.*?)(?=^\s+- name:|^\s+- uses:|^  [a-zA-Z0-9_-]+:|\Z)",
+        source,
+    )
+
+
 def test_trusted_builder_has_a_closed_raw_material_interface_and_owns_attestation():
     workflow = TRUSTED_BUILDER.read_text("utf-8")
 
@@ -36,7 +43,19 @@ def test_trusted_builder_has_a_closed_raw_material_interface_and_owns_attestatio
     assert "repository: hbhjt/vending-vision" in workflow
     assert "ref: ${{ inputs.source_commit }}" in workflow
     assert "path: source" in workflow
-    assert '"${{ inputs.source_commit }}" -cne "${{ github.sha }}"' in workflow
+    run_blocks = _run_blocks(workflow)
+    assert run_blocks
+    assert all("${{ inputs." not in block for block in run_blocks)
+    assert all("${{ github.event.inputs" not in block for block in run_blocks)
+    assert all("${{ needs." not in block for block in run_blocks)
+    input_lines = [line.strip() for line in workflow.splitlines() if "${{ inputs." in line]
+    assert input_lines
+    assert all(
+        line.startswith("ref: ")
+        or re.fullmatch(r"[A-Z][A-Z0-9_]*: \$\{\{ inputs\.[a-z][a-z0-9_]* \}\}", line)
+        for line in input_lines
+    )
+    assert "$env:SOURCE_COMMIT" in workflow
     assert "runs-on: windows-latest" in workflow
     assert "id-token: write" in workflow
     assert "attestations: write" in workflow
