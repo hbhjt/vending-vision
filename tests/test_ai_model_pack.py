@@ -491,6 +491,39 @@ def test_official_source_descriptor_binds_tracked_worker_and_vendor_sources():
     assert verify_official_source_provenance() is True
 
 
+def test_official_provenance_owns_reference_lineage_and_exclusions_without_runtime_dependency():
+    provenance = (
+        Path(__file__).parents[1] / "vision/vendor/catvton/PROVENANCE.md"
+    ).read_text("utf-8")
+    fixture_provenance = (
+        Path(__file__).parents[1] / "fixtures/recorded-video/README.md"
+    ).read_text("utf-8")
+
+    for fact in (
+        "c0a76e499a620a253b7ac0a6a07f8ee0754c2c10",
+        "3b795364a4d2f3b5adb365f39cdea376d20bc53c",
+        "487ac2261ae102a80f8a2142d2a369af7776869cc3e91d9b6729a122bd49af03",
+        "4fae4fa44ee8ab75c94869680deea944de5e5c03a4b56689e8c23422c3cfc18d",
+        "person-woman-front.png",
+        "coral-tee",
+        "cream-sweater",
+        "midnight-jacket",
+        "ocean-polo",
+        "652ab2a22dd83ec45e81e283af5310ec.jpg",
+        "c196741201df156a8a2ff68fabd2d034.jpg",
+    ):
+        assert fact in provenance
+    assert (
+        "not a build, test, packaging, runtime, download, fallback, or deployment"
+        in provenance
+    )
+    assert "c0a76e499a620a253b7ac0a6a07f8ee0754c2c10" in fixture_provenance
+    assert (
+        "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c"
+        in fixture_provenance
+    )
+
+
 def test_official_source_provenance_verifies_real_frozen_like_layout_and_detects_tamper(tmp_path):
     descriptor = json.loads(OFFICIAL_SOURCE_DESCRIPTOR_PATH.read_text("utf-8"))
     for source in descriptor["sources"]:
