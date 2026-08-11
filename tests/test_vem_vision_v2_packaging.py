@@ -434,7 +434,7 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "secrets:" not in builder
 
     assert "trusted-ai-candidate-builder.yml@fbb97d16f42b2c20a04831750c639fda6db1a3e9" in publisher
-    assert "trusted-ai-candidate-signer.yml@14e97b96b57acf3e3f23442e0d80904a55565a59" in publisher
+    assert "trusted-ai-candidate-signer.yml@8b9f19da1fe07ba3e484f60317db6d14a5b447de" in publisher
     assert "scripts/build_exe.ps1" not in publisher
     assert "actions/attest-build-provenance" not in publisher
     assert "needs: trusted_builder" in publisher

@@ -11,7 +11,7 @@ TRUSTED_BUILDER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder
 PUBLISHER = ROOT / ".github" / "workflows" / "publish-candidate.yml"
 TRUSTED_BUILDER_COMMIT = "fbb97d16f42b2c20a04831750c639fda6db1a3e9"
 TRUSTED_SIGNER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-signer.yml"
-TRUSTED_SIGNER_COMMIT = "14e97b96b57acf3e3f23442e0d80904a55565a59"
+TRUSTED_SIGNER_COMMIT = "8b9f19da1fe07ba3e484f60317db6d14a5b447de"
 TRUST_POLICY = ROOT / "scripts" / "check_trusted_candidate_workflows.py"
 
 
@@ -102,8 +102,11 @@ def test_publish_caller_pins_builder_a_and_signer_s_without_holding_supplier_sec
     assert "sign_candidate_evidence.py" not in workflow
     publish = workflow[workflow.index("  publish:\n"):]
     assert "trusted_signer" in publish.split("steps:", 1)[0]
-    assert "actions/checkout" not in publish
+    assert f"ref: {TRUSTED_SIGNER_COMMIT}" in publish
     assert publish.count("actions/download-artifact@v4") == 2
+    assert "--target $env:RELEASE_TARGET" in publish
+    assert "verify_release_tag_ruleset.py" in publish
+    assert "rulesets?targets=tag" in publish
 
 
 def test_trust_policy_rejects_mutable_caller_and_missing_or_wrong_signer_digest(tmp_path):
@@ -124,6 +127,11 @@ def test_trust_policy_rejects_mutable_caller_and_missing_or_wrong_signer_digest(
         "mutable-signer": trusted.replace(
             f"trusted-ai-candidate-signer.yml@{TRUSTED_SIGNER_COMMIT}",
             "trusted-ai-candidate-signer.yml@${{ github.sha }}",
+        ),
+        "raw-input-injection": trusted.replace(
+            "run: |\n          if ($env:SOURCE_COMMIT",
+            'run: |\n          Write-Output "${{ github.event.inputs.source_ref }}"\n          if ($env:SOURCE_COMMIT',
+            1,
         ),
     }
     for name, source in mutations.items():

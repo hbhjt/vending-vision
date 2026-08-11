@@ -10,7 +10,7 @@ import tempfile
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 TRUSTED_BUILDER_COMMIT = "fbb97d16f42b2c20a04831750c639fda6db1a3e9"
 TRUSTED_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-TRUSTED_SIGNER_COMMIT = "14e97b96b57acf3e3f23442e0d80904a55565a59"
+TRUSTED_SIGNER_COMMIT = "8b9f19da1fe07ba3e484f60317db6d14a5b447de"
 TRUSTED_SIGNER_PATH = ".github/workflows/trusted-ai-candidate-signer.yml"
 BUILDER_INPUTS = {
     "source_commit",
@@ -22,20 +22,21 @@ SIGNER_INPUTS = {
     "source_commit",
     "source_ref",
     "artifact_name",
-    "artifact_file",
     "subject_sha256",
     "manifest_sha256",
-    "attestation_bundle_file",
     "attestation_bundle_sha256",
-    "builder_evidence_file",
 }
 TRUSTED_SIGNER_FILES = {
     TRUSTED_SIGNER_PATH,
     "scripts/approve_candidate_source.py",
     "scripts/candidate_artifact_manifest.py",
+    "scripts/evidence_artifact.py",
     "scripts/generate_trusted_candidate_evidence.py",
     "scripts/sign_candidate_evidence.py",
+    "scripts/verify_release_tag_ruleset.py",
     "scripts/verify_trusted_candidate_inputs.py",
+    "scripts/verify_trusted_script_set.py",
+    "trusted-signer-scripts.json",
 }
 
 
@@ -60,6 +61,21 @@ def _job_block(source: str, job: str) -> str:
     _require(match is not None, f"publisher_job_missing:{job}")
     assert match is not None
     return match.group(0)
+
+
+def _run_blocks(source: str) -> list[str]:
+    return re.findall(
+        r"(?ms)^\s+run: \|\n(?P<body>.*?)(?=^\s+- name:|^\s+- uses:|^  [a-zA-Z0-9_-]+:|\Z)",
+        source,
+    )
+
+
+def _assert_no_untrusted_run_expressions(source: str, label: str) -> None:
+    blocks = _run_blocks(source)
+    _require(bool(blocks), f"{label}_run_blocks_missing")
+    for block in blocks:
+        _require("${{ inputs." not in block, f"{label}_raw_workflow_input_in_run")
+        _require("${{ github.event.inputs" not in block, f"{label}_raw_event_input_in_run")
 
 
 def _assert_files_are_immutable(
@@ -114,6 +130,8 @@ def check_trusted_candidate_workflows(
     builder_source = builder.read_text("utf-8")
     signer_source = signer.read_text("utf-8")
     publisher_source = publisher.read_text("utf-8")
+    _assert_no_untrusted_run_expressions(signer_source, "trusted_signer")
+    _assert_no_untrusted_run_expressions(publisher_source, "publisher")
     _assert_files_are_immutable(
         commit=TRUSTED_BUILDER_COMMIT,
         paths={TRUSTED_BUILDER_PATH: builder},
@@ -138,10 +156,10 @@ def check_trusted_candidate_workflows(
         "source_path", "artifact_path", "custom_command", "predicate", "private_key",
     ):
         _require(forbidden not in signer_source, f"trusted_signer_forbidden_input:{forbidden}")
-    signer_job = _job_block(signer_source, "sign")
+    verify_evidence = _job_block(signer_source, "verify_evidence")
+    sign_evidence = _job_block(signer_source, "sign_evidence")
     for fragment in (
         "runs-on: windows-latest",
-        "environment: experimental-candidate",
         "repository: ${{ job.workflow_repository }}",
         "ref: ${{ job.workflow_sha }}",
         "path: trusted-signer",
@@ -150,8 +168,8 @@ def check_trusted_candidate_workflows(
         f'--repo "{TRUSTED_REPOSITORY}"',
         f'--signer-workflow "{TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}"',
         f'--signer-digest "{TRUSTED_BUILDER_COMMIT}"',
-        '--source-ref "${{ inputs.source_ref }}"',
-        '--source-digest "${{ inputs.source_commit }}"',
+        "--source-ref $env:SOURCE_REF",
+        "--source-digest $env:SOURCE_COMMIT",
         "--deny-self-hosted-runners",
         "https://github.com/hbhjt/vending-vision.git",
         "+refs/heads/main:refs/remotes/origin/main",
@@ -159,22 +177,38 @@ def check_trusted_candidate_workflows(
         "--protected-main refs/remotes/origin/main",
         "trusted-signer/scripts/verify_trusted_candidate_inputs.py",
         "trusted-signer/scripts/generate_trusted_candidate_evidence.py",
+        "trusted-signer/scripts/evidence_artifact.py",
+    ):
+        _require(fragment in verify_evidence, f"trusted_signer_verify_policy:{fragment}")
+    _require("environment:" not in verify_evidence, "trusted_signer_verify_environment")
+    _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in verify_evidence, "trusted_signer_verify_secret")
+    _require("--signer-repo" not in verify_evidence, "trusted_signer_mutually_exclusive_repo_flags")
+
+    for fragment in (
+        "needs: verify_evidence",
+        "runs-on: windows-latest",
+        "environment: experimental-candidate",
+        "repository: ${{ job.workflow_repository }}",
+        "ref: ${{ job.workflow_sha }}",
+        "path: trusted-signer",
+        "trusted-signer/scripts/verify_trusted_script_set.py",
+        "trusted-signer/scripts/evidence_artifact.py",
+        "--expected-digest $env:UNSIGNED_EVIDENCE_SHA256",
         "trusted-signer/scripts/sign_candidate_evidence.py",
+        "--openssl $env:TRUSTED_OPENSSL",
         "VISION_SUPPLIER_PRIVATE_KEY_PEM",
     ):
-        _require(fragment in signer_job, f"trusted_signer_policy:{fragment}")
-    _require("--signer-repo" not in signer_job, "trusted_signer_mutually_exclusive_repo_flags")
-    _require(signer_job.count("actions/checkout@v4") == 1, "trusted_signer_checkout_count")
-    for forbidden in ("path: source", "actions/setup-python", "source/scripts", ".spec", ".exe"):
-        _require(forbidden not in signer_job, f"trusted_signer_candidate_execution:{forbidden}")
-    python_commands = re.findall(r"(?m)^\s+(python\s+[^\r\n]+)$", signer_job)
-    _require(bool(python_commands), "trusted_signer_python_commands_missing")
-    _require(all("python trusted-signer/scripts/" in command for command in python_commands), "trusted_signer_executes_untrusted_python")
-    secret_step = re.search(r"(?ms)^      - name: Sign evidence.*?(?=^      - name:)", signer_job)
+        _require(fragment in sign_evidence, f"trusted_signer_sign_policy:{fragment}")
+    _require(signer_source.count("actions/checkout@v4") == 2, "trusted_signer_checkout_count")
+    for forbidden in ("path: source", "actions/setup-python", "source/scripts", ".spec"):
+        _require(forbidden not in signer_source, f"trusted_signer_candidate_execution:{forbidden}")
+    for forbidden in ("candidate-input", "verified-candidate", "source-approval", ".venv"):
+        _require(forbidden not in sign_evidence, f"trusted_signer_cross_job_leak:{forbidden}")
+    secret_step = re.search(r"(?ms)^      - name: Sign only verified evidence.*?(?=^      - name:)", sign_evidence)
     _require(secret_step is not None, "trusted_signer_secret_step_missing")
     assert secret_step is not None
     _require("trusted-signer/scripts/sign_candidate_evidence.py" in secret_step.group(0), "trusted_signer_secret_script")
-    _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in signer_job[: secret_step.start()], "trusted_signer_secret_exposed_early")
+    _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in sign_evidence[: secret_step.start()], "trusted_signer_secret_exposed_early")
 
     trusted_call = (
         f"uses: {TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}@{TRUSTED_BUILDER_COMMIT}"
@@ -232,9 +266,28 @@ def check_trusted_candidate_workflows(
     publish = _job_block(publisher_source, "publish")
     _require("needs: [verify, trusted_signer]" in publish, "publisher_requires_trusted_signer")
     _require(publish.count("actions/download-artifact@v4") == 2, "publisher_downloads_candidate_and_evidence")
-    _require("gh release create" in publish, "publisher_release_step_missing")
+    for fragment in (
+        f"ref: {TRUSTED_SIGNER_COMMIT}",
+        "path: trusted-policy",
+        "trusted-policy/scripts/verify_trusted_script_set.py",
+        "trusted-policy/scripts/evidence_artifact.py",
+        "--expected-digest $env:SIGNED_EVIDENCE_SHA256",
+        "supplier.attestedSubjectDigest",
+        "supplier.approvedSourceCommit",
+        "descriptor.sourceApproval.commit",
+        "git init --bare release-authority.git",
+        "+refs/heads/main:refs/remotes/origin/main",
+        "trusted-policy/scripts/approve_candidate_source.py",
+        "rulesets?targets=tag&includes_parents=true&per_page=100",
+        "trusted-policy/scripts/verify_release_tag_ruleset.py",
+        "gh release create $env:RELEASE_TAG",
+        "--target $env:RELEASE_TARGET",
+        "--verify-tag",
+    ):
+        _require(fragment in publish, f"publisher_release_authority:{fragment}")
+    _require(publish.count("actions/checkout@v4") == 1, "publisher_trusted_policy_checkout")
     for forbidden in (
-        "VISION_SUPPLIER_PRIVATE_KEY_PEM", "actions/checkout", "python ",
+        "VISION_SUPPLIER_PRIVATE_KEY_PEM",
         "generate_candidate_evidence.py", "sign_candidate_evidence.py", "environment:",
     ):
         _require(forbidden not in publish, f"publisher_forbidden_capability:{forbidden}")

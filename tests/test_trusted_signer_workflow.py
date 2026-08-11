@@ -158,6 +158,42 @@ def test_source_approval_rejects_an_attested_commit_outside_protected_main(tmp_p
     assert accepted.returncode == 0, accepted.stdout + accepted.stderr
 
 
+def test_source_approval_rejects_a_tag_moved_away_from_the_claimed_commit(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-b", "main")
+    _git(repository, "config", "user.email", "stage27@example.test")
+    _git(repository, "config", "user.name", "Stage 27")
+    (repository / "tracked.txt").write_text("first\n", "utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-m", "first")
+    claimed = _git(repository, "rev-parse", "HEAD")
+    (repository / "tracked.txt").write_text("moved\n", "utf-8")
+    _git(repository, "commit", "-am", "moved")
+    moved = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "tag", "v0.2.1-rc.1", moved)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SOURCE_APPROVAL),
+            "--git-dir",
+            str(repository / ".git"),
+            "--source-commit",
+            claimed,
+            "--source-ref",
+            "refs/tags/v0.2.1-rc.1",
+            "--protected-main",
+            "main",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "does not identify the claimed commit" in completed.stdout
+
+
 def test_source_ref_injection_is_data_and_cannot_execute(tmp_path):
     marker = tmp_path / "injected"
     malicious_ref = f'refs/tags/v0.2.1-rc.1";touch {marker};#'
