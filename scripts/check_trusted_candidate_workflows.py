@@ -8,9 +8,9 @@ import tempfile
 
 
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
-TRUSTED_BUILDER_COMMIT = "fbb97d16f42b2c20a04831750c639fda6db1a3e9"
+TRUSTED_BUILDER_COMMIT = "be8fe434855b94f61511e8c6c926e02c54230a38"
 TRUSTED_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-TRUSTED_SIGNER_COMMIT = "8b9f19da1fe07ba3e484f60317db6d14a5b447de"
+TRUSTED_SIGNER_COMMIT = "222c55385c3ddae58247a8911f5c3c441f0cb290"
 TRUSTED_SIGNER_PATH = ".github/workflows/trusted-ai-candidate-signer.yml"
 BUILDER_INPUTS = {
     "source_commit",
@@ -76,6 +76,7 @@ def _assert_no_untrusted_run_expressions(source: str, label: str) -> None:
     for block in blocks:
         _require("${{ inputs." not in block, f"{label}_raw_workflow_input_in_run")
         _require("${{ github.event.inputs" not in block, f"{label}_raw_event_input_in_run")
+        _require("${{ needs." not in block, f"{label}_raw_needs_output_in_run")
 
 
 def _assert_files_are_immutable(
@@ -130,6 +131,7 @@ def check_trusted_candidate_workflows(
     builder_source = builder.read_text("utf-8")
     signer_source = signer.read_text("utf-8")
     publisher_source = publisher.read_text("utf-8")
+    _assert_no_untrusted_run_expressions(builder_source, "trusted_builder")
     _assert_no_untrusted_run_expressions(signer_source, "trusted_signer")
     _assert_no_untrusted_run_expressions(publisher_source, "publisher")
     _assert_files_are_immutable(
@@ -239,8 +241,8 @@ def check_trusted_candidate_workflows(
         f'--repo "{TRUSTED_REPOSITORY}"',
         f'--signer-workflow "{TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}"',
         f'--signer-digest "{TRUSTED_BUILDER_COMMIT}"',
-        '--source-digest "${{ github.sha }}"',
-        '--source-ref "${{ github.ref }}"',
+        "--source-digest $env:SOURCE_COMMIT",
+        "--source-ref $env:SOURCE_REF",
         "--deny-self-hosted-runners",
         "--require-ai-worker",
     )

@@ -25,7 +25,7 @@ def verify_dependency_closure(*args, **kwargs):
 
 
 SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$")
-TRUSTED_BUILDER_COMMIT = "fbb97d16f42b2c20a04831750c639fda6db1a3e9"
+TRUSTED_BUILDER_COMMIT = "be8fe434855b94f61511e8c6c926e02c54230a38"
 TRUSTED_BUILDER_WORKFLOW = ".github/workflows/trusted-ai-candidate-builder.yml"
 
 

@@ -9,9 +9,9 @@ import sys
 ROOT = Path(__file__).parents[1]
 TRUSTED_BUILDER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder.yml"
 PUBLISHER = ROOT / ".github" / "workflows" / "publish-candidate.yml"
-TRUSTED_BUILDER_COMMIT = "fbb97d16f42b2c20a04831750c639fda6db1a3e9"
+TRUSTED_BUILDER_COMMIT = "be8fe434855b94f61511e8c6c926e02c54230a38"
 TRUSTED_SIGNER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-signer.yml"
-TRUSTED_SIGNER_COMMIT = "8b9f19da1fe07ba3e484f60317db6d14a5b447de"
+TRUSTED_SIGNER_COMMIT = "222c55385c3ddae58247a8911f5c3c441f0cb290"
 TRUST_POLICY = ROOT / "scripts" / "check_trusted_candidate_workflows.py"
 
 
@@ -71,14 +71,14 @@ def test_trusted_builder_has_a_closed_raw_material_interface_and_owns_attestatio
 
 
 def _check_policy(
-    publisher: Path, *, signer: Path = TRUSTED_SIGNER
+    publisher: Path, *, builder: Path = TRUSTED_BUILDER, signer: Path = TRUSTED_SIGNER
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             sys.executable,
             str(TRUST_POLICY),
             "--builder",
-            str(TRUSTED_BUILDER),
+            str(builder),
             "--signer",
             str(signer),
             "--publisher",
@@ -152,6 +152,11 @@ def test_trust_policy_rejects_mutable_caller_and_missing_or_wrong_signer_digest(
             'run: |\n          Write-Output "${{ github.event.inputs.source_ref }}"\n          if ($env:SOURCE_COMMIT',
             1,
         ),
+        "raw-needs-injection": trusted.replace(
+            "run: |\n          if ($env:SOURCE_COMMIT",
+            'run: |\n          Write-Output "${{ needs.verify.outputs.subject_sha256 }}"\n          if ($env:SOURCE_COMMIT',
+            1,
+        ),
     }
     for name, source in mutations.items():
         candidate = tmp_path / f"{name}.yml"
@@ -173,3 +178,43 @@ def test_trust_policy_rejects_any_signer_byte_change_and_does_not_require_mutual
     policy = TRUST_POLICY.read_text("utf-8")
     assert 'f\'--signer-repo "{TRUSTED_REPOSITORY}"\'' not in policy
     assert "failed to open local artifact" in policy
+
+
+def test_policy_rejects_builder_source_input_shell_interpolation_without_execution(tmp_path):
+    marker = tmp_path / "builder-injection-ran"
+    mutated_builder = tmp_path / "trusted-ai-candidate-builder.yml"
+    mutated_builder.write_text(
+        TRUSTED_BUILDER.read_text("utf-8").replace(
+            "run: |\n          if ($env:TRUSTED_WORKFLOW_REPOSITORY",
+            'run: |\n          Write-Output "${{ inputs.source_commit }}"\n          if ($env:TRUSTED_WORKFLOW_REPOSITORY',
+            1,
+        ),
+        "utf-8",
+    )
+
+    completed = _check_policy(PUBLISHER, builder=mutated_builder)
+
+    assert completed.returncode != 0
+    assert "trusted_builder_raw_workflow_input_in_run" in completed.stdout
+    assert not marker.exists()
+
+
+def test_policy_rejects_publisher_needs_output_shell_injection_without_execution(tmp_path):
+    marker = tmp_path / "publisher-injection-ran"
+    mutated_publisher = tmp_path / "publish-candidate.yml"
+    mutated_publisher.write_text(
+        PUBLISHER.read_text("utf-8").replace(
+            "run: |\n          if ($env:SOURCE_COMMIT",
+            'run: |\n          Write-Output "${{ needs.verify.outputs.artifact_name }}"; '
+            f'New-Item -ItemType File -Path "{marker}"\n'
+            "          if ($env:SOURCE_COMMIT",
+            1,
+        ),
+        "utf-8",
+    )
+
+    completed = _check_policy(mutated_publisher)
+
+    assert completed.returncode != 0
+    assert "publisher_raw_needs_output_in_run" in completed.stdout
+    assert not marker.exists()
