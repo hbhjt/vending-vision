@@ -294,11 +294,89 @@ def _valid_png(data: bytes) -> bool:
 
 
 def _valid_jpeg(data: bytes) -> bool:
-    return (
-        len(data) >= 4
-        and data.startswith(b"\xff\xd8")
-        and data.rfind(b"\xff\xd9") >= 2
-    )
+    if len(data) < 4 or not data.startswith(b"\xff\xd8"):
+        return False
+    offset = 2
+    saw_frame = False
+    saw_scan = False
+    saw_scan_data = False
+    while offset < len(data):
+        if data[offset] != 0xFF:
+            return False
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return False
+        marker = data[offset]
+        offset += 1
+        if marker == 0xD9:
+            return saw_frame and saw_scan and saw_scan_data and offset == len(data)
+        if marker in {0x00, 0x01, 0xD8} or 0xD0 <= marker <= 0xD7:
+            return False
+        if offset + 2 > len(data):
+            return False
+        segment_length = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            return False
+        segment_start = offset + 2
+        segment_end = offset + segment_length
+        is_start_of_frame = (
+            0xC0 <= marker <= 0xC3
+            or 0xC5 <= marker <= 0xC7
+            or 0xC9 <= marker <= 0xCB
+            or 0xCD <= marker <= 0xCF
+        )
+        if is_start_of_frame:
+            if saw_frame or segment_length < 8:
+                return False
+            component_count = data[segment_start + 5]
+            if (
+                int.from_bytes(data[segment_start + 1 : segment_start + 3], "big")
+                == 0
+                or int.from_bytes(
+                    data[segment_start + 3 : segment_start + 5], "big"
+                )
+                == 0
+                or component_count == 0
+                or segment_length != 8 + 3 * component_count
+            ):
+                return False
+            saw_frame = True
+        if marker == 0xDA:
+            component_count = data[segment_start]
+            if (
+                not saw_frame
+                or saw_scan
+                or component_count == 0
+                or segment_length != 6 + 2 * component_count
+            ):
+                return False
+            saw_scan = True
+            offset = segment_end
+            while offset < len(data):
+                if data[offset] != 0xFF:
+                    saw_scan_data = True
+                    offset += 1
+                    continue
+                marker_offset = offset + 1
+                while marker_offset < len(data) and data[marker_offset] == 0xFF:
+                    marker_offset += 1
+                if marker_offset >= len(data):
+                    return False
+                scan_marker = data[marker_offset]
+                if scan_marker == 0x00:
+                    saw_scan_data = True
+                    offset = marker_offset + 1
+                    continue
+                if 0xD0 <= scan_marker <= 0xD7:
+                    offset = marker_offset + 1
+                    continue
+                if scan_marker == 0xD9:
+                    return saw_scan_data and marker_offset + 1 == len(data)
+                return False
+            return False
+        offset = segment_end
+    return False
 
 
 def _valid_ico(data: bytes) -> bool:
@@ -978,6 +1056,19 @@ def test_binary_allowlist_rejects_executable_magic_mismatch_and_truncation(tmp_p
         subprocess.run(["git", "add", relative_path], cwd=root, check=True)
 
         assert f"{disguised}: binary-format-invalid" in find_violations(root)
+
+
+def test_jpeg_format_validator_requires_eoi_at_end():
+    jpeg = (
+        b"\xff\xd8"
+        b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+        b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"
+        b"\x01\xff\xd9"
+    )
+
+    assert _valid_jpeg(jpeg)
+    assert not _valid_jpeg(jpeg + b"MZ")
+    assert not _valid_jpeg(b"\xff\xd8MZ\xff\xd9")
 
 
 def test_binary_allowlist_assets_decode_with_production_opencv_loaders():
