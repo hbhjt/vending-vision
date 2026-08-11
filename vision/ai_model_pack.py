@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from vision.ai_runtime_descriptor import digest_runtime_descriptor
+from vision.source_provenance import official_source_digest
 
 OFFICIAL_CATVTON_REPOSITORY = "zhengchong/CatVTON"
 OFFICIAL_CATVTON_REVISION = "2969fcf85fe62f2036605716f0b56f0b81d01d79"
@@ -45,25 +46,27 @@ def _digest(path: Path) -> str:
     return value.hexdigest()
 
 
-def _quick_file_identity(path: Path) -> tuple[str, int, int]:
+def _quick_file_identity(path: Path) -> tuple[str, int, int, int, int | None, int | None]:
     stat = path.stat()
-    return (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+    return (
+        str(path.resolve()),
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+        getattr(stat, "st_ino", None),
+        getattr(stat, "st_dev", None),
+    )
 
 
 def _source_worker_identity() -> str:
-    value = hashlib.sha256()
-    for relative in (
-        "ai_attempt_worker.py",
-        "ai_attempt_process.py",
-        "catvton_pose_masks.py",
-        "catvton_preprocess.py",
-        "vendor/catvton/PROVENANCE.md",
-    ):
-        path = Path(__file__).resolve().parent / relative
-        if path.is_file():
-            value.update(relative.encode("utf-8"))
-            value.update(path.read_bytes())
-    return value.hexdigest()
+    return official_source_digest()
+
+
+def _pack_files_identity(pack_root: Path, descriptor: dict) -> tuple[tuple[str, int, int, int, int | None, int | None], ...]:
+    identities = []
+    for item in descriptor["files"]:
+        identities.append(_quick_file_identity(pack_root / item["path"]))
+    return tuple(identities)
 
 
 def _reject_duplicate_object_keys(pairs: list[tuple[str, object]]) -> dict:
@@ -98,8 +101,9 @@ def canonical_ai_model_manifest_json(manifest: dict) -> str:
 
 def load_official_ai_model_pack_descriptor() -> dict:
     try:
+        raw = OFFICIAL_DESCRIPTOR_PATH.read_text("utf-8")
         descriptor = json.loads(
-            OFFICIAL_DESCRIPTOR_PATH.read_text("utf-8"),
+            raw,
             object_pairs_hook=_reject_duplicate_object_keys,
         )
     except AiModelPackError:
@@ -107,7 +111,7 @@ def load_official_ai_model_pack_descriptor() -> dict:
     except (OSError, ValueError) as exc:
         raise AiModelPackError("ai_model_descriptor_missing_or_invalid") from exc
     _validate_descriptor_shape(descriptor)
-    if canonical_ai_model_manifest_json(descriptor) != OFFICIAL_DESCRIPTOR_PATH.read_text("utf-8"):
+    if canonical_ai_model_manifest_json(descriptor) != raw.rstrip("\n"):
         raise AiModelPackError("ai_model_descriptor_noncanonical")
     return descriptor
 
@@ -279,6 +283,8 @@ def official_ai_readiness(root: str | Path | None) -> bool:
     try:
         manifest_identity = _quick_file_identity(pack_root / MANIFEST_NAME)
         descriptor_identity = _quick_file_identity(OFFICIAL_DESCRIPTOR_PATH)
+        descriptor = load_official_ai_model_pack_descriptor()
+        files_identity = _pack_files_identity(pack_root, descriptor)
         worker_identity = _source_worker_identity()
         runtime_descriptor_digest = digest_runtime_descriptor()
     except OSError:
@@ -286,6 +292,7 @@ def official_ai_readiness(root: str | Path | None) -> bool:
     cache_key = (
         str(pack_root),
         manifest_identity,
+        files_identity,
         descriptor_identity,
         worker_identity,
         runtime_descriptor_digest,
@@ -294,7 +301,7 @@ def official_ai_readiness(root: str | Path | None) -> bool:
     if cached is not None:
         return cached
     try:
-        verify_ai_model_pack(pack_root)
+        verify_ai_model_pack(pack_root, descriptor=descriptor)
         from vision.ai_attempt_process import probe_ai_attempt_worker
 
         probe_ai_attempt_worker(pack_root)

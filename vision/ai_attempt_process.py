@@ -70,6 +70,8 @@ def probe_ai_attempt_worker(model_pack: Path, *, timeout: float = 30.0) -> None:
         payload = json.loads(result.stdout_tail.decode("utf-8").strip().splitlines()[-1])
     except (IndexError, UnicodeDecodeError, ValueError) as exc:
         raise RuntimeError("official_ai_child_probe_failed") from exc
+    if payload.get("probe") != "official-catvton-worker":
+        raise RuntimeError("official_ai_child_probe_failed")
     expected = expected_dependency_versions()
     for name in ("torch", "torchvision", "diffusers", "transformers"):
         if payload.get(name) != expected[name]:

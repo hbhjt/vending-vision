@@ -73,6 +73,40 @@ def test_model_pack_zip_build_is_deterministic_and_verifiable(tmp_path):
             assert info.comment == b""
 
 
+def test_model_pack_zip_checker_streams_each_entry_and_rejects_same_size_tamper(tmp_path):
+    source = tmp_path / "source"
+    descriptor = mini_descriptor(source)
+    archive_path = tmp_path / "pack.zip"
+    build_model_pack_zip(source, archive_path, descriptor)
+
+    tampered = tmp_path / "tampered.zip"
+    with zipfile.ZipFile(archive_path) as src, zipfile.ZipFile(tampered, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as dst:
+        for info in src.infolist():
+            data = src.read(info.filename)
+            if info.filename == "weights/model.bin":
+                data = b"X" + data[1:]
+            replacement = zipfile.ZipInfo(info.filename, info.date_time)
+            replacement.compress_type = info.compress_type
+            replacement.external_attr = info.external_attr
+            dst.writestr(replacement, data)
+
+    with pytest.raises(AiModelPackError, match="ai_model_zip_entry_digest"):
+        verify_model_pack_zip(tampered, descriptor)
+
+
+def test_model_pack_zip_checker_rejects_compressed_zip_bomb_before_extracting(tmp_path):
+    source = tmp_path / "source"
+    descriptor = mini_descriptor(source)
+    archive_path = tmp_path / "bomb.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(MANIFEST_NAME, canonical_ai_model_manifest_json(descriptor))
+        archive.writestr("a/config.json", b"{}")
+        archive.writestr("weights/model.bin", b"mini-weights")
+
+    with pytest.raises(AiModelPackError, match="ai_model_zip_metadata"):
+        verify_model_pack_zip(archive_path, descriptor)
+
+
 @pytest.mark.parametrize("bad_name", ["../escape.bin", "weights\\model.bin", "weights/model.bin:ads", "Weights/model.bin"])
 def test_model_pack_zip_checker_rejects_unsafe_or_duplicate_entries(tmp_path, bad_name):
     source = tmp_path / "source"
@@ -111,3 +145,30 @@ def test_model_pack_installer_is_idempotent_and_failed_install_keeps_active(tmp_
     with pytest.raises(AiModelPackError, match="ai_model_zip_outer_digest"):
         install_model_pack_zip(bad_archive, install_root, descriptor, outer_sha256=digest)
     assert json.loads((install_root / "active-pack.json").read_text("utf-8")) == active_record
+
+
+def test_model_pack_installer_bad_payload_cannot_replace_active_or_leave_evidence(tmp_path):
+    source = tmp_path / "source"
+    descriptor = mini_descriptor(source)
+    archive_path = tmp_path / "pack.zip"
+    digest = build_model_pack_zip(source, archive_path, descriptor)
+    install_root = tmp_path / "install"
+    install_model_pack_zip(archive_path, install_root, descriptor, outer_sha256=digest)
+    active_record = json.loads((install_root / "active-pack.json").read_text("utf-8"))
+
+    tampered = tmp_path / "tampered.zip"
+    with zipfile.ZipFile(archive_path) as src, zipfile.ZipFile(tampered, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as dst:
+        for info in src.infolist():
+            data = src.read(info.filename)
+            if info.filename == "weights/model.bin":
+                data = b"X" + data[1:]
+            replacement = zipfile.ZipInfo(info.filename, info.date_time)
+            replacement.compress_type = info.compress_type
+            replacement.external_attr = info.external_attr
+            dst.writestr(replacement, data)
+
+    with pytest.raises(AiModelPackError, match="ai_model_zip_entry_digest"):
+        install_model_pack_zip(tampered, install_root, descriptor)
+
+    assert json.loads((install_root / "active-pack.json").read_text("utf-8")) == active_record
+    assert not any(path.name.startswith(".staging-") for path in (install_root / "packs").iterdir())

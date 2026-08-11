@@ -83,3 +83,20 @@ def test_startup_probe_rejects_worker_dependency_version_mismatch(monkeypatch, t
         assert str(exc) == "official_ai_child_probe_failed"
     else:
         raise AssertionError("dependency mismatch must fail closed")
+
+
+def test_startup_probe_requires_official_probe_marker(monkeypatch, tmp_path):
+    async def fake_run_supervised(_command, *, timeout):
+        return SimpleNamespace(
+            returncode=0,
+            stdout_tail=b'{"probe":"runtime-boundary","torch":"2.8.0","torchvision":"0.23.0","diffusers":"0.29.2","transformers":"4.53.3"}\n',
+        )
+
+    monkeypatch.setattr(ai_attempt_process_module, "run_supervised", fake_run_supervised)
+
+    try:
+        probe_ai_attempt_worker(tmp_path)
+    except RuntimeError as exc:
+        assert str(exc) == "official_ai_child_probe_failed"
+    else:
+        raise AssertionError("wrong probe marker must fail closed")

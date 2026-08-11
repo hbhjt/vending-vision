@@ -155,6 +155,9 @@ pipeline_module.CatVTONPipeline = CatVTONPipeline
 sys.modules["vision.vendor.catvton.model.pipeline"] = pipeline_module
 
 import vision.catvton_pose_masks as masks
+import vision.source_provenance as provenance
+if os.environ.get("CATVTON_MINIATURE_SOURCE_TAMPER"):
+    provenance.verify_official_source_provenance = lambda: False
 class L:
     def __init__(self, x, y, visibility=1.0):
         self.x = x
@@ -263,6 +266,39 @@ def test_worker_probe_accepts_only_official_manifest_and_no_fake_arguments(tmp_p
     )
     assert fake.returncode != 0
     assert "--fake-worker" in fake.stderr
+
+
+def test_worker_probe_rejects_source_descriptor_tamper(tmp_path):
+    pack = tmp_path / "pack"
+    modules = tmp_path / "miniature-modules"
+    pack.mkdir()
+    modules.mkdir()
+    write_worker_pack(pack)
+    write_miniature_catvton_modules(modules)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{modules}{os.pathsep}{ROOT}"
+    env["CATVTON_MINIATURE_DESCRIPTOR"] = (pack / "ai-model-manifest.json").read_text("utf-8")
+    env["CATVTON_MINIATURE_SOURCE_TAMPER"] = "1"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "vision.ai_attempt_worker",
+            "--model-pack",
+            str(pack),
+            "--probe",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "official_catvton_probe_failed" in completed.stderr
 
 
 def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tmp_path):

@@ -1,6 +1,10 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$Wheelhouse
+    [string]$Wheelhouse,
+    [Parameter(Mandatory = $true)]
+    [string]$AiWheelhouse,
+    [Parameter(Mandatory = $true)]
+    [string]$AiWheelhouseDescriptor
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,7 +22,13 @@ $Venv = Join-Path $Root ".venv-packaging"
 $Python = Join-Path $Venv "Scripts\python.exe"
 $ExpectedPythonVersion = (Get-Content (Join-Path $Root ".python-version") -Raw).Trim()
 if (-not (Test-Path -LiteralPath $Wheelhouse -PathType Container)) {
-    throw "A pre-validated offline wheelhouse is required: $Wheelhouse"
+    throw "A pre-validated offline core wheelhouse is required: $Wheelhouse"
+}
+if (-not (Test-Path -LiteralPath $AiWheelhouse -PathType Container)) {
+    throw "A verified exact offline AI wheelhouse is required: $AiWheelhouse"
+}
+if (-not (Test-Path -LiteralPath $AiWheelhouseDescriptor -PathType Leaf)) {
+    throw "AI wheelhouse release descriptor is required: $AiWheelhouseDescriptor"
 }
 
 $ActualPythonVersion = (& python -c "import platform; print(platform.python_version())").Trim()
@@ -38,9 +48,20 @@ if (-not (Test-Path $Python)) {
 }
 
 Invoke-Checked $Python -m pip install --no-index --find-links $Wheelhouse --require-hashes -r (Join-Path $Root "requirements.txt")
+Invoke-Checked $Python (Join-Path $Root "scripts\verify_ai_wheelhouse.py") --descriptor $AiWheelhouseDescriptor --wheelhouse $AiWheelhouse
+Invoke-Checked $Python -m pip install --no-index --find-links $AiWheelhouse --require-hashes -r (Join-Path $Root "requirements-ai.txt")
 
 Invoke-Checked $Python -m PyInstaller --clean --noconfirm (Join-Path $Root "vending_vision.spec")
+Invoke-Checked $Python -m PyInstaller --clean --noconfirm (Join-Path $Root "vending_vision_ai_worker.spec")
+
+$MainExe = Join-Path $Root "dist\vending-vision\vending-vision.exe"
+$WorkerExe = Join-Path $Root "dist\vending-vision-ai-worker\vending-vision-ai-worker.exe"
+if (-not (Test-Path -LiteralPath $MainExe -PathType Leaf)) { throw "main Vision exe missing after build: $MainExe" }
+if (-not (Test-Path -LiteralPath $WorkerExe -PathType Leaf)) { throw "AI worker exe missing after build: $WorkerExe" }
+
+Invoke-Checked $Python (Join-Path $Root "scripts\verify_packaged_exe.py") $MainExe --require-ai-worker
 
 Write-Host ""
 Write-Host "Build complete:"
-Write-Host (Join-Path $Root "dist\vending-vision\vending-vision.exe")
+Write-Host $MainExe
+Write-Host $WorkerExe

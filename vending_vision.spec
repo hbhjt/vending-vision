@@ -32,6 +32,7 @@ datas = [
     (str(ROOT / "models"), "models"),
     (str(ROOT / "official-ai-model-pack-descriptor.json"), "."),
     (str(ROOT / "ai-runtime-descriptor.json"), "."),
+    (str(ROOT / "official-ai-source-descriptor.json"), "."),
     *[(str(source), destination) for source, destination in CONTRACT_DATA_FILES],
 ]
 datas += collect_data_files("mediapipe")

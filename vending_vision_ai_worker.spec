@@ -10,6 +10,7 @@ ROOT = Path(SPECPATH)
 datas = [
     (str(ROOT / "official-ai-model-pack-descriptor.json"), "."),
     (str(ROOT / "ai-runtime-descriptor.json"), "."),
+    (str(ROOT / "official-ai-source-descriptor.json"), "."),
     (str(ROOT / "vision" / "vendor" / "catvton" / "LICENSE"), "vision/vendor/catvton"),
     (str(ROOT / "vision" / "vendor" / "catvton" / "PROVENANCE.md"), "vision/vendor/catvton"),
 ]

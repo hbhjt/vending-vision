@@ -61,6 +61,11 @@ def parse_args():
     parser.add_argument("--port", type=int, default=17892)
     parser.add_argument("--startup-timeout", type=float, default=45.0)
     parser.add_argument("--expected-version")
+    parser.add_argument(
+        "--require-ai-worker",
+        action="store_true",
+        help="require the packaged AI worker onedir and runtime boundary probe",
+    )
     return parser.parse_args()
 
 
@@ -377,6 +382,35 @@ def run_packaged_probe(exe_path, argument, expected_stdout):
         )
 
 
+def _candidate_ai_worker_paths(exe_path):
+    suffix = ".exe" if sys.platform == "win32" else ""
+    return [
+        exe_path.with_name(f"vending-vision-ai-worker{suffix}"),
+        exe_path.parent / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}",
+        exe_path.parent.parent / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}",
+    ]
+
+
+def assert_ai_worker_layout(exe_path, *, required):
+    candidates = _candidate_ai_worker_paths(exe_path)
+    worker = next((path for path in candidates if path.is_file()), None)
+    if worker is None:
+        if required:
+            raise AssertionError(f"missing packaged AI worker: {[str(path) for path in candidates]}")
+        return None
+    internal = worker.parent / "_internal"
+    required_resources = [
+        internal / "official-ai-model-pack-descriptor.json",
+        internal / "ai-runtime-descriptor.json",
+        internal / "official-ai-source-descriptor.json",
+    ]
+    missing = [str(path) for path in required_resources if not path.is_file()]
+    if missing:
+        raise AssertionError(f"missing packaged AI worker resources: {missing}")
+    digest = __import__("hashlib").sha256(worker.read_bytes()).hexdigest()
+    return {"path": worker, "sha256": digest}
+
+
 def verify_plain_camera_maintenance_contract(base_url):
     """Exercise the real packaged adapter through plain loopback v2 routes."""
     read_status, contract = http_status_json(f"{base_url}/maintenance/cameras")
@@ -466,6 +500,7 @@ def main():
         raise FileNotFoundError(exe_path)
 
     assert_bundled_resources(exe_path)
+    ai_worker = assert_ai_worker_layout(exe_path, required=args.require_ai_worker)
     run_packaged_probe(
         exe_path,
         "--verify-v2-contract-bundle",
@@ -476,11 +511,12 @@ def main():
         "--verify-v2-try-on-workers",
         "V2 try-on worker probe passed",
     )
-    run_packaged_probe(
-        exe_path,
-        "--verify-ai-worker-boundary",
-        "AI runtime worker contract probe passed",
-    )
+    if ai_worker is not None:
+        run_packaged_probe(
+            exe_path,
+            "--verify-ai-worker-boundary",
+            "AI runtime worker contract probe passed",
+        )
     ensure_port_available(args.port)
     managed_port = args.port + 1
     ensure_port_available(managed_port)
@@ -560,8 +596,15 @@ def main():
             startup_timeout=args.startup_timeout,
             temp_dir=Path(temp_dir) / "managed-production",
         )
-        print("PACKAGED_EXE_VERIFICATION=PASS")
+        print(
+            "PACKAGED_EXE_VERIFICATION=PASS"
+            if ai_worker is not None
+            else "PACKAGED_EXE_VERIFICATION=CORE_ONLY"
+        )
         print(f"EXE={exe_path}")
+        if ai_worker is not None:
+            print(f"AI_WORKER={ai_worker['path']}")
+            print(f"AI_WORKER_SHA256={ai_worker['sha256']}")
         print(f"SERVER_VERSION={version.get('version')}")
         print(f"AGE_GENDER_MODE={health.get('ageGenderMode')}")
 

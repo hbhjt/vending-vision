@@ -5,6 +5,8 @@ import asyncio
 import os
 import signal
 import subprocess
+import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -168,12 +170,17 @@ class WindowsJobProcess:
         self.thread_handle = None
         self.pid: int | None = None
         self.resumed = False
+        self.stdout = StreamTail()
+        self.stderr = StreamTail()
+        self.pipes = None
+        self._drainers = []
 
     def start(self) -> None:
         self.job = self.api.create_job()
         try:
+            self.pipes = self.api.create_pipes()
             self.api.set_kill_on_close_and_low_priority(self.job)
-            created = self.api.create_process_suspended(self.command)
+            created = self.api.create_process_suspended(self.command, self.pipes)
             self.process_handle = created["process"]
             self.thread_handle = created["thread"]
             self.pid = created["pid"]
@@ -182,6 +189,7 @@ class WindowsJobProcess:
             except WindowsJobApiUnavailable:
                 self.api.terminate_process(self.process_handle, 1)
                 raise
+            self._drainers = self.api.start_pipe_drainers(self.pipes, self.stdout, self.stderr)
             self.api.resume_thread(self.thread_handle)
             self.resumed = True
         except Exception:
@@ -190,8 +198,13 @@ class WindowsJobProcess:
 
     def terminate_tree(self) -> None:
         if self.job is not None:
-            self.api.terminate_job(self.job, 1)
-            self.api.wait_active_processes_zero(self.job, timeout=3.0)
+            try:
+                self.api.terminate_job(self.job, 1)
+                self.api.wait_active_processes_zero(self.job, timeout=3.0)
+            except ProcessSupervisorError:
+                if self.pid is not None:
+                    self.api.taskkill_fallback(self.pid)
+                raise
 
     def wait(self, timeout: float) -> SupervisedResult:
         if self.process_handle is None:
@@ -201,12 +214,19 @@ class WindowsJobProcess:
         except ProcessSupervisorError:
             self.terminate_tree()
             raise
+        self.api.finish_pipe_drainers(self._drainers, timeout=3.0)
         try:
             self.api.wait_active_processes_zero(self.job, timeout=3.0)
         except Exception as exc:
             self.terminate_tree()
             raise ProcessSupervisorError("windows_job_descendants_alive") from exc
-        return SupervisedResult(code, b"", b"", 0, 0)
+        return SupervisedResult(
+            code,
+            self.stdout.bytes(),
+            self.stderr.bytes(),
+            self.stdout.total,
+            self.stderr.total,
+        )
 
     def close(self) -> None:
         try:
@@ -217,9 +237,12 @@ class WindowsJobProcess:
                 self.api.close_handle(self.thread_handle)
             if self.process_handle is not None:
                 self.api.close_handle(self.process_handle)
+            if self.pipes is not None:
+                self.api.close_pipes(self.pipes)
             self.job = None
             self.thread_handle = None
             self.process_handle = None
+            self.pipes = None
 
 
 class WindowsJobApi:
@@ -235,6 +258,7 @@ class WindowsJobApi:
         self.wintypes = wintypes
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._define_structures()
+        self._declare_functions()
 
     def _define_structures(self) -> None:
         ctypes = self.ctypes
@@ -303,9 +327,66 @@ class WindowsJobApi:
                 ("dwThreadId", wintypes.DWORD),
             ]
 
+        class JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("TotalUserTime", ctypes.c_int64),
+                ("TotalKernelTime", ctypes.c_int64),
+                ("ThisPeriodTotalUserTime", ctypes.c_int64),
+                ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                ("TotalPageFaultCount", wintypes.DWORD),
+                ("TotalProcesses", wintypes.DWORD),
+                ("ActiveProcesses", wintypes.DWORD),
+                ("TotalTerminatedProcesses", wintypes.DWORD),
+            ]
+
         self.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        self.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
         self.STARTUPINFOW = STARTUPINFOW
         self.PROCESS_INFORMATION = PROCESS_INFORMATION
+
+    def _declare_functions(self) -> None:
+        ctypes = self.ctypes
+        wintypes = self.wintypes
+        k32 = self.kernel32
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.SetInformationJobObject.restype = wintypes.BOOL
+        k32.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        k32.QueryInformationJobObject.restype = wintypes.BOOL
+        k32.CreatePipe.argtypes = [ctypes.POINTER(wintypes.HANDLE), ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p, wintypes.DWORD]
+        k32.CreatePipe.restype = wintypes.BOOL
+        k32.SetHandleInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]
+        k32.SetHandleInformation.restype = wintypes.BOOL
+        k32.CreateProcessW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+            ctypes.POINTER(self.STARTUPINFOW),
+            ctypes.POINTER(self.PROCESS_INFORMATION),
+        ]
+        k32.CreateProcessW.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.ResumeThread.argtypes = [wintypes.HANDLE]
+        k32.ResumeThread.restype = wintypes.DWORD
+        k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.TerminateProcess.restype = wintypes.BOOL
+        k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.TerminateJobObject.restype = wintypes.BOOL
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.GetExitCodeProcess.restype = wintypes.BOOL
+        k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k32.ReadFile.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
 
     def create_job(self):
         handle = self.kernel32.CreateJobObjectW(None, None)
@@ -327,13 +408,42 @@ class WindowsJobApi:
         if not ok:
             raise WindowsJobApiUnavailable("windows_job_set_failed")
 
-    def create_process_suspended(self, command: list[str]) -> dict[str, object]:
+    def create_pipes(self) -> dict[str, object]:
+        stdout_read = self.wintypes.HANDLE()
+        stdout_write = self.wintypes.HANDLE()
+        stderr_read = self.wintypes.HANDLE()
+        stderr_write = self.wintypes.HANDLE()
+        if not self.kernel32.CreatePipe(self.ctypes.byref(stdout_read), self.ctypes.byref(stdout_write), None, 0):
+            raise WindowsJobApiUnavailable("windows_pipe_create_failed")
+        if not self.kernel32.CreatePipe(self.ctypes.byref(stderr_read), self.ctypes.byref(stderr_write), None, 0):
+            self.close_handle(stdout_read)
+            self.close_handle(stdout_write)
+            raise WindowsJobApiUnavailable("windows_pipe_create_failed")
+        HANDLE_FLAG_INHERIT = 0x00000001
+        for read_handle in (stdout_read, stderr_read):
+            if not self.kernel32.SetHandleInformation(read_handle, HANDLE_FLAG_INHERIT, 0):
+                self.close_handle(stdout_read)
+                self.close_handle(stdout_write)
+                self.close_handle(stderr_read)
+                self.close_handle(stderr_write)
+                raise WindowsJobApiUnavailable("windows_pipe_inheritance_failed")
+        return {
+            "stdout_read": stdout_read,
+            "stdout_write": stdout_write,
+            "stderr_read": stderr_read,
+            "stderr_write": stderr_write,
+        }
+
+    def create_process_suspended(self, command: list[str], pipes: dict[str, object]) -> dict[str, object]:
         import subprocess as _subprocess
 
         ctypes = self.ctypes
         si = self.STARTUPINFOW()
         pi = self.PROCESS_INFORMATION()
         si.cb = ctypes.sizeof(si)
+        si.dwFlags = 0x00000100
+        si.hStdOutput = pipes["stdout_write"]
+        si.hStdError = pipes["stderr_write"]
         cmdline = _subprocess.list2cmdline(command)
         flags = 0x00000004 | 0x08000000 | 0x00004000
         ok = self.kernel32.CreateProcessW(
@@ -350,7 +460,51 @@ class WindowsJobApi:
         )
         if not ok:
             raise WindowsJobApiUnavailable("windows_create_process_failed")
+        self.close_handle(pipes["stdout_write"])
+        self.close_handle(pipes["stderr_write"])
+        pipes["stdout_write"] = None
+        pipes["stderr_write"] = None
         return {"process": pi.hProcess, "thread": pi.hThread, "pid": int(pi.dwProcessId)}
+
+    def start_pipe_drainers(self, pipes: dict[str, object], stdout: StreamTail, stderr: StreamTail) -> list[threading.Thread]:
+        threads = [
+            threading.Thread(target=self._drain_pipe, args=(pipes["stdout_read"], stdout), daemon=True),
+            threading.Thread(target=self._drain_pipe, args=(pipes["stderr_read"], stderr), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        return threads
+
+    def _drain_pipe(self, handle, tail: StreamTail) -> None:
+        ctypes = self.ctypes
+        buffer = ctypes.create_string_buffer(8192)
+        read = self.wintypes.DWORD()
+        while True:
+            ok = self.kernel32.ReadFile(handle, buffer, 8192, ctypes.byref(read), None)
+            if not ok or read.value == 0:
+                return
+            tail.append(buffer.raw[: read.value])
+
+    def finish_pipe_drainers(self, drainers: list[threading.Thread], *, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        for thread in drainers:
+            remaining = max(0.0, deadline - time.monotonic())
+            thread.join(remaining)
+
+    def close_pipes(self, pipes: dict[str, object]) -> None:
+        for handle in pipes.values():
+            if handle:
+                self.close_handle(handle)
+
+    def taskkill_fallback(self, pid: int) -> None:
+        subprocess.run(
+            taskkill_fallback_command(pid),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
 
     def assign_process_to_job(self, job, process) -> None:
         ok = self.kernel32.AssignProcessToJobObject(job, process)
@@ -371,7 +525,24 @@ class WindowsJobApi:
         self.kernel32.TerminateJobObject(job, code)
 
     def wait_active_processes_zero(self, job, *, timeout: float) -> None:
-        return None
+        deadline = time.monotonic() + timeout
+        while True:
+            info = self.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION()
+            returned = self.wintypes.DWORD()
+            ok = self.kernel32.QueryInformationJobObject(
+                job,
+                1,
+                self.ctypes.byref(info),
+                self.ctypes.sizeof(info),
+                self.ctypes.byref(returned),
+            )
+            if not ok:
+                raise ProcessSupervisorError("windows_job_query_failed")
+            if int(info.ActiveProcesses) == 0:
+                return
+            if time.monotonic() >= deadline:
+                raise ProcessSupervisorError("windows_job_descendants_alive")
+            time.sleep(0.025)
 
     def wait_process(self, process, *, timeout: float) -> int:
         ctypes = self.ctypes

@@ -45,6 +45,7 @@ def test_frozen_spec_keeps_the_generated_v2_bundle_and_static_boundary_import():
     assert '"vision.ai_attempt_worker"' in spec
     assert '"vision.ai_attempt_process"' in spec
     assert '"vision.catvton_preprocess"' in spec
+    assert "official-ai-source-descriptor.json" in spec
     assert '"contracts.vem_vision_v2.python.vision_v2_models"' in spec
 
 
@@ -75,6 +76,7 @@ def test_ai_runtime_packaging_includes_worker_code_but_excludes_official_weights
     assert 'name="vending-vision-ai-worker"' in worker_spec
     assert "collect_submodules(\"vision.vendor.catvton\")" in worker_spec
     assert "official-ai-model-pack-descriptor.json" in worker_spec
+    assert "official-ai-source-descriptor.json" in worker_spec
     assert "model.safetensors" not in worker_spec
 
 
@@ -142,10 +144,76 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     assert "packaged_archive_entries" in verifier
     assert '"--verify-ai-worker-boundary"' in verifier
     assert '"AI runtime worker contract probe passed"' in verifier
+    assert "--require-ai-worker" in verifier
+    assert "PACKAGED_EXE_VERIFICATION=CORE_ONLY" in verifier
+    assert "PACKAGED_EXE_VERIFICATION=PASS" in verifier
+    assert "assert_ai_worker_layout" in verifier
     assert "assert_hard_cutover_archive_absence(exe_path)" in verifier
     assert "retired modules remain in packaged archive" in verifier
     assert "retired_try_on_route" in verifier
     assert "assert_no_worker_resource_leak_output" in verifier
+
+
+def test_packaged_verifier_require_ai_worker_rejects_missing_layout(tmp_path):
+    from scripts.verify_packaged_exe import assert_ai_worker_layout
+
+    exe = tmp_path / "vending-vision" / "vending-vision.exe"
+    exe.parent.mkdir()
+    exe.write_bytes(b"main")
+
+    assert assert_ai_worker_layout(exe, required=False) is None
+    try:
+        assert_ai_worker_layout(exe, required=True)
+    except AssertionError as exc:
+        assert "missing packaged AI worker" in str(exc)
+    else:
+        raise AssertionError("missing worker must fail when required")
+
+
+def test_packaged_verifier_ai_worker_layout_binds_descriptor_resources(tmp_path):
+    from scripts.verify_packaged_exe import assert_ai_worker_layout
+
+    suffix = ".exe" if sys.platform == "win32" else ""
+    exe = tmp_path / "vending-vision" / f"vending-vision{suffix}"
+    worker = tmp_path / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}"
+    internal = worker.parent / "_internal"
+    exe.parent.mkdir()
+    internal.mkdir(parents=True)
+    exe.write_bytes(b"main")
+    worker.write_bytes(b"worker")
+    for name in (
+        "official-ai-model-pack-descriptor.json",
+        "ai-runtime-descriptor.json",
+        "official-ai-source-descriptor.json",
+    ):
+        (internal / name).write_text("{}", "utf-8")
+
+    result = assert_ai_worker_layout(exe, required=True)
+
+    assert result["path"] == worker
+    assert len(result["sha256"]) == 64
+
+
+def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
+    build = (ROOT / "scripts" / "build_exe.ps1").read_text("utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "publish-candidate.yml").read_text("utf-8")
+
+    assert "AiWheelhouseDescriptor" in build
+    assert "verify_ai_wheelhouse.py" in build
+    assert "requirements-ai.txt" in build
+    assert "vending_vision.spec" in build
+    assert "vending_vision_ai_worker.spec" in build
+    assert "vending-vision-ai-worker" in build
+    assert "--require-ai-worker" in build
+    assert "pip install --no-index" in build
+    assert "pip download" not in build
+
+    assert "AI_WHEELHOUSE" in workflow
+    assert "verify_ai_wheelhouse.py" in workflow
+    assert "vending_vision_ai_worker.spec" in workflow
+    assert "--require-ai-worker" in workflow
+    assert "requirements-ai.txt" in workflow
+    assert "pip download" not in workflow
 
 
 def test_worker_probe_executes_production_observation_and_render_ipc():

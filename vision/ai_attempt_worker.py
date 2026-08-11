@@ -20,6 +20,7 @@ from vision.ai_model_pack import (
     OFFICIAL_CATVTON_SOURCE_REVISION,
     verify_ai_model_pack,
 )
+from vision.source_provenance import verify_official_source_provenance
 
 _MAX_INPUT_BYTES = 20 * 1024 * 1024
 _MAX_INPUT_PIXELS = 8192 * 8192
@@ -106,6 +107,8 @@ def _probe_official_worker(pack_root: Path) -> dict[str, object]:
     provenance = Path(__file__).resolve().parent / "vendor" / "catvton" / "PROVENANCE.md"
     if OFFICIAL_CATVTON_SOURCE_REVISION not in provenance.read_text("utf-8"):
         raise CatVTONWorkerError("official_catvton_source_revision_mismatch")
+    if not verify_official_source_provenance():
+        raise CatVTONWorkerError("official_catvton_source_provenance_mismatch")
 
     for relative in (
         "inpainting/scheduler/scheduler_config.json",

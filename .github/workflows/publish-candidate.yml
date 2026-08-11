@@ -30,26 +30,54 @@ jobs:
         with:
           python-version-file: ".python-version"
           cache: pip
-      - name: 下载完整锁定 wheel 闭包
+      - name: 展开 release-provided 核心 wheel 闭包
         shell: pwsh
-        run: >-
-          python -m pip download --only-binary=:all: --require-hashes
-          --dest wheelhouse -r requirements.txt
+        env:
+          CORE_WHEELHOUSE_ARCHIVE: ${{ vars.CORE_WHEELHOUSE_ARCHIVE }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CORE_WHEELHOUSE_ARCHIVE)) { throw "CORE_WHEELHOUSE_ARCHIVE is required" }
+          if (-not (Test-Path -LiteralPath $env:CORE_WHEELHOUSE_ARCHIVE -PathType Leaf)) { throw "CORE_WHEELHOUSE_ARCHIVE does not exist" }
+          New-Item -ItemType Directory -Force wheelhouse | Out-Null
+          tar -xf $env:CORE_WHEELHOUSE_ARCHIVE -C wheelhouse
+      - name: 下载并校验 AI worker wheel 闭包
+        shell: pwsh
+        env:
+          AI_WHEELHOUSE_ARCHIVE: ${{ vars.AI_WHEELHOUSE_ARCHIVE }}
+          AI_WHEELHOUSE_DESCRIPTOR: ${{ vars.AI_WHEELHOUSE_DESCRIPTOR }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:AI_WHEELHOUSE_ARCHIVE)) { throw "AI_WHEELHOUSE_ARCHIVE is required" }
+          if ([string]::IsNullOrWhiteSpace($env:AI_WHEELHOUSE_DESCRIPTOR)) { throw "AI_WHEELHOUSE_DESCRIPTOR is required" }
+          if (-not (Test-Path -LiteralPath $env:AI_WHEELHOUSE_ARCHIVE -PathType Leaf)) { throw "AI_WHEELHOUSE_ARCHIVE does not exist" }
+          New-Item -ItemType Directory -Force ai-wheelhouse | Out-Null
+          tar -xf $env:AI_WHEELHOUSE_ARCHIVE -C ai-wheelhouse
+          Copy-Item -LiteralPath $env:AI_WHEELHOUSE_DESCRIPTOR -Destination ai-wheelhouse-release.json
+          python scripts/verify_ai_wheelhouse.py --descriptor ai-wheelhouse-release.json --wheelhouse ai-wheelhouse
       - name: 离线安装、校验精确源码和模型
         shell: pwsh
         run: |
           python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
+          python -m pip install --no-index --find-links ai-wheelhouse --require-hashes -r requirements-ai.txt
           python scripts/dependency_lock.py --wheelhouse wheelhouse --python python --target-sys-platform win32
+          python scripts/verify_ai_wheelhouse.py --descriptor ai-wheelhouse-release.json --wheelhouse ai-wheelhouse
           python -m pytest -q
           python -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
       - name: 构建带版本的 Windows bundle
         shell: pwsh
         run: |
           python scripts/set_release_version.py $env:VISION_RELEASE_VERSION
-          ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse")
-          python scripts/verify_packaged_exe.py --expected-version $env:VISION_RELEASE_VERSION
+          ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse") -AiWheelhouse (Join-Path $PWD "ai-wheelhouse") -AiWheelhouseDescriptor (Join-Path $PWD "ai-wheelhouse-release.json")
+          python -m PyInstaller --clean --noconfirm vending_vision.spec
+          python -m PyInstaller --clean --noconfirm vending_vision_ai_worker.spec
+          python scripts/verify_packaged_exe.py --expected-version $env:VISION_RELEASE_VERSION --require-ai-worker
           New-Item -ItemType Directory -Force candidate | Out-Null
-          Compress-Archive -Path dist/vending-vision -DestinationPath candidate/vending-vision-$env:VISION_RELEASE_VERSION-windows-x86_64.zip -CompressionLevel Optimal
+          Compress-Archive -Path dist/vending-vision,dist/vending-vision-ai-worker -DestinationPath candidate/vending-vision-$env:VISION_RELEASE_VERSION-windows-x86_64.zip -CompressionLevel Optimal
+          $manifest = @{
+            schemaVersion = "vending-vision-candidate-artifact/v1"
+            workerExecutable = "vending-vision-ai-worker/vending-vision-ai-worker.exe"
+            runtimeDescriptorSha256 = (Get-FileHash ai-runtime-descriptor.json -Algorithm SHA256).Hash.ToLowerInvariant()
+            aiWheelhouseManifestSha256 = (Get-FileHash ai-wheelhouse-release.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          } | ConvertTo-Json -Depth 4 -Compress
+          Set-Content -LiteralPath candidate/vending-vision-$env:VISION_RELEASE_VERSION-windows-x86_64.manifest.json -Value $manifest -Encoding utf8NoBOM
       - name: 生成并签署供应方证据
         shell: pwsh
         env:
