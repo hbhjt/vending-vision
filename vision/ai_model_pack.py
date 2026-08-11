@@ -15,15 +15,15 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from vision.ai_runtime_descriptor import RUNTIME_DESCRIPTOR_PATH
-from vision.source_provenance import OFFICIAL_SOURCE_DESCRIPTOR_PATH
-
 OFFICIAL_CATVTON_REPOSITORY = "zhengchong/CatVTON"
 OFFICIAL_CATVTON_REVISION = "2969fcf85fe62f2036605716f0b56f0b81d01d79"
 OFFICIAL_CATVTON_SOURCE_REVISION = "3b795364a4d2f3b5adb365f39cdea376d20bc53c"
 MANIFEST_NAME = "ai-model-manifest.json"
 MANIFEST_SCHEMA_VERSION = "vem-official-ai-model-pack-descriptor/v2"
-OFFICIAL_DESCRIPTOR_PATH = Path(__file__).resolve().parents[1] / "official-ai-model-pack-descriptor.json"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+OFFICIAL_DESCRIPTOR_PATH = REPO_ROOT / "official-ai-model-pack-descriptor.json"
+OFFICIAL_SOURCE_DESCRIPTOR_PATH = REPO_ROOT / "official-ai-source-descriptor.json"
+RUNTIME_DESCRIPTOR_PATH = REPO_ROOT / "ai-runtime-descriptor.json"
 _READINESS_LOCK = threading.Lock()
 _REQUIREMENTS_AI_PATH = RUNTIME_DESCRIPTOR_PATH.with_name("requirements-ai.txt")
 _REQUIREMENTS_AI_LOCK_PATH = RUNTIME_DESCRIPTOR_PATH.with_name("requirements-ai.lock.json")

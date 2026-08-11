@@ -1,5 +1,6 @@
 import hashlib
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -100,6 +101,25 @@ def test_precutover_proof_requires_actual_archive_and_installs_verified_bytes(tm
     }
     assert report["descriptor"]["catvtonSourceRevision"] == "mini-source"
     assert Path(report["installedPack"]).is_dir()
+
+
+def test_precutover_verifier_imports_with_the_pinned_stdlib_python():
+    result = subprocess.run(
+        [
+            "/usr/bin/python3.11",
+            "-I",
+            "-c",
+            (
+                "import sys;"
+                f"sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
+                "import scripts.precutover_ai_model_pack"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_model_pack_zip_checker_streams_each_entry_and_rejects_same_size_tamper(tmp_path):
