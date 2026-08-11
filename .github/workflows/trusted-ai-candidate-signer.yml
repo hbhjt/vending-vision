@@ -1,0 +1,141 @@
+name: Trusted AI candidate signer
+
+on:
+  workflow_call:
+    inputs:
+      source_commit:
+        description: Exact approved candidate source commit
+        required: true
+        type: string
+      source_ref:
+        description: Exact RC tag ref pointing at source_commit
+        required: true
+        type: string
+      artifact_name:
+        description: Trusted builder artifact name from this workflow run
+        required: true
+        type: string
+      artifact_file:
+        description: Candidate ZIP file name within the builder artifact
+        required: true
+        type: string
+      subject_sha256:
+        description: Candidate ZIP digest reported by the trusted builder
+        required: true
+        type: string
+      manifest_sha256:
+        description: Embedded candidate manifest digest reported by the trusted builder
+        required: true
+        type: string
+      attestation_bundle_file:
+        description: GitHub attestation bundle file name within the builder artifact
+        required: true
+        type: string
+      attestation_bundle_sha256:
+        description: GitHub attestation bundle digest reported by the trusted builder
+        required: true
+        type: string
+      builder_evidence_file:
+        description: Trusted builder evidence file name within the builder artifact
+        required: true
+        type: string
+    outputs:
+      signed_evidence_artifact_name:
+        description: Artifact containing supplier-signed installed evidence
+        value: ${{ jobs.sign.outputs.signed_evidence_artifact_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: windows-latest
+    environment: experimental-candidate
+    permissions:
+      contents: read
+      attestations: read
+    outputs:
+      signed_evidence_artifact_name: ${{ steps.identities.outputs.signed_evidence_artifact_name }}
+    steps:
+      - name: Checkout immutable trusted signer implementation
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: trusted-signer
+          persist-credentials: false
+      - name: Validate immutable signer and builder identities
+        id: identities
+        shell: pwsh
+        run: |
+          if ("${{ job.workflow_repository }}" -cne "hbhjt/vending-vision") { throw "unexpected trusted signer repository" }
+          if ("${{ job.workflow_file_path }}" -cne ".github/workflows/trusted-ai-candidate-signer.yml") { throw "unexpected trusted signer workflow" }
+          if ("${{ job.workflow_sha }}" -notmatch '^[a-f0-9]{40}$') { throw "trusted signer SHA is unavailable" }
+          if ("${{ inputs.source_commit }}" -notmatch '^[a-f0-9]{40}$') { throw "source_commit must be a full lowercase commit SHA" }
+          if ("${{ inputs.source_ref }}" -notmatch '^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+$') { throw "source_ref must be an RC tag ref" }
+          if ("${{ inputs.source_commit }}" -cne "${{ github.sha }}" -or "${{ inputs.source_ref }}" -cne "${{ github.ref }}") { throw "source claim must equal the caller event identity" }
+          if ("${{ inputs.artifact_name }}" -cne "vending-vision-trusted-${{ inputs.source_commit }}") { throw "builder artifact name is not from the current source claim" }
+          foreach ($digest in @("${{ inputs.subject_sha256 }}", "${{ inputs.manifest_sha256 }}", "${{ inputs.attestation_bundle_sha256 }}")) {
+            if ($digest -notmatch '^[a-f0-9]{64}$') { throw "builder metadata digest is invalid" }
+          }
+          "signed_evidence_artifact_name=vending-vision-signed-evidence-${{ inputs.source_commit }}" >> $env:GITHUB_OUTPUT
+      - name: Download only the trusted builder artifact from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: builder-input
+      - name: Verify trusted builder provenance before reading the candidate
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $artifact = Join-Path $PWD "builder-input/${{ inputs.artifact_file }}"
+          $bundle = Join-Path $PWD "builder-input/${{ inputs.attestation_bundle_file }}"
+          gh attestation verify $artifact --bundle $bundle --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "fbb97d16f42b2c20a04831750c639fda6db1a3e9" --source-ref "${{ inputs.source_ref }}" --source-digest "${{ inputs.source_commit }}" --deny-self-hosted-runners
+          if ($LASTEXITCODE -ne 0) { throw "trusted builder attestation verification failed" }
+      - name: Safely verify and extract only manifest-bound ZIP data
+        shell: pwsh
+        run: |
+          python trusted-signer/scripts/verify_trusted_candidate_inputs.py --artifact "builder-input/${{ inputs.artifact_file }}" --candidate-manifest builder-input/candidate-manifest.json --github-attestation "builder-input/${{ inputs.attestation_bundle_file }}" --trusted-builder-evidence "builder-input/${{ inputs.builder_evidence_file }}" --subject-sha256 "${{ inputs.subject_sha256 }}" --manifest-sha256 "${{ inputs.manifest_sha256 }}" --attestation-bundle-sha256 "${{ inputs.attestation_bundle_sha256 }}" --source-commit "${{ inputs.source_commit }}" --destination verified-candidate
+          if ($LASTEXITCODE -ne 0) { throw "trusted candidate data verification failed" }
+      - name: Approve source as data against protected main and its exact RC tag
+        shell: pwsh
+        run: |
+          git init --bare source-approval.git
+          git --git-dir source-approval.git remote add origin https://github.com/hbhjt/vending-vision.git
+          git --git-dir source-approval.git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git --git-dir source-approval.git fetch --no-tags origin "+${{ inputs.source_commit }}:refs/trusted/source-commit"
+          git --git-dir source-approval.git fetch --no-tags origin "+${{ inputs.source_ref }}:${{ inputs.source_ref }}"
+          python trusted-signer/scripts/approve_candidate_source.py --git-dir source-approval.git --source-commit "${{ inputs.source_commit }}" --source-ref "${{ inputs.source_ref }}" --protected-main refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) { throw "source commit is not approved by protected main and its exact tag" }
+      - name: Generate evidence from trusted code and approved source data
+        shell: pwsh
+        env:
+          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}
+        run: |
+          if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "supplier signer identity is invalid" }
+          $version = "${{ inputs.source_ref }}" -replace '^refs/tags/v',''
+          python trusted-signer/scripts/generate_trusted_candidate_evidence.py --bundle "builder-input/${{ inputs.artifact_file }}" --candidate-manifest builder-input/candidate-manifest.json --github-attestation "builder-input/${{ inputs.attestation_bundle_file }}" --trusted-builder-evidence "builder-input/${{ inputs.builder_evidence_file }}" --verified-root verified-candidate --git-dir source-approval.git --source-commit "${{ inputs.source_commit }}" --source-ref "${{ inputs.source_ref }}" --version $version --repository hbhjt/vending-vision --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY --output signed-evidence
+          if ($LASTEXITCODE -ne 0) { throw "trusted evidence generation failed" }
+      - name: Sign evidence without exposing the supplier key to candidate code
+        shell: pwsh
+        env:
+          VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}
+          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:VISION_SUPPLIER_PRIVATE_KEY_PEM)) { throw "supplier private key is required" }
+          $key = Join-Path $env:RUNNER_TEMP "supplier-ed25519.pem"
+          try {
+            [IO.File]::WriteAllText($key, $env:VISION_SUPPLIER_PRIVATE_KEY_PEM)
+            python trusted-signer/scripts/sign_candidate_evidence.py --candidate-dir signed-evidence --private-key $key --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY
+            if ($LASTEXITCODE -ne 0) { throw "installed evidence signing failed" }
+          } finally {
+            Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue
+          }
+      - name: Upload only supplier-signed evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.identities.outputs.signed_evidence_artifact_name }}
+          path: signed-evidence/*
+          if-no-files-found: error
+          retention-days: 14
