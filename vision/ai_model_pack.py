@@ -54,7 +54,7 @@ _READINESS_SNAPSHOT = OfficialAiReadinessSnapshot(
     root=None,
     identity=None,
     ready=False,
-    diagnostic="ai_model_pack_missing",
+    diagnostic="model_pack_missing",
 )
 _READINESS_FILE_RELATIVES: tuple[str, ...] = ()
 _READINESS_DESIRED_ROOT: str | None = None
@@ -294,11 +294,16 @@ def verify_ai_model_pack(root: str | Path | None, *, descriptor: dict | None = N
     return AiModelPack(pack_root, primary["repository"], primary["revision"], tuple(files), manifest)
 
 
-def _readiness_identity(pack_root: Path, descriptor: dict) -> tuple[object, ...]:
+def _pack_readiness_identity(pack_root: Path, descriptor: dict) -> tuple[object, ...]:
     return (
         str(pack_root),
         _quick_file_identity(pack_root / MANIFEST_NAME),
         _pack_files_identity(pack_root, descriptor),
+    )
+
+
+def _runtime_readiness_identity() -> tuple[object, ...]:
+    return (
         _quick_file_identity(OFFICIAL_DESCRIPTOR_PATH),
         _quick_file_identity(OFFICIAL_SOURCE_DESCRIPTOR_PATH),
         _quick_file_identity(RUNTIME_DESCRIPTOR_PATH),
@@ -314,14 +319,38 @@ def _compute_official_ai_readiness_snapshot(root: str | Path | None) -> Official
             root=None,
             identity=None,
             ready=False,
-            diagnostic="ai_model_pack_missing",
+            diagnostic="model_pack_missing",
         )
     pack_root = Path(root).resolve()
-    identity = None
+    if not pack_root.is_dir():
+        return OfficialAiReadinessSnapshot(
+            root=str(pack_root),
+            identity=None,
+            ready=False,
+            diagnostic="model_pack_missing",
+        )
     try:
         descriptor = load_official_ai_model_pack_descriptor()
-        identity = _readiness_identity(pack_root, descriptor)
+        runtime_identity = _runtime_readiness_identity()
+    except (AiModelPackError, OSError, ValueError):
+        return OfficialAiReadinessSnapshot(
+            root=str(pack_root),
+            identity=None,
+            ready=False,
+            diagnostic="worker_unavailable",
+        )
+    try:
+        pack_identity = _pack_readiness_identity(pack_root, descriptor)
         verify_ai_model_pack(pack_root, descriptor=descriptor)
+    except (AiModelPackError, OSError, ValueError):
+        return OfficialAiReadinessSnapshot(
+            root=str(pack_root),
+            identity=None,
+            ready=False,
+            diagnostic="model_pack_invalid",
+        )
+    identity = pack_identity + runtime_identity
+    try:
         from vision.ai_attempt_process import probe_ai_attempt_worker
 
         probe_ai_attempt_worker(pack_root)
@@ -331,16 +360,13 @@ def _compute_official_ai_readiness_snapshot(root: str | Path | None) -> Official
             ready=True,
             diagnostic="ready",
         )
-    except AiModelPackError as exc:
-        diagnostic = str(exc) or "ai_model_pack_invalid"
-    except (ImportError, RuntimeError, OSError) as exc:
-        diagnostic = str(exc) or exc.__class__.__name__
-    return OfficialAiReadinessSnapshot(
-        root=str(pack_root),
-        identity=identity,
-        ready=False,
-        diagnostic=diagnostic,
-    )
+    except (ImportError, RuntimeError, OSError):
+        return OfficialAiReadinessSnapshot(
+            root=str(pack_root),
+            identity=identity,
+            ready=False,
+            diagnostic="worker_unavailable",
+        )
 
 
 async def refresh_official_ai_readiness(root: str | Path | None) -> OfficialAiReadinessSnapshot:
@@ -361,20 +387,27 @@ async def refresh_official_ai_readiness(root: str | Path | None) -> OfficialAiRe
     return snapshot
 
 
-def _current_readiness_identity(root: str) -> tuple[object, ...]:
+def _current_readiness_failure(
+    root: str,
+) -> tuple[tuple[object, ...] | None, str | None]:
     pack_root = Path(root)
+    if not pack_root.is_dir():
+        return None, "model_pack_missing"
     with _READINESS_LOCK:
         relatives = _READINESS_FILE_RELATIVES
-    return (
-        root,
-        _quick_file_identity(pack_root / MANIFEST_NAME),
-        tuple(_quick_file_identity(pack_root / relative) for relative in relatives),
-        _quick_file_identity(OFFICIAL_DESCRIPTOR_PATH),
-        _quick_file_identity(OFFICIAL_SOURCE_DESCRIPTOR_PATH),
-        _quick_file_identity(RUNTIME_DESCRIPTOR_PATH),
-        _quick_file_identity(_REQUIREMENTS_AI_PATH),
-        _quick_file_identity(_REQUIREMENTS_AI_LOCK_PATH),
-    )
+    try:
+        pack_identity = (
+            root,
+            _quick_file_identity(pack_root / MANIFEST_NAME),
+            tuple(_quick_file_identity(pack_root / relative) for relative in relatives),
+        )
+    except OSError:
+        return None, "model_pack_invalid"
+    try:
+        runtime_identity = _runtime_readiness_identity()
+    except OSError:
+        return None, "worker_unavailable"
+    return pack_identity + runtime_identity, None
 
 
 async def _owned_readiness_refresh() -> None:
@@ -410,10 +443,7 @@ def _hot_revalidate_readiness(root: str | None) -> OfficialAiReadinessSnapshot:
         snapshot = _READINESS_SNAPSHOT
     if root is None:
         return snapshot
-    try:
-        identity = _current_readiness_identity(root)
-    except OSError:
-        identity = None
+    identity, failure_diagnostic = _current_readiness_failure(root)
     if snapshot.root == root and snapshot.identity == identity:
         return snapshot
     with _READINESS_LOCK:
@@ -424,7 +454,7 @@ def _hot_revalidate_readiness(root: str | None) -> OfficialAiReadinessSnapshot:
                 root=root,
                 identity=identity,
                 ready=False,
-                diagnostic="ai_model_pack_identity_changed",
+                diagnostic=failure_diagnostic or "model_pack_invalid",
             )
         snapshot = _READINESS_SNAPSHOT
     _schedule_owned_readiness_refresh()
@@ -463,7 +493,7 @@ def reset_official_ai_readiness_cache_for_tests() -> None:
             root=None,
             identity=None,
             ready=False,
-            diagnostic="ai_model_pack_missing",
+            diagnostic="model_pack_missing",
         )
         _READINESS_FILE_RELATIVES = ()
         _READINESS_DESIRED_ROOT = None

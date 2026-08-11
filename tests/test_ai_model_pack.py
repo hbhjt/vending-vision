@@ -194,6 +194,69 @@ def test_official_readiness_cache_misses_when_weight_identity_changes(tmp_path, 
     assert calls == [tmp_path.resolve()]
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_diagnostic"),
+    [
+        ("missing", "model_pack_missing"),
+        ("incomplete", "model_pack_invalid"),
+        ("digest", "model_pack_invalid"),
+        ("corrupt", "model_pack_invalid"),
+        ("probe", "worker_unavailable"),
+    ],
+)
+def test_readiness_failures_expose_only_stable_diagnostics(
+    tmp_path, monkeypatch, failure, expected_diagnostic
+):
+    pack = tmp_path / "pack"
+    model = pack / "mini" / "a.bin"
+    expected_bytes = b"mini-model"
+    descriptor = {
+        "schemaVersion": "vem-official-ai-model-pack-descriptor/v2",
+        "catvtonSourceRevision": "test-source",
+        "totalByteSize": len(expected_bytes),
+        "upstreams": [{"id": "mini", "repository": "example/mini", "revision": "abc"}],
+        "files": [{
+            "path": "mini/a.bin",
+            "upstreamPath": "a.bin",
+            "upstream": "mini",
+            "role": "mini_weight",
+            "format": "bin",
+            "byteSize": len(expected_bytes),
+            "sha256": hashlib.sha256(expected_bytes).hexdigest(),
+        }],
+    }
+    if failure != "missing":
+        model.parent.mkdir(parents=True)
+        if failure != "incomplete":
+            model.write_bytes(b"bad-digest" if failure == "digest" else expected_bytes)
+        (pack / "ai-model-manifest.json").write_text(
+            "{corrupt"
+            if failure == "corrupt"
+            else canonical_ai_model_manifest_json(descriptor),
+            "utf-8",
+        )
+
+    monkeypatch.setattr(
+        ai_model_pack_module,
+        "load_official_ai_model_pack_descriptor",
+        lambda: descriptor,
+    )
+    if failure == "probe":
+        monkeypatch.setattr(
+            "vision.ai_attempt_process.probe_ai_attempt_worker",
+            lambda _pack: (_ for _ in ()).throw(RuntimeError("C:\\private\\worker.exe")),
+        )
+    else:
+        monkeypatch.setattr("vision.ai_attempt_process.probe_ai_attempt_worker", lambda _pack: None)
+    reset_official_ai_readiness_cache_for_tests()
+
+    snapshot = asyncio.run(refresh_official_ai_readiness(pack))
+
+    assert snapshot.ready is False
+    assert snapshot.diagnostic == expected_diagnostic
+    assert str(tmp_path) not in snapshot.diagnostic
+
+
 def test_official_readiness_refresh_runs_heavy_probe_off_loop_and_cache_read_is_stat_only(tmp_path, monkeypatch):
     model = tmp_path / "mini" / "a.bin"
     model.parent.mkdir()

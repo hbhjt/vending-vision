@@ -230,6 +230,78 @@ def test_generated_hello_reports_fast_unavailable_when_acquisition_observer_is_n
     assert ready["payload"]["businessReadinessDiagnostic"] == "camera_unavailable"
 
 
+@pytest.mark.parametrize(
+    ("pack_case", "expected_diagnostic"),
+    [
+        ("missing", "model_pack_missing"),
+        ("corrupt", "model_pack_invalid"),
+    ],
+)
+def test_ai_pack_failure_reports_stable_reason_without_degrading_public_core(
+    tmp_path,
+    monkeypatch,
+    pack_case,
+    expected_diagnostic,
+):
+    """AI-only degradation remains diagnosable across the public Vision boundary."""
+    manifest = json.loads((BUNDLE_ROOT / "manifest.json").read_text("utf-8"))
+    if pack_case == "missing":
+        monkeypatch.delenv("VEM_AI_MODEL_PACK", raising=False)
+    else:
+        pack = tmp_path / "corrupt-pack"
+        descriptor = json.loads(
+            (Path(__file__).parents[1] / "official-ai-model-pack-descriptor.json").read_text(
+                "utf-8"
+            )
+        )
+        for entry in descriptor["files"]:
+            model = pack / entry["path"]
+            model.parent.mkdir(parents=True, exist_ok=True)
+            with model.open("wb") as stream:
+                stream.truncate(entry["byteSize"])
+        (pack / "ai-model-manifest.json").write_text("{corrupt", "utf-8")
+        monkeypatch.setenv("VEM_AI_MODEL_PACK", str(pack))
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "ageGenderReady": True,
+            "ageGenderMode": "production",
+            "fastRenderReady": True,
+            "fastPoseReady": True,
+            "acquisitionObserverReady": True,
+            "check": {"checks": {}},
+        },
+    )
+
+    with TestClient(vision_app.app) as client:
+        health = client.get("/health")
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_envelope("vision.hello", _hello_payload(manifest)))
+            ready = socket.receive_json()
+            socket.send_json(_envelope("vision.ping", {}))
+            pong = socket.receive_json()
+
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
+    assert ready["type"] == "vision.ready"
+    assert ready["payload"]["aiReady"] is False
+    assert ready["payload"]["fastReady"] is True
+    assert ready["payload"]["visionBusinessReady"] is True
+    assert "try_on_fast" in ready["payload"]["capabilities"]
+    assert "try_on_ai" not in ready["payload"]["capabilities"]
+    assert "profile_push" in ready["payload"]["capabilities"]
+    assert "presence_status" in ready["payload"]["capabilities"]
+    assert pong["type"] == "vision.pong"
+    assert ready["payload"]["aiReadinessDiagnostic"] == expected_diagnostic
+    assert health.json()["aiReadinessDiagnostic"] == expected_diagnostic
+    assert str(tmp_path) not in json.dumps(ready)
+    assert str(tmp_path) not in json.dumps(health.json())
+
+
 def test_websocket_session_repeated_cancel_still_runs_cleanup_barrier(monkeypatch):
     """Transport cancellation must not skip registry/profile cleanup awaits."""
     async def scenario():
