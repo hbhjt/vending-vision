@@ -1,8 +1,10 @@
 import asyncio
+import contextlib
 import hashlib
 import json
 import math
 import os
+import socket as socket_module
 import sys
 import tempfile
 import threading
@@ -18,7 +20,9 @@ import cv2
 import httpx
 import numpy as np
 import pytest
+import uvicorn
 from fastapi import FastAPI, WebSocket
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 import app as vision_app
@@ -309,27 +313,85 @@ def _receive_json_deadline(socket, *, timeout: float = 3.0):
     return json.loads(message["text"])
 
 
-def _http_get_deadline(client, path: str, *, timeout: float = 3.0):
-    portal = getattr(client, "portal", None)
-    if portal is None:
-        raise AssertionError("TestClient deadline request requires an active portal")
-
-    async def get():
-        transport = httpx.ASGITransport(app=client.app)
-        with anyio.fail_after(timeout):
-            async with httpx.AsyncClient(
-                transport=transport,
-                base_url=str(client.base_url),
-                headers=client.headers,
-                cookies=client.cookies,
-                follow_redirects=True,
-            ) as async_client:
-                return await async_client.get(path)
-
+def _http_get_deadline(base_url: str, path: str, *, timeout: float = 3.0):
     try:
-        return portal.call(get)
-    except TimeoutError as exc:
+        return httpx.get(
+            f"{base_url}{path}",
+            timeout=httpx.Timeout(timeout),
+            follow_redirects=True,
+            trust_env=False,
+        )
+    except httpx.TimeoutException as exc:
         raise TimeoutError(f"HTTP GET {path} deadline exceeded") from exc
+
+
+@contextlib.contextmanager
+def _production_http_loopback(*, extra_routes=()):
+    production_paths = {
+        "/",
+        "/health",
+        "/v2/try-on/results/{attempt_id}",
+    }
+    production_routes = [
+        route
+        for route in vision_app.app.routes
+        if getattr(route, "path", None) in production_paths
+    ]
+    assert {route.path for route in production_routes} == production_paths
+    router = FastAPI()
+    router.router.routes = [*production_routes, *extra_routes]
+    listener = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+    listener.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(128)
+    host, port = listener.getsockname()
+    config = uvicorn.Config(
+        router,
+        host=host,
+        port=port,
+        loop="asyncio",
+        http="h11",
+        lifespan="off",
+        access_log=False,
+        log_level="warning",
+    )
+    server = uvicorn.Server(config)
+    server_errors = []
+
+    def serve():
+        try:
+            server.run(sockets=[listener])
+        except BaseException as exc:
+            server_errors.append(exc)
+
+    server_thread = threading.Thread(
+        target=serve,
+        name=f"uvicorn-loopback-{uuid4()}",
+    )
+    server_thread.start()
+    startup_deadline = time.monotonic() + 3.0
+    while (
+        not server.started
+        and server_thread.is_alive()
+        and time.monotonic() < startup_deadline
+    ):
+        time.sleep(0.01)
+    if not server.started:
+        server.should_exit = True
+        server_thread.join(2.0)
+        listener.close()
+        raise AssertionError(f"loopback Uvicorn failed startup: {server_errors}")
+    try:
+        yield f"http://{host}:{port}"
+    finally:
+        server.should_exit = True
+        server_thread.join(3.0)
+        if server_thread.is_alive():
+            server.force_exit = True
+            server_thread.join(2.0)
+        listener.close()
+        assert not server_thread.is_alive(), "loopback Uvicorn failed bounded shutdown"
+        assert server_errors == []
 
 
 def _deadline_probe_app(exits: dict[str, int]) -> FastAPI:
@@ -343,15 +405,8 @@ def _deadline_probe_app(exits: dict[str, int]) -> FastAPI:
         finally:
             exits["websocket"] += 1
 
-    @probe.get("/blocked")
-    async def blocked():
-        try:
-            await anyio.sleep_forever()
-        finally:
-            exits["http"] += 1
-
     @probe.get("/health")
-    async def health():
+    def health():
         return {"status": "ok"}
 
     return probe
@@ -379,20 +434,44 @@ def test_real_public_websocket_receive_deadline_cancels_without_residue():
 
 def test_real_blocked_http_deadline_cancels_and_keeps_client_usable():
     exits = {"websocket": 0, "http": 0}
-    app = _deadline_probe_app(exits)
+    handler_started = threading.Event()
+    handler_finished = threading.Event()
+    request_threads = []
+    health_route = next(
+        route for route in vision_app.app.routes if getattr(route, "path", None) == "/health"
+    )
 
-    with TestClient(app) as client:
-        for expected_exits in range(1, 6):
-            started = time.monotonic()
-            with pytest.raises(TimeoutError, match="HTTP GET /blocked deadline"):
-                _http_get_deadline(client, "/blocked", timeout=0.05)
-            assert time.monotonic() - started < 0.5
-            assert exits["http"] == expected_exits
-        assert client.get("/health").json() == {"status": "ok"}
+    def blocked_health():
+        request_threads.append(threading.current_thread())
+        handler_started.set()
+        try:
+            time.sleep(0.6)
+            return health_route.endpoint()
+        finally:
+            exits["http"] += 1
+            handler_finished.set()
+
+    with TestClient(vision_app.app) as client:
+        with _production_http_loopback(
+            extra_routes=[APIRoute("/blocked", blocked_health, methods=["GET"])]
+        ) as base_url:
+            for expected_exits in range(1, 6):
+                handler_started.clear()
+                handler_finished.clear()
+                started = time.monotonic()
+                with pytest.raises(TimeoutError, match="HTTP GET /blocked deadline"):
+                    _http_get_deadline(base_url, "/blocked", timeout=0.05)
+                assert time.monotonic() - started < 0.5
+                assert handler_started.wait(0.5)
+                assert handler_finished.wait(1.0)
+                assert exits["http"] == expected_exits
+                assert _http_get_deadline(base_url, "/health").status_code == 200
+        assert client.get("/health").status_code == 200
 
     assert exits["http"] == 5
+    assert all(not thread.is_alive() for thread in request_threads)
     assert not any(
-        thread.name.startswith("deadline-") for thread in threading.enumerate()
+        thread.name.startswith("uvicorn-loopback-") for thread in threading.enumerate()
     )
 
 
@@ -498,7 +577,10 @@ def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_l
     server, thread, reference = _serve_garment()
     attempt_id = str(uuid4())
     try:
-        with TestClient(vision_app.app) as client:
+        with (
+            TestClient(vision_app.app) as client,
+            _production_http_loopback() as http_base_url,
+        ):
             with client.websocket_connect("/ws") as socket:
                 socket.send_json(
                     _hello(
@@ -509,7 +591,7 @@ def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_l
                     )
                 )
                 ready = _receive_json_deadline(socket)
-                initial_health = _http_get_deadline(client, "/health")
+                initial_health = _http_get_deadline(http_base_url, "/health")
                 socket.send_json(_start(attempt_id, reference))
                 trace = _receive_until_generating(socket)
                 tree = _wait_pid_tree(pid_file)
@@ -548,7 +630,7 @@ def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_l
                     try:
                         for path in ("/", "/health") * 4:
                             started = time.monotonic()
-                            response = _http_get_deadline(client, path)
+                            response = _http_get_deadline(http_base_url, path)
                             core_latencies.append(time.monotonic() - started)
                             core_statuses.append((path, response.status_code))
                     except Exception as exc:
@@ -621,10 +703,10 @@ def test_public_ai_bounded_cpu_rss_pressure_keeps_ws_presence_profile_and_core_l
                         break
 
             missing = _http_get_deadline(
-                client,
+                http_base_url,
                 f"/v2/try-on/results/{attempt_id}?token=no-result"
             )
-            final_health = _http_get_deadline(client, "/health")
+            final_health = _http_get_deadline(http_base_url, "/health")
             with client.websocket_connect("/ws") as final_socket:
                 final_socket.send_json(_hello())
                 final_ready = _receive_json_deadline(final_socket)
