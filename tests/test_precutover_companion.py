@@ -456,6 +456,52 @@ def test_windows_file_lease_allows_only_read_sharing_and_checks_close_result(tmp
     kernel32.close_result = 0
     with pytest.raises(RuntimeError, match="precutover_integrity_handle_close"):
         api.close(handle)
+    assert kernel32.closed == [42, 42, 42]
+
+
+def test_windows_prepared_proof_is_created_and_flushed_with_read_only_sharing(tmp_path):
+    class FakeKernel32:
+        def __init__(self):
+            self.opened = []
+            self.written = bytearray()
+            self.flushed = []
+
+        def CreateFileW(self, *arguments):
+            self.opened.append(arguments)
+            return 84
+
+        def WriteFile(self, handle, buffer, size, written, _overlapped):
+            assert handle == 84
+            self.written.extend(bytes(buffer.raw[:size]))
+            written._obj.value = size
+            return 1
+
+        def FlushFileBuffers(self, handle):
+            self.flushed.append(handle)
+            return 1
+
+        def CloseHandle(self, _handle):
+            return 1
+
+    kernel32 = FakeKernel32()
+    api = _WindowsFileApi(kernel32)
+    path = tmp_path / ".proof.random.tmp"
+    handle = api.create_prepared_lease(path)
+    api.write_all(handle, b"canonical proof\n")
+
+    assert kernel32.opened == [
+        (
+            str(path),
+            _WindowsFileApi.GENERIC_READ | _WindowsFileApi.GENERIC_WRITE,
+            _WindowsFileApi.FILE_SHARE_READ,
+            None,
+            _WindowsFileApi.CREATE_NEW,
+            _WindowsFileApi.FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    ]
+    assert kernel32.written == b"canonical proof\n"
+    assert kernel32.flushed == [84]
 
 
 @pytest.mark.parametrize("invalid_handle", [None, 0, -1])
@@ -595,3 +641,118 @@ def test_failure_after_final_link_rolls_back_only_this_invocation(tmp_path, monk
     assert not output.exists()
     assert not list(tmp_path.glob(".proof.json.*.tmp"))
     assert not list(tmp_path.glob(".precutover-*"))
+
+
+@pytest.mark.parametrize("mutation", ["atomic-replace", "in-place-same-bytes"])
+def test_prepared_proof_is_fenced_while_inputs_close_and_private_state_cleans(
+    tmp_path, monkeypatch, mutation
+):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+    original_prepare = companion._prepare_exclusive
+
+    def mutate_after_prepare(path, value, *, before_close):
+        prepared = original_prepare(path, value, before_close=before_close)
+        content = prepared.path.read_bytes()
+        if mutation == "atomic-replace":
+            replacement = prepared.path.with_name(f".{prepared.path.name}.replacement")
+            replacement.write_bytes(b"attacker-controlled proof\n")
+            os.replace(replacement, prepared.path)
+        else:
+            with prepared.path.open("r+b") as stream:
+                stream.seek(0)
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        return prepared
+
+    monkeypatch.setattr(companion, "_prepare_exclusive", mutate_after_prepare)
+
+    with pytest.raises(RuntimeError, match="precutover_integrity"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))
+
+
+def test_prepared_proof_link_rejects_an_instant_source_identity_swap(tmp_path, monkeypatch):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+    original_link = companion.os.link
+
+    def swap_source_after_link(source, destination):
+        original_link(source, destination)
+        replacement = Path(source).with_name(f".{Path(source).name}.replacement")
+        replacement.write_bytes(b"swapped after link\n")
+        os.replace(replacement, source)
+
+    monkeypatch.setattr(companion.os, "link", swap_source_after_link)
+
+    with pytest.raises(RuntimeError, match="precutover_integrity"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))
+
+
+def test_prepared_proof_lease_close_failure_rolls_back_linked_final(tmp_path, monkeypatch):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+    original_close = _IntegrityFence.close
+    failed = False
+
+    def fail_prepared_close(fence):
+        nonlocal failed
+        original_close(fence)
+        if (
+            not failed
+            and fence._expected
+            and fence._expected[0].label == "prepared_proof"
+        ):
+            failed = True
+            raise RuntimeError("precutover_integrity_handle_close")
+
+    monkeypatch.setattr(companion._IntegrityFence, "close", fail_prepared_close)
+
+    with pytest.raises(RuntimeError, match="precutover_integrity_handle_close"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert failed
+    assert not output.exists()
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))
+
+
+def test_windows_prepared_closehandle_false_rolls_back_the_linked_final(tmp_path):
+    temporary = tmp_path / ".proof.windows.tmp"
+    final = tmp_path / "proof.json"
+    temporary.write_bytes(b"canonical proof\n")
+    expectation = _ExpectedFile(
+        temporary,
+        temporary.stat().st_size,
+        sha256(temporary),
+        "prepared_proof",
+    )
+
+    class Kernel32:
+        def __init__(self):
+            self.close_results = [0, 1]
+
+        def CloseHandle(self, handle):
+            assert handle == 84
+            return self.close_results.pop(0)
+
+    prepared = companion._PreparedProof(
+        temporary,
+        expectation,
+        windows_api=_WindowsFileApi(Kernel32()),
+        windows_handle=84,
+    )
+
+    with pytest.raises(RuntimeError, match="precutover_integrity_handle_close"):
+        companion._publish_prepared(prepared, final)
+
+    assert not final.exists()
+    assert not temporary.exists()

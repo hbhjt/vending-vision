@@ -11,8 +11,10 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import stat
+import struct
 import sys
 import tempfile
 from typing import Callable
@@ -61,9 +63,23 @@ def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
         value.st_ino,
         value.st_mode,
         value.st_nlink,
+        value.st_uid,
+        value.st_gid,
         value.st_size,
         value.st_mtime_ns,
         value.st_ctime_ns,
+    )
+
+
+def _stable_hardlink_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_size,
+        value.st_mtime_ns,
     )
 
 
@@ -88,7 +104,9 @@ def _fd_sha256(descriptor: int) -> str:
 
 class _WindowsFileApi:
     GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
     FILE_SHARE_READ = 0x00000001
+    CREATE_NEW = 1
     OPEN_EXISTING = 3
     FILE_ATTRIBUTE_NORMAL = 0x00000080
 
@@ -109,6 +127,16 @@ class _WindowsFileApi:
             kernel32.CreateFileW.restype = ctypes.c_void_p
             kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
             kernel32.CloseHandle.restype = ctypes.c_int
+            kernel32.WriteFile.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_void_p,
+            ]
+            kernel32.WriteFile.restype = ctypes.c_int
+            kernel32.FlushFileBuffers.argtypes = [ctypes.c_void_p]
+            kernel32.FlushFileBuffers.restype = ctypes.c_int
         self._kernel32 = kernel32
 
     def open_read_lease(self, path: Path):
@@ -126,12 +154,53 @@ class _WindowsFileApi:
             raise RuntimeError("precutover_integrity_handle_open")
         return handle
 
+    def create_prepared_lease(self, path: Path):
+        handle = self._kernel32.CreateFileW(
+            str(path),
+            self.GENERIC_READ | self.GENERIC_WRITE,
+            self.FILE_SHARE_READ,
+            None,
+            self.CREATE_NEW,
+            self.FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in {None, 0, -1, invalid}:
+            raise RuntimeError("precutover_integrity_handle_create")
+        return handle
+
+    def write_all(self, handle, payload: bytes) -> None:
+        offset = 0
+        while offset < len(payload):
+            chunk = payload[offset : offset + 1024 * 1024]
+            buffer = ctypes.create_string_buffer(chunk)
+            written = ctypes.c_uint32()
+            if not self._kernel32.WriteFile(
+                handle,
+                buffer,
+                len(chunk),
+                ctypes.byref(written),
+                None,
+            ) or written.value != len(chunk):
+                raise RuntimeError("precutover_integrity_handle_write")
+            offset += written.value
+        if not self._kernel32.FlushFileBuffers(handle):
+            raise RuntimeError("precutover_integrity_handle_flush")
+
     def close(self, handle) -> None:
-        if not self._kernel32.CloseHandle(handle):
-            raise RuntimeError("precutover_integrity_handle_close")
+        failed = False
+        for _attempt in range(2):
+            if self._kernel32.CloseHandle(handle):
+                if failed:
+                    raise RuntimeError("precutover_integrity_handle_close")
+                return
+            failed = True
+        raise RuntimeError("precutover_integrity_handle_close")
 
 
 class _PosixChangeMonitor:
+    _ATTRIB = 0x00000004
+    _EVENT = struct.Struct("iIII")
     _MASK = (
         0x00000002
         | 0x00000004
@@ -167,13 +236,26 @@ class _PosixChangeMonitor:
             raise RuntimeError(f"precutover_integrity_monitor_add:{label}")
         self._labels[watch] = label
 
-    def verify(self) -> None:
-        try:
-            changed = os.read(self._descriptor, 1024 * 1024)
-        except BlockingIOError:
-            return
-        if changed:
-            raise RuntimeError("precutover_integrity_write_event")
+    def verify(self, *, allowed_mask: int = 0) -> list[int]:
+        changed = bytearray()
+        while True:
+            try:
+                changed.extend(os.read(self._descriptor, 1024 * 1024))
+            except BlockingIOError:
+                break
+        offset = 0
+        events = []
+        while offset < len(changed):
+            if len(changed) - offset < self._EVENT.size:
+                raise RuntimeError("precutover_integrity_monitor_event")
+            _watch, mask, _cookie, name_length = self._EVENT.unpack_from(changed, offset)
+            offset += self._EVENT.size + name_length
+            if mask & ~allowed_mask:
+                raise RuntimeError("precutover_integrity_write_event")
+            events.append(mask)
+        if offset != len(changed):
+            raise RuntimeError("precutover_integrity_monitor_event")
+        return events
 
     def close(self) -> None:
         if self._descriptor >= 0:
@@ -294,6 +376,25 @@ class _IntegrityFence:
                 digest = _sha256(expected.path)
             if digest != expected.sha256:
                 raise RuntimeError(f"precutover_integrity_digest:{expected.label}")
+
+    def accept_hardlink(self) -> None:
+        if self._monitor is not None:
+            events = self._monitor.verify(allowed_mask=_PosixChangeMonitor._ATTRIB)
+            if events != [_PosixChangeMonitor._ATTRIB]:
+                raise RuntimeError("precutover_integrity_hardlink_event")
+        for held in self._held:
+            current = held.expected.path.stat()
+            opened = os.fstat(held.descriptor) if held.descriptor is not None else current
+            if _stable_hardlink_identity(current) != _stable_hardlink_identity(opened):
+                raise RuntimeError("precutover_integrity_hardlink_identity")
+            digest = (
+                _fd_sha256(held.descriptor)
+                if held.descriptor is not None
+                else _sha256(held.expected.path)
+            )
+            if digest != held.expected.sha256:
+                raise RuntimeError("precutover_integrity_hardlink_digest")
+            held.identity = _stat_identity(current)
 
     def close(self) -> None:
         failure = None
@@ -503,23 +604,157 @@ def _unlink_owned(path: Path) -> None:
     raise failure
 
 
-def _prepare_exclusive(path: Path, value: dict, *, before_close) -> Path:
+class _PreparedProof:
+    def __init__(
+        self,
+        path: Path,
+        expectation: _ExpectedFile,
+        *,
+        descriptor: int | None = None,
+        fence: _IntegrityFence | None = None,
+        windows_api: _WindowsFileApi | None = None,
+        windows_handle=None,
+    ):
+        self.path = path
+        self._descriptor = descriptor
+        self._fence = fence
+        self._windows_api = windows_api
+        self._windows_handle = windows_handle
+        self._expectation = expectation
+        self._identity = _stat_identity(path.stat())
+        self._closed = False
+        self._linked = False
+
+    def verify(self) -> None:
+        if self._closed:
+            raise RuntimeError("precutover_integrity_prepared_closed")
+        if self._fence is not None:
+            self._fence.verify()
+        current = self.path.stat()
+        descriptor_changed = self._descriptor is not None and (
+            _stat_identity(os.fstat(self._descriptor)) != self._identity
+            or _fd_sha256(self._descriptor) != self._expectation.sha256
+        )
+        if (
+            _stat_identity(current) != self._identity
+            or descriptor_changed
+            or _sha256(self.path) != self._expectation.sha256
+        ):
+            raise RuntimeError("precutover_integrity_prepared_changed")
+
+    def verify_link(self, final_path: Path) -> None:
+        if not self._linked:
+            if self._fence is not None:
+                self._fence.accept_hardlink()
+            current = self.path.stat()
+            held = os.fstat(self._descriptor) if self._descriptor is not None else current
+            if _stable_hardlink_identity(current) != _stable_hardlink_identity(held):
+                raise RuntimeError("precutover_integrity_hardlink_identity")
+            self._identity = _stat_identity(current)
+            self._linked = True
+        else:
+            self.verify()
+        try:
+            final = final_path.lstat()
+        except OSError as exc:
+            raise RuntimeError("precutover_integrity_final_missing") from exc
+        held = self.path.stat()
+        if (
+            (final.st_dev, final.st_ino, final.st_mode)
+            != (held.st_dev, held.st_ino, held.st_mode)
+            or final.st_size != self._expectation.byte_size
+            or _sha256(final_path) != self._expectation.sha256
+        ):
+            raise RuntimeError("precutover_integrity_final_identity")
+        self.verify()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        failure = None
+        try:
+            if self._fence is not None:
+                self._fence.close()
+        except Exception as exc:
+            failure = exc
+        try:
+            if self._descriptor is not None:
+                os.close(self._descriptor)
+            elif self._windows_api is not None and self._windows_handle is not None:
+                self._windows_api.close(self._windows_handle)
+        except Exception as exc:
+            failure = failure or exc
+        self._closed = True
+        if failure is not None:
+            raise failure
+
+
+def _prepare_exclusive(path: Path, value: dict, *, before_close) -> _PreparedProof:
     if not path.is_absolute() or path.exists() or path.parent.resolve() != path.parent:
         raise RuntimeError("precutover_report_path")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(16)}.tmp")
+    descriptor = None
+    fence = None
+    windows_api = None
+    windows_handle = None
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(_canonical(value) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        payload = (_canonical(value) + "\n").encode("utf-8")
+        if os.name == "nt":
+            windows_api = _WindowsFileApi()
+            windows_handle = windows_api.create_prepared_lease(temporary)
+            windows_api.write_all(windows_handle, payload)
+        else:
+            descriptor = os.open(
+                temporary,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise RuntimeError("precutover_integrity_prepared_write")
+                offset += written
+            os.fsync(descriptor)
+        expectation = _ExpectedFile(
+            temporary,
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+            "prepared_proof",
+        )
+        if os.name != "nt":
+            fence = _IntegrityFence([expectation])
+            fence.__enter__()
         before_close()
-        return temporary
-    except Exception:
-        _unlink_owned(temporary)
-        raise
+        prepared = _PreparedProof(
+            temporary,
+            expectation,
+            descriptor=descriptor,
+            fence=fence,
+            windows_api=windows_api,
+            windows_handle=windows_handle,
+        )
+        prepared.verify()
+        return prepared
+    except Exception as exc:
+        failure = exc
+        try:
+            if fence is not None:
+                fence.close()
+        except Exception as cleanup_exc:
+            failure = cleanup_exc
+        try:
+            if descriptor is not None:
+                os.close(descriptor)
+            elif windows_api is not None and windows_handle is not None:
+                windows_api.close(windows_handle)
+        except Exception as cleanup_exc:
+            failure = failure or cleanup_exc
+        try:
+            _unlink_owned(temporary)
+        except Exception as cleanup_exc:
+            failure = failure or cleanup_exc
+        raise failure
 
 
 def _fsync_parent(path: Path) -> None:
@@ -532,25 +767,39 @@ def _fsync_parent(path: Path) -> None:
         os.close(descriptor)
 
 
-def _publish_prepared(temporary: Path, path: Path) -> None:
+def _publish_prepared(prepared: _PreparedProof, path: Path) -> None:
     created = False
-    temporary_stat = temporary.lstat()
+    temporary_stat = prepared.path.lstat()
     created_identity = (temporary_stat.st_dev, temporary_stat.st_ino, temporary_stat.st_mode)
+    failure = None
     try:
-        os.link(temporary, path)
+        prepared.verify()
+        os.link(prepared.path, path)
         created = True
-        _unlink_owned(temporary)
+        prepared.verify_link(path)
         _fsync_parent(path.parent)
-    except Exception:
+        prepared.verify_link(path)
+        prepared.close()
+        _unlink_owned(prepared.path)
+        _fsync_parent(path.parent)
+        return
+    except Exception as exc:
+        failure = exc
+    try:
+        prepared.close()
+    except Exception as exc:
+        failure = failure or exc
+    try:
         if created:
-            try:
-                current = path.lstat()
-                if (current.st_dev, current.st_ino, current.st_mode) == created_identity:
-                    _unlink_owned(path)
-                    _fsync_parent(path.parent)
-            except FileNotFoundError:
-                pass
-        raise
+            current = path.lstat()
+            if (current.st_dev, current.st_ino, current.st_mode) == created_identity:
+                _unlink_owned(path)
+                _fsync_parent(path.parent)
+    except FileNotFoundError:
+        pass
+    finally:
+        _unlink_owned(prepared.path)
+    raise failure
 
 
 def verify_precutover(
@@ -644,7 +893,7 @@ def verify_precutover(
         ),
     ]
     private_root = Path(tempfile.mkdtemp(prefix=".precutover-", dir=private_parent))
-    prepared_report: Path | None = None
+    prepared_report: _PreparedProof | None = None
     try:
         with ExitStack() as leases:
             fences = [leases.enter_context(_IntegrityFence(source_expectations))]
@@ -866,9 +1115,13 @@ def verify_precutover(
         cleanup_failure = None
         if prepared_report is not None:
             try:
-                _unlink_owned(prepared_report)
+                prepared_report.close()
             except Exception as exc:
                 cleanup_failure = exc
+            try:
+                _unlink_owned(prepared_report.path)
+            except Exception as exc:
+                cleanup_failure = cleanup_failure or exc
         if private_root.exists():
             try:
                 shutil.rmtree(private_root)
