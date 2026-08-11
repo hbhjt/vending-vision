@@ -1,6 +1,7 @@
 import json
 import hashlib
 import email.message
+from pathlib import Path
 import zipfile
 
 import pytest
@@ -165,7 +166,7 @@ def test_wheelhouse_descriptor_builder_records_exact_wheels_and_rejects_extra(tm
 
 
 def test_tracked_ai_wheelhouse_descriptor_is_complete_and_nonempty():
-    descriptor = json.loads(open("requirements-ai.lock.json", encoding="utf-8").read())
+    descriptor = json.loads(Path("requirements-ai.lock.json").read_text(encoding="utf-8"))
 
     assert len(descriptor["wheels"]) == 34
     assert all(wheel["url"].startswith("https://") for wheel in descriptor["wheels"])

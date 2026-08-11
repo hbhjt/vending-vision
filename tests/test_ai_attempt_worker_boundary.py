@@ -401,9 +401,9 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
 
     assert completed.returncode == 0, completed.stderr + completed.stdout
     assert output.is_file()
-    result = Image.open(output)
-    assert result.format == "PNG"
-    assert result.size == (96, 128)
+    with Image.open(output) as result:
+        assert result.format == "PNG"
+        assert result.size == (96, 128)
     pipeline_call = json.loads(record.read_text("utf-8"))
     assert pipeline_call["api"] == "CatVTONPipeline"
     assert pipeline_call["attn_ckpt_version"] == "mix"
