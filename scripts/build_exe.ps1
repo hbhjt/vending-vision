@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$AiWheelhouse,
     [Parameter(Mandatory = $true)]
-    [string]$AiWheelhouseDescriptor
+    [string]$AiWheelhouseDescriptor,
+    [string]$SourceRoot
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,7 +18,12 @@ function Invoke-Checked {
     }
 }
 
-$Root = Resolve-Path (Join-Path $PSScriptRoot "..")
+$ToolRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$Root = if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
+    $ToolRoot
+} else {
+    Resolve-Path -LiteralPath $SourceRoot
+}
 $BasePython = (Get-Command python -ErrorAction Stop).Source
 $CoreVenv = Join-Path $Root ".venv-packaging-core"
 $AiVenv = Join-Path $Root ".venv-packaging-ai"
@@ -49,8 +55,8 @@ if ($ActualPythonVersion -cne $ExpectedPythonVersion) {
 }
 
 New-Item -ItemType Directory -Force $BuildDir | Out-Null
-Invoke-Checked $BasePython (Join-Path $Root "scripts\materialize_ai_wheelhouse.py") --descriptor $AiWheelhouseDescriptor --wheelhouse $AiWheelhouse --runtime-descriptor (Join-Path $Root "ai-runtime-descriptor.json") --requirements-output $AiReleaseRequirements
-Invoke-Checked $BasePython (Join-Path $Root "scripts\render_ai_build_requirements.py") --core-requirements (Join-Path $Root "requirements.txt") --output $AiBuildRequirements
+Invoke-Checked $BasePython (Join-Path $ToolRoot "scripts\materialize_ai_wheelhouse.py") --descriptor $AiWheelhouseDescriptor --wheelhouse $AiWheelhouse --runtime-descriptor (Join-Path $Root "ai-runtime-descriptor.json") --requirements-output $AiReleaseRequirements
+Invoke-Checked $BasePython (Join-Path $ToolRoot "scripts\render_ai_build_requirements.py") --core-requirements (Join-Path $Root "requirements.txt") --output $AiBuildRequirements
 
 foreach ($Environment in @($CoreVenv, $AiVenv)) {
     if (Test-Path -LiteralPath $Environment) {
@@ -63,7 +69,7 @@ foreach ($Output in @($CoreWork, $AiWork, $CoreDist, $AiDist, $FinalDist)) {
     }
 }
 
-Invoke-Checked $BasePython (Join-Path $Root "scripts\bootstrap_build_envs.py") `
+Invoke-Checked $BasePython (Join-Path $ToolRoot "scripts\bootstrap_build_envs.py") `
     --base-python $BasePython `
     --core-env $CoreVenv `
     --core-wheelhouse $Wheelhouse `
@@ -75,12 +81,12 @@ Invoke-Checked $BasePython (Join-Path $Root "scripts\bootstrap_build_envs.py") `
 if (-not (Test-Path -LiteralPath $CorePython -PathType Leaf)) { throw "core build Python missing: $CorePython" }
 if (-not (Test-Path -LiteralPath $AiPython -PathType Leaf)) { throw "AI build Python missing: $AiPython" }
 
-Invoke-Checked $CorePython (Join-Path $Root "scripts\dependency_lock.py") --requirements-lock (Join-Path $Root "requirements.txt") --wheelhouse $Wheelhouse --python $CorePython --target-sys-platform win32
+Invoke-Checked $CorePython (Join-Path $ToolRoot "scripts\dependency_lock.py") --requirements-lock (Join-Path $Root "requirements.txt") --wheelhouse $Wheelhouse --python $CorePython --target-sys-platform win32
 Invoke-Checked $CorePython -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
 Invoke-Checked $CorePython -m PyInstaller --clean --noconfirm --workpath $CoreWork --distpath $CoreDist (Join-Path $Root "vending_vision.spec")
 
 Invoke-Checked $AiPython -m pip install --disable-pip-version-check --no-index --find-links $Wheelhouse --require-hashes --no-deps -r $AiBuildRequirements
-Invoke-Checked $AiPython (Join-Path $Root "scripts\verify_ai_wheelhouse.py") --descriptor $AiWheelhouseDescriptor --wheelhouse $AiWheelhouse --runtime-descriptor (Join-Path $Root "ai-runtime-descriptor.json") --requirements-output $AiReleaseRequirements
+Invoke-Checked $AiPython (Join-Path $ToolRoot "scripts\verify_ai_wheelhouse.py") --descriptor $AiWheelhouseDescriptor --wheelhouse $AiWheelhouse --runtime-descriptor (Join-Path $Root "ai-runtime-descriptor.json") --requirements-output $AiReleaseRequirements
 Invoke-Checked $AiPython (Join-Path $Root "run_ai_attempt_worker.py") "--probe-runtime"
 Invoke-Checked $AiPython -m PyInstaller --clean --noconfirm --workpath $AiWork --distpath $AiDist (Join-Path $Root "vending_vision_ai_worker.spec")
 
@@ -93,7 +99,7 @@ $WorkerExe = Join-Path $FinalDist "vending-vision-ai-worker\vending-vision-ai-wo
 if (-not (Test-Path -LiteralPath $MainExe -PathType Leaf)) { throw "main Vision exe missing after build: $MainExe" }
 if (-not (Test-Path -LiteralPath $WorkerExe -PathType Leaf)) { throw "AI worker exe missing after build: $WorkerExe" }
 
-Invoke-Checked $CorePython (Join-Path $Root "scripts\verify_packaged_exe.py") $MainExe
+Invoke-Checked $CorePython (Join-Path $ToolRoot "scripts\verify_packaged_exe.py") $MainExe
 
 Write-Host ""
 Write-Host "Build complete:"

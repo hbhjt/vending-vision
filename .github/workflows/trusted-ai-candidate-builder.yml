@@ -1,0 +1,186 @@
+name: Trusted AI candidate builder
+
+on:
+  workflow_call:
+    inputs:
+      source_commit:
+        description: Exact vending-vision source commit to build
+        required: true
+        type: string
+      core_wheelhouse_url:
+        description: Immutable HTTPS URL for the core Windows wheelhouse archive
+        required: true
+        type: string
+      core_wheelhouse_sha256:
+        description: Expected SHA-256 for the core wheelhouse archive
+        required: true
+        type: string
+      core_wheelhouse_bytes:
+        description: Exact byte size for the core wheelhouse archive
+        required: true
+        type: number
+    outputs:
+      artifact_name:
+        description: Actions artifact containing the attested candidate
+        value: ${{ jobs.build.outputs.artifact_name }}
+      artifact_file:
+        description: Candidate ZIP file name
+        value: ${{ jobs.build.outputs.artifact_file }}
+      subject_sha256:
+        description: Attested candidate ZIP SHA-256
+        value: ${{ jobs.build.outputs.subject_sha256 }}
+      manifest_sha256:
+        description: Embedded canonical manifest SHA-256
+        value: ${{ jobs.build.outputs.manifest_sha256 }}
+      attestation_bundle_file:
+        description: GitHub build-provenance bundle file name
+        value: ${{ jobs.build.outputs.attestation_bundle_file }}
+      attestation_bundle_sha256:
+        description: GitHub build-provenance bundle SHA-256
+        value: ${{ jobs.build.outputs.attestation_bundle_sha256 }}
+      builder_evidence_file:
+        description: Trusted builder evidence file name
+        value: ${{ jobs.build.outputs.builder_evidence_file }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      artifact_name: ${{ steps.bundle.outputs.artifact_name }}
+      artifact_file: ${{ steps.bundle.outputs.artifact_file }}
+      subject_sha256: ${{ steps.bundle.outputs.subject_sha256 }}
+      manifest_sha256: ${{ steps.bundle.outputs.manifest_sha256 }}
+      attestation_bundle_file: ${{ steps.evidence.outputs.attestation_bundle_file }}
+      attestation_bundle_sha256: ${{ steps.evidence.outputs.attestation_bundle_sha256 }}
+      builder_evidence_file: ${{ steps.evidence.outputs.builder_evidence_file }}
+    steps:
+      - name: Checkout immutable trusted builder implementation
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: trusted-builder
+          persist-credentials: false
+      - name: Checkout exact candidate source
+        uses: actions/checkout@v4
+        with:
+          repository: hbhjt/vending-vision
+          ref: ${{ inputs.source_commit }}
+          path: source
+          fetch-depth: 1
+          lfs: true
+          persist-credentials: false
+      - name: Validate immutable builder and source identities
+        shell: pwsh
+        working-directory: source
+        run: |
+          if ("${{ job.workflow_repository }}" -cne "hbhjt/vending-vision") { throw "unexpected trusted builder repository" }
+          if ("${{ job.workflow_file_path }}" -cne ".github/workflows/trusted-ai-candidate-builder.yml") { throw "unexpected trusted builder workflow" }
+          if ("${{ job.workflow_sha }}" -notmatch '^[a-f0-9]{40}$') { throw "trusted builder SHA is unavailable" }
+          if ("${{ inputs.source_commit }}" -notmatch '^[a-f0-9]{40}$') { throw "source_commit must be a full lowercase commit SHA" }
+          if ("${{ inputs.source_commit }}" -cne "${{ github.sha }}") { throw "built source must equal the caller source claim" }
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -cne "${{ inputs.source_commit }}") { throw "source checkout identity mismatch" }
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: source/.python-version
+          cache: pip
+      - name: Validate release source and download the core wheelhouse
+        shell: pwsh
+        working-directory: source
+        env:
+          CORE_WHEELHOUSE_URL: ${{ inputs.core_wheelhouse_url }}
+          CORE_WHEELHOUSE_SHA256: ${{ inputs.core_wheelhouse_sha256 }}
+          CORE_WHEELHOUSE_BYTES: ${{ inputs.core_wheelhouse_bytes }}
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v',''
+          if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+$') { throw "Only SemVer RC tags may build candidates" }
+          if ($env:CORE_WHEELHOUSE_URL -notmatch '^https://') { throw "core wheelhouse URL must be HTTPS" }
+          if ($env:CORE_WHEELHOUSE_SHA256 -notmatch '^[a-f0-9]{64}$') { throw "core wheelhouse SHA-256 is invalid" }
+          if ($env:CORE_WHEELHOUSE_BYTES -notmatch '^[1-9][0-9]*$') { throw "core wheelhouse byte size is invalid" }
+          python ../trusted-builder/scripts/set_release_version.py $version --root $PWD
+          if ($LASTEXITCODE -ne 0) { throw "release version materialization failed" }
+          python ../trusted-builder/scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --expected-bytes $env:CORE_WHEELHOUSE_BYTES --destination wheelhouse
+          if ($LASTEXITCODE -ne 0) { throw "core wheelhouse materialization failed" }
+          "VISION_RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+      - name: Materialize the exact AI wheel closure
+        shell: pwsh
+        working-directory: source
+        run: |
+          python ../trusted-builder/scripts/materialize_ai_wheelhouse.py --descriptor requirements-ai.lock.json --runtime-descriptor ai-runtime-descriptor.json --destination ai-wheelhouse --requirements-output build/requirements-ai-release.txt
+          if ($LASTEXITCODE -ne 0) { throw "AI wheelhouse materialization failed" }
+      - name: Build isolated main and AI worker runtimes
+        shell: pwsh
+        working-directory: source
+        run: |
+          ../trusted-builder/scripts/build_exe.ps1 -SourceRoot $PWD -Wheelhouse (Join-Path $PWD "wheelhouse") -AiWheelhouse (Join-Path $PWD "ai-wheelhouse") -AiWheelhouseDescriptor (Join-Path $PWD "requirements-ai.lock.json")
+          if ($LASTEXITCODE -ne 0) { throw "trusted candidate build failed" }
+      - name: Create the canonical candidate ZIP
+        id: bundle
+        shell: pwsh
+        working-directory: source
+        run: |
+          $CorePython = Join-Path $PWD ".venv-packaging-core\Scripts\python.exe"
+          if (-not (Test-Path -LiteralPath $CorePython -PathType Leaf)) { throw "isolated core Python missing" }
+          New-Item -ItemType Directory -Force ../trusted-output | Out-Null
+          $artifactName = "vending-vision-$env:VISION_RELEASE_VERSION-windows-x86_64.zip"
+          $artifact = Join-Path $PWD "../trusted-output/$artifactName"
+          $manifest = Join-Path $PWD "../trusted-output/candidate-manifest.json"
+          $result = (& $CorePython ../trusted-builder/scripts/candidate_artifact_manifest.py --dist-root dist --artifact $artifact --manifest-output $manifest --source-commit "${{ inputs.source_commit }}") | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "candidate archive generation failed" }
+          if ($result.subjectSha256 -notmatch '^[a-f0-9]{64}$') { throw "candidate subject digest missing" }
+          if ($result.embeddedManifestSha256 -notmatch '^[a-f0-9]{64}$') { throw "candidate manifest digest missing" }
+          "artifact_name=vending-vision-trusted-${{ inputs.source_commit }}" >> $env:GITHUB_OUTPUT
+          "artifact_file=$artifactName" >> $env:GITHUB_OUTPUT
+          "subject_sha256=$($result.subjectSha256)" >> $env:GITHUB_OUTPUT
+          "manifest_sha256=$($result.embeddedManifestSha256)" >> $env:GITHUB_OUTPUT
+          "TRUSTED_CANDIDATE_ARTIFACT=$artifact" >> $env:GITHUB_ENV
+      - name: Run the full packaged candidate verifier before signing
+        shell: pwsh
+        working-directory: source
+        run: |
+          $CorePython = Join-Path $PWD ".venv-packaging-core\Scripts\python.exe"
+          & $CorePython ../trusted-builder/scripts/verify_packaged_exe.py --require-ai-worker --candidate-artifact $env:TRUSTED_CANDIDATE_ARTIFACT --trusted-subject-sha256 "${{ steps.bundle.outputs.subject_sha256 }}" --expected-embedded-manifest-sha256 "${{ steps.bundle.outputs.manifest_sha256 }}" --expected-source-commit "${{ inputs.source_commit }}" --extract-root (Join-Path $PWD "../trusted-verification")
+          if ($LASTEXITCODE -ne 0) { throw "trusted full candidate verification failed" }
+      - name: Attest only the fully verified candidate
+        id: attest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.TRUSTED_CANDIDATE_ARTIFACT }}
+      - name: Record trusted builder evidence
+        id: evidence
+        shell: pwsh
+        run: |
+          $bundleFile = "github-build-provenance.sigstore.json"
+          $evidenceFile = "trusted-builder-evidence.json"
+          $bundle = Join-Path $PWD "trusted-output/$bundleFile"
+          Copy-Item -LiteralPath "${{ steps.attest.outputs.bundle-path }}" -Destination $bundle
+          $bundleSha = (Get-FileHash -LiteralPath $bundle -Algorithm SHA256).Hash.ToLowerInvariant()
+          $evidence = [ordered]@{
+            schemaVersion = "vending-vision-trusted-builder-evidence/v1"
+            builderRepository = "${{ job.workflow_repository }}"
+            builderWorkflow = "${{ job.workflow_file_path }}"
+            builderWorkflowSha = "${{ job.workflow_sha }}"
+            sourceCommit = "${{ inputs.source_commit }}"
+            subjectSha256 = "${{ steps.bundle.outputs.subject_sha256 }}"
+            embeddedManifestSha256 = "${{ steps.bundle.outputs.manifest_sha256 }}"
+            attestationBundleSha256 = $bundleSha
+          }
+          $evidence | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $PWD "trusted-output/$evidenceFile") -Encoding utf8NoBOM -NoNewline
+          "attestation_bundle_file=$bundleFile" >> $env:GITHUB_OUTPUT
+          "attestation_bundle_sha256=$bundleSha" >> $env:GITHUB_OUTPUT
+          "builder_evidence_file=$evidenceFile" >> $env:GITHUB_OUTPUT
+      - name: Upload only trusted builder outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.bundle.outputs.artifact_name }}
+          path: trusted-output/*
+          if-no-files-found: error
+          retention-days: 14
