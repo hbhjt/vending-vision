@@ -189,6 +189,41 @@ def test_stdlib_bootstrap_verifies_existing_ai_wheels_and_writes_hashed_requirem
     )
 
 
+def test_existing_large_wheel_digest_is_streamed_without_read_bytes(tmp_path, monkeypatch):
+    from scripts.materialize_ai_wheelhouse import prepare_existing_ai_wheelhouse
+
+    lock_path = tmp_path / "requirements-ai.lock.json"
+    descriptor, payload, _url = _descriptor(lock_path, payload=b"stream-this-wheel")
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    wheel = wheelhouse / descriptor["wheels"][0]["fileName"]
+    wheel.write_bytes(payload)
+    requirements_path = tmp_path / "requirements-ai.txt"
+    requirements_path.write_text("demo==1.0.0\n", "utf-8")
+    runtime = {
+        "schemaVersion": "vem-ai-runtime-descriptor/v1",
+        "target": "windows-x86_64",
+        "python": "3.11.9",
+        "directRequirements": ["demo==1.0.0"],
+        "requirementsAiSha256": hashlib.sha256(requirements_path.read_bytes()).hexdigest(),
+        "requirementsAiLockSha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+        "workerLayout": {},
+    }
+    runtime_path = tmp_path / "ai-runtime-descriptor.json"
+    runtime_path.write_text(json.dumps(runtime, sort_keys=True, separators=(",", ":")), "utf-8")
+    original = Path.read_bytes
+
+    def guarded_read_bytes(path):
+        if path.suffix == ".whl":
+            raise AssertionError("wheel verification must stream")
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+    prepare_existing_ai_wheelhouse(
+        lock_path, wheelhouse, runtime_path, tmp_path / "requirements-ai-release.txt"
+    )
+
+
 def test_materializer_aborts_expected_plus_one_before_writing_chunk(tmp_path, monkeypatch):
     _descriptor(tmp_path / "lock.json", payload=b"wheel")
     writes = []

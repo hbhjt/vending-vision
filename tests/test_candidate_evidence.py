@@ -26,6 +26,9 @@ SIGNER = "spki-sha256:" + "a" * 64
 
 
 def _ai_evidence_args(tmp_path):
+    bundle = tmp_path / "vending-vision-0.2.1-rc.1-windows-x86_64.zip"
+    if not bundle.exists():
+        bundle.write_bytes(b"candidate-bundle")
     worker = tmp_path / "vending-vision-ai-worker.exe"
     worker.write_bytes(b"stage23-worker")
     runtime = ROOT / "ai-runtime-descriptor.json"
@@ -53,9 +56,27 @@ def _ai_evidence_args(tmp_path):
     )
     github_attestation = tmp_path / "github-attestation.json"
     github_attestation.write_text('{"verifiedBy":"stage23-test"}', "utf-8")
+    trusted_builder_evidence = tmp_path / "trusted-builder-evidence.json"
+    trusted_builder_evidence.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "vending-vision-trusted-builder-evidence/v1",
+                "builderRepository": "hbhjt/vending-vision",
+                "builderWorkflow": ".github/workflows/trusted-ai-candidate-builder.yml",
+                "builderWorkflowSha": "fbb97d16f42b2c20a04831750c639fda6db1a3e9",
+                "sourceCommit": "b" * 40,
+                "subjectSha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+                "embeddedManifestSha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                "attestationBundleSha256": hashlib.sha256(github_attestation.read_bytes()).hexdigest(),
+            },
+            separators=(",", ":"),
+        ),
+        "utf-8",
+    )
     return [
         "--candidate-manifest", str(manifest),
         "--github-attestation", str(github_attestation),
+        "--trusted-builder-evidence", str(trusted_builder_evidence),
         "--ai-requirements-lock", str(lock),
         "--ai-runtime-descriptor", str(runtime),
         "--source-descriptor", str(source),
@@ -204,6 +225,7 @@ def test_candidate_sbom_covers_the_actual_win32_locked_closure(tmp_path, monkeyp
     }
     assert descriptor["candidateManifest"]["schemaVersion"] == "vending-vision-candidate-artifact/v3"
     assert descriptor["githubArtifactAttestation"]["format"] == "sigstore-bundle"
+    assert descriptor["trustedBuilderEvidence"]["schemaVersion"] == "vending-vision-trusted-builder-evidence/v1"
     assert set(descriptor["aiRuntime"]) == {
         "requirementsLock", "runtimeDescriptor", "sourceDescriptor",
         "modelPackDescriptor", "workerExecutable",
@@ -213,6 +235,8 @@ def test_candidate_sbom_covers_the_actual_win32_locked_closure(tmp_path, monkeyp
     )
     assert supplier_attestation["candidateManifestDigest"] == descriptor["candidateManifest"]["digest"]
     assert supplier_attestation["githubArtifactAttestationDigest"] == descriptor["githubArtifactAttestation"]["digest"]
+    assert supplier_attestation["trustedBuilderEvidenceDigest"] == descriptor["trustedBuilderEvidence"]["digest"]
+    assert supplier_attestation["attestedSubjectDigest"] == descriptor["bundle"]["digest"]
     assert supplier_attestation["workerExecutableDigest"] == descriptor["aiRuntime"]["workerExecutable"]["digest"]
     provenance = json.loads((tmp_path / "candidate" / "vision-provenance.json").read_text("utf-8"))
     dependency_uris = {
@@ -247,14 +271,16 @@ def test_win32_marked_lock_selects_a_complete_offline_wheel_closure(tmp_path):
 def test_windows_ci_and_candidate_publish_force_the_win32_offline_closure():
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     publish = (ROOT / ".github/workflows/publish-candidate.yml").read_text(encoding="utf-8")
+    builder = (ROOT / ".github/workflows/trusted-ai-candidate-builder.yml").read_text(encoding="utf-8")
 
     assert (ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.11.9"
     assert ci.count("--target-sys-platform win32") == 1
     assert "python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt" in ci
     assert "dependency_lock.py" not in publish
     assert "python -m pip install" not in publish
-    assert publish.count("./scripts/build_exe.ps1") == 1
-    assert ".venv-packaging-core" in publish
+    assert "scripts/build_exe.ps1" not in publish
+    assert builder.count("scripts/build_exe.ps1") == 1
+    assert ".venv-packaging-core" in builder
 
 
 def test_reviewed_license_facts_match_the_locked_cffi_and_pillow_wheel_metadata():

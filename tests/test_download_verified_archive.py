@@ -157,3 +157,23 @@ def test_archive_downloader_aborts_oversized_stream_before_writing_chunk(tmp_pat
 
     assert writes == []
     assert not (tmp_path / "wheelhouse").exists()
+
+
+def test_verified_archive_rejects_member_count_before_extracting(tmp_path):
+    url = "https://example.invalid/core-wheelhouse.zip"
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("one.whl", b"one")
+        archive.writestr("two.whl", b"two")
+    payload = output.getvalue()
+
+    with pytest.raises(ArchiveError, match="archive_member_count"):
+        download_verified_archive(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            tmp_path / "wheelhouse",
+            expected_bytes=len(payload),
+            max_members=1,
+            opener=lambda _request, timeout: _Response(payload, url),
+        )
+    assert not (tmp_path / "wheelhouse").exists()

@@ -21,6 +21,14 @@ _SAFE_VERSION = re.compile(r"^[A-Za-z0-9]+(?:[.!+_-][A-Za-z0-9]+)*$")
 _MAX_TOTAL_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _canonical_json(value: dict) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -162,7 +170,7 @@ def prepare_existing_ai_wheelhouse(
         path = wheelhouse / wheel["fileName"]
         if path.is_symlink() or not path.is_file():
             raise MaterializeError("ai_wheelhouse_file_type")
-        if path.stat().st_size != wheel["byteSize"] or hashlib.sha256(path.read_bytes()).hexdigest() != wheel["sha256"]:
+        if path.stat().st_size != wheel["byteSize"] or _sha256_file(path) != wheel["sha256"]:
             raise MaterializeError("ai_wheelhouse_digest")
     _write_atomic(requirements_output, _hashed_requirements(wheels))
 

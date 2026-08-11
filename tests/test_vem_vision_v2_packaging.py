@@ -379,7 +379,8 @@ def test_packaged_verifier_rejects_worker_that_does_not_emit_runtime_probe_json(
 
 def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     build = (ROOT / "scripts" / "build_exe.ps1").read_text("utf-8")
-    workflow = (ROOT / ".github" / "workflows" / "publish-candidate.yml").read_text("utf-8")
+    builder = (ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder.yml").read_text("utf-8")
+    publisher = (ROOT / ".github" / "workflows" / "publish-candidate.yml").read_text("utf-8")
 
     assert "AiWheelhouseDescriptor" in build
     assert '".venv-packaging-core"' in build
@@ -407,50 +408,52 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "Copy-Item -LiteralPath (Join-Path $AiDist \"vending-vision-ai-worker\")" in build
     assert "pip download" not in build
 
-    assert "ai-wheelhouse" in workflow
-    assert "materialize_ai_wheelhouse.py" in workflow
-    assert "requirements-ai.lock.json" in workflow
-    assert "AI_WHEELHOUSE_ARCHIVE" not in workflow
-    assert "AI_WHEELHOUSE_DESCRIPTOR" not in workflow
-    assert "CORE_WHEELHOUSE_URL" in workflow
-    assert "CORE_WHEELHOUSE_SHA256" in workflow
-    assert "CORE_WHEELHOUSE_BYTES" in workflow
-    assert "--expected-bytes $env:CORE_WHEELHOUSE_BYTES" in workflow
-    assert "download_verified_archive.py" in workflow
-    assert "CORE_WHEELHOUSE_ARCHIVE" not in workflow
-    assert "requirements-ai-release.txt" in workflow
-    assert "--requirements-output build/requirements-ai-release.txt" in workflow
-    assert "python -m pip install" not in workflow
-    assert "dependency_lock.py" not in workflow
-    assert "verify_ai_wheelhouse.py" not in workflow
-    assert "pip download" not in workflow
-    assert workflow.count("scripts/build_exe.ps1") == 1
-    assert ".venv-packaging-core" in workflow
-    assert ".venv-packaging-ai" in workflow
-    assert "candidate_artifact_manifest.py" in workflow
-    assert "--manifest-output" in workflow
-    assert "--source-commit" in workflow
-    assert "Compress-Archive" not in workflow
-    assert "actions/attest-build-provenance@v4" in workflow
-    assert "subject-path:" in workflow
-    assert "id-token: write" in workflow
-    assert "attestations: write" in workflow
-    assert "verify:" in workflow
-    assert "needs: build" in workflow
-    assert workflow.count("runs-on: windows-latest") >= 2
-    assert "actions/download-artifact@v4" in workflow
-    assert "gh attestation verify" in workflow
-    assert "--signer-repo" in workflow
-    assert "--signer-workflow" in workflow
-    assert "--source-ref" in workflow
-    assert "--source-digest" in workflow
-    assert "--trusted-subject-sha256" in workflow
-    assert "--expected-embedded-manifest-sha256" in workflow
-    assert "--expected-source-commit" in workflow
-    assert "--extract-root" in workflow
-    assert "--require-ai-worker" in workflow
-    assert "--expected-candidate-manifest-sha256" not in workflow
-    assert workflow.count("PyInstaller --clean --noconfirm") == 0
+    assert "ai-wheelhouse" in builder
+    assert "materialize_ai_wheelhouse.py" in builder
+    assert "requirements-ai.lock.json" in builder
+    assert "CORE_WHEELHOUSE_URL" in builder
+    assert "CORE_WHEELHOUSE_SHA256" in builder
+    assert "CORE_WHEELHOUSE_BYTES" in builder
+    assert "--expected-bytes $env:CORE_WHEELHOUSE_BYTES" in builder
+    assert "download_verified_archive.py" in builder
+    assert "requirements-ai-release.txt" in builder
+    assert "--requirements-output build/requirements-ai-release.txt" in builder
+    assert "pip download" not in builder
+    assert builder.count("scripts/build_exe.ps1") == 1
+    assert "-SourceRoot $PWD" in builder
+    assert "candidate_artifact_manifest.py" in builder
+    assert "--manifest-output" in builder
+    assert "--source-commit" in builder
+    assert "Compress-Archive" not in builder
+    assert "actions/attest-build-provenance@v4" in builder
+    assert builder.index("--require-ai-worker") < builder.index("actions/attest-build-provenance@v4")
+    assert "subject-path:" in builder
+    assert "id-token: write" in builder
+    assert "attestations: write" in builder
+    assert "secrets:" not in builder
+
+    assert "trusted-ai-candidate-builder.yml@fbb97d16f42b2c20a04831750c639fda6db1a3e9" in publisher
+    assert "scripts/build_exe.ps1" not in publisher
+    assert "actions/attest-build-provenance" not in publisher
+    assert "needs: trusted_builder" in publisher
+    assert "needs: verify" in publisher
+    assert publisher.count("runs-on: windows-latest") == 2
+    assert "actions/download-artifact@v4" in publisher
+    assert "gh attestation verify" in publisher
+    assert "--signer-repo \"hbhjt/vending-vision\"" in publisher
+    assert "--signer-workflow \"hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml\"" in publisher
+    assert "--signer-digest \"fbb97d16f42b2c20a04831750c639fda6db1a3e9\"" in publisher
+    assert "--source-ref" in publisher
+    assert "--source-digest" in publisher
+    assert "--deny-self-hosted-runners" in publisher
+    assert "--trusted-subject-sha256" in publisher
+    assert "--expected-embedded-manifest-sha256" in publisher
+    assert "--expected-source-commit" in publisher
+    assert "--extract-root" in publisher
+    assert "--require-ai-worker" in publisher
+    assert "environment: experimental-candidate" in publisher
+    assert "--trusted-builder-evidence" in publisher
+    assert "--expected-candidate-manifest-sha256" not in publisher
 
 
 def test_worker_probe_executes_production_observation_and_render_ipc():

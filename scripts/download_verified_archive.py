@@ -19,6 +19,7 @@ class ArchiveError(RuntimeError):
 
 _MAX_EXTRACTED_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_ARCHIVE_MEMBERS = 100_000
 
 
 def _safe_relative(name: str) -> PurePosixPath:
@@ -28,7 +29,13 @@ def _safe_relative(name: str) -> PurePosixPath:
     return value
 
 
-def _validate_members(members: list[tuple[PurePosixPath, bool, int]], max_extracted_bytes: int) -> None:
+def _validate_members(
+    members: list[tuple[PurePosixPath, bool, int]],
+    max_extracted_bytes: int,
+    max_members: int,
+) -> None:
+    if len(members) > max_members:
+        raise ArchiveError("archive_member_count")
     seen: set[str] = set()
     files: set[str] = set()
     total = 0
@@ -49,7 +56,13 @@ def _validate_members(members: list[tuple[PurePosixPath, bool, int]], max_extrac
                 raise ArchiveError("archive_extracted_size")
 
 
-def _extract_archive(archive_path: Path, destination: Path, *, max_extracted_bytes: int) -> None:
+def _extract_archive(
+    archive_path: Path,
+    destination: Path,
+    *,
+    max_extracted_bytes: int,
+    max_members: int,
+) -> None:
     if zipfile.is_zipfile(archive_path):
         with zipfile.ZipFile(archive_path) as archive:
             members = []
@@ -60,7 +73,7 @@ def _extract_archive(archive_path: Path, destination: Path, *, max_extracted_byt
                 if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
                     raise ArchiveError("archive_symlink_or_special")
                 members.append((relative, member.is_dir(), member.file_size))
-            _validate_members(members, max_extracted_bytes)
+            _validate_members(members, max_extracted_bytes, max_members)
             for member, (relative, _is_dir, _size) in zip(archive.infolist(), members):
                 target = destination.joinpath(*relative.parts)
                 if member.is_dir():
@@ -81,7 +94,7 @@ def _extract_archive(archive_path: Path, destination: Path, *, max_extracted_byt
             if not (member.isfile() or member.isdir()):
                 raise ArchiveError("archive_symlink_or_special")
             members.append((relative, member.isdir(), member.size))
-        _validate_members(members, max_extracted_bytes)
+        _validate_members(members, max_extracted_bytes, max_members)
         for member, (relative, _is_dir, _size) in zip(archive.getmembers(), members):
             target = destination.joinpath(*relative.parts)
             if member.isdir():
@@ -104,6 +117,7 @@ def download_verified_archive(
     opener=urlopen,
     max_download_bytes: int = _MAX_DOWNLOAD_BYTES,
     max_extracted_bytes: int = _MAX_EXTRACTED_BYTES,
+    max_members: int = _MAX_ARCHIVE_MEMBERS,
 ) -> None:
     parsed = urlsplit(url)
     if parsed.scheme != "https" or parsed.username or parsed.password or len(sha256) != 64:
@@ -118,6 +132,8 @@ def download_verified_archive(
         or type(max_download_bytes) is not int
         or max_download_bytes <= 0
         or expected_bytes > max_download_bytes
+        or type(max_members) is not int
+        or max_members <= 0
     ):
         raise ArchiveError("archive_download_size")
     if destination.exists():
@@ -145,7 +161,12 @@ def download_verified_archive(
             raise ArchiveError("archive_download_size")
         if digest.hexdigest() != sha256.lower():
             raise ArchiveError("archive_digest")
-        _extract_archive(archive_path, extracted, max_extracted_bytes=max_extracted_bytes)
+        _extract_archive(
+            archive_path,
+            extracted,
+            max_extracted_bytes=max_extracted_bytes,
+            max_members=max_members,
+        )
         os.replace(extracted, destination)
     finally:
         shutil.rmtree(work, ignore_errors=True)

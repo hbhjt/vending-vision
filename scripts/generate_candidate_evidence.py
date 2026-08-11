@@ -25,6 +25,8 @@ def verify_dependency_closure(*args, **kwargs):
 
 
 SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$")
+TRUSTED_BUILDER_COMMIT = "fbb97d16f42b2c20a04831750c639fda6db1a3e9"
+TRUSTED_BUILDER_WORKFLOW = ".github/workflows/trusted-ai-candidate-builder.yml"
 
 
 def digest_bytes(data):
@@ -57,6 +59,7 @@ def main():
     parser.add_argument("--bundle", required=True)
     parser.add_argument("--candidate-manifest", required=True)
     parser.add_argument("--github-attestation", required=True)
+    parser.add_argument("--trusted-builder-evidence", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--repository", required=True)
@@ -73,12 +76,15 @@ def main():
     args = parser.parse_args()
     if not SEMVER.fullmatch(args.version) or "-rc." not in args.version:
         raise SystemExit("candidate version must be prerelease SemVer containing -rc.")
+    if re.fullmatch(r"[a-f0-9]{40}", args.commit) is None:
+        raise SystemExit("candidate commit must be a full lowercase SHA")
     if not re.fullmatch(r"spki-sha256:[a-f0-9]{64}", args.signer_identity):
         raise SystemExit("signer identity must be spki-sha256:<64 lowercase hex>")
 
     bundle = Path(args.bundle).resolve()
     candidate_manifest = Path(args.candidate_manifest).resolve()
     github_attestation = Path(args.github_attestation).resolve()
+    trusted_builder_evidence = Path(args.trusted_builder_evidence).resolve()
     ai_requirements_lock = Path(args.ai_requirements_lock).resolve()
     ai_runtime_descriptor = Path(args.ai_runtime_descriptor).resolve()
     source_descriptor = Path(args.source_descriptor).resolve()
@@ -90,7 +96,8 @@ def main():
     contract_identity = load_v2_contract_identity()
     requirements = verify_dependency_closure(args.requirements_lock, args.wheelhouse, args.python)
     required_ai_files = (
-        candidate_manifest, github_attestation, ai_requirements_lock, ai_runtime_descriptor,
+        bundle, candidate_manifest, github_attestation, trusted_builder_evidence,
+        ai_requirements_lock, ai_runtime_descriptor,
         source_descriptor, model_pack_descriptor, worker_executable,
     )
     if not all(path.is_file() for path in required_ai_files):
@@ -120,6 +127,28 @@ def main():
         binding = bindings.get(name)
         if not isinstance(binding, dict) or binding.get("sha256") != digest_file(path).split(":", 1)[1]:
             raise SystemExit(f"candidate manifest does not bind {name}")
+    try:
+        builder_evidence = json.loads(trusted_builder_evidence.read_text("utf-8"))
+    except ValueError as exc:
+        raise SystemExit("trusted builder evidence is invalid") from exc
+    if set(builder_evidence) != {
+        "schemaVersion", "builderRepository", "builderWorkflow", "builderWorkflowSha",
+        "sourceCommit", "subjectSha256", "embeddedManifestSha256",
+        "attestationBundleSha256",
+    }:
+        raise SystemExit("trusted builder evidence shape mismatch")
+    expected_builder_evidence = {
+        "schemaVersion": "vending-vision-trusted-builder-evidence/v1",
+        "builderRepository": args.repository,
+        "builderWorkflow": TRUSTED_BUILDER_WORKFLOW,
+        "builderWorkflowSha": TRUSTED_BUILDER_COMMIT,
+        "sourceCommit": args.commit,
+        "subjectSha256": digest_file(bundle).split(":", 1)[1],
+        "embeddedManifestSha256": digest_file(candidate_manifest).split(":", 1)[1],
+        "attestationBundleSha256": digest_file(github_attestation).split(":", 1)[1],
+    }
+    if builder_evidence != expected_builder_evidence:
+        raise SystemExit("trusted builder evidence binding mismatch")
 
     sbom = {
         "spdxVersion": "SPDX-2.3",
@@ -205,6 +234,7 @@ def main():
                     {"uri": "legacy-bundle:vending-vision.zip", "digest": {"sha256": model_manifest["sourceArtifact"]["digest"].split(":", 1)[1]}},
                     {"uri": f"candidate-manifest:{candidate_manifest.name}", "digest": {"sha256": digest_file(candidate_manifest).split(":", 1)[1]}},
                     {"uri": f"github-attestation:{github_attestation.name}", "digest": {"sha256": digest_file(github_attestation).split(":", 1)[1]}},
+                    {"uri": f"trusted-builder-evidence:{trusted_builder_evidence.name}", "digest": {"sha256": digest_file(trusted_builder_evidence).split(":", 1)[1]}},
                     {"uri": f"ai-lock:{ai_requirements_lock.name}", "digest": {"sha256": digest_file(ai_requirements_lock).split(":", 1)[1]}},
                     {"uri": f"ai-runtime:{ai_runtime_descriptor.name}", "digest": {"sha256": digest_file(ai_runtime_descriptor).split(":", 1)[1]}},
                     {"uri": f"ai-source:{source_descriptor.name}", "digest": {"sha256": digest_file(source_descriptor).split(":", 1)[1]}},
@@ -235,6 +265,10 @@ def main():
         "entrypoint": {"command": "vending-vision/vending-vision.exe", "arguments": ["--no-browser"]},
         "candidateManifest": evidence_ref(candidate_manifest, schemaVersion="vending-vision-candidate-artifact/v3"),
         "githubArtifactAttestation": evidence_ref(github_attestation, format="sigstore-bundle"),
+        "trustedBuilderEvidence": evidence_ref(
+            trusted_builder_evidence,
+            schemaVersion="vending-vision-trusted-builder-evidence/v1",
+        ),
         "aiRuntime": {
             "requirementsLock": evidence_ref(ai_requirements_lock),
             "runtimeDescriptor": evidence_ref(ai_runtime_descriptor),
@@ -271,6 +305,8 @@ def main():
         "provenanceDigest": descriptor["provenance"]["digest"],
         "candidateManifestDigest": descriptor["candidateManifest"]["digest"],
         "githubArtifactAttestationDigest": descriptor["githubArtifactAttestation"]["digest"],
+        "trustedBuilderEvidenceDigest": descriptor["trustedBuilderEvidence"]["digest"],
+        "attestedSubjectDigest": descriptor["bundle"]["digest"],
         "workerExecutableDigest": descriptor["aiRuntime"]["workerExecutable"]["digest"],
         "signerIdentity": args.signer_identity,
     }
