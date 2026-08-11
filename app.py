@@ -77,7 +77,6 @@ from vision.v2_contract_bundle import (
     parse_v2_server_message,
 )
 from vision.ai_model_pack import (
-    official_ai_readiness,
     official_ai_readiness_snapshot,
     refresh_official_ai_readiness,
     shutdown_official_ai_readiness_refresh,
@@ -700,8 +699,7 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
         contract_digest = identity.contract_digest
 
     model_pack = os.environ.get("VEM_AI_MODEL_PACK")
-    ai_ready = official_ai_readiness(model_pack)
-    ai_snapshot = official_ai_readiness_snapshot()
+    ai_snapshot = official_ai_readiness_snapshot(model_pack)
     ready = envelope(
         message_type="vision.ready",
         message_id=str(uuid4()),
@@ -715,7 +713,7 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
             "fastReady": diagnostic == "ready",
             # The separate pack is optional for core/Fast.  This lightweight
             # verifier never loads model weights or performs inference.
-            "aiReady": diagnostic == "ready" and ai_ready,
+            "aiReady": ai_snapshot.ready,
             "aiReadinessDiagnostic": ai_snapshot.diagnostic,
             "visionBusinessReady": diagnostic == "ready",
             "businessReadinessDiagnostic": diagnostic,
@@ -725,7 +723,7 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
                 "person_departed",
                 "ambient_light",
                 "try_on_fast",
-                *( ["try_on_ai"] if diagnostic == "ready" and ai_ready else [] ),
+                *(["try_on_ai"] if diagnostic == "ready" and ai_snapshot.ready else []),
             ],
         },
     )
@@ -841,8 +839,7 @@ def debug_contract_bundle():
 @app.get("/health")
 def health():
     status = get_runtime_status()
-    ai_ready = official_ai_readiness(os.environ.get("VEM_AI_MODEL_PACK"))
-    ai_snapshot = official_ai_readiness_snapshot()
+    ai_snapshot = official_ai_readiness_snapshot(os.environ.get("VEM_AI_MODEL_PACK"))
 
     service_status = (
         "ok"
@@ -858,7 +855,7 @@ def health():
         "mockScenario": settings.MOCK_SCENARIO,
         "cameraReady": status["cameraReady"],
         "modelReady": status["modelReady"],
-        "aiReady": ai_ready,
+        "aiReady": ai_snapshot.ready,
         "aiReadinessDiagnostic": ai_snapshot.diagnostic,
         "ageGenderReady": status["ageGenderReady"],
         "ageGenderMode": status["ageGenderMode"],
@@ -1580,7 +1577,7 @@ async def run_v2_ai_attempt(
     attempt_id = payload["attemptId"]
     model_pack = os.environ.get("VEM_AI_MODEL_PACK")
     ai_ready = bool(
-        official_ai_readiness(model_pack)
+        official_ai_readiness_snapshot(model_pack).ready
         and _acquisition_observer_ready()
     )
     unavailable_terminal = _generated_v2_envelope(
@@ -1615,7 +1612,10 @@ async def run_v2_ai_attempt(
             accepted=accepted,
             generating=None,
             unavailable_terminal=unavailable_terminal,
-            readiness=lambda: bool(official_ai_readiness(model_pack) and _acquisition_observer_ready()),
+            readiness=lambda: bool(
+                official_ai_readiness_snapshot(model_pack).ready
+                and _acquisition_observer_ready()
+            ),
         )
         if not admission.is_owner:
             for replay_message in admission.replay:

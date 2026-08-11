@@ -59,6 +59,8 @@ _READINESS_SNAPSHOT = OfficialAiReadinessSnapshot(
 _READINESS_FILE_RELATIVES: tuple[str, ...] = ()
 _READINESS_DESIRED_ROOT: str | None = None
 _READINESS_REFRESH_TASK: asyncio.Task | None = None
+_READINESS_GENERATION = 0
+_READINESS_OWNER_LOOP: asyncio.AbstractEventLoop | None = None
 
 
 def _digest(path: Path) -> str:
@@ -371,20 +373,37 @@ def _compute_official_ai_readiness_snapshot(root: str | Path | None) -> Official
 
 async def refresh_official_ai_readiness(root: str | Path | None) -> OfficialAiReadinessSnapshot:
     """Refresh the official AI readiness cache off the event loop."""
-    global _READINESS_DESIRED_ROOT, _READINESS_FILE_RELATIVES, _READINESS_SNAPSHOT
+    global _READINESS_DESIRED_ROOT, _READINESS_FILE_RELATIVES
+    global _READINESS_GENERATION, _READINESS_OWNER_LOOP, _READINESS_SNAPSHOT
     normalized_root = str(Path(root).resolve()) if root else None
+    owner_loop = asyncio.get_running_loop()
     with _READINESS_LOCK:
+        _READINESS_OWNER_LOOP = owner_loop
+        _READINESS_GENERATION += 1
+        generation = _READINESS_GENERATION
         _READINESS_DESIRED_ROOT = normalized_root
+        if normalized_root is None:
+            _READINESS_FILE_RELATIVES = ()
+            _READINESS_SNAPSHOT = OfficialAiReadinessSnapshot(
+                root=None,
+                identity=None,
+                ready=False,
+                diagnostic="model_pack_missing",
+            )
+            return _READINESS_SNAPSHOT
     snapshot = await asyncio.to_thread(_compute_official_ai_readiness_snapshot, root)
     with _READINESS_LOCK:
-        if _READINESS_DESIRED_ROOT == normalized_root:
+        if (
+            _READINESS_GENERATION == generation
+            and _READINESS_DESIRED_ROOT == normalized_root
+        ):
             _READINESS_SNAPSHOT = snapshot
             if snapshot.identity is not None:
                 _READINESS_FILE_RELATIVES = tuple(
                     str(Path(identity[0]).relative_to(normalized_root))
                     for identity in snapshot.identity[2]
                 )
-    return snapshot
+        return _READINESS_SNAPSHOT
 
 
 def _current_readiness_failure(
@@ -411,14 +430,28 @@ def _current_readiness_failure(
 
 
 async def _owned_readiness_refresh() -> None:
-    global _READINESS_REFRESH_TASK
+    global _READINESS_FILE_RELATIVES, _READINESS_REFRESH_TASK, _READINESS_SNAPSHOT
     try:
         while True:
             with _READINESS_LOCK:
                 desired = _READINESS_DESIRED_ROOT
-            await refresh_official_ai_readiness(desired)
+                generation = _READINESS_GENERATION
+            if desired is None:
+                return
+            snapshot = await asyncio.to_thread(
+                _compute_official_ai_readiness_snapshot, desired
+            )
             with _READINESS_LOCK:
-                if desired == _READINESS_DESIRED_ROOT:
+                if (
+                    generation == _READINESS_GENERATION
+                    and desired == _READINESS_DESIRED_ROOT
+                ):
+                    _READINESS_SNAPSHOT = snapshot
+                    if snapshot.identity is not None:
+                        _READINESS_FILE_RELATIVES = tuple(
+                            str(Path(identity[0]).relative_to(desired))
+                            for identity in snapshot.identity[2]
+                        )
                     return
     finally:
         with _READINESS_LOCK:
@@ -426,29 +459,55 @@ async def _owned_readiness_refresh() -> None:
                 _READINESS_REFRESH_TASK = None
 
 
-def _schedule_owned_readiness_refresh() -> None:
+def _start_owned_readiness_refresh() -> None:
     global _READINESS_REFRESH_TASK
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
+    loop = asyncio.get_running_loop()
     with _READINESS_LOCK:
         if _READINESS_REFRESH_TASK is None or _READINESS_REFRESH_TASK.done():
             _READINESS_REFRESH_TASK = loop.create_task(_owned_readiness_refresh())
 
 
+def _schedule_owned_readiness_refresh() -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        with _READINESS_LOCK:
+            owner_loop = _READINESS_OWNER_LOOP
+        if owner_loop is not None and owner_loop.is_running():
+            owner_loop.call_soon_threadsafe(_start_owned_readiness_refresh)
+        return
+    _start_owned_readiness_refresh()
+
+
 def _hot_revalidate_readiness(root: str | None) -> OfficialAiReadinessSnapshot:
-    global _READINESS_DESIRED_ROOT, _READINESS_SNAPSHOT
-    with _READINESS_LOCK:
-        snapshot = _READINESS_SNAPSHOT
+    global _READINESS_DESIRED_ROOT, _READINESS_FILE_RELATIVES
+    global _READINESS_GENERATION, _READINESS_SNAPSHOT
     if root is None:
-        return snapshot
+        with _READINESS_LOCK:
+            if (
+                _READINESS_DESIRED_ROOT is not None
+                or _READINESS_SNAPSHOT.root is not None
+            ):
+                _READINESS_GENERATION += 1
+                _READINESS_DESIRED_ROOT = None
+                _READINESS_FILE_RELATIVES = ()
+                _READINESS_SNAPSHOT = OfficialAiReadinessSnapshot(
+                    root=None,
+                    identity=None,
+                    ready=False,
+                    diagnostic="model_pack_missing",
+                )
+            return _READINESS_SNAPSHOT
     identity, failure_diagnostic = _current_readiness_failure(root)
-    if snapshot.root == root and snapshot.identity == identity:
-        return snapshot
     with _READINESS_LOCK:
         snapshot = _READINESS_SNAPSHOT
-        if snapshot.root != root or snapshot.identity != identity:
+        changed = (
+            _READINESS_DESIRED_ROOT != root
+            or snapshot.root != root
+            or snapshot.identity != identity
+        )
+        if changed:
+            _READINESS_GENERATION += 1
             _READINESS_DESIRED_ROOT = root
             _READINESS_SNAPSHOT = OfficialAiReadinessSnapshot(
                 root=root,
@@ -457,26 +516,27 @@ def _hot_revalidate_readiness(root: str | None) -> OfficialAiReadinessSnapshot:
                 diagnostic=failure_diagnostic or "model_pack_invalid",
             )
         snapshot = _READINESS_SNAPSHOT
-    _schedule_owned_readiness_refresh()
+    if changed:
+        _schedule_owned_readiness_refresh()
     return snapshot
 
 
-def official_ai_readiness_snapshot() -> OfficialAiReadinessSnapshot:
-    with _READINESS_LOCK:
-        root = _READINESS_SNAPSHOT.root
-    return _hot_revalidate_readiness(root)
+def official_ai_readiness_snapshot(
+    root: str | Path | None,
+) -> OfficialAiReadinessSnapshot:
+    """Return one root-bound, internally consistent stat-only readiness fact."""
+    if not root:
+        return _hot_revalidate_readiness(None)
+    try:
+        normalized_root = str(Path(root).resolve())
+    except OSError:
+        return _hot_revalidate_readiness(None)
+    return _hot_revalidate_readiness(normalized_root)
 
 
 def official_ai_readiness(root: str | Path | None) -> bool:
     """Bounded stat-only readiness getter for hello/admission hot paths."""
-    if not root:
-        return False
-    try:
-        normalized_root = str(Path(root).resolve())
-    except OSError:
-        return False
-    snapshot = _hot_revalidate_readiness(normalized_root)
-    return snapshot.ready and snapshot.root == normalized_root
+    return official_ai_readiness_snapshot(root).ready
 
 
 async def shutdown_official_ai_readiness_refresh() -> None:
@@ -487,7 +547,9 @@ async def shutdown_official_ai_readiness_refresh() -> None:
 
 
 def reset_official_ai_readiness_cache_for_tests() -> None:
-    global _READINESS_DESIRED_ROOT, _READINESS_FILE_RELATIVES, _READINESS_REFRESH_TASK, _READINESS_SNAPSHOT
+    global _READINESS_DESIRED_ROOT, _READINESS_FILE_RELATIVES
+    global _READINESS_GENERATION, _READINESS_OWNER_LOOP
+    global _READINESS_REFRESH_TASK, _READINESS_SNAPSHOT
     with _READINESS_LOCK:
         _READINESS_SNAPSHOT = OfficialAiReadinessSnapshot(
             root=None,
@@ -497,4 +559,6 @@ def reset_official_ai_readiness_cache_for_tests() -> None:
         )
         _READINESS_FILE_RELATIVES = ()
         _READINESS_DESIRED_ROOT = None
+        _READINESS_GENERATION = 0
+        _READINESS_OWNER_LOOP = None
         _READINESS_REFRESH_TASK = None

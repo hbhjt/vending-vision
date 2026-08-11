@@ -3,6 +3,7 @@ import json
 import os
 import asyncio
 import time
+import threading
 from pathlib import Path
 
 import pytest
@@ -391,10 +392,84 @@ def test_ready_pack_selection_change_atomically_replaces_snapshot(tmp_path, monk
         await refresh_official_ai_readiness(roots[0])
         assert official_ai_readiness(roots[0]) is True
         assert official_ai_readiness(roots[1]) is False
-        assert official_ai_readiness_snapshot().root == str(roots[1].resolve())
-        assert official_ai_readiness_snapshot().ready is False
+        assert official_ai_readiness_snapshot(roots[1]).root == str(
+            roots[1].resolve()
+        )
+        assert official_ai_readiness_snapshot(roots[1]).ready is False
         await shutdown_official_ai_readiness_refresh()
         assert official_ai_readiness(roots[1]) is True
+
+    asyncio.run(exercise())
+
+
+def test_unset_root_generation_fences_out_an_older_background_refresh(
+    tmp_path, monkeypatch
+):
+    model = tmp_path / "mini" / "a.bin"
+    model.parent.mkdir()
+    model.write_bytes(b"mini-model")
+    descriptor = {
+        "schemaVersion": "vem-official-ai-model-pack-descriptor/v2",
+        "catvtonSourceRevision": "test-source",
+        "totalByteSize": model.stat().st_size,
+        "upstreams": [
+            {"id": "mini", "repository": "example/mini", "revision": "abc"}
+        ],
+        "files": [
+            {
+                "path": "mini/a.bin",
+                "upstreamPath": "a.bin",
+                "upstream": "mini",
+                "role": "mini_weight",
+                "format": "bin",
+                "byteSize": model.stat().st_size,
+                "sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    (tmp_path / "ai-model-manifest.json").write_text(
+        canonical_ai_model_manifest_json(descriptor), "utf-8"
+    )
+    monkeypatch.setattr(
+        ai_model_pack_module,
+        "load_official_ai_model_pack_descriptor",
+        lambda: descriptor,
+    )
+    monkeypatch.setattr(
+        "vision.ai_attempt_process.probe_ai_attempt_worker", lambda _pack: None
+    )
+    reset_official_ai_readiness_cache_for_tests()
+    asyncio.run(refresh_official_ai_readiness(tmp_path))
+
+    original_stat = model.stat()
+    model.write_bytes(b"evil-model")
+    os.utime(model, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    original_compute = ai_model_pack_module._compute_official_ai_readiness_snapshot
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_compute(root):
+        started.set()
+        assert release.wait(timeout=2)
+        return original_compute(root)
+
+    monkeypatch.setattr(
+        ai_model_pack_module, "_compute_official_ai_readiness_snapshot", slow_compute
+    )
+
+    async def exercise():
+        assert official_ai_readiness_snapshot(tmp_path).ready is False
+        assert await asyncio.to_thread(started.wait, 2)
+        unset = official_ai_readiness_snapshot(None)
+        assert (unset.ready, unset.diagnostic) == (False, "model_pack_missing")
+        release.set()
+        await shutdown_official_ai_readiness_refresh()
+        final = official_ai_readiness_snapshot(None)
+        assert (final.root, final.ready, final.diagnostic) == (
+            None,
+            False,
+            "model_pack_missing",
+        )
 
     asyncio.run(exercise())
 

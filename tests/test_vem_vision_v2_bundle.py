@@ -46,3 +46,18 @@ def test_runtime_boundary_has_no_generic_message_parser():
     ready = json.loads((ROOT / "server-valid.json").read_text("utf-8"))[0]
     assert parse_v2_client_message(hello).type == "vision.hello"
     assert parse_v2_server_message(ready).type == "vision.ready"
+
+
+@pytest.mark.parametrize(
+    ("ai_ready", "diagnostic"),
+    [(True, "model_pack_missing"), (False, "ready")],
+)
+def test_generated_python_parser_rejects_contradictory_ai_readiness(
+    ai_ready, diagnostic
+):
+    ready = json.loads((ROOT / "server-valid.json").read_text("utf-8"))[0]
+    ready["payload"]["aiReady"] = ai_ready
+    ready["payload"]["aiReadinessDiagnostic"] = diagnostic
+
+    with pytest.raises(ValueError, match="invalid vem.vision.v2 message"):
+        parse_server_message(ready)

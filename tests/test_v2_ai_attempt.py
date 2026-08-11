@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as vision_app
+from vision.ai_model_pack import OfficialAiReadinessSnapshot
 
 
 def _png_bytes(color=(20, 120, 220, 255), *, size=(48, 36)):
@@ -319,7 +320,18 @@ class _OutputValidationAiChild:
 
 def _configure_stage1_runtime(monkeypatch, pack: Path, *, ai_ready: bool = True):
     monkeypatch.setenv("VEM_AI_MODEL_PACK", str(pack))
-    monkeypatch.setattr(vision_app, "official_ai_readiness", lambda value: bool(ai_ready and value == str(pack)))
+    monkeypatch.setattr(
+        vision_app,
+        "official_ai_readiness_snapshot",
+        lambda value: OfficialAiReadinessSnapshot(
+            root=str(pack),
+            identity=None,
+            ready=bool(ai_ready and value == str(pack)),
+            diagnostic="ready"
+            if ai_ready and value == str(pack)
+            else "model_pack_missing",
+        ),
+    )
     monkeypatch.setattr(vision_app, "_ai_attempt_execution_lock", asyncio.Lock())
     monkeypatch.setattr(
         vision_app,
