@@ -12,6 +12,12 @@ import pytest
 from scripts.ai_model_pack_release import build_model_pack_zip
 from scripts.candidate_artifact_manifest import write_candidate_archive
 from vision.ai_model_pack import canonical_ai_model_manifest_json
+from vision.precutover_companion import (
+    _ExpectedFile,
+    _fd_sha256,
+    _IntegrityFence,
+    _WindowsFileApi,
+)
 from vision.precutover_companion import verify_frozen_worker_archive, verify_precutover
 from vision.precutover_companion import main as companion_main
 
@@ -53,6 +59,7 @@ def build_fixture(
         "utf-8",
     )
     worker.chmod(0o700)
+    (internal / "runtime-resource.dll").write_bytes(b"test worker runtime resource")
     requirements = [
         "torch==2.8.0+cpu",
         "torchvision==0.23.0+cpu",
@@ -190,6 +197,11 @@ def test_source_mode_verifies_real_candidate_model_archive_and_both_worker_probe
     assert report["probes"]["runtime"]["probe"] == "official-catvton-worker-runtime"
     assert report["probes"]["model"]["probe"] == "official-catvton-worker"
     assert report["candidate"]["workerMode"] == "source-test-only"
+    manifest = json.loads(fixture["candidate_manifest"].read_text("utf-8"))
+    assert (
+        report["candidate"]["workerExecutableSha256"]
+        == manifest["bindings"]["workerExecutable"]["sha256"]
+    )
     assert list(tmp_path.glob(".precutover-*")) == []
 
 
@@ -327,3 +339,153 @@ def test_worker_timeout_kills_its_descendant_and_leaves_no_partial_proof(tmp_pat
     assert not Path(f"/proc/{descendant}").exists()
     assert not output.exists()
     assert list(tmp_path.glob(".precutover-*")) == []
+
+
+def test_private_worker_rewrite_between_probes_cannot_publish_a_proof(tmp_path):
+    script = (
+        "#!/usr/bin/env python3\n"
+        "import json,pathlib,sys\n"
+        "path=pathlib.Path(__file__)\n"
+        "if '--probe-runtime' in sys.argv:\n"
+        " data=path.read_bytes()\n"
+        " with path.open('r+b') as stream:\n"
+        "  stream.seek(0); stream.write(data); stream.flush()\n"
+        f"payload={{'catvtonSourceRevision':{SOURCE_REVISION!r},"
+        "'torch':'2.8.0+cpu','torchvision':'0.23.0+cpu',"
+        "'diffusers':'0.29.2','transformers':'4.53.3'}\n"
+        "payload['probe']='official-catvton-worker-runtime' if '--probe-runtime' in sys.argv else 'official-catvton-worker'\n"
+        "print(json.dumps(payload,sort_keys=True))\n"
+    )
+    fixture = build_fixture(tmp_path, worker_script=script)
+    output = tmp_path / "proof.json"
+
+    with pytest.raises(RuntimeError, match="precutover_integrity"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert not output.exists()
+    assert list(tmp_path.glob(".precutover-*")) == []
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "worker",
+        "worker_resource",
+        "runtime_descriptor",
+        "ai_lock",
+        "source_descriptor",
+        "model_descriptor",
+        "staged_model_archive",
+        "installed_model",
+        "source_candidate",
+        "source_manifest",
+        "source_attestation",
+        "source_evidence",
+        "source_model_archive",
+    ],
+)
+@pytest.mark.parametrize("mutation", ["atomic-replace", "in-place-rewrite"])
+@pytest.mark.parametrize(
+    "phase", ["before-runtime-probe", "between-probes", "before-receipt"]
+)
+def test_every_critical_input_is_fenced_through_both_probes_and_receipt_publish(
+    tmp_path, target, mutation, phase
+):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+
+    def mutate(observed_phase: str, paths: dict[str, Path]) -> None:
+        if observed_phase != phase:
+            return
+        path = paths[target]
+        content = path.read_bytes()
+        if mutation == "atomic-replace":
+            replacement = path.with_name(f".{path.name}.replacement")
+            replacement.write_bytes(content)
+            os.replace(replacement, path)
+        else:
+            with path.open("r+b") as stream:
+                stream.seek(0)
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+    with pytest.raises(RuntimeError, match="precutover_integrity"):
+        invoke_fixture(fixture, tmp_path, output, _test_phase_hook=mutate)
+
+    assert not output.exists()
+    assert list(tmp_path.glob(".precutover-*")) == []
+
+
+def test_windows_file_lease_allows_only_read_sharing_and_checks_close_result(tmp_path):
+    class FakeKernel32:
+        def __init__(self):
+            self.opened = []
+            self.closed = []
+            self.close_result = 1
+
+        def CreateFileW(self, *arguments):
+            self.opened.append(arguments)
+            return 42
+
+        def CloseHandle(self, handle):
+            self.closed.append(handle)
+            return self.close_result
+
+    kernel32 = FakeKernel32()
+    api = _WindowsFileApi(kernel32)
+    path = tmp_path / "worker.exe"
+    handle = api.open_read_lease(path)
+
+    assert handle == 42
+    assert kernel32.opened == [
+        (
+            str(path),
+            _WindowsFileApi.GENERIC_READ,
+            _WindowsFileApi.FILE_SHARE_READ,
+            None,
+            _WindowsFileApi.OPEN_EXISTING,
+            _WindowsFileApi.FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    ]
+    api.close(handle)
+    assert kernel32.closed == [42]
+
+    kernel32.close_result = 0
+    with pytest.raises(RuntimeError, match="precutover_integrity_handle_close"):
+        api.close(handle)
+
+
+@pytest.mark.parametrize("invalid_handle", [None, 0, -1])
+def test_windows_file_lease_open_failure_is_fail_closed(tmp_path, invalid_handle):
+    class FakeKernel32:
+        def CreateFileW(self, *_arguments):
+            return invalid_handle
+
+        def CloseHandle(self, _handle):
+            raise AssertionError("an invalid handle must not be closed")
+
+    with pytest.raises(RuntimeError, match="precutover_integrity_handle_open"):
+        _WindowsFileApi(FakeKernel32()).open_read_lease(tmp_path / "worker.exe")
+
+
+def test_integrity_fence_rejects_unbounded_file_sets_before_opening_paths(tmp_path):
+    oversized = [
+        _ExpectedFile(tmp_path / str(index), 0, "a" * 64, str(index))
+        for index in range(20_001)
+    ]
+
+    with pytest.raises(RuntimeError, match="precutover_integrity_bounds"):
+        _IntegrityFence(oversized)
+
+
+def test_held_descriptor_hash_has_a_windows_compatible_fallback(tmp_path, monkeypatch):
+    path = tmp_path / "resource.dll"
+    path.write_bytes(b"held resource")
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        monkeypatch.delattr(os, "pread")
+        assert _fd_sha256(descriptor) == sha256(path)
+    finally:
+        os.close(descriptor)
