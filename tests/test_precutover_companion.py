@@ -816,3 +816,117 @@ def test_posix_linkat_uses_held_source_fd_parent_dirfd_and_empty_path_flag(tmp_p
     finally:
         os.close(parent_descriptor)
         os.close(source_descriptor)
+
+
+def test_parent_directory_close_after_effect_rolls_back_owned_final(tmp_path, monkeypatch):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+    original_open_parent = companion._PosixLinkApi.open_parent
+    original_close = companion.os.close
+    parent_descriptor = None
+    close_calls = 0
+
+    def capture_parent(api, path):
+        nonlocal parent_descriptor
+        parent_descriptor, identity = original_open_parent(api, path)
+        return parent_descriptor, identity
+
+    def close_then_raise(descriptor):
+        nonlocal close_calls
+        if descriptor == parent_descriptor:
+            close_calls += 1
+            if close_calls == 1:
+                original_close(descriptor)
+                raise OSError("injected parent close failure after effect")
+        return original_close(descriptor)
+
+    monkeypatch.setattr(companion._PosixLinkApi, "open_parent", capture_parent)
+    monkeypatch.setattr(companion.os, "close", close_then_raise)
+
+    with pytest.raises(OSError, match="injected parent close failure after effect"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    # One close for the original lease and one for the independently reopened
+    # rollback lease; neither descriptor generation is closed twice.
+    assert close_calls == 2
+    assert not output.exists()
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))
+
+
+def test_rollback_parent_close_after_effect_keeps_owned_final_removed(tmp_path, monkeypatch):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+    original_open_parent = companion._PosixLinkApi.open_parent
+    original_close = companion.os.close
+    parent_descriptors = set()
+    close_calls = 0
+
+    def capture_parent(api, path):
+        descriptor, identity = original_open_parent(api, path)
+        parent_descriptors.add(descriptor)
+        return descriptor, identity
+
+    def close_then_raise(descriptor):
+        nonlocal close_calls
+        if descriptor in parent_descriptors:
+            close_calls += 1
+            original_close(descriptor)
+            raise OSError(f"injected parent close failure {close_calls} after effect")
+        return original_close(descriptor)
+
+    monkeypatch.setattr(companion._PosixLinkApi, "open_parent", capture_parent)
+    monkeypatch.setattr(companion.os, "close", close_then_raise)
+
+    with pytest.raises(OSError, match="injected parent close failure 1 after effect"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert close_calls == 2
+    assert not output.exists()
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))
+
+
+def test_rollback_parent_reopen_identity_mismatch_never_unlinks_other_directory(
+    tmp_path, monkeypatch
+):
+    fixture = build_fixture(tmp_path)
+    output = tmp_path / "proof.json"
+    other_parent = tmp_path / "other-parent"
+    other_parent.mkdir()
+    other_proof = other_parent / output.name
+    other_proof.write_bytes(b"operator-owned proof\n")
+    original_open_parent = companion._PosixLinkApi.open_parent
+    original_close = companion.os.close
+    open_calls = 0
+    first_parent_descriptor = None
+    close_failed = False
+
+    def redirect_rollback_open(api, path):
+        nonlocal open_calls, first_parent_descriptor
+        open_calls += 1
+        opened = original_open_parent(api, path if open_calls == 1 else other_parent)
+        if open_calls == 1:
+            first_parent_descriptor = opened[0]
+        return opened
+
+    def close_first_parent_then_raise(descriptor):
+        nonlocal close_failed
+        if descriptor == first_parent_descriptor and not close_failed:
+            close_failed = True
+            original_close(descriptor)
+            raise OSError("injected original parent close failure after effect")
+        return original_close(descriptor)
+
+    monkeypatch.setattr(companion._PosixLinkApi, "open_parent", redirect_rollback_open)
+    monkeypatch.setattr(companion.os, "close", close_first_parent_then_raise)
+
+    with pytest.raises(OSError, match="original parent close failure after effect"):
+        invoke_fixture(fixture, tmp_path, output)
+
+    assert open_calls == 2
+    assert close_failed
+    assert output.exists()
+    assert other_proof.read_bytes() == b"operator-owned proof\n"
+    assert not list(tmp_path.glob(".proof.json.*.tmp"))
+    assert not list(tmp_path.glob(".precutover-*"))

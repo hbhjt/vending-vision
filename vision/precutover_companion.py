@@ -343,6 +343,55 @@ class _PosixLinkApi:
             raise OSError(error, os.strerror(error), name)
 
 
+class _ParentDirectoryLease:
+    def __init__(
+        self,
+        api: _PosixLinkApi,
+        path: Path,
+        descriptor: int,
+        identity: tuple[int, ...],
+    ):
+        self.api = api
+        self.path = path
+        self.identity = identity
+        self._descriptor = descriptor
+
+    @classmethod
+    def open(cls, api: _PosixLinkApi, path: Path) -> "_ParentDirectoryLease":
+        descriptor, identity = api.open_parent(path)
+        return cls(api, path, descriptor, identity)
+
+    @property
+    def available(self) -> bool:
+        return self._descriptor is not None
+
+    @property
+    def descriptor(self) -> int:
+        if self._descriptor is None:
+            raise RuntimeError("precutover_integrity_parent_closed")
+        return self._descriptor
+
+    def reopen(self) -> "_ParentDirectoryLease":
+        reopened = self.open(self.api, self.path)
+        if reopened.identity != self.identity:
+            failure = RuntimeError("precutover_integrity_parent_changed")
+            try:
+                reopened.close()
+            except Exception:
+                pass
+            raise failure
+        return reopened
+
+    def close(self) -> None:
+        descriptor = self._descriptor
+        if descriptor is None:
+            return
+        # close(2) failure has ambiguous descriptor lifetime. Make the lease
+        # unavailable before the call and never retry or reuse this integer.
+        self._descriptor = None
+        os.close(descriptor)
+
+
 @dataclass(frozen=True)
 class _ExpectedFile:
     path: Path
@@ -883,11 +932,10 @@ def _fsync_parent(path: Path, *, descriptor: int | None = None) -> None:
 def _publish_prepared(prepared: _PreparedProof, path: Path) -> None:
     created = False
     posix_api = None
-    parent_descriptor = None
-    parent_identity = None
+    parent_lease = None
     if os.name != "nt" and not prepared.is_windows:
         posix_api = _PosixLinkApi()
-        parent_descriptor, parent_identity = posix_api.open_parent(path.parent)
+        parent_lease = _ParentDirectoryLease.open(posix_api, path.parent)
         temporary_stat = os.fstat(prepared.descriptor)
     else:
         temporary_stat = prepared.path.lstat()
@@ -896,7 +944,7 @@ def _publish_prepared(prepared: _PreparedProof, path: Path) -> None:
     try:
         prepared.verify()
         if posix_api is not None:
-            posix_api.link_fd(prepared.descriptor, parent_descriptor, path.name)
+            posix_api.link_fd(prepared.descriptor, parent_lease.descriptor, path.name)
         else:
             if not prepared.is_windows:
                 raise RuntimeError("precutover_integrity_windows_prepared_handle")
@@ -904,17 +952,20 @@ def _publish_prepared(prepared: _PreparedProof, path: Path) -> None:
             # CreateHardLinkW (via os.link) cannot select a replaced path.
             os.link(prepared.path, path)
         created = True
+        parent_descriptor = parent_lease.descriptor if parent_lease is not None else None
         prepared.verify_link(path, parent_descriptor=parent_descriptor)
         _fsync_parent(path.parent, descriptor=parent_descriptor)
         prepared.verify_link(path, parent_descriptor=parent_descriptor)
         prepared.close()
         _unlink_owned(prepared.path)
         _fsync_parent(path.parent, descriptor=parent_descriptor)
-        if posix_api is not None and posix_api.parent_identity(path.parent.stat()) != parent_identity:
+        if (
+            posix_api is not None
+            and posix_api.parent_identity(path.parent.stat()) != parent_lease.identity
+        ):
             raise RuntimeError("precutover_integrity_parent_changed")
-        if parent_descriptor is not None:
-            os.close(parent_descriptor)
-            parent_descriptor = None
+        if parent_lease is not None:
+            parent_lease.close()
         return
     except Exception as exc:
         failure = exc
@@ -922,27 +973,46 @@ def _publish_prepared(prepared: _PreparedProof, path: Path) -> None:
         prepared.close()
     except Exception as exc:
         failure = failure or exc
+    rollback_lease = None
     try:
         if created:
+            if parent_lease is not None:
+                rollback_lease = (
+                    parent_lease if parent_lease.available else parent_lease.reopen()
+                )
+            parent_descriptor = (
+                rollback_lease.descriptor if rollback_lease is not None else None
+            )
             current = (
                 os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
-                if parent_descriptor is not None
+                if rollback_lease is not None
                 else path.lstat()
             )
             if (current.st_dev, current.st_ino, current.st_mode) == created_identity:
-                if parent_descriptor is not None:
+                if rollback_lease is not None:
                     os.unlink(path.name, dir_fd=parent_descriptor)
                 else:
                     _unlink_owned(path)
                 _fsync_parent(path.parent, descriptor=parent_descriptor)
     except FileNotFoundError:
         pass
+    except Exception as exc:
+        failure = failure or exc
     finally:
         try:
             _unlink_owned(prepared.path)
-        finally:
-            if parent_descriptor is not None:
-                os.close(parent_descriptor)
+        except Exception as exc:
+            failure = failure or exc
+        if rollback_lease is not None and rollback_lease is not parent_lease:
+            try:
+                rollback_lease.close()
+            except Exception as exc:
+                failure = failure or exc
+        if parent_lease is not None:
+            try:
+                parent_lease.close()
+            except Exception as exc:
+                failure = failure or exc
     raise failure
 
 
