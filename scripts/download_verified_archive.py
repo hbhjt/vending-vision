@@ -6,6 +6,7 @@ import errno
 import hashlib
 import math
 import os
+import re
 import selectors
 import shutil
 import signal
@@ -18,7 +19,7 @@ import time
 import zipfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 
 class ArchiveError(RuntimeError):
@@ -42,6 +43,59 @@ _EXTRACT_EXIT_CODES = {
     "archive_format": 25,
     "archive_member": 26,
 }
+_PUBLIC_RELEASE_PATH = re.compile(
+    r"^/YKDZ/vem/releases/download/[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
+_GITHUB_ASSET_PATH = re.compile(r"^/github-production-release-asset/[0-9]+/[0-9a-f-]+$")
+
+
+class _BoundGithubReleaseRedirectHandler(HTTPRedirectHandler):
+    """Record the one narrowly-authorized public Release redirect."""
+
+    def __init__(self):
+        super().__init__()
+        self.redirects: list[tuple[str, str]] = []
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.redirects.append((req.full_url, newurl))
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _is_public_vem_release_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc == "github.com"
+        and not parsed.query
+        and not parsed.fragment
+        and _PUBLIC_RELEASE_PATH.fullmatch(parsed.path) is not None
+    )
+
+
+def _is_github_asset_cdn_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc == "release-assets.githubusercontent.com"
+        and bool(parsed.query)
+        and not parsed.fragment
+        and _GITHUB_ASSET_PATH.fullmatch(parsed.path) is not None
+    )
+
+
+def _verify_redirect_identity(
+    original_url: str, response_url: str, redirects: tuple[tuple[str, str], ...]
+) -> None:
+    if response_url == original_url:
+        if redirects:
+            raise ArchiveError("archive_redirect_identity")
+        return
+    if (
+        not _is_public_vem_release_url(original_url)
+        or not _is_github_asset_cdn_url(response_url)
+        or redirects != ((original_url, response_url),)
+    ):
+        raise ArchiveError("archive_redirect_identity")
 
 
 class _WindowsJobApi:
@@ -584,7 +638,7 @@ def download_verified_archive(
     destination: Path,
     *,
     expected_bytes: int,
-    opener=urlopen,
+    opener=None,
     max_download_bytes: int = _MAX_DOWNLOAD_BYTES,
     max_extracted_bytes: int = _MAX_EXTRACTED_BYTES,
     max_members: int = _MAX_ARCHIVE_MEMBERS,
@@ -638,12 +692,20 @@ def download_verified_archive(
     try:
         digest = hashlib.sha256()
         request = Request(url, headers={"User-Agent": "vem-release-archive-fetcher/1"})
+        redirect_handler = None
+        if opener is None:
+            redirect_handler = _BoundGithubReleaseRedirectHandler()
+            opener = build_opener(redirect_handler).open
         with opener(request, timeout=min(_SOCKET_TIMEOUT_SECONDS, remaining())) as response:
             remaining()
             response_url = response.geturl()
             remaining()
-            if response_url != url:
-                raise ArchiveError("archive_redirect_identity")
+            redirects = tuple(
+                redirect_handler.redirects
+                if redirect_handler is not None
+                else getattr(opener, "redirects", ())
+            )
+            _verify_redirect_identity(url, response_url, redirects)
             with archive_path.open("xb") as output:
                 downloaded = 0
                 while True:

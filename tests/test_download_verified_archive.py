@@ -29,6 +29,19 @@ class _Response(io.BytesIO):
         self.close()
 
 
+class _RedirectingOpener:
+    def __init__(self, payload, origin, final, redirects):
+        self._payload = payload
+        self._origin = origin
+        self._final = final
+        self.redirects = redirects
+
+    def __call__(self, request, timeout):
+        assert request.full_url == self._origin
+        assert timeout == 120.0
+        return _Response(self._payload, self._final)
+
+
 class _Clock:
     def __init__(self):
         self.now = 0.0
@@ -513,6 +526,96 @@ def test_verified_archive_download_extracts_only_digest_bound_safe_members(tmp_p
     )
 
     assert (destination / "demo.whl").read_bytes() == b"wheel"
+
+
+def test_verified_archive_accepts_one_bound_public_github_release_asset_redirect(tmp_path):
+    origin = (
+        "https://github.com/YKDZ/vem/releases/download/"
+        "vision-core-wheelhouse-d2e4050/core-wheelhouse-d2e4050-windows-cp311.zip"
+    )
+    final = (
+        "https://release-assets.githubusercontent.com/github-production-release-asset/"
+        "1228601580/019acf24-78a5-4338-a514-a4ff543caabb?token=bound"
+    )
+    payload = _zip("demo.whl")
+    destination = tmp_path / "wheelhouse"
+    opener = _RedirectingOpener(payload, origin, final, [(origin, final)])
+
+    download_verified_archive(
+        origin,
+        hashlib.sha256(payload).hexdigest(),
+        destination,
+        expected_bytes=len(payload),
+        opener=opener,
+    )
+
+    assert (destination / "demo.whl").read_bytes() == b"wheel"
+
+
+@pytest.mark.parametrize(
+    ("origin", "final", "redirects"),
+    [
+        (
+            "https://github.com/YKDZ/vem/releases/download/"
+            "vision-core-wheelhouse-d2e4050/core-wheelhouse-d2e4050-windows-cp311.zip",
+            "https://evil.example/payload.zip",
+            [
+                (
+                    "https://github.com/YKDZ/vem/releases/download/"
+                    "vision-core-wheelhouse-d2e4050/core-wheelhouse-d2e4050-windows-cp311.zip",
+                    "https://evil.example/payload.zip",
+                )
+            ],
+        ),
+        (
+            "https://github.com/YKDZ/vem/releases/download/"
+            "vision-core-wheelhouse-d2e4050/core-wheelhouse-d2e4050-windows-cp311.zip",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/"
+            "1228601580/019acf24-78a5-4338-a514-a4ff543caabb?token=bound",
+            [
+                (
+                    "https://github.com/YKDZ/vem/releases/download/"
+                    "vision-core-wheelhouse-d2e4050/core-wheelhouse-d2e4050-windows-cp311.zip",
+                    "https://github.com/YKDZ/vem/releases/download/"
+                    "vision-core-wheelhouse-d2e4050/intermediate.zip",
+                ),
+                (
+                    "https://github.com/YKDZ/vem/releases/download/"
+                    "vision-core-wheelhouse-d2e4050/intermediate.zip",
+                    "https://release-assets.githubusercontent.com/github-production-release-asset/"
+                    "1228601580/019acf24-78a5-4338-a514-a4ff543caabb?token=bound",
+                ),
+            ],
+        ),
+        (
+            "https://example.invalid/releases/download/"
+            "vision-core-wheelhouse-d2e4050/core-wheelhouse-d2e4050-windows-cp311.zip",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/"
+            "1228601580/019acf24-78a5-4338-a514-a4ff543caabb?token=bound",
+            [
+                (
+                    "https://example.invalid/releases/download/"
+                    "vision-core-wheelhouse-d2e4050/core-wheelhouse-d2e4050-windows-cp311.zip",
+                    "https://release-assets.githubusercontent.com/github-production-release-asset/"
+                    "1228601580/019acf24-78a5-4338-a514-a4ff543caabb?token=bound",
+                )
+            ],
+        ),
+    ],
+)
+def test_verified_archive_rejects_unbound_or_multihop_redirect(
+    tmp_path, origin, final, redirects
+):
+    payload = _zip("demo.whl")
+
+    with pytest.raises(ArchiveError, match="archive_redirect_identity"):
+        download_verified_archive(
+            origin,
+            hashlib.sha256(payload).hexdigest(),
+            tmp_path / "wheelhouse",
+            expected_bytes=len(payload),
+            opener=_RedirectingOpener(payload, origin, final, redirects),
+        )
 
 
 def test_verified_archive_rejects_traversal_without_publishing_destination(tmp_path):
