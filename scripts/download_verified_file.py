@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 import time
 from urllib.parse import urlsplit
@@ -22,6 +23,32 @@ MAX_TOTAL_TIMEOUT_SECONDS = 3600.0
 
 class DownloadError(RuntimeError):
     pass
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int]:
+    facts = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(facts.st_mode):
+        raise DownloadError("download_destination_identity")
+    return facts.st_dev, facts.st_ino, facts.st_mode, facts.st_size
+
+
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _unlink_if_identity(path: Path, expected: tuple[int, int, int, int]) -> bool:
+    try:
+        if _file_identity(path) != expected:
+            return False
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def download_verified_file(
@@ -76,6 +103,8 @@ def download_verified_file(
         prefix=f".{destination.name}-", dir=destination.parent
     )
     temporary = Path(temporary_name)
+    created_identity: tuple[int, int, int, int] | None = None
+    temporary_removed = False
     try:
         digest = hashlib.sha256()
         downloaded = 0
@@ -119,11 +148,35 @@ def download_verified_file(
             os.link(temporary, destination)
         except FileExistsError as exc:
             raise DownloadError("download_destination") from exc
+        created_identity = _file_identity(destination)
+        if created_identity != _file_identity(temporary):
+            raise DownloadError("download_destination_identity")
+        _fsync_directory(destination.parent)
         temporary.unlink()
+        temporary_removed = True
+        _fsync_directory(destination.parent)
+        if _file_identity(destination) != created_identity:
+            raise DownloadError("download_destination_identity")
+    except BaseException:
+        if created_identity is not None:
+            removed = _unlink_if_identity(destination, created_identity)
+            if removed:
+                _fsync_directory(destination.parent)
+        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        if not temporary_removed:
+            cleanup_error: OSError | None = None
+            for _attempt in range(2):
+                try:
+                    temporary.unlink(missing_ok=True)
+                    temporary_removed = True
+                    break
+                except OSError as exc:
+                    cleanup_error = exc
+            if not temporary_removed and cleanup_error is not None:
+                raise cleanup_error
 
 
 def main() -> int:

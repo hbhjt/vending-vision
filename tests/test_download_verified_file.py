@@ -4,6 +4,7 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 
@@ -269,6 +270,226 @@ def test_publish_race_preserves_preexisting_destination_and_removes_temp(
 
     assert destination.read_bytes() == b"preexisting winner"
     assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_post_link_temp_unlink_failure_rolls_back_only_created_destination(
+    tmp_path, monkeypatch
+):
+    url = "https://example.invalid/unlink-failure.bin"
+    payload = b"verified post-link bytes"
+    destination = tmp_path / "unlink-failure.bin"
+    real_unlink = os.unlink
+    failed_once = False
+
+    def transient_temp_unlink(path, *args, **kwargs):
+        nonlocal failed_once
+        if not failed_once and Path(path).name.startswith(f".{destination.name}-"):
+            failed_once = True
+            raise OSError("injected post-link temp unlink failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr("scripts.download_verified_file.os.unlink", transient_temp_unlink)
+    with pytest.raises(OSError, match="post-link temp unlink"):
+        download_verified_file(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            destination,
+            opener=lambda _request, timeout: Response(payload, url),
+        )
+
+    assert failed_once
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_post_link_parent_fsync_failure_rolls_back_destination(tmp_path, monkeypatch):
+    url = "https://example.invalid/parent-fsync.bin"
+    payload = b"parent fsync"
+    destination = tmp_path / "parent-fsync.bin"
+    real_fsync = os.fsync
+    calls = 0
+
+    def fail_first_parent_fsync(descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected parent fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr("scripts.download_verified_file.os.fsync", fail_first_parent_fsync)
+    with pytest.raises(OSError, match="parent fsync failure"):
+        download_verified_file(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            destination,
+            opener=lambda _request, timeout: Response(payload, url),
+        )
+
+    assert calls >= 3  # file, failing first parent fsync, rollback parent fsync
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_post_link_failure_preserves_an_identity_replacement(tmp_path, monkeypatch):
+    url = "https://example.invalid/replaced.bin"
+    payload = b"created identity"
+    destination = tmp_path / "replaced.bin"
+    other = b"other actor replacement"
+    real_unlink = os.unlink
+    failed_once = False
+
+    def replace_then_fail_temp_unlink(path, *args, **kwargs):
+        nonlocal failed_once
+        if not failed_once and Path(path).name.startswith(f".{destination.name}-"):
+            failed_once = True
+            replacement = tmp_path / "other.tmp"
+            replacement.write_bytes(other)
+            os.replace(replacement, destination)
+            raise OSError("injected replacement window")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "scripts.download_verified_file.os.unlink", replace_then_fail_temp_unlink
+    )
+    with pytest.raises(OSError, match="replacement window"):
+        download_verified_file(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            destination,
+            opener=lambda _request, timeout: Response(payload, url),
+        )
+
+    assert destination.read_bytes() == other
+    assert [path.name for path in tmp_path.iterdir()] == [destination.name]
+
+
+def test_final_identity_change_after_durable_cleanup_preserves_replacement(
+    tmp_path, monkeypatch
+):
+    url = "https://example.invalid/final-replaced.bin"
+    payload = b"created final identity"
+    destination = tmp_path / "final-replaced.bin"
+    other = b"other final identity"
+    real_fsync = os.fsync
+    fsync_calls = 0
+
+    def replace_after_second_parent_fsync(descriptor):
+        nonlocal fsync_calls
+        result = real_fsync(descriptor)
+        facts = os.fstat(descriptor)
+        if stat.S_ISDIR(facts.st_mode):
+            fsync_calls += 1
+            if fsync_calls == 2:
+                replacement = tmp_path / "other-final.tmp"
+                replacement.write_bytes(other)
+                os.replace(replacement, destination)
+        return result
+
+    monkeypatch.setattr(
+        "scripts.download_verified_file.os.fsync", replace_after_second_parent_fsync
+    )
+    with pytest.raises(DownloadError, match="destination_identity"):
+        download_verified_file(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            destination,
+            opener=lambda _request, timeout: Response(payload, url),
+        )
+
+    assert destination.read_bytes() == other
+    assert [path.name for path in tmp_path.iterdir()] == [destination.name]
+
+
+def test_normal_publish_fsyncs_file_and_parent_around_temp_cleanup(
+    tmp_path, monkeypatch
+):
+    url = "https://example.invalid/ordered.bin"
+    payload = b"ordered durable publish"
+    destination = tmp_path / "ordered.bin"
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_link = os.link
+    real_unlink = os.unlink
+
+    def record_fsync(descriptor):
+        facts = os.fstat(descriptor)
+        events.append(
+            "parent-fsync" if stat.S_ISDIR(facts.st_mode) else "file-fsync"
+        )
+        return real_fsync(descriptor)
+
+    def record_link(source, target):
+        events.append("link")
+        return real_link(source, target)
+
+    def record_unlink(path, *args, **kwargs):
+        if Path(path).name.startswith(f".{destination.name}-"):
+            events.append("temp-unlink")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr("scripts.download_verified_file.os.fsync", record_fsync)
+    monkeypatch.setattr("scripts.download_verified_file.os.link", record_link)
+    monkeypatch.setattr("scripts.download_verified_file.os.unlink", record_unlink)
+    download_verified_file(
+        url,
+        hashlib.sha256(payload).hexdigest(),
+        len(payload),
+        destination,
+        opener=lambda _request, timeout: Response(payload, url),
+    )
+
+    assert events == [
+        "file-fsync",
+        "link",
+        "parent-fsync",
+        "temp-unlink",
+        "parent-fsync",
+    ]
+    assert destination.read_bytes() == payload
+
+
+def test_rollback_cleanup_failure_never_returns_success(tmp_path, monkeypatch):
+    url = "https://example.invalid/rollback-failure.bin"
+    payload = b"rollback failure"
+    destination = tmp_path / "rollback-failure.bin"
+    real_fsync = os.fsync
+    real_unlink = os.unlink
+    fsync_calls = 0
+    temp_failed = False
+
+    def fail_rollback_parent_fsync(descriptor):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("publish parent fsync failure")
+        if fsync_calls == 3:
+            raise OSError("rollback parent fsync failure")
+        return real_fsync(descriptor)
+
+    def fail_first_temp_cleanup(path, *args, **kwargs):
+        nonlocal temp_failed
+        if not temp_failed and Path(path).name.startswith(f".{destination.name}-"):
+            temp_failed = True
+            raise OSError("temporary cleanup failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr("scripts.download_verified_file.os.fsync", fail_rollback_parent_fsync)
+    monkeypatch.setattr("scripts.download_verified_file.os.unlink", fail_first_temp_cleanup)
+    with pytest.raises(OSError):
+        download_verified_file(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            destination,
+            opener=lambda _request, timeout: Response(payload, url),
+        )
+
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_bounded_file_downloader_publishes_only_exact_https_identity(tmp_path):
