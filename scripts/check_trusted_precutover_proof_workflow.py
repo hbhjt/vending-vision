@@ -323,6 +323,11 @@ def check(workflow_path: Path, repository_root: Path) -> None:
             f"trusted_proof_model_input_mode:{label}",
         )
         _require(
+            f'$downloads += ,@($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "{root}/model/official-model-pack.zip")'
+            in block,
+            f"trusted_proof_single_model_tuple:{label}",
+        )
+        _require(
             block.count("assemble-model-pack --parts-root") == 1
             and f"--parts-root {root}/model-parts" in block
             and f"--destination {root}/model/official-model-pack.zip" in block,

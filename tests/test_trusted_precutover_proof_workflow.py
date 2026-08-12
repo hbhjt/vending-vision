@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import textwrap
 
 import pytest
 
@@ -282,6 +284,76 @@ def test_proof_reconstructs_only_the_exact_three_model_parts_in_both_fresh_jobs(
         assert job.count("assemble-model-pack --parts-root") == 1
 
 
+def _download_collection_shape(job: str, *, multipart: bool) -> list[list[str]]:
+    start = job.index("          $downloads = @(")
+    end = job.index("          foreach ($download in $downloads) {")
+    script = job[start:end].replace(
+        "            New-Item -ItemType Directory -Path ", "            # model-part directory: "
+    )
+    environment = {
+        "CANDIDATE_ARCHIVE_URL": "https://example.invalid/candidate.zip",
+        "CANDIDATE_ARCHIVE_SHA256": "a" * 64,
+        "CANDIDATE_ARCHIVE_BYTES": "101",
+        "CANDIDATE_MANIFEST_URL": "https://example.invalid/candidate-manifest.json",
+        "CANDIDATE_MANIFEST_SHA256": "b" * 64,
+        "CANDIDATE_MANIFEST_BYTES": "102",
+        "CANDIDATE_ATTESTATION_URL": "https://example.invalid/candidate.sigstore.json",
+        "CANDIDATE_ATTESTATION_SHA256": "c" * 64,
+        "CANDIDATE_ATTESTATION_BYTES": "103",
+        "CANDIDATE_EVIDENCE_URL": "https://example.invalid/candidate-evidence.json",
+        "CANDIDATE_EVIDENCE_SHA256": "d" * 64,
+        "CANDIDATE_EVIDENCE_BYTES": "104",
+        "MODEL_PACK_SHA256": "e" * 64,
+        "MODEL_PACK_BYTES": "105",
+    }
+    for index in range(1, 4):
+        prefix = f"MODEL_PACK_PART_{index:02d}"
+        environment[f"{prefix}_URL"] = (
+            f"https://example.invalid/official-model-pack.part{index:02d}"
+        ) if multipart else ""
+        environment[f"{prefix}_SHA256"] = (chr(101 + index) * 64) if multipart else ""
+        environment[f"{prefix}_BYTES"] = str(105 + index) if multipart else ""
+    environment["MODEL_PACK_URL"] = "" if multipart else "https://example.invalid/model.zip"
+    completed = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            textwrap.dedent(script)
+            + "\n$downloads | ConvertTo-Json -Depth 3 -Compress\n",
+        ],
+        cwd=ROOT,
+        env={**os.environ, **environment},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    return json.loads(completed.stdout)
+
+
+@pytest.mark.parametrize(
+    ("job_name", "multipart", "expected_count"),
+    (("execute", False, 5), ("execute", True, 7), ("sign", False, 5), ("sign", True, 7)),
+)
+def test_proof_downloads_keep_every_input_as_one_four_field_tuple(
+    job_name: str, multipart: bool, expected_count: int
+):
+    source = TRUSTED_PROOF.read_text("utf-8")
+    boundaries = {
+        "execute": ("  execute:\n", "  sign:\n"),
+        "sign": ("  sign:\n", "  verify:\n"),
+    }
+    start, end = boundaries[job_name]
+    job = source[source.index(start) : source.index(end)]
+
+    downloads = _download_collection_shape(job, multipart=multipart)
+
+    assert len(downloads) == expected_count
+    assert all(len(download) == 4 for download in downloads)
+
+
 def test_proof_and_fresh_verify_jobs_use_only_immutable_trusted_code_and_safe_env():
     source = TRUSTED_PROOF.read_text("utf-8")
     workflow = load_workflow_yaml(source)
@@ -405,6 +477,11 @@ def test_trusted_proof_policy_rejects_mutable_authority_and_execution_bypasses(t
         "multipart-allows-mixed-inputs": trusted.replace(
             "$env:MODEL_PACK_URL -match '\\S' -and $partValueCount -eq 0",
             "$env:MODEL_PACK_URL -match '\\S' -and $partValueCount -ge 0",
+            1,
+        ),
+        "single-model-download-flattens-tuple": trusted.replace(
+            "$downloads += ,@($env:MODEL_PACK_URL",
+            "$downloads += @(@($env:MODEL_PACK_URL",
             1,
         ),
         "multipart-part-order-drift": trusted.replace(

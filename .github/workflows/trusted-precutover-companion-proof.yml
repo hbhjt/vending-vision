@@ -244,7 +244,7 @@ jobs:
           $partValueCount = @($partValues | Where-Object { $_ -match '\S' -and $_ -ne '0' }).Count
           $useMultipartModelPack = $false
           if ($env:MODEL_PACK_URL -match '\S' -and $partValueCount -eq 0) {
-            $downloads += @(@($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "proof-input/model/official-model-pack.zip"))
+            $downloads += ,@($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "proof-input/model/official-model-pack.zip")
           } elseif ($env:MODEL_PACK_URL -notmatch '\S' -and $partValueCount -eq 9) {
             New-Item -ItemType Directory -Path proof-input/model-parts -Force | Out-Null
             $downloads += @(
@@ -470,7 +470,7 @@ jobs:
           $partValueCount = @($partValues | Where-Object { $_ -match '\S' -and $_ -ne '0' }).Count
           $useMultipartModelPack = $false
           if ($env:MODEL_PACK_URL -match '\S' -and $partValueCount -eq 0) {
-            $downloads += @(@($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "signer-proof-input/model/official-model-pack.zip"))
+            $downloads += ,@($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "signer-proof-input/model/official-model-pack.zip")
           } elseif ($env:MODEL_PACK_URL -notmatch '\S' -and $partValueCount -eq 9) {
             New-Item -ItemType Directory -Path signer-proof-input/model-parts -Force | Out-Null
             $downloads += @(
