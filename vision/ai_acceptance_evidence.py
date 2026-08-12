@@ -36,7 +36,8 @@ class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
 
 
 class _FILE_DISPOSITION_INFO(ctypes.Structure):
-    _fields_ = [("DeleteFile", ctypes.c_int)]
+    # BOOLEAN is an unsigned one-byte Win32 ABI type, not a C int/BOOL.
+    _fields_ = [("DeleteFile", ctypes.c_ubyte)]
 
 
 class _WindowsEvidenceFileApi:
@@ -156,13 +157,6 @@ class _WindowsEvidenceFileApi:
             if read.value == 0:
                 return digest.digest()
             digest.update(buffer.raw[: read.value])
-
-    def flush_directory(self, root: Path) -> None:
-        handle = self.open_directory(root)
-        try:
-            self.flush(handle)
-        finally:
-            self.close(handle)
 
     def mark_delete(self, handle: int) -> None:
         disposition = _FILE_DISPOSITION_INFO(1)
@@ -473,18 +467,19 @@ def _publish_windows_ai_regional_evidence(
     def delete_owned(path: Path, identity: tuple[int, int, int] | None) -> None:
         if identity is None:
             return
-        handle = None
         try:
             handle = api.open_delete(path)
+        except RuntimeError:
+            if not path.exists() and not path.is_symlink():
+                return
+            raise
+        try:
             observed, _size = api.information(handle)
             if observed != identity:
                 return
             api.mark_delete(handle)
-        except RuntimeError:
-            return
         finally:
-            if handle is not None:
-                api.close(handle)
+            api.close(handle)
 
     try:
         claim_handle = api.open_directory(claim)
@@ -502,10 +497,12 @@ def _publish_windows_ai_regional_evidence(
         published_identity, published_size = api.information(destination_handle)
         if published_identity != temporary_identity or published_size != len(content):
             raise RuntimeError("ai_acceptance_evidence_publish_invalid")
-        api.flush(destination_handle)
-        # Parent-directory durability is a best available Windows boundary;
-        # source, destination, and claim handles all remain held through it.
-        api.flush_directory(root)
+        # FlushFileBuffers requires GENERIC_WRITE.  The held source has it;
+        # the read-only destination must never be passed to that API.  Windows
+        # exposes no directory durability primitive usable with this least-
+        # privilege handle, so correctness is fenced by the flushed file and
+        # held source/destination identities rather than a directory flush.
+        api.flush(source_handle)
         final_identity, final_size = api.information(destination_handle)
         if (
             final_identity != temporary_identity
@@ -533,7 +530,6 @@ def _publish_windows_ai_regional_evidence(
             cleanup(lambda: delete_owned(destination, published_identity))
             cleanup(lambda: delete_owned(temporary, temporary_identity))
             cleanup(claim.rmdir)
-            cleanup(lambda: api.flush_directory(root))
         _raise_with_cleanup(primary, cleanup_errors)
     return destination
 

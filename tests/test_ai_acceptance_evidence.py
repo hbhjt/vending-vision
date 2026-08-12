@@ -1,3 +1,4 @@
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -30,8 +31,9 @@ class FakeWindowsKernel32:
         self.write_failure = False
         self.flush_failure = False
         self.flush_failure_once = False
-        self.directory_flush_failure = False
-        self.directory_flush_hook = None
+        self.flush_hook = None
+        self.directory_open_failure = False
+        self.delete_failure_once = False
         self.close_fail_once = False
 
     def CreateFileW(self, path, access, share, _security, creation, flags, _template):
@@ -39,7 +41,7 @@ class FakeWindowsKernel32:
         self.calls.append(("CreateFileW", target, access, share, creation, flags))
         try:
             if flags & acceptance_evidence._WindowsEvidenceFileApi.FILE_FLAG_BACKUP_SEMANTICS:
-                if not target.is_dir():
+                if not target.is_dir() or self.directory_open_failure:
                     return -1
                 stream = None
             elif creation == acceptance_evidence._WindowsEvidenceFileApi.CREATE_NEW:
@@ -54,6 +56,7 @@ class FakeWindowsKernel32:
             "path": target,
             "stream": stream,
             "share": share,
+            "access": access,
             "flags": flags,
         }
         return handle
@@ -69,16 +72,18 @@ class FakeWindowsKernel32:
         return 1
 
     def FlushFileBuffers(self, handle):
-        self.calls.append(("FlushFileBuffers", handle))
+        self.calls.append(
+            ("FlushFileBuffers", handle, self.handles[handle]["access"])
+        )
         stream = self.handles[handle]["stream"]
-        if stream is None and self.directory_flush_hook is not None:
-            self.directory_flush_hook()
+        if not self.handles[handle]["access"] & acceptance_evidence._WindowsEvidenceFileApi.GENERIC_WRITE:
+            return 0
+        if self.flush_hook is not None:
+            self.flush_hook(handle)
         if self.flush_failure:
             return 0
         if self.flush_failure_once:
             self.flush_failure_once = False
-            return 0
-        if stream is None and self.directory_flush_failure:
             return 0
         if stream is not None:
             stream.flush()
@@ -113,11 +118,16 @@ class FakeWindowsKernel32:
         self.calls.append(("ReadFile", handle, len(chunk)))
         return 1
 
-    def SetFileInformationByHandle(self, handle, information_class, info, _size):
-        self.calls.append(("SetFileInformationByHandle", handle, information_class))
+    def SetFileInformationByHandle(self, handle, information_class, info, size):
+        self.calls.append(("SetFileInformationByHandle", handle, information_class, size))
         if information_class != acceptance_evidence._WindowsEvidenceFileApi.FILE_DISPOSITION_INFO:
             return 0
-        if not info._obj.DeleteFile:
+        if size != 1 or ctypes.sizeof(info._obj) != 1 or info._obj.DeleteFile != 1:
+            return 0
+        if not self.handles[handle]["access"] & acceptance_evidence._WindowsEvidenceFileApi.DELETE:
+            return 0
+        if self.delete_failure_once:
+            self.delete_failure_once = False
             return 0
         try:
             self.handles[handle]["path"].unlink()
@@ -196,6 +206,19 @@ def test_windows_acceptance_sink_publishes_with_held_read_only_handles(
     assert file_opens[2][3] == acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_READ
     assert any(call[0] == "CreateHardLinkW" for call in kernel.calls)
     assert any(call[0] == "ReadFile" for call in kernel.calls)
+    flushes = [call for call in kernel.calls if call[0] == "FlushFileBuffers"]
+    assert flushes
+    assert all(
+        call[2] & acceptance_evidence._WindowsEvidenceFileApi.GENERIC_WRITE
+        for call in flushes
+    )
+    delete_call = next(
+        call for call in kernel.calls if call[0] == "SetFileInformationByHandle"
+    )
+    assert delete_call[2:] == (
+        acceptance_evidence._WindowsEvidenceFileApi.FILE_DISPOSITION_INFO,
+        1,
+    )
     source_handle = kernel.next_handle - len(kernel.handles) - 3
     read_index = next(
         index
@@ -249,7 +272,11 @@ def test_windows_acceptance_sink_held_handles_block_external_mutation(
         else:
             assert kernel.inplace_write(destination, b"in-place mutation\n") is False
 
-    kernel.directory_flush_hook = attempt_mutation
+    def mutate_after_publish(_handle):
+        if destination.exists():
+            attempt_mutation()
+
+    kernel.flush_hook = mutate_after_publish
     assert publish_completed_ai_regional_evidence(
         attempt_id, canonical_sidecar()
     ) == destination
@@ -279,6 +306,54 @@ def test_windows_acceptance_sink_rolls_back_on_write_flush_or_close_failure(
         assert list(root.iterdir()) == []
 
 
+def test_windows_acceptance_sink_rolls_back_when_temp_delete_or_claim_cleanup_fails(
+    tmp_path, monkeypatch
+):
+    for failure in ("delete", "claim"):
+        root = tmp_path / failure
+        root.mkdir()
+        monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(root))
+        kernel = FakeWindowsKernel32()
+        if failure == "delete":
+            kernel.delete_failure_once = True
+        else:
+            original_rmdir = Path.rmdir
+            failed = False
+
+            def fail_claim_once(path):
+                nonlocal failed
+                if path.name == ".ai-regional-evidence-publishing" and not failed:
+                    failed = True
+                    raise OSError("claim cleanup failed")
+                return original_rmdir(path)
+
+            monkeypatch.setattr(Path, "rmdir", fail_claim_once)
+        windows_sink(monkeypatch, kernel)
+
+        with pytest.raises(
+            (RuntimeError, OSError), match="windows_handle_delete|claim cleanup failed"
+        ):
+            publish_completed_ai_regional_evidence(str(uuid4()), canonical_sidecar())
+
+        assert list(root.iterdir()) == []
+
+
+def test_windows_acceptance_sink_rolls_back_when_claim_directory_handle_cannot_open(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "acceptance"
+    root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(root))
+    kernel = FakeWindowsKernel32()
+    kernel.directory_open_failure = True
+    windows_sink(monkeypatch, kernel)
+
+    with pytest.raises(RuntimeError, match="windows_handle_open"):
+        publish_completed_ai_regional_evidence(str(uuid4()), canonical_sidecar())
+
+    assert list(root.iterdir()) == []
+
+
 def test_windows_acceptance_sink_preserves_external_replacement_during_rollback(
     tmp_path, monkeypatch
 ):
@@ -292,11 +367,12 @@ def test_windows_acceptance_sink_preserves_external_replacement_during_rollback(
     replacement = tmp_path / "replacement.json"
     replacement.write_bytes(b"external publisher bytes\n")
 
-    def replace_then_fail_directory_flush():
-        os.replace(replacement, destination)
+    def replace_then_fail_source_flush(_handle):
+        if destination.exists() and replacement.exists():
+            os.replace(replacement, destination)
+            kernel.flush_failure_once = True
 
-    kernel.directory_flush_hook = replace_then_fail_directory_flush
-    kernel.directory_flush_failure = True
+    kernel.flush_hook = replace_then_fail_source_flush
 
     with pytest.raises(RuntimeError, match="windows_handle_flush"):
         publish_completed_ai_regional_evidence(attempt_id, canonical_sidecar())
