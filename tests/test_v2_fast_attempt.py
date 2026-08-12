@@ -74,7 +74,11 @@ def _fast_block_then_ready_barrier_broker_target(connection, config):
         # lets the parent prove whether cleanup waits for replacement readiness
         # without charging arbitrary hosted spawn time to a 1s frame budget.
         restart_ready_entered.set()
-        restart_ready_release.wait()
+        # Do not wait on a multiprocessing.Condition here.  The production
+        # timeout can kill this child while it is parked at the boundary;
+        # notifying a condition whose waiter died can itself deadlock cleanup.
+        while not restart_ready_release.value:
+            time.sleep(0.01)
     try:
         connection.send(("ready", {"pid": os.getpid()}))
         while True:
@@ -1949,7 +1953,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
     starts = context.Value("i", 0)
     blocked_read_entered = context.Event()
     restart_ready_entered = context.Event()
-    restart_ready_release = context.Event()
+    restart_ready_release = context.RawValue("b", 0)
     broker = DirectShowCameraBroker(
         "front",
         {
@@ -2020,7 +2024,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
             await asyncio.wait_for(
                 asyncio.to_thread(restart_ready_entered.wait), timeout=15.0
             )
-            restart_ready_release.set()
+            restart_ready_release.value = 1
         with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
             await asyncio.wait_for(blocked, timeout=15.0)
 
@@ -2039,7 +2043,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
             # The child is now definitely at the ready barrier.  Only the
             # attempt's own one-second deadline remains to elapse.
             await asyncio.sleep(1.05)
-            restart_ready_release.set()
+            restart_ready_release.value = 1
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(next_read, timeout=15.0)
             return
@@ -2055,7 +2059,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
         # Never strand a child in its synchronization barrier when a prior
         # assertion fails; the barrier is test-only and not the behavior
         # being asserted.
-        restart_ready_release.set()
+        restart_ready_release.value = 1
         assert asyncio.run(broker.abort_async(reason="test_cleanup"))
         with camera_manager._streams_lock:
             camera_manager._dshow_brokers.pop("front", None)
