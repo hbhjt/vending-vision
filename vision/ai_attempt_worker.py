@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import socket
@@ -25,6 +26,7 @@ from vision.source_provenance import verify_official_source_provenance
 
 _MAX_INPUT_BYTES = 20 * 1024 * 1024
 _MAX_INPUT_PIXELS = 8192 * 8192
+_DIGEST = __import__("re").compile(r"^[a-f0-9]{64}$")
 
 
 def _deny_downloads() -> None:
@@ -40,6 +42,161 @@ class CatVTONWorkerError(RuntimeError):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_json(value: dict[str, object]) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+
+def _captured_source(raw: str | None) -> dict[str, object]:
+    try:
+        value = json.loads(raw or "")
+    except ValueError as exc:
+        raise CatVTONWorkerError("official_catvton_captured_source_invalid") from exc
+    keys = {
+        "adapter",
+        "configSha256",
+        "decodedFrameCount",
+        "fixtureSha256",
+        "frameIndex",
+        "relabeled",
+        "role",
+        "synthetic",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or value.get("adapter") != "recorded_video"
+        or value.get("role") != "front"
+        or value.get("synthetic") is not False
+        or value.get("relabeled") is not False
+        or not isinstance(value.get("decodedFrameCount"), int)
+        or not isinstance(value.get("frameIndex"), int)
+        or not 0 <= value["frameIndex"] < value["decodedFrameCount"]
+        or not _DIGEST.fullmatch(value.get("configSha256", ""))
+        or not _DIGEST.fullmatch(value.get("fixtureSha256", ""))
+    ):
+        raise CatVTONWorkerError("official_catvton_captured_source_invalid")
+    return value
+
+
+def _rle(mask) -> dict[str, object]:
+    flat = (mask.reshape(-1) > 0).tolist()
+    runs: list[list[int]] = []
+    start = None
+    for index, selected in enumerate([*flat, False]):
+        if selected and start is None:
+            start = index
+        elif not selected and start is not None:
+            runs.append([start, index - start])
+            start = None
+    if not runs:
+        raise CatVTONWorkerError("official_catvton_regional_mask_empty")
+    return {"encoding": "rle-row-major/v1", "runs": runs}
+
+
+def _measurement(original, result, mask) -> dict[str, int]:
+    import numpy as np
+
+    selected = mask > 0
+    sampled = int(np.count_nonzero(selected))
+    if sampled == 0:
+        raise CatVTONWorkerError("official_catvton_regional_mask_empty")
+    delta = np.abs(result.astype(np.int16) - original.astype(np.int16))
+    changed = int(np.count_nonzero(np.any(delta > 0, axis=2) & selected))
+    return {
+        "changedFractionBps": changed * 10_000 // sampled,
+        "changedPixels": changed,
+        "meanDelta": int(delta[selected].sum()) // (sampled * 3),
+        "sampledPixels": sampled,
+    }
+
+
+def _write_regional_evidence(
+    *,
+    args: argparse.Namespace,
+    original,
+    result,
+    upper_body,
+    protected,
+) -> None:
+    source = _captured_source(args.captured_source)
+    output_path = Path(args.output)
+    evidence_path = Path(args.regional_evidence_output)
+    if evidence_path.parent.resolve() != output_path.parent.resolve() or evidence_path == output_path:
+        raise CatVTONWorkerError("official_catvton_regional_output_path_invalid")
+    upper_measurement = _measurement(original, result, upper_body)
+    protected_measurement = _measurement(original, result, protected)
+    source_descriptor = Path(__file__).resolve().parents[1] / "official-ai-source-descriptor.json"
+    upper_measurement["verdict"] = (
+        "changed" if upper_measurement["changedPixels"] > 0 else "insufficient_change"
+    )
+    protected_measurement["verdict"] = (
+        "preserved" if protected_measurement["changedPixels"] == 0 else "changed"
+    )
+    verdict = (
+        "passed"
+        if upper_measurement["verdict"] == "changed"
+        and protected_measurement["verdict"] == "preserved"
+        else "regional_check_failed"
+    )
+    sidecar = {
+        "attempt": {
+            "acquisitionSource": "direct_recorded_frame",
+            "decodedHeight": int(original.shape[0]),
+            "decodedWidth": int(original.shape[1]),
+            "garmentSha256": _sha256(Path(args.garment)),
+            "inputSha256": _sha256(Path(args.person)),
+            "recordedFixtureSha256": source["fixtureSha256"],
+            "resultSha256": _sha256(output_path),
+            "sourceCamera": "front",
+        },
+        "evaluator": {
+            "algorithm": "rgb-absolute-delta-rle/v1",
+            "atr": "schp-atr",
+            "lip": "schp-lip",
+            "pose": "mediapipe-pose",
+            "sourceDescriptorSha256": _sha256(source_descriptor),
+        },
+        "kind": "regional-evidence",
+        "masks": {
+            "height": int(original.shape[0]),
+            "protectedRegion": _rle(protected),
+            "upperBody": _rle(upper_body),
+            "width": int(original.shape[1]),
+        },
+        "measurements": {
+            "protectedRegion": protected_measurement,
+            "upperBody": upper_measurement,
+        },
+        "policy": {
+            "schemaVersion": "vem-ai-regional-evidence-policy/v1",
+            "sha256": "780b7adad8f9512635448a94d7f8cbc868abe2555a2fb601d421a2e5d73e2d35",
+        },
+        "schemaVersion": "vem-ai-regional-evidence/v1",
+        "verdict": verdict,
+    }
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    temp = evidence_path.with_name(f".{evidence_path.name}.{os.getpid()}.tmp")
+    try:
+        with temp.open("xb") as stream:
+            stream.write(_canonical_json(sidecar))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, evidence_path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def _pack_path(root: Path, relative: str) -> Path:
@@ -152,6 +309,7 @@ def _run_catvton_attempt(args: argparse.Namespace, pack_root: Path) -> dict[str,
         letterbox_image,
         letterbox_mask,
         parsed_old_clothes_mask,
+        protected_mask_to_original,
         refine_mask_with_generated_parse,
     )
     from vision.vendor.catvton.model.SCHP import SCHP
@@ -255,6 +413,9 @@ def _run_catvton_attempt(args: argparse.Namespace, pack_root: Path) -> dict[str,
     post_parse_seconds = time.perf_counter() - post_parse_started
     generated_rgb = harmonize_garment_color(generated_rgb_raw, final_mask_fit, garment_fit)
     result = composite_to_original(original, generated_rgb, final_mask_fit, transform)
+    upper_body, protected = protected_mask_to_original(
+        mask_fit, final_mask_fit, transform
+    )
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -265,6 +426,14 @@ def _run_catvton_attempt(args: argparse.Namespace, pack_root: Path) -> dict[str,
         if check.format != "PNG" or check.width != original.shape[1] or check.height != original.shape[0]:
             raise CatVTONWorkerError("official_catvton_invalid_output")
     os.replace(temp_output, output)
+    if args.regional_evidence_output:
+        _write_regional_evidence(
+            args=args,
+            original=original,
+            result=result,
+            upper_body=upper_body,
+            protected=protected,
+        )
     return {
         "output": str(output),
         "parsing_seconds": round(parsing_seconds, 2),
@@ -287,6 +456,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--garment")
     parser.add_argument("--template", choices=["tshirt_short_sleeve", "tshirt_long_sleeve"], default="tshirt_short_sleeve")
     parser.add_argument("--output")
+    parser.add_argument("--regional-evidence-output")
+    parser.add_argument("--captured-source")
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--steps", type=int, default=12)
@@ -327,6 +498,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not (args.person and args.garment and args.output):
         raise RuntimeError("official_catvton_attempt_paths_required")
+    if bool(args.regional_evidence_output) != bool(args.captured_source):
+        raise RuntimeError("official_catvton_regional_evidence_paths_required")
     try:
         metrics = _run_catvton_attempt(args, pack_root)
     except ModuleNotFoundError as exc:

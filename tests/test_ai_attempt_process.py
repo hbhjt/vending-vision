@@ -51,12 +51,39 @@ def test_official_ai_child_attempt_command_carries_template_without_fake_selecto
         person_png=tmp_path / "person.png",
         garment_png=tmp_path / "garment.png",
         output_png=tmp_path / "output.png",
+        regional_evidence_output=tmp_path / "regional-evidence.json",
+        captured_source={
+            "adapter": "recorded_video",
+            "configSha256": "7" * 64,
+            "decodedFrameCount": 2,
+            "fixtureSha256": "8" * 64,
+            "frameIndex": 1,
+            "relabeled": False,
+            "role": "front",
+            "synthetic": False,
+        },
         template="tshirt_long_sleeve",
     )
 
     assert command[-2:] == ["--template", "tshirt_long_sleeve"]
+    assert "--regional-evidence-output" in command
+    assert "--captured-source" in command
     assert "--fake-worker" not in command
     assert "--config" not in command
+
+
+def test_official_ai_child_attempt_command_keeps_customer_path_free_of_acceptance_sidecar(
+    tmp_path,
+):
+    command = ai_attempt_worker_command(
+        tmp_path / "pack",
+        person_png=tmp_path / "person.png",
+        garment_png=tmp_path / "garment.png",
+        output_png=tmp_path / "output.png",
+    )
+
+    assert "--regional-evidence-output" not in command
+    assert "--captured-source" not in command
 
 
 def test_startup_probe_rejects_worker_dependency_version_mismatch(monkeypatch, tmp_path):

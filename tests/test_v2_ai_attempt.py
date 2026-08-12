@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 import app as vision_app
 from vision.ai_model_pack import OfficialAiReadinessSnapshot
@@ -212,13 +213,31 @@ class _DeterministicAiChild:
         self.model_pack = Path(model_pack)
         self.closed = False
 
-    async def run(self, *, person_png: Path, garment_png: Path, output_png: Path, timeout: float, template: str = "tshirt_short_sleeve"):
+    async def run(
+        self,
+        *,
+        person_png: Path,
+        garment_png: Path,
+        output_png: Path,
+        timeout: float,
+        template: str = "tshirt_short_sleeve",
+        regional_evidence_output: Path | None = None,
+        captured_source: dict | None = None,
+    ):
         type(self).calls += 1
         assert self.model_pack.exists()
         assert person_png.exists()
         assert garment_png.read_bytes() == _GarmentHandler.payload
         assert template in {"tshirt_short_sleeve", "tshirt_long_sleeve"}
         output_png.write_bytes(_png_bytes((5, 80, 140, 255), size=(64, 64)))
+        if regional_evidence_output is not None:
+            _write_test_regional_sidecar(
+                regional_evidence_output,
+                person_png,
+                garment_png,
+                output_png,
+                captured_source,
+            )
 
     async def close(self):
         self.closed = True
@@ -242,7 +261,7 @@ class _BlockingAiChild:
         self.output_path = None
         type(self).instances.append(self)
 
-    async def run(self, *, person_png: Path, garment_png: Path, output_png: Path, timeout: float, template: str = "tshirt_short_sleeve"):
+    async def run(self, *, person_png: Path, garment_png: Path, output_png: Path, timeout: float, template: str = "tshirt_short_sleeve", regional_evidence_output: Path | None = None, captured_source: dict | None = None):
         self.loop = asyncio.get_running_loop()
         self._run_release = asyncio.Event()
         self.staging_dir = output_png.parent
@@ -251,6 +270,8 @@ class _BlockingAiChild:
         try:
             await self._run_release.wait()
             output_png.write_bytes(_png_bytes((9, 90, 160, 255), size=(64, 64)))
+            if regional_evidence_output is not None:
+                _write_test_regional_sidecar(regional_evidence_output, person_png, garment_png, output_png, captured_source)
         except asyncio.CancelledError:
             try:
                 output_png.write_bytes(_png_bytes((200, 20, 40, 255), size=(64, 64)))
@@ -294,7 +315,7 @@ class _OutputValidationAiChild:
         self.escape_path = None
         type(self).instances.append(self)
 
-    async def run(self, *, person_png: Path, garment_png: Path, output_png: Path, timeout: float, template: str = "tshirt_short_sleeve"):
+    async def run(self, *, person_png: Path, garment_png: Path, output_png: Path, timeout: float, template: str = "tshirt_short_sleeve", regional_evidence_output: Path | None = None, captured_source: dict | None = None):
         self.staging_dir = output_png.parent
         mode = type(self).mode
         if mode == "undecodable":
@@ -331,6 +352,8 @@ class _OutputValidationAiChild:
             raise RuntimeError("deterministic worker failure")
         else:
             raise AssertionError(mode)
+        if regional_evidence_output is not None and output_png.is_file() and not output_png.is_symlink() and mode != "extra-file":
+            _write_test_regional_sidecar(regional_evidence_output, person_png, garment_png, output_png, captured_source)
 
     async def close(self):
         self.closed = True
@@ -375,8 +398,49 @@ def _configure_stage1_runtime(monkeypatch, pack: Path, *, ai_ready: bool = True)
         "read_camera_with_source",
         lambda *_args, **_kwargs: (
             np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8),
-            {"source": "recorded_video"},
+            _recorded_front_source(),
         ),
+    )
+
+
+def _recorded_front_source():
+    return {
+        "adapter": "recorded_video",
+        "configSha256": "7" * 64,
+        "decodedFrameCount": 42,
+        "fixtureSha256": "8" * 64,
+        "frameIndex": 7,
+        "relabeled": False,
+        "role": "front",
+        "synthetic": False,
+    }
+
+
+def _write_test_regional_sidecar(path, person, garment, output, captured_source):
+    with Image.open(output) as image:
+        width, height = image.size
+    value = {
+        "attempt": {
+            "acquisitionSource": "direct_recorded_frame",
+            "decodedHeight": height,
+            "decodedWidth": width,
+            "garmentSha256": hashlib.sha256(garment.read_bytes()).hexdigest(),
+            "inputSha256": hashlib.sha256(person.read_bytes()).hexdigest(),
+            "recordedFixtureSha256": captured_source["fixtureSha256"],
+            "resultSha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+            "sourceCamera": "front",
+        },
+        "evaluator": {},
+        "kind": "regional-evidence",
+        "masks": {},
+        "measurements": {},
+        "policy": {},
+        "schemaVersion": "vem-ai-regional-evidence/v1",
+        "verdict": "regional_check_failed",
+    }
+    path.write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+        "utf-8",
     )
 
 
@@ -482,6 +546,9 @@ def test_v2_ai_attempt_uses_official_boundary_not_fast_and_publishes_tokenized_r
     fast = _CountingFastBroker()
     monkeypatch.setattr(vision_app, "_fast_render_broker", fast)
     monkeypatch.setattr(vision_app, "_ai_attempt_process_factory", _DeterministicAiChild)
+    acceptance_root = tmp_path / "acceptance-regional"
+    acceptance_root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(acceptance_root))
     server, thread, reference = _serve_garment()
     try:
         attempt_id = str(uuid4())
@@ -508,6 +575,12 @@ def test_v2_ai_attempt_uses_official_boundary_not_fast_and_publishes_tokenized_r
         assert int(head.headers["content-length"]) == len(get.content)
         assert fast.calls == 0
         assert _DeterministicAiChild.calls == 1
+        exported = acceptance_root / f"{attempt_id}.regional-evidence.json"
+        assert exported.is_file()
+        assert json.loads(exported.read_text("utf-8"))["attempt"]["resultSha256"] == result[
+            "digest"
+        ].removeprefix("sha256:")
+        assert set(completed["payload"]) == {"attemptId", "result"}
     finally:
         _DeterministicAiChild.calls = 0
         server.shutdown()
@@ -778,6 +851,9 @@ def test_v2_ai_cancel_route_leave_kills_child_removes_staging_and_fences_late_re
     pack = tmp_path / "pack"
     _write_official_pack(pack)
     _configure_stage1_runtime(monkeypatch, pack)
+    acceptance_root = tmp_path / "acceptance-regional"
+    acceptance_root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(acceptance_root))
     _start_blocking_ai(monkeypatch)
     server, thread, reference = _serve_garment()
     try:
@@ -801,6 +877,7 @@ def test_v2_ai_cancel_route_leave_kills_child_removes_staging_and_fences_late_re
             _assert_canceled_cleanup_and_no_result(
                 client, attempt_id, child, "route_leave", terminal
             )
+            assert list(acceptance_root.iterdir()) == []
 
             with client.websocket_connect("/ws") as replay:
                 replay.send_json(_hello())
@@ -1007,6 +1084,9 @@ def test_v2_ai_invalid_private_staging_outputs_fail_without_result_or_orphan(
     pack = tmp_path / "pack"
     _write_official_pack(pack)
     _configure_stage1_runtime(monkeypatch, pack)
+    acceptance_root = tmp_path / "acceptance-regional"
+    acceptance_root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(acceptance_root))
     if mode == "oversize-bytes":
         monkeypatch.setattr(vision_app, "_FAST_RESULT_MAX_BYTES", 8)
     _start_output_validation_ai(monkeypatch, mode)
@@ -1022,6 +1102,7 @@ def test_v2_ai_invalid_private_staging_outputs_fail_without_result_or_orphan(
                 _trace, terminal = _receive_until_terminal(socket)
             child = _OutputValidationAiChild.instances[0]
             _assert_failed_cleanup_and_no_result(client, attempt_id, child, terminal)
+            assert list(acceptance_root.iterdir()) == []
 
             with client.websocket_connect("/ws") as replay:
                 replay.send_json(_hello())
@@ -1062,6 +1143,9 @@ def test_v2_ai_completed_terminal_encode_failure_has_no_orphan_result(
     pack = tmp_path / "pack"
     _write_official_pack(pack)
     _configure_stage1_runtime(monkeypatch, pack)
+    acceptance_root = tmp_path / "acceptance-regional"
+    acceptance_root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(acceptance_root))
     monkeypatch.setattr(vision_app, "_ai_attempt_process_factory", _DeterministicAiChild)
     original_envelope = vision_app._generated_v2_envelope
 
@@ -1086,12 +1170,50 @@ def test_v2_ai_completed_terminal_encode_failure_has_no_orphan_result(
             assert client.get(
                 f"/v2/try-on/results/{attempt_id}?token=sentinel"
             ).status_code == 404
+            assert list(acceptance_root.iterdir()) == []
 
             with client.websocket_connect("/ws") as replay:
                 replay.send_json(_hello())
                 assert replay.receive_json()["type"] == "vision.ready"
                 replay.send_json(_start(attempt_id, reference, mode="ai"))
                 assert replay.receive_json() == terminal
+    finally:
+        _DeterministicAiChild.calls = 0
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_v2_ai_result_admission_failure_does_not_export_uncommitted_sidecar(
+    tmp_path, monkeypatch
+):
+    pack = tmp_path / "pack"
+    _write_official_pack(pack)
+    _configure_stage1_runtime(monkeypatch, pack)
+    acceptance_root = tmp_path / "acceptance-regional"
+    acceptance_root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(acceptance_root))
+    monkeypatch.setattr(vision_app, "_ai_attempt_process_factory", _DeterministicAiChild)
+    monkeypatch.setattr(vision_app._fast_attempt_registry._results, "single_max_bytes", 1)
+    server, thread, reference = _serve_garment()
+    try:
+        attempt_id = str(uuid4())
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_hello())
+                assert socket.receive_json()["payload"]["aiReady"] is True
+                socket.send_json(_start(attempt_id, reference, mode="ai"))
+                _trace, terminal = _receive_until_terminal(socket)
+
+            assert terminal["type"] == "vision.try_on.attempt.failed"
+            assert terminal["payload"] == {
+                "attemptId": attempt_id,
+                "reason": "ai_failed",
+            }
+            assert client.get(
+                f"/v2/try-on/results/{attempt_id}?token=sentinel"
+            ).status_code == 404
+            assert list(acceptance_root.iterdir()) == []
     finally:
         _DeterministicAiChild.calls = 0
         server.shutdown()

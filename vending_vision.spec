@@ -61,6 +61,7 @@ hiddenimports = [
     "vision.ai_runtime_descriptor",
     "vision.ai_attempt_worker",
     "vision.ai_attempt_process",
+    "vision.ai_acceptance_evidence",
     "vision.process_supervisor",
     "vision.catvton_pose_masks",
     "vision.catvton_preprocess",

@@ -82,6 +82,7 @@ from vision.ai_model_pack import (
     shutdown_official_ai_readiness_refresh,
 )
 from vision.ai_attempt_process import AiAttemptProcess
+from vision.ai_acceptance_evidence import publish_completed_ai_regional_evidence
 
 
 app = FastAPI(
@@ -513,12 +514,22 @@ async def _read_ai_output_bytes(output_png: Path) -> bytes:
     return await asyncio.to_thread(output_png.read_bytes)
 
 
-def _validate_ai_private_staging(staging_dir: Path, output_png: Path) -> None:
+def _validate_ai_private_staging(
+    staging_dir: Path,
+    output_png: Path,
+    *,
+    regional_evidence_output: Path | None = None,
+) -> None:
     root = staging_dir.resolve()
     output = output_png.resolve(strict=False)
     if output.parent != root or output_png.is_symlink():
         raise RuntimeError("ai_staging_output_path_invalid")
     expected = {"person.png", "garment.png", "output.png"}
+    if regional_evidence_output is not None:
+        regional = regional_evidence_output.resolve(strict=False)
+        if regional.parent != root or regional_evidence_output.is_symlink():
+            raise RuntimeError("ai_staging_regional_evidence_path_invalid")
+        expected.add("regional-evidence.json")
     actual = {path.name for path in staging_dir.iterdir()}
     if actual != expected:
         raise RuntimeError("ai_staging_unexpected_files")
@@ -526,6 +537,70 @@ def _validate_ai_private_staging(staging_dir: Path, output_png: Path) -> None:
         path = staging_dir / name
         if path.is_symlink() or not path.is_file():
             raise RuntimeError("ai_staging_file_invalid")
+
+
+def _validate_captured_ai_source(source: object) -> dict:
+    expected = {
+        "adapter",
+        "configSha256",
+        "decodedFrameCount",
+        "fixtureSha256",
+        "frameIndex",
+        "relabeled",
+        "role",
+        "synthetic",
+    }
+    if (
+        not isinstance(source, dict)
+        or set(source) != expected
+        or source.get("adapter") != "recorded_video"
+        or source.get("role") != "front"
+        or source.get("synthetic") is not False
+        or source.get("relabeled") is not False
+        or not isinstance(source.get("decodedFrameCount"), int)
+        or not isinstance(source.get("frameIndex"), int)
+        or not 0 <= source["frameIndex"] < source["decodedFrameCount"]
+        or not re.fullmatch(r"[a-f0-9]{64}", source.get("fixtureSha256", ""))
+        or not re.fullmatch(r"[a-f0-9]{64}", source.get("configSha256", ""))
+    ):
+        raise RuntimeError("ai_captured_source_invalid")
+    return source
+
+
+def _validate_ai_regional_evidence(
+    content: bytes,
+    *,
+    captured_source: dict,
+    person_png: bytes,
+    garment_png: bytes,
+    result_png: bytes,
+    result: dict,
+) -> None:
+    try:
+        value = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError("ai_regional_evidence_invalid") from exc
+    if (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8") != content:
+        raise RuntimeError("ai_regional_evidence_noncanonical")
+    attempt = value.get("attempt") if isinstance(value, dict) else None
+    if (
+        value.get("schemaVersion") != "vem-ai-regional-evidence/v1"
+        or value.get("kind") != "regional-evidence"
+        or not isinstance(attempt, dict)
+        or attempt.get("acquisitionSource") != "direct_recorded_frame"
+        or attempt.get("sourceCamera") != "front"
+        or attempt.get("recordedFixtureSha256")
+        != captured_source["fixtureSha256"]
+        or attempt.get("inputSha256") != hashlib.sha256(person_png).hexdigest()
+        or attempt.get("garmentSha256") != hashlib.sha256(garment_png).hexdigest()
+        or attempt.get("resultSha256") != hashlib.sha256(result_png).hexdigest()
+        or attempt.get("decodedWidth") != result["width"]
+        or attempt.get("decodedHeight") != result["height"]
+    ):
+        raise RuntimeError("ai_regional_evidence_identity_invalid")
 
 
 def _generated_v2_envelope(message_type: str, payload: dict) -> dict:
@@ -1584,6 +1659,9 @@ async def run_v2_ai_attempt(
         {"attemptId": attempt_id, "reason": "replaced"},
     )
     admitted_model_pack: Path | None = None
+    acceptance_evidence_enabled = bool(
+        os.environ.get("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", "").strip()
+    )
 
     def resolve_current_ai_accepted() -> dict | None:
         nonlocal admitted_model_pack
@@ -1636,6 +1714,7 @@ async def run_v2_ai_attempt(
         staging_dir: Path | None = None
         ai_child = None
         stored_result = None
+        regional_evidence_bytes = None
         try:
             for replay_message in admission.replay:
                 await _send_json_bounded(websocket, send_lock, replay_message)
@@ -1653,11 +1732,12 @@ async def run_v2_ai_attempt(
             stable_frames = 0
             last_guidance = None
             captured_frame = None
+            captured_source = None
             deadline = asyncio.get_running_loop().time() + _FAST_ATTEMPT_TIMEOUT_SECONDS
             preview_token = None
             while asyncio.get_running_loop().time() < deadline:
                 remaining = max(0.001, deadline - asyncio.get_running_loop().time())
-                frame, _source = await _read_attempt_front_frame(
+                frame, source = await _read_attempt_front_frame(
                     receipt, timeout=remaining, lease_token=lease_token
                 )
                 observation = await _get_acquisition_observer().observe(frame, timeout=remaining)
@@ -1677,11 +1757,13 @@ async def run_v2_ai_attempt(
                     last_guidance = acquiring["payload"]["guidance"]
                 manual = await _fast_attempt_registry.take_manual_capture_request(receipt)
                 if occupancy == "single" and aligned and (stable or manual):
-                    captured_frame = frame.copy()
+                    captured_frame, captured_source = frame.copy(), source
                     break
                 await asyncio.sleep(_ACQUISITION_POLL_SECONDS)
             if captured_frame is None:
                 raise asyncio.TimeoutError()
+            if acceptance_evidence_enabled:
+                captured_source = _validate_captured_ai_source(captured_source)
 
             cleanup_errors = await _release_acquisition_resources(receipt, lease_token)
             lease_acquired = False
@@ -1707,6 +1789,11 @@ async def run_v2_ai_attempt(
             person_png = staging_dir / "person.png"
             garment_png = staging_dir / "garment.png"
             output_png = staging_dir / "output.png"
+            regional_evidence = (
+                staging_dir / "regional-evidence.json"
+                if acceptance_evidence_enabled
+                else None
+            )
             ok, encoded_person = cv2.imencode(".png", captured_frame)
             if not ok:
                 raise RuntimeError("ai_person_encode_failed")
@@ -1730,19 +1817,38 @@ async def run_v2_ai_attempt(
                     person_png=person_png,
                     garment_png=garment_png,
                     output_png=output_png,
+                    regional_evidence_output=regional_evidence,
+                    captured_source=(captured_source if acceptance_evidence_enabled else None),
                     timeout=_AI_ATTEMPT_TIMEOUT_SECONDS,
                     template=garment_source.template,
                 ),
                 timeout=_AI_ATTEMPT_TIMEOUT_SECONDS,
             )
-            _validate_ai_private_staging(staging_dir, output_png)
+            _validate_ai_private_staging(
+                staging_dir,
+                output_png,
+                regional_evidence_output=regional_evidence,
+            )
             output = await _read_ai_output_bytes(output_png)
+            if regional_evidence is not None:
+                regional_evidence_bytes = await asyncio.to_thread(
+                    regional_evidence.read_bytes
+                )
             stored_result, result = _prepare_ai_result(
                 attempt_id,
                 output,
                 person_png=person_bytes,
                 garment_png=garment_source.png_bytes,
             )
+            if regional_evidence_bytes is not None:
+                _validate_ai_regional_evidence(
+                    regional_evidence_bytes,
+                    captured_source=captured_source,
+                    person_png=person_bytes,
+                    garment_png=garment_source.png_bytes,
+                    result_png=output,
+                    result=result,
+                )
             terminal = _generated_v2_envelope(
                 "vision.try_on.attempt.completed", {"attemptId": attempt_id, "result": result}
             )
@@ -1783,10 +1889,28 @@ async def run_v2_ai_attempt(
 
         if terminal.get("type") != "vision.try_on.attempt.completed":
             stored_result = None
+            regional_evidence_bytes = None
         transition = await _fast_attempt_registry.commit_terminal_transition(
             receipt, terminal, stored_result
         )
         if transition is not None:
+            if (
+                transition.message.get("type") == "vision.try_on.attempt.completed"
+                and transition.message.get("payload", {}).get("attemptId")
+                == receipt.attempt_id
+                and regional_evidence_bytes is not None
+            ):
+                try:
+                    await asyncio.to_thread(
+                        publish_completed_ai_regional_evidence,
+                        attempt_id,
+                        regional_evidence_bytes,
+                    )
+                except Exception:
+                    logger.exception(
+                        "AI acceptance evidence export failed attemptId=%s",
+                        attempt_id,
+                    )
             await _publish_fast_transition(transition)
     finally:
         _ai_attempt_execution_lock.release()

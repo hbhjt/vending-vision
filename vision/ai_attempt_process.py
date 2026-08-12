@@ -33,6 +33,8 @@ def ai_attempt_worker_command(
     person_png: Path | None = None,
     garment_png: Path | None = None,
     output_png: Path | None = None,
+    regional_evidence_output: Path | None = None,
+    captured_source: dict[str, object] | None = None,
     template: str = "tshirt_short_sleeve",
 ) -> list[str]:
     if getattr(sys, "frozen", False):
@@ -53,10 +55,20 @@ def ai_attempt_worker_command(
                 str(garment_png),
                 "--output",
                 str(output_png),
-                "--template",
-                template,
             ]
         )
+        if (regional_evidence_output is None) != (captured_source is None):
+            raise RuntimeError("official_ai_child_regional_evidence_paths_required")
+        if regional_evidence_output is not None:
+            command.extend(
+                [
+                    "--regional-evidence-output",
+                    str(regional_evidence_output),
+                    "--captured-source",
+                    json.dumps(captured_source, sort_keys=True, separators=(",", ":")),
+                ]
+            )
+        command.extend(["--template", template])
     return command
 
 
@@ -158,6 +170,8 @@ class AiAttemptProcess:
         person_png: Path,
         garment_png: Path,
         output_png: Path,
+        regional_evidence_output: Path | None = None,
+        captured_source: dict[str, object] | None = None,
         timeout: float,
         template: str = "tshirt_short_sleeve",
     ) -> None:
@@ -171,6 +185,8 @@ class AiAttemptProcess:
                     person_png=person_png,
                     garment_png=garment_png,
                     output_png=output_png,
+                    regional_evidence_output=regional_evidence_output,
+                    captured_source=captured_source,
                     template=template,
                 ),
                 timeout=timeout,
@@ -179,6 +195,11 @@ class AiAttemptProcess:
                 raise RuntimeError("official_ai_child_failed")
             if not output_png.is_file():
                 raise RuntimeError("official_ai_child_missing_output")
+            if (
+                regional_evidence_output is not None
+                and not regional_evidence_output.is_file()
+            ):
+                raise RuntimeError("official_ai_child_missing_regional_evidence")
         except ProcessSupervisorError as exc:
             raise RuntimeError("official_ai_child_failed") from exc
         finally:

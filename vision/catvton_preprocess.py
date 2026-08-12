@@ -312,3 +312,31 @@ def composite_to_original(
     ).astype(np.uint8)
     result[alpha == 0.0] = original[alpha == 0.0]
     return result
+
+
+def protected_mask_to_original(
+    generation_mask_letterboxed: np.ndarray,
+    final_mask_letterboxed: np.ndarray,
+    transform: Letterbox,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return disjoint generated/protected acceptance regions in input space."""
+    y0, y1 = transform.y, transform.y + transform.content_height
+    x0, x1 = transform.x, transform.x + transform.content_width
+    generation = cv2.resize(
+        generation_mask_letterboxed[y0:y1, x0:x1],
+        (transform.original_width, transform.original_height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    final = cv2.resize(
+        final_mask_letterboxed[y0:y1, x0:x1],
+        (transform.original_width, transform.original_height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    upper_body = np.where(final > 0, 255, 0).astype(np.uint8)
+    generation_region = cv2.dilate(
+        np.where(generation > 0, 255, 0).astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    protected = np.where(generation_region == 0, 255, 0).astype(np.uint8)
+    protected[upper_body > 0] = 0
+    return upper_body, protected

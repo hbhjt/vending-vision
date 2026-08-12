@@ -90,6 +90,10 @@ def main() -> int:
     parser.add_argument("--pid-file", type=Path, required=True)
     parser.add_argument("--success-png", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--regional-evidence-output", type=Path)
+    parser.add_argument("--person", type=Path)
+    parser.add_argument("--garment", type=Path)
+    parser.add_argument("--captured-source")
     parser.add_argument("--stress-mib", type=int, default=0)
     parser.add_argument("--stress-seconds", type=float, default=0.0)
     args = parser.parse_args()
@@ -164,6 +168,50 @@ def main() -> int:
         if args.success_png is None or args.output is None:
             raise RuntimeError("success mode requires input and output paths")
         shutil.copyfile(args.success_png, args.output)
+        if any(
+            value is not None
+            for value in (
+                args.regional_evidence_output,
+                args.person,
+                args.garment,
+                args.captured_source,
+            )
+        ):
+            if not all(
+                value is not None
+                for value in (
+                    args.regional_evidence_output,
+                    args.person,
+                    args.garment,
+                    args.captured_source,
+                )
+            ):
+                raise RuntimeError("regional evidence requires complete paths")
+            with __import__("PIL.Image").Image.open(args.output) as image:
+                width, height = image.size
+            source = json.loads(args.captured_source)
+            value = {
+            "attempt": {
+                "acquisitionSource": "direct_recorded_frame",
+                "decodedHeight": height,
+                "decodedWidth": width,
+                "garmentSha256": __import__("hashlib").sha256(args.garment.read_bytes()).hexdigest(),
+                "inputSha256": __import__("hashlib").sha256(args.person.read_bytes()).hexdigest(),
+                "recordedFixtureSha256": source["fixtureSha256"],
+                "resultSha256": __import__("hashlib").sha256(args.output.read_bytes()).hexdigest(),
+                "sourceCamera": "front",
+            },
+            "evaluator": {},
+            "kind": "regional-evidence",
+            "masks": {},
+            "measurements": {},
+            "policy": {},
+            "schemaVersion": "vem-ai-regional-evidence/v1",
+            "verdict": "regional_check_failed",
+            }
+            args.regional_evidence_output.write_text(
+                json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", "utf-8"
+            )
         time.sleep(0.1)
         _terminate_and_wait(child)
         return 0

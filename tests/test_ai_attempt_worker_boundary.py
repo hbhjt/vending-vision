@@ -1,4 +1,5 @@
 import inspect
+import hashlib
 import json
 import os
 import subprocess
@@ -359,6 +360,7 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
     person = work / "person.png"
     garment = work / "garment.png"
     output = work / "output.png"
+    regional = work / "regional-evidence.json"
     record = work / "record.json"
     write_png(person, (20, 40, 90, 255))
     write_png(garment, (220, 40, 20, 255), size=(80, 110))
@@ -382,6 +384,23 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
             "tshirt_short_sleeve",
             "--output",
             str(output),
+            "--regional-evidence-output",
+            str(regional),
+            "--captured-source",
+            json.dumps(
+                {
+                    "adapter": "recorded_video",
+                    "configSha256": "7" * 64,
+                    "decodedFrameCount": 42,
+                    "fixtureSha256": "8" * 64,
+                    "frameIndex": 7,
+                    "relabeled": False,
+                    "role": "front",
+                    "synthetic": False,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
             "--width",
             "64",
             "--height",
@@ -401,6 +420,7 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
 
     assert completed.returncode == 0, completed.stderr + completed.stdout
     assert output.is_file()
+    assert regional.is_file()
     with Image.open(output) as result:
         assert result.format == "PNG"
         assert result.size == (96, 128)
@@ -413,6 +433,156 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
     assert pipeline_call["base_ckpt"].endswith("/inpainting")
     assert pipeline_call["vae_ckpt"].endswith("/vae")
     assert "CatVTON" in pipeline_call["attn_ckpt"]
+
+    raw_regional = regional.read_text("utf-8")
+    sidecar = json.loads(raw_regional)
+    assert raw_regional == json.dumps(
+        sidecar, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ) + "\n"
+    assert sidecar["schemaVersion"] == "vem-ai-regional-evidence/v1"
+    assert sidecar["kind"] == "regional-evidence"
+    assert sidecar["attempt"] == {
+        "acquisitionSource": "direct_recorded_frame",
+        "decodedHeight": 128,
+        "decodedWidth": 96,
+        "garmentSha256": hashlib.sha256(garment.read_bytes()).hexdigest(),
+        "inputSha256": hashlib.sha256(person.read_bytes()).hexdigest(),
+        "recordedFixtureSha256": "8" * 64,
+        "resultSha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "sourceCamera": "front",
+    }
+    assert sidecar["evaluator"] == {
+        "algorithm": "rgb-absolute-delta-rle/v1",
+        "atr": "schp-atr",
+        "lip": "schp-lip",
+        "pose": "mediapipe-pose",
+        "sourceDescriptorSha256": hashlib.sha256(
+            (ROOT / "official-ai-source-descriptor.json").read_bytes()
+        ).hexdigest(),
+    }
+    assert sidecar["masks"]["width"] == 96
+    assert sidecar["masks"]["height"] == 128
+    upper_runs = sidecar["masks"]["upperBody"]["runs"]
+    protected_runs = sidecar["masks"]["protectedRegion"]["runs"]
+    assert upper_runs
+    assert protected_runs
+    upper_pixels = {pixel for start, length in upper_runs for pixel in range(start, start + length)}
+    protected_pixels = {
+        pixel for start, length in protected_runs for pixel in range(start, start + length)
+    }
+    assert upper_pixels.isdisjoint(protected_pixels)
+
+    with Image.open(person) as person_image, Image.open(output) as result_image:
+        person_rgb = person_image.convert("RGB")
+        result_rgb = result_image.convert("RGB")
+        for name, pixels in (("upperBody", upper_pixels), ("protectedRegion", protected_pixels)):
+            changed = 0
+            delta = 0
+            for pixel in pixels:
+                x, y = pixel % person_rgb.width, pixel // person_rgb.width
+                before, after = person_rgb.getpixel((x, y)), result_rgb.getpixel((x, y))
+                differences = [abs(after[index] - before[index]) for index in range(3)]
+                changed += int(any(differences))
+                delta += sum(differences)
+            measurement = sidecar["measurements"][name]
+            assert measurement["sampledPixels"] == len(pixels)
+            assert measurement["changedPixels"] == changed
+            assert measurement["changedFractionBps"] == changed * 10_000 // len(pixels)
+            assert measurement["meanDelta"] == delta // (len(pixels) * 3)
+            assert measurement["verdict"] == (
+                "changed"
+                if name == "upperBody" and changed > 0
+                else (
+                    "insufficient_change"
+                    if name == "upperBody"
+                    else ("preserved" if changed == 0 else "changed")
+                )
+            )
+    assert sidecar["policy"] == {
+        "schemaVersion": "vem-ai-regional-evidence-policy/v1",
+        "sha256": "780b7adad8f9512635448a94d7f8cbc868abe2555a2fb601d421a2e5d73e2d35",
+    }
+    assert sidecar["verdict"] in {"passed", "regional_check_failed"}
+
+
+@pytest.mark.parametrize(
+    "captured_source",
+    [
+        None,
+        {"adapter": "recorded_video", "role": "front"},
+        {
+            "adapter": "recorded_video",
+            "configSha256": "7" * 64,
+            "decodedFrameCount": 42,
+            "fixtureSha256": "8" * 64,
+            "frameIndex": 42,
+            "relabeled": False,
+            "role": "front",
+            "synthetic": False,
+        },
+    ],
+)
+def test_worker_regional_evidence_requires_exact_recorded_source_and_leaves_no_sidecar(
+    tmp_path, captured_source
+):
+    pack = tmp_path / "pack"
+    modules = tmp_path / "miniature-modules"
+    work = tmp_path / "work"
+    pack.mkdir()
+    modules.mkdir()
+    work.mkdir()
+    write_worker_pack(pack)
+    write_miniature_catvton_modules(modules)
+    person = work / "person.png"
+    garment = work / "garment.png"
+    output = work / "output.png"
+    regional = work / "regional-evidence.json"
+    write_png(person, (20, 40, 90, 255))
+    write_png(garment, (220, 40, 20, 255), size=(80, 110))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{modules}{os.pathsep}{ROOT}"
+    env["CATVTON_MINIATURE_DESCRIPTOR"] = (pack / "ai-model-manifest.json").read_text(
+        "utf-8"
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "vision.ai_attempt_worker",
+        "--model-pack",
+        str(pack),
+        "--person",
+        str(person),
+        "--garment",
+        str(garment),
+        "--output",
+        str(output),
+        "--regional-evidence-output",
+        str(regional),
+        "--width",
+        "64",
+        "--height",
+        "96",
+        "--steps",
+        "1",
+    ]
+    if captured_source is not None:
+        command.extend(
+            [
+                "--captured-source",
+                json.dumps(captured_source, sort_keys=True, separators=(",", ":")),
+            ]
+        )
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert not regional.exists()
 
 
 @pytest.mark.parametrize(

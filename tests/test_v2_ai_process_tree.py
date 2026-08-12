@@ -169,7 +169,16 @@ def _configure_public_ai(
         "read_camera_with_source",
         lambda *_args, **_kwargs: (
             np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8),
-            {"source": "recorded_video"},
+            {
+                "adapter": "recorded_video",
+                "configSha256": "7" * 64,
+                "decodedFrameCount": 42,
+                "fixtureSha256": "8" * 64,
+                "frameIndex": 7,
+                "relabeled": False,
+                "role": "front",
+                "synthetic": False,
+            },
         ),
     )
 
@@ -200,8 +209,26 @@ def _configure_public_ai(
         if selected_mode == "success":
             assert success_png is not None
             command.extend(
-                ["--success-png", str(success_png), "--output", str(kwargs["output_png"])]
+                [
+                    "--success-png",
+                    str(success_png),
+                    "--output",
+                    str(kwargs["output_png"]),
+                ]
             )
+            if kwargs["regional_evidence_output"] is not None:
+                command.extend(
+                    [
+                        "--regional-evidence-output",
+                        str(kwargs["regional_evidence_output"]),
+                        "--person",
+                        str(kwargs["person_png"]),
+                        "--garment",
+                        str(kwargs["garment_png"]),
+                        "--captured-source",
+                        json.dumps(kwargs["captured_source"], sort_keys=True, separators=(",", ":")),
+                    ]
+                )
         command.extend(worker_args or [])
         return command
 
