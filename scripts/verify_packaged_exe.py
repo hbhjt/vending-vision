@@ -22,6 +22,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.candidate_artifact_manifest import LAYOUT, verify_candidate_archive
+from vision.regional_evaluator_provenance import (
+    verify_regional_evaluator_provenance_at_root,
+)
 
 
 CONTRACT_ROOT = Path(__file__).resolve().parents[1] / "contracts" / "vem_vision_v2"
@@ -420,6 +423,8 @@ def assert_ai_worker_layout(exe_path, *, required):
     missing = [str(path) for path in required_resources if not path.is_file()]
     if missing:
         raise AssertionError(f"missing packaged AI worker resources: {missing}")
+    if not verify_regional_evaluator_provenance_at_root(internal):
+        raise AssertionError("packaged regional evaluator resources are invalid")
     digest = __import__("hashlib").sha256(worker.read_bytes()).hexdigest()
     return {"path": worker, "sha256": digest}
 

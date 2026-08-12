@@ -162,8 +162,11 @@ sys.modules["vision.vendor.catvton.model.pipeline"] = pipeline_module
 
 import vision.catvton_pose_masks as masks
 import vision.source_provenance as provenance
+import vision.regional_evaluator_provenance as regional_provenance
 if os.environ.get("CATVTON_MINIATURE_SOURCE_TAMPER"):
     provenance.verify_official_source_provenance = lambda: False
+if os.environ.get("CATVTON_MINIATURE_REGIONAL_TAMPER"):
+    regional_provenance.verify_regional_evaluator_provenance = lambda: False
 class L:
     def __init__(self, x, y, visibility=1.0):
         self.x = x
@@ -348,6 +351,28 @@ def test_worker_probe_rejects_source_descriptor_tamper(tmp_path):
     assert "official_catvton_probe_failed" in completed.stderr
 
 
+def test_worker_runtime_probe_rejects_regional_evaluator_descriptor_tamper(tmp_path):
+    modules = tmp_path / "miniature-modules"
+    modules.mkdir()
+    write_miniature_catvton_modules(modules)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{modules}{os.pathsep}{ROOT}"
+    env["CATVTON_MINIATURE_REGIONAL_TAMPER"] = "1"
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "vision.ai_attempt_worker", "--probe-runtime"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "official_catvton_regional_evaluator_provenance_mismatch" in completed.stderr
+
+
 def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tmp_path):
     pack = tmp_path / "pack"
     modules = tmp_path / "miniature-modules"
@@ -500,7 +525,7 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
             )
     assert sidecar["policy"] == {
         "schemaVersion": "vem-ai-regional-evidence-policy/v1",
-        "sha256": "5f007b21e7b64d65bd878c9af08bc20b764e31fb16a03807bc8ddaab1bc22d6d",
+        "sha256": "1dfc50804123f31382e9e2e27ed8e35fed8f6c68cce7df0dee4975f43726f405",
     }
     assert sidecar["verdict"] in {"passed", "regional_check_failed"}
 
@@ -729,7 +754,12 @@ def test_worker_source_hard_guards_downloads_and_probe_does_not_load_or_infer():
     assert "snapshot_download" not in source
     assert "huggingface_hub" not in source
     assert "fake" not in source.lower()
-    assert source.index("if args.probe:") < source.index("metrics = _run_catvton_attempt(args")
+    assert "exp-schp-201908261155-lip.pth" not in source
+    assert "exp-schp-201908301523-atr.pth" not in source
+    assert "protected_mask_to_original" not in source
+    assert source.index("if args.probe:") < source.index(
+        "metrics = run_regional_evaluator_attempt("
+    )
 
 
 def test_network_guard_blocks_customer_attempt_network_calls():

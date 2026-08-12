@@ -33,6 +33,14 @@ def test_regional_evaluator_descriptor_is_canonical_exact_and_verifiable():
         sorted(REGIONAL_EVALUATOR_SOURCE_PATHS)
     )
     assert "vision/ai_attempt_worker.py" not in REGIONAL_EVALUATOR_SOURCE_PATHS
+    assert {
+        "vision/config.py",
+        "vision/regional_evaluator_provenance.py",
+        "vision/vendor/catvton/model/attn_processor.py",
+        "vision/vendor/catvton/model/pipeline.py",
+        "vision/vendor/catvton/model/utils.py",
+        "vision/vendor/catvton/utils.py",
+    } <= set(REGIONAL_EVALUATOR_SOURCE_PATHS)
     assert all(source["byteSize"] > 0 for source in descriptor["sources"])
     assert all(len(source["sha256"]) == 64 for source in descriptor["sources"])
     assert regional_evaluator_descriptor_sha256() == __import__("hashlib").sha256(
@@ -53,7 +61,7 @@ def test_regional_evaluator_descriptor_rejects_source_mutation_and_script_check(
     )
 
     assert verify_regional_evaluator_provenance_at_root(tmp_path) is True
-    mutated = tmp_path / "vision" / "catvton_preprocess.py"
+    mutated = tmp_path / "vision" / "config.py"
     mutated.write_text(mutated.read_text("utf-8") + "\n# mutation\n", "utf-8")
     assert verify_regional_evaluator_provenance_at_root(tmp_path) is False
 
@@ -65,3 +73,30 @@ def test_regional_evaluator_descriptor_rejects_source_mutation_and_script_check(
         check=False,
     )
     assert checked.returncode == 0, checked.stderr
+
+
+def test_regional_evaluator_descriptor_rejects_an_unlisted_local_import(tmp_path):
+    descriptor = build_regional_evaluator_descriptor()
+    for source in descriptor["sources"]:
+        source_path = Path(source["path"])
+        destination = tmp_path / source_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / source_path, destination)
+    (tmp_path / "regional-evaluator-descriptor.json").write_text(
+        REGIONAL_EVALUATOR_DESCRIPTOR_PATH.read_text("utf-8"), "utf-8"
+    )
+    evaluator = tmp_path / "vision" / "regional_evaluator.py"
+    evaluator.write_text(
+        "from vision.ai_model_pack import verify_ai_model_pack\n"
+        + evaluator.read_text("utf-8"),
+        "utf-8",
+    )
+    (tmp_path / "regional-evaluator-descriptor.json").write_text(
+        canonical_regional_evaluator_descriptor_json(
+            build_regional_evaluator_descriptor(tmp_path)
+        )
+        + "\n",
+        "utf-8",
+    )
+
+    assert verify_regional_evaluator_provenance_at_root(tmp_path) is False

@@ -7,12 +7,10 @@ Issue 10/11 run the full official inference with the staged pack on Windows.
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import os
 import socket
 import sys
-import time
 from pathlib import Path
 
 from vision.ai_model_pack import (
@@ -21,17 +19,14 @@ from vision.ai_model_pack import (
     verify_ai_model_pack,
 )
 from vision.ai_runtime_descriptor import dependency_version_satisfies, expected_dependency_requirements
-from vision.regional_evaluator import RegionalEvaluatorError, write_regional_evidence
-from vision.regional_evaluator_provenance import (
-    regional_evaluator_descriptor_sha256,
-    verify_regional_evaluator_provenance,
-)
+from vision.regional_evaluator import RegionalEvaluatorError, run_regional_evaluator_attempt
+from vision.regional_evaluator_provenance import verify_regional_evaluator_provenance
 from vision.source_provenance import verify_official_source_provenance
 
-_MAX_INPUT_BYTES = 20 * 1024 * 1024
-_MAX_INPUT_PIXELS = 8192 * 8192
-_DIGEST = __import__("re").compile(r"^[a-f0-9]{64}$")
-
+_REGIONAL_EVIDENCE_POLICY = {
+    "schemaVersion": "vem-ai-regional-evidence-policy/v1",
+    "sha256": "1dfc50804123f31382e9e2e27ed8e35fed8f6c68cce7df0dee4975f43726f405",
+}
 
 def _deny_downloads() -> None:
     os.environ.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1"})
@@ -48,117 +43,11 @@ class CatVTONWorkerError(RuntimeError):
         self.code = code
 
 
-def _captured_source(raw: str | None) -> dict[str, object]:
-    try:
-        value = json.loads(raw or "")
-    except ValueError as exc:
-        raise CatVTONWorkerError("official_catvton_captured_source_invalid") from exc
-    keys = {
-        "adapter",
-        "configSha256",
-        "decodedFrameCount",
-        "fixtureSha256",
-        "frameIndex",
-        "relabeled",
-        "role",
-        "synthetic",
-    }
-    if (
-        not isinstance(value, dict)
-        or set(value) != keys
-        or value.get("adapter") != "recorded_video"
-        or value.get("role") != "front"
-        or value.get("synthetic") is not False
-        or value.get("relabeled") is not False
-        or not isinstance(value.get("decodedFrameCount"), int)
-        or not isinstance(value.get("frameIndex"), int)
-        or not 0 <= value["frameIndex"] < value["decodedFrameCount"]
-        or not _DIGEST.fullmatch(value.get("configSha256", ""))
-        or not _DIGEST.fullmatch(value.get("fixtureSha256", ""))
-    ):
-        raise CatVTONWorkerError("official_catvton_captured_source_invalid")
-    return value
-
-
-def _write_regional_evidence(
-    *,
-    args: argparse.Namespace,
-    original,
-    result,
-    upper_body,
-    protected,
-) -> None:
-    source = _captured_source(args.captured_source)
-    output_path = Path(args.output)
-    evidence_path = Path(args.regional_evidence_output)
-    try:
-        if not verify_regional_evaluator_provenance():
-            raise CatVTONWorkerError("official_catvton_regional_evaluator_provenance_mismatch")
-        write_regional_evidence(
-            output_path=output_path,
-            evidence_path=evidence_path,
-            person_path=Path(args.person),
-            garment_path=Path(args.garment),
-            captured_source=source,
-            original=original,
-            result=result,
-            upper_body=upper_body,
-            protected=protected,
-            evaluator_source_descriptor_sha256=regional_evaluator_descriptor_sha256(),
-            policy={
-                "schemaVersion": "vem-ai-regional-evidence-policy/v1",
-                "sha256": "5f007b21e7b64d65bd878c9af08bc20b764e31fb16a03807bc8ddaab1bc22d6d",
-            },
-        )
-    except RegionalEvaluatorError as exc:
-        raise CatVTONWorkerError(str(exc)) from exc
-
-
 def _pack_path(root: Path, relative: str) -> Path:
     path = (root / relative).resolve(strict=False)
     if not path.is_file() or root.resolve() not in path.parents:
         raise CatVTONWorkerError(f"official_catvton_missing:{relative}")
     return path
-
-
-def _read_png(path: Path, *, role: str):
-    from PIL import Image, UnidentifiedImageError
-
-    try:
-        if not path.is_file() or path.stat().st_size > _MAX_INPUT_BYTES:
-            raise CatVTONWorkerError(f"official_catvton_invalid_{role}")
-        with Image.open(path) as image:
-            if image.format != "PNG":
-                raise CatVTONWorkerError(f"official_catvton_invalid_{role}")
-            image.load()
-            if image.width < 1 or image.height < 1 or image.width * image.height > _MAX_INPUT_PIXELS:
-                raise CatVTONWorkerError(f"official_catvton_invalid_{role}")
-            return image.convert("RGBA")
-    except CatVTONWorkerError:
-        raise
-    except (OSError, UnidentifiedImageError) as exc:
-        raise CatVTONWorkerError(f"official_catvton_invalid_{role}") from exc
-
-
-def _person_arrays(person_path: Path):
-    import numpy as np
-
-    person = _read_png(person_path, role="person").convert("RGB")
-    return person, np.array(person, dtype=np.uint8)
-
-
-def _garment_condition(garment_path: Path):
-    import numpy as np
-
-    garment = _read_png(garment_path, role="garment")
-    rgba = np.array(garment, dtype=np.uint8)
-    alpha = rgba[:, :, 3:4].astype(np.float32) / 255.0
-    rgb = np.clip(
-        rgba[:, :, :3].astype(np.float32) * alpha + 255.0 * (1.0 - alpha),
-        0,
-        255,
-    ).astype(np.uint8)
-    return rgb, rgba
 
 
 def _probe_runtime_worker() -> dict[str, object]:
@@ -184,6 +73,8 @@ def _probe_runtime_worker() -> dict[str, object]:
         raise CatVTONWorkerError("official_catvton_source_revision_mismatch")
     if not verify_official_source_provenance():
         raise CatVTONWorkerError("official_catvton_source_provenance_mismatch")
+    if not verify_regional_evaluator_provenance():
+        raise CatVTONWorkerError("official_catvton_regional_evaluator_provenance_mismatch")
 
     payload: dict[str, object] = {
         "probe": "official-catvton-worker-runtime",
@@ -207,159 +98,6 @@ def _probe_official_worker(pack_root: Path) -> dict[str, object]:
         json.loads(_pack_path(pack_root, relative).read_text("utf-8"))
     payload["probe"] = "official-catvton-worker"
     return payload
-
-
-def _run_catvton_attempt(args: argparse.Namespace, pack_root: Path) -> dict[str, object]:
-    import cv2
-    import numpy as np
-    import torch
-    from PIL import Image
-
-    from vision.catvton_pose_masks import CatVTONPoseError, target_hands_sleeve_masks
-    from vision.catvton_preprocess import (
-        build_generation_mask,
-        composite_to_original,
-        harmonize_garment_color,
-        include_color_matched_old_edges,
-        letterbox_image,
-        letterbox_mask,
-        parsed_old_clothes_mask,
-        protected_mask_to_original,
-        refine_mask_with_generated_parse,
-    )
-    from vision.vendor.catvton.model.SCHP import SCHP
-    from vision.vendor.catvton.model.pipeline import CatVTONPipeline
-
-    started = time.perf_counter()
-    torch.set_num_threads(max(1, min(16, (os.cpu_count() or 8) - 2)))
-    attention_file = _pack_path(pack_root, "CatVTON/mix-48k-1024/attention/model.safetensors")
-    lip_checkpoint = _pack_path(pack_root, "CatVTON/SCHP/exp-schp-201908261155-lip.pth")
-    atr_checkpoint = _pack_path(pack_root, "CatVTON/SCHP/exp-schp-201908301523-atr.pth")
-    base_model = _pack_path(
-        pack_root,
-        "inpainting/scheduler/scheduler_config.json",
-    ).parents[1]
-    vae_model = _pack_path(pack_root, "vae/config.json").parent
-
-    person_image, original = _person_arrays(Path(args.person))
-    garment_source, garment_rgba = _garment_condition(Path(args.garment))
-    try:
-        target_mask, hands_mask, sleeve_mask = target_hands_sleeve_masks(
-            original,
-            garment_rgba,
-            template=args.template,
-        )
-    except CatVTONPoseError as exc:
-        raise CatVTONWorkerError(exc.code) from exc
-
-    parsing_started = time.perf_counter()
-    lip_model = SCHP(str(lip_checkpoint), device="cpu")
-    with torch.inference_mode():
-        lip_parse = np.array(lip_model(person_image), dtype=np.uint8)
-    del lip_model
-    gc.collect()
-
-    atr_model = SCHP(str(atr_checkpoint), device="cpu")
-    with torch.inference_mode():
-        atr_parse = np.array(atr_model(person_image), dtype=np.uint8)
-    del atr_model
-    gc.collect()
-    parsing_seconds = time.perf_counter() - parsing_started
-
-    original_clothes = parsed_old_clothes_mask(lip_parse, atr_parse)
-    generation_mask = build_generation_mask(target_mask, lip_parse, atr_parse, hands_mask)
-    person_fit, transform = letterbox_image(original, args.width, args.height)
-    mask_fit = letterbox_mask(generation_mask, transform)
-    original_clothes_fit = letterbox_mask(original_clothes, transform)
-    sleeve_mask_fit = letterbox_mask(sleeve_mask, transform)
-    garment_fit, _ = letterbox_image(garment_source, args.width, args.height)
-
-    load_started = time.perf_counter()
-    pipeline = CatVTONPipeline(
-        base_ckpt=str(base_model),
-        vae_ckpt=str(vae_model),
-        attn_ckpt=str(attention_file.parents[2]),
-        attn_ckpt_version="mix",
-        weight_dtype=torch.float32,
-        device="cpu",
-        compile=False,
-        skip_safety_check=True,
-        use_tf32=False,
-        local_files_only=True,
-    )
-    load_seconds = time.perf_counter() - load_started
-
-    generator = torch.Generator(device="cpu").manual_seed(args.seed)
-    generation_started = time.perf_counter()
-    with torch.inference_mode():
-        generated = pipeline(
-            image=Image.fromarray(person_fit),
-            condition_image=Image.fromarray(garment_fit),
-            mask=Image.fromarray(mask_fit),
-            num_inference_steps=args.steps,
-            guidance_scale=2.5,
-            height=args.height,
-            width=args.width,
-            generator=generator,
-        )[0]
-    generation_seconds = time.perf_counter() - generation_started
-
-    generated_rgb_raw = np.array(generated.convert("RGB"), dtype=np.uint8)
-    del pipeline
-    gc.collect()
-    post_parse_started = time.perf_counter()
-    post_parse_model = SCHP(str(lip_checkpoint), device="cpu")
-    with torch.inference_mode():
-        generated_lip_parse = np.array(post_parse_model(Image.fromarray(generated_rgb_raw)), dtype=np.uint8)
-    del post_parse_model
-    gc.collect()
-    final_mask_fit = refine_mask_with_generated_parse(
-        mask_fit,
-        generated_lip_parse,
-        original_clothes_fit,
-        sleeve_mask_fit,
-    )
-    final_mask_fit = include_color_matched_old_edges(
-        final_mask_fit,
-        mask_fit,
-        person_fit,
-        original_clothes_fit,
-    )
-    post_parse_seconds = time.perf_counter() - post_parse_started
-    generated_rgb = harmonize_garment_color(generated_rgb_raw, final_mask_fit, garment_fit)
-    result = composite_to_original(original, generated_rgb, final_mask_fit, transform)
-    upper_body, protected = protected_mask_to_original(
-        mask_fit, final_mask_fit, transform
-    )
-
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temp_output = output.with_name(f".{output.name}.{os.getpid()}.tmp")
-    Image.fromarray(result).save(temp_output, format="PNG", compress_level=3)
-    with Image.open(temp_output) as check:
-        check.load()
-        if check.format != "PNG" or check.width != original.shape[1] or check.height != original.shape[0]:
-            raise CatVTONWorkerError("official_catvton_invalid_output")
-    os.replace(temp_output, output)
-    if args.regional_evidence_output:
-        _write_regional_evidence(
-            args=args,
-            original=original,
-            result=result,
-            upper_body=upper_body,
-            protected=protected,
-        )
-    return {
-        "output": str(output),
-        "parsing_seconds": round(parsing_seconds, 2),
-        "post_parse_seconds": round(post_parse_seconds, 2),
-        "load_seconds": round(load_seconds, 2),
-        "generation_seconds": round(generation_seconds, 2),
-        "worker_seconds": round(time.perf_counter() - started, 2),
-        "width": args.width,
-        "height": args.height,
-        "steps": args.steps,
-    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -416,11 +154,13 @@ def main(argv: list[str] | None = None) -> int:
     if bool(args.regional_evidence_output) != bool(args.captured_source):
         raise RuntimeError("official_catvton_regional_evidence_paths_required")
     try:
-        metrics = _run_catvton_attempt(args, pack_root)
+        metrics = run_regional_evaluator_attempt(
+            args, pack_root, policy=_REGIONAL_EVIDENCE_POLICY
+        )
     except ModuleNotFoundError as exc:
         print(f"official_catvton_dependency_missing:{exc.name}", file=sys.stderr)
         return 2
-    except CatVTONWorkerError as exc:
+    except (CatVTONWorkerError, RegionalEvaluatorError) as exc:
         print(exc.code, file=sys.stderr)
         return 2
     except Exception as exc:

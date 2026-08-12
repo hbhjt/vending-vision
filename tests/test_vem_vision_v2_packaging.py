@@ -13,6 +13,19 @@ import pytest
 ROOT = Path(__file__).parents[1]
 
 
+def materialize_regional_evaluator_resources(internal: Path) -> None:
+    descriptor = json.loads((ROOT / "regional-evaluator-descriptor.json").read_text("utf-8"))
+    (internal / "regional-evaluator-descriptor.json").write_text(
+        json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        "utf-8",
+    )
+    for source in descriptor["sources"]:
+        destination = internal / source["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((ROOT / source["path"]).read_bytes())
+
+
 def test_packaged_archive_guard_rejects_retired_modules_and_resources():
     from scripts.verify_packaged_exe import retired_packaged_entries
 
@@ -276,14 +289,39 @@ def test_packaged_verifier_ai_worker_layout_binds_descriptor_resources(tmp_path)
         "ai-runtime-descriptor.json",
         "requirements-ai.lock.json",
         "official-ai-source-descriptor.json",
-        "regional-evaluator-descriptor.json",
     ):
         (internal / name).write_text("{}", "utf-8")
+    materialize_regional_evaluator_resources(internal)
 
     result = assert_ai_worker_layout(exe, required=True)
 
     assert result["path"] == worker
     assert len(result["sha256"]) == 64
+
+
+def test_packaged_verifier_rejects_missing_regional_evaluator_source(tmp_path):
+    from scripts.verify_packaged_exe import assert_ai_worker_layout
+
+    suffix = ".exe" if sys.platform == "win32" else ""
+    exe = tmp_path / "vending-vision" / f"vending-vision{suffix}"
+    worker = tmp_path / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}"
+    internal = worker.parent / "_internal"
+    exe.parent.mkdir()
+    internal.mkdir(parents=True)
+    exe.write_bytes(b"main")
+    worker.write_bytes(b"worker")
+    for name in (
+        "official-ai-model-pack-descriptor.json",
+        "ai-runtime-descriptor.json",
+        "requirements-ai.lock.json",
+        "official-ai-source-descriptor.json",
+    ):
+        (internal / name).write_text("{}", "utf-8")
+    materialize_regional_evaluator_resources(internal)
+    (internal / "vision" / "config.py").unlink()
+
+    with pytest.raises(AssertionError, match="regional evaluator"):
+        assert_ai_worker_layout(exe, required=True)
 
 
 def test_candidate_archive_rejects_self_manifested_exact_json_fake_without_external_trust(tmp_path):
@@ -422,6 +460,7 @@ def test_packaged_verifier_rejects_worker_that_does_not_emit_runtime_probe_json(
         "official-ai-source-descriptor.json",
     ):
         (internal / name).write_text("{}", "utf-8")
+    materialize_regional_evaluator_resources(internal)
 
     layout = assert_ai_worker_layout(exe, required=True)
     try:
