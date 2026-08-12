@@ -81,6 +81,24 @@ def test_candidate_execution_job_has_no_oidc_or_attestation_write_capability():
     assert signing["permissions"]["attestations"] == "write"
 
 
+def test_proof_jobs_and_downloads_have_fixed_total_deadlines():
+    source = TRUSTED_PROOF.read_text("utf-8")
+    workflow = load_workflow_yaml(source)
+    for name, expected in {"execute": 180, "sign": 180, "verify": 30}.items():
+        timeout = workflow["jobs"][name].get("timeout-minutes")
+        assert timeout == str(expected), name
+        assert f"    timeout-minutes: {expected}\n" in source
+
+    download_commands = [
+        line.strip()
+        for run in workflow_run_scalars(source)
+        for line in run.splitlines()
+        if "$downloader --url" in line
+    ]
+    assert len(download_commands) == 2
+    assert all("--total-timeout-seconds 1800" in line for line in download_commands)
+
+
 def test_proof_and_fresh_verify_jobs_use_only_immutable_trusted_code_and_safe_env():
     source = TRUSTED_PROOF.read_text("utf-8")
     workflow = load_workflow_yaml(source)
@@ -207,6 +225,7 @@ def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
     execute_permission = """  execute:
     needs: companion_builder
     runs-on: windows-latest
+    timeout-minutes: 180
     permissions:
       contents: read
       attestations: read
@@ -258,6 +277,40 @@ def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
         "execution-and-signing-jobs-merged": merged,
     }
     for name, source in mutations.items():
+        candidate = tmp_path / f"{name}.yml"
+        candidate.write_text(source, "utf-8")
+        completed = _check_policy(candidate)
+        assert completed.returncode != 0, name
+
+
+def test_trusted_proof_policy_rejects_missing_mutable_or_zero_deadlines(tmp_path):
+    trusted = TRUSTED_PROOF.read_text("utf-8")
+    mutations = {
+        "missing-execute-job-timeout": trusted.replace(
+            "    timeout-minutes: 180\n", "", 1
+        ),
+        "zero-job-timeout": trusted.replace(
+            "    timeout-minutes: 180\n", "    timeout-minutes: 0\n", 1
+        ),
+        "expression-verify-job-timeout": trusted.replace(
+            "    timeout-minutes: 30\n",
+            "    timeout-minutes: ${{ inputs.model_pack_bytes }}\n",
+            1,
+        ),
+        "missing-download-total-timeout": trusted.replace(
+            " --total-timeout-seconds 1800", "", 1
+        ),
+        "zero-download-total-timeout": trusted.replace(
+            "--total-timeout-seconds 1800", "--total-timeout-seconds 0", 1
+        ),
+        "expression-download-total-timeout": trusted.replace(
+            "--total-timeout-seconds 1800",
+            "--total-timeout-seconds ${{ inputs.model_pack_bytes }}",
+            1,
+        ),
+    }
+    for name, source in mutations.items():
+        assert source != trusted, name
         candidate = tmp_path / f"{name}.yml"
         candidate.write_text(source, "utf-8")
         completed = _check_policy(candidate)

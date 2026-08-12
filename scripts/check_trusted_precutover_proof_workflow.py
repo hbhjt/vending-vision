@@ -235,6 +235,29 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         and verify_job.get("needs") == ["companion_builder", "sign"],
         "trusted_proof_verify_needs_sign",
     )
+    for name, expected_timeout in {"execute": 180, "sign": 180, "verify": 30}.items():
+        _require(
+            jobs[name].get("timeout-minutes") == str(expected_timeout)
+            and _job_block(source, name).count(
+                f"    timeout-minutes: {expected_timeout}\n"
+            )
+            == 1,
+            f"trusted_proof_job_timeout:{name}",
+        )
+    download_commands = [
+        line.strip()
+        for run in workflow_run_scalars(source)
+        for line in run.splitlines()
+        if "$downloader --url" in line
+    ]
+    _require(len(download_commands) == 2, "trusted_proof_download_command_count")
+    _require(
+        all(
+            re.search(r"--total-timeout-seconds 1800(?:\s|$)", line) is not None
+            for line in download_commands
+        ),
+        "trusted_proof_download_total_timeout",
+    )
     write_capable = [
         name
         for name, job in jobs.items()

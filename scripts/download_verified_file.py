@@ -3,16 +3,21 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import os
 from pathlib import Path
 import re
 import tempfile
+import time
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
 MAX_DOWNLOAD_BYTES = 16 * 1024 * 1024 * 1024
 CHUNK_BYTES = 1024 * 1024
+SOCKET_TIMEOUT_SECONDS = 120.0
+DEFAULT_TOTAL_TIMEOUT_SECONDS = 1800.0
+MAX_TOTAL_TIMEOUT_SECONDS = 3600.0
 
 
 class DownloadError(RuntimeError):
@@ -27,6 +32,8 @@ def download_verified_file(
     *,
     opener=urlopen,
     max_download_bytes: int = MAX_DOWNLOAD_BYTES,
+    total_timeout_seconds: float = DEFAULT_TOTAL_TIMEOUT_SECONDS,
+    monotonic=time.monotonic,
 ) -> None:
     parsed = urlsplit(url)
     if (
@@ -46,6 +53,22 @@ def download_verified_file(
         or expected_bytes > max_download_bytes
     ):
         raise DownloadError("download_size")
+    if (
+        type(total_timeout_seconds) not in {int, float}
+        or not math.isfinite(total_timeout_seconds)
+        or total_timeout_seconds <= 0
+        or total_timeout_seconds > MAX_TOTAL_TIMEOUT_SECONDS
+    ):
+        raise DownloadError("download_timeout")
+    deadline = monotonic() + total_timeout_seconds
+
+    def remaining() -> float:
+        value = deadline - monotonic()
+        if not math.isfinite(value) or value <= 0:
+            raise DownloadError("download_timeout")
+        return value
+
+    remaining()
     if destination.exists() or destination.is_symlink():
         raise DownloadError("download_destination")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -57,12 +80,20 @@ def download_verified_file(
         digest = hashlib.sha256()
         downloaded = 0
         request = Request(url, headers={"User-Agent": "vending-vision-proof-fetcher/1"})
-        with opener(request, timeout=120.0) as response, os.fdopen(descriptor, "wb") as output:
+        response_timeout = min(SOCKET_TIMEOUT_SECONDS, remaining())
+        with opener(request, timeout=response_timeout) as response, os.fdopen(
+            descriptor, "wb"
+        ) as output:
             descriptor = -1
-            if response.geturl() != url:
+            remaining()
+            response_url = response.geturl()
+            remaining()
+            if response_url != url:
                 raise DownloadError("download_redirect_identity")
             while True:
+                remaining()
                 chunk = response.read(min(CHUNK_BYTES, expected_bytes - downloaded + 1))
+                remaining()
                 if not chunk:
                     break
                 if downloaded + len(chunk) > expected_bytes:
@@ -70,12 +101,20 @@ def download_verified_file(
                 output.write(chunk)
                 digest.update(chunk)
                 downloaded += len(chunk)
+            remaining()
             output.flush()
+            remaining()
             os.fsync(output.fileno())
+            remaining()
+        remaining()
         if downloaded != expected_bytes:
             raise DownloadError("download_size")
-        if digest.hexdigest() != sha256:
+        remaining()
+        actual_sha256 = digest.hexdigest()
+        remaining()
+        if actual_sha256 != sha256:
             raise DownloadError("download_digest")
+        remaining()
         try:
             os.link(temporary, destination)
         except FileExistsError as exc:
@@ -93,6 +132,7 @@ def main() -> int:
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--expected-bytes", required=True, type=int)
     parser.add_argument("--destination", required=True, type=Path)
+    parser.add_argument("--total-timeout-seconds", required=True, type=float)
     args = parser.parse_args()
     try:
         download_verified_file(
@@ -100,6 +140,7 @@ def main() -> int:
             args.sha256,
             args.expected_bytes,
             args.destination.resolve(),
+            total_timeout_seconds=args.total_timeout_seconds,
         )
     except (DownloadError, OSError) as exc:
         print(f"VERIFIED_FILE_DOWNLOAD=FAIL:{exc}")

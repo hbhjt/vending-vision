@@ -101,6 +101,7 @@ jobs:
   execute:
     needs: companion_builder
     runs-on: windows-latest
+    timeout-minutes: 180
     permissions:
       contents: read
       attestations: read
@@ -196,7 +197,7 @@ jobs:
             @($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "proof-input/model/official-model-pack.zip")
           )
           foreach ($download in $downloads) {
-            & $env:TRUSTED_PYTHON $downloader --url $download[0] --sha256 $download[1] --expected-bytes $download[2] --destination $download[3]
+            & $env:TRUSTED_PYTHON $downloader --url $download[0] --sha256 $download[1] --expected-bytes $download[2] --destination $download[3] --total-timeout-seconds 1800
             if ($LASTEXITCODE -ne 0) { throw "trusted proof input download failed" }
           }
       - name: Derive exact candidate identities without executing candidate code
@@ -283,6 +284,7 @@ jobs:
       - companion_builder
       - execute
     runs-on: windows-latest
+    timeout-minutes: 180
     permissions:
       contents: read
       id-token: write
@@ -390,7 +392,7 @@ jobs:
             @($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "signer-proof-input/model/official-model-pack.zip")
           )
           foreach ($download in $downloads) {
-            & $env:TRUSTED_PYTHON $downloader --url $download[0] --sha256 $download[1] --expected-bytes $download[2] --destination $download[3]
+            & $env:TRUSTED_PYTHON $downloader --url $download[0] --sha256 $download[1] --expected-bytes $download[2] --destination $download[3] --total-timeout-seconds 1800
             if ($LASTEXITCODE -ne 0) { throw "signer proof input download failed" }
           }
       - name: Fresh inspect candidate and model identities without execution
@@ -483,6 +485,7 @@ jobs:
       - companion_builder
       - sign
     runs-on: windows-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       attestations: read
