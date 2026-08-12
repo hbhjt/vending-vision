@@ -1919,7 +1919,8 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
-def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monkeypatch):
+@pytest.mark.parametrize("prestart", [False, True])
+def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monkeypatch, prestart):
     """A new generation receives a warmed command loop, not a spawn deadline."""
     context = multiprocessing.get_context("spawn")
     starts = context.Value("i", 0)
@@ -1934,7 +1935,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
             "keep_open": True,
             "_brokerReadyHandshake": True,
             "starts": starts,
-            "restartReadyDelay": 0.5,
+            "restartReadyDelay": 1.1,
         },
         context=context,
         target=_fast_block_then_slow_ready_broker_target,
@@ -1970,6 +1971,11 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
     })
     monkeypatch.setattr(camera_manager, "get_camera_maintenance", lambda: Maintenance())
     monkeypatch.setattr(camera_manager, "DirectShowCameraBroker", lambda _role, _config: broker)
+    if not prestart:
+        async def skip_restart(_role):
+            return True
+
+        monkeypatch.setattr(vision_app, "restart_camera_request", skip_restart)
     camera_manager.release_all_cameras()
 
     async def scenario():
@@ -1984,12 +1990,18 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
         with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
             await asyncio.wait_for(blocked, timeout=4.0)
 
-        # The half-second startup delay was paid behind the canceled owner's
-        # cleanup barrier; the CI's one-second generation budget covers the read alone.
-        assert starts.value == 2
-        assert broker.active_request_count == 0
+        assert starts.value == (2 if prestart else 1)
         registry.cancel_event = asyncio.Event()
         second = vision_app.AttemptReceipt(str(uuid4()), "owner-2", 2)
+        if not prestart:
+            # This is the hosted failure mode: the next generation's one
+            # second budget includes a >1s child readiness delay.
+            with pytest.raises(asyncio.TimeoutError):
+                await vision_app._read_attempt_front_frame(second, timeout=1.0)
+            return
+        # The >1s startup delay was paid behind the canceled owner's cleanup
+        # barrier; the CI's one-second generation budget covers the read alone.
+        assert broker.active_request_count == 0
         frame, _source = await vision_app._read_attempt_front_frame(second, timeout=1.0)
         assert frame.shape == (80, 60, 3)
 

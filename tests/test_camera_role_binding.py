@@ -31,6 +31,8 @@ def _maintenance_handoff_broker_target(connection, config):
     with active.get_lock():
         active.value += 1
     try:
+        if config.get("_brokerReadyHandshake", False):
+            connection.send(("ready", {"pid": os.getpid()}))
         while True:
             command, _payload = connection.recv()
             if command == "shutdown":
@@ -271,6 +273,7 @@ def test_active_directshow_broker_is_dead_before_parent_maintenance_open_and_res
         "backend": "dshow",
         "stableId": "usb#front-002",
         "keep_open": True,
+        "_brokerReadyHandshake": True,
         "activeCounter": active,
         "startCounter": starts,
     }

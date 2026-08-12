@@ -349,6 +349,10 @@ _streams_lock = threading.RLock()
 _maintenance_candidates: set[str] = set()
 _last_frame_metadata: dict[str, dict] = {}
 _role_read_locks = {role: threading.RLock() for role in CAMERA_ROLES}
+# Every bulk release invalidates in-flight restart work.  A cancellation may
+# await child startup, so it must not recreate a broker after shutdown has
+# observed the old mapping as empty.
+_camera_lifecycle_generation = 0
 
 
 class DirectShowFrameSource:
@@ -708,6 +712,8 @@ async def abort_camera_request(role: str, *, reason: str) -> bool:
 
 async def restart_camera_request(role: str) -> bool:
     """Prestart a fresh DirectShow child after the prior request has joined."""
+    with _streams_lock:
+        generation = _camera_lifecycle_generation
     source = get_frame_source(role)
     if not isinstance(source, DirectShowFrameSource):
         return True
@@ -717,12 +723,28 @@ async def restart_camera_request(role: str) -> bool:
         return True
     try:
         await start()
-        return True
     except Exception:
+        with _streams_lock:
+            # Keep a broker whose abort did not prove physical death.  Its
+            # handle is the sole truthful owner record and prevents a second
+            # DirectShow process from being admitted.
+            if _dshow_brokers.get(role) is broker and broker.assert_dead():
+                _dshow_brokers.pop(role, None)
+        raise
+    with _streams_lock:
+        still_current = _camera_lifecycle_generation == generation
+        registered = _dshow_brokers.get(role) is broker
+    if still_current and registered:
+        return True
+    # release_all_cameras raced this restart.  Tear down the newly ready child
+    # and retain its handle if that teardown cannot prove it is dead.
+    dead = await broker.abort_async(reason="restart_invalidated_by_release")
+    if dead:
         with _streams_lock:
             if _dshow_brokers.get(role) is broker:
                 _dshow_brokers.pop(role, None)
-        raise
+        return False
+    raise RuntimeError("directshow restart invalidated but broker remained alive")
 
 
 async def abort_all_camera_requests(*, reason: str) -> dict[str, bool]:
@@ -819,4 +841,7 @@ def reset_camera(role: str):
 
 def release_all_cameras():
     """释放所有摄像头资源。"""
+    global _camera_lifecycle_generation
+    with _streams_lock:
+        _camera_lifecycle_generation += 1
     return {role: release_camera(role) for role in sorted(CAMERA_ROLES)}

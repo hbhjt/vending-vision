@@ -442,8 +442,16 @@ class DirectShowCameraBroker:
                 process,
                 time.monotonic() + max(float(timeout), 0.001),
             )
-        except BaseException:
-            await self.abort_async(reason="startup_readiness_failed")
+        except BaseException as exc:
+            # Do not discard this broker's process handle unless its death was
+            # confirmed.  A readiness timeout may race a child that is still
+            # importing; losing that handle would let camera_manager create a
+            # second physical-camera owner.
+            stopped = await self.abort_async(reason="startup_readiness_failed")
+            if not stopped:
+                raise DirectShowCameraUnavailable(
+                    "directshow broker startup failed and its owner remains live"
+                ) from exc
             raise
         finally:
             self._request_slot.release()

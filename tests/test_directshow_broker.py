@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import vision.directshow_broker as directshow_broker
+from vision import camera_manager
 from vision.directshow_broker import (
     DirectShowCameraUnavailable,
     DirectShowCameraBroker,
@@ -86,6 +87,92 @@ def _broker_config():
 
 def test_directshow_broker_target_is_spawn_importable_without_app_boundary():
     assert directshow_broker_entry.__module__ == "vision.directshow_broker"
+
+
+def test_restart_failure_retains_live_broker_owner(monkeypatch):
+    """A failed readiness abort never drops the only live-owner handle."""
+
+    class Broker:
+        async def start_async(self):
+            raise DirectShowCameraUnavailable("owner remains live")
+
+        def assert_dead(self):
+            return False
+
+    class Source(camera_manager.DirectShowFrameSource):
+        def __init__(self):
+            pass
+
+        async def _broker_async(self):
+            return broker
+
+    broker = Broker()
+    monkeypatch.setattr(camera_manager, "get_frame_source", lambda _role: Source())
+    with camera_manager._streams_lock:
+        camera_manager._dshow_brokers["front"] = broker
+    try:
+        with pytest.raises(DirectShowCameraUnavailable, match="owner remains live"):
+            asyncio.run(camera_manager.restart_camera_request("front"))
+        with camera_manager._streams_lock:
+            assert camera_manager._dshow_brokers["front"] is broker
+    finally:
+        with camera_manager._streams_lock:
+            camera_manager._dshow_brokers.pop("front", None)
+
+
+def test_release_all_invalidates_inflight_restart_before_it_can_escape(monkeypatch):
+    """Shutdown wins over a restart that was waiting for child readiness."""
+
+    class Broker:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.ready_release = asyncio.Event()
+            self.aborted = False
+            self.released = False
+
+        async def start_async(self):
+            self.entered.set()
+            await self.ready_release.wait()
+
+        async def abort_async(self, *, reason):
+            assert reason == "restart_invalidated_by_release"
+            self.aborted = True
+            return True
+
+        def release(self):
+            self.released = True
+            return True
+
+        def assert_dead(self):
+            return self.aborted or self.released
+
+    class Source(camera_manager.DirectShowFrameSource):
+        def __init__(self):
+            pass
+
+        async def _broker_async(self):
+            return broker
+
+    broker = Broker()
+    monkeypatch.setattr(camera_manager, "get_frame_source", lambda _role: Source())
+    with camera_manager._streams_lock:
+        camera_manager._dshow_brokers["front"] = broker
+
+    async def scenario():
+        restart = asyncio.create_task(camera_manager.restart_camera_request("front"))
+        await broker.entered.wait()
+        assert camera_manager.release_all_cameras()["front"] is True
+        broker.ready_release.set()
+        assert await restart is False
+
+    try:
+        asyncio.run(scenario())
+        assert broker.aborted
+        with camera_manager._streams_lock:
+            assert "front" not in camera_manager._dshow_brokers
+    finally:
+        with camera_manager._streams_lock:
+            camera_manager._dshow_brokers.pop("front", None)
 
 
 def test_directshow_broker_deadline_kills_blocked_child_and_next_request_restarts():
