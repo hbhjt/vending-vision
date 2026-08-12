@@ -163,19 +163,13 @@ class FakeWindowsKernel32:
         self.calls.append(("ReadFile", handle, len(chunk)))
         return 1
 
-    def SetFileInformationByHandle(self, handle, information_class, info, size):
-        self.calls.append(("SetFileInformationByHandle", handle, information_class, size))
-        if information_class != acceptance_evidence._WindowsEvidenceFileApi.FILE_DISPOSITION_INFO:
-            return 0
-        if size != 1 or ctypes.sizeof(info._obj) != 1 or info._obj.DeleteFile != 1:
-            return 0
-        if not self.handles[handle]["access"] & acceptance_evidence._WindowsEvidenceFileApi.DELETE:
-            return 0
+    def DeleteFileW(self, path):
+        self.calls.append(("DeleteFileW", Path(path)))
         if self.delete_failure_once:
             self.delete_failure_once = False
             return 0
         try:
-            self.handles[handle]["path"].unlink()
+            Path(path).unlink()
         except OSError:
             return 0
         return 1
@@ -292,13 +286,7 @@ def test_windows_acceptance_sink_publishes_with_held_read_only_handles(
         call[2] & acceptance_evidence._WindowsEvidenceFileApi.GENERIC_WRITE
         for call in flushes
     )
-    delete_call = next(
-        call for call in kernel.calls if call[0] == "SetFileInformationByHandle"
-    )
-    assert delete_call[2:] == (
-        acceptance_evidence._WindowsEvidenceFileApi.FILE_DISPOSITION_INFO,
-        1,
-    )
+    assert any(call[0] == "DeleteFileW" for call in kernel.calls)
     source_open = next(
         call
         for call in file_opens
@@ -448,7 +436,7 @@ def test_windows_acceptance_sink_rolls_back_when_temp_delete_or_claim_cleanup_fa
         windows_sink(monkeypatch, kernel)
 
         with pytest.raises(
-            (RuntimeError, OSError), match="windows_handle_delete|claim cleanup failed"
+            (RuntimeError, OSError), match="windows_path_delete|claim cleanup failed"
         ):
             publish_completed_ai_regional_evidence(str(uuid4()), canonical_sidecar())
 
@@ -471,7 +459,7 @@ def test_windows_acceptance_sink_rolls_back_when_claim_directory_handle_cannot_o
     assert list(root.iterdir()) == []
 
 
-def test_windows_acceptance_sink_preserves_external_replacement_during_rollback(
+def test_windows_acceptance_sink_blocks_external_replacement_until_publish_finishes(
     tmp_path, monkeypatch
 ):
     root = tmp_path / "acceptance"
@@ -484,17 +472,22 @@ def test_windows_acceptance_sink_preserves_external_replacement_during_rollback(
     replacement = tmp_path / "replacement.json"
     replacement.write_bytes(b"external publisher bytes\n")
 
-    def replace_then_fail_source_flush(_handle):
+    replacement_attempted = False
+
+    def attempt_replace_while_source_is_held(_handle):
+        nonlocal replacement_attempted
         if destination.exists() and replacement.exists():
-            os.replace(replacement, destination)
-            kernel.flush_failure_once = True
+            replacement_attempted = True
+            assert not kernel.atomic_replace(destination, replacement)
 
-    kernel.flush_hook = replace_then_fail_source_flush
+    kernel.flush_hook = attempt_replace_while_source_is_held
 
-    with pytest.raises(RuntimeError, match="windows_handle_flush"):
-        publish_completed_ai_regional_evidence(attempt_id, canonical_sidecar())
+    published = publish_completed_ai_regional_evidence(attempt_id, canonical_sidecar())
 
-    assert destination.read_bytes() == b"external publisher bytes\n"
+    assert replacement_attempted
+    assert published == destination
+    assert destination.read_bytes() == canonical_sidecar()
+    assert replacement.read_bytes() == b"external publisher bytes\n"
     assert {path.name for path in root.iterdir()} == {destination.name}
 
 

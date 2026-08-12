@@ -35,11 +35,6 @@ class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
     ]
 
 
-class _FILE_DISPOSITION_INFO(ctypes.Structure):
-    # BOOLEAN is an unsigned one-byte Win32 ABI type, not a C int/BOOL.
-    _fields_ = [("DeleteFile", ctypes.c_ubyte)]
-
-
 class _WindowsEvidenceFileApi:
     """Held-handle file operations for the Windows acceptance-only sink."""
 
@@ -53,7 +48,6 @@ class _WindowsEvidenceFileApi:
     OPEN_EXISTING = 3
     FILE_ATTRIBUTE_NORMAL = 0x00000080
     FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-    FILE_DISPOSITION_INFO = 4
 
     def __init__(self, kernel32):
         self._kernel32 = kernel32
@@ -173,15 +167,9 @@ class _WindowsEvidenceFileApi:
                 return digest.digest()
             digest.update(buffer.raw[: read.value])
 
-    def mark_delete(self, handle: int) -> None:
-        disposition = _FILE_DISPOSITION_INFO(1)
-        if not self._kernel32.SetFileInformationByHandle(
-            handle,
-            self.FILE_DISPOSITION_INFO,
-            ctypes.byref(disposition),
-            ctypes.sizeof(disposition),
-        ):
-            raise RuntimeError("ai_acceptance_evidence_windows_handle_delete")
+    def delete_path(self, path: Path) -> None:
+        if not self._kernel32.DeleteFileW(str(path)):
+            raise RuntimeError("ai_acceptance_evidence_windows_path_delete")
 
 
 def _windows_kernel32_factory():
@@ -214,6 +202,8 @@ def _windows_kernel32_factory():
         ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_void_p
     ]
     kernel32.CreateHardLinkW.restype = ctypes.c_int
+    kernel32.DeleteFileW.argtypes = [ctypes.c_wchar_p]
+    kernel32.DeleteFileW.restype = ctypes.c_int
     kernel32.GetFileInformationByHandle.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(_BY_HANDLE_FILE_INFORMATION)
     ]
@@ -226,13 +216,6 @@ def _windows_kernel32_factory():
         ctypes.c_void_p,
     ]
     kernel32.ReadFile.restype = ctypes.c_int
-    kernel32.SetFileInformationByHandle.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-    ]
-    kernel32.SetFileInformationByHandle.restype = ctypes.c_int
     return kernel32
 
 
@@ -493,13 +476,11 @@ def _publish_windows_ai_regional_evidence(
             if not path.exists() and not path.is_symlink():
                 return
             raise
-        try:
-            observed, _size = api.information(handle)
-            if observed != identity:
-                return
-            api.mark_delete(handle)
-        finally:
-            api.close(handle)
+        observed, _size = api.information(handle)
+        api.close(handle)
+        if observed != identity:
+            return
+        api.delete_path(path)
 
     def verify_root_path() -> None:
         if root_identity is None:
