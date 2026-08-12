@@ -1,0 +1,135 @@
+name: Run trusted Windows pre-cutover proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_archive_url:
+        description: Immutable candidate ZIP URL
+        required: true
+        type: string
+      candidate_archive_sha256:
+        description: Candidate ZIP SHA-256
+        required: true
+        type: string
+      candidate_archive_bytes:
+        description: Candidate ZIP byte size
+        required: true
+        type: number
+      candidate_manifest_url:
+        description: Immutable candidate manifest URL
+        required: true
+        type: string
+      candidate_manifest_sha256:
+        description: Candidate manifest SHA-256
+        required: true
+        type: string
+      candidate_manifest_bytes:
+        description: Candidate manifest byte size
+        required: true
+        type: number
+      candidate_attestation_url:
+        description: Immutable candidate attestation URL
+        required: true
+        type: string
+      candidate_attestation_sha256:
+        description: Candidate attestation SHA-256
+        required: true
+        type: string
+      candidate_attestation_bytes:
+        description: Candidate attestation byte size
+        required: true
+        type: number
+      candidate_evidence_url:
+        description: Immutable trusted-builder evidence URL
+        required: true
+        type: string
+      candidate_evidence_sha256:
+        description: Trusted-builder evidence SHA-256
+        required: true
+        type: string
+      candidate_evidence_bytes:
+        description: Trusted-builder evidence byte size
+        required: true
+        type: number
+      model_pack_url:
+        description: Optional immutable complete model-pack URL
+        required: false
+        type: string
+      model_pack_sha256:
+        description: Reconstructed model-pack SHA-256
+        required: true
+        type: string
+      model_pack_bytes:
+        description: Reconstructed model-pack byte size
+        required: true
+        type: number
+      model_pack_part_01_url:
+        description: Immutable model-pack part 01 URL
+        required: false
+        type: string
+      model_pack_part_01_sha256:
+        description: Model-pack part 01 SHA-256
+        required: false
+        type: string
+      model_pack_part_01_bytes:
+        description: Model-pack part 01 byte size
+        required: false
+        type: number
+      model_pack_part_02_url:
+        description: Immutable model-pack part 02 URL
+        required: false
+        type: string
+      model_pack_part_02_sha256:
+        description: Model-pack part 02 SHA-256
+        required: false
+        type: string
+      model_pack_part_02_bytes:
+        description: Model-pack part 02 byte size
+        required: false
+        type: number
+      model_pack_part_03_url:
+        description: Immutable model-pack part 03 URL
+        required: false
+        type: string
+      model_pack_part_03_sha256:
+        description: Model-pack part 03 SHA-256
+        required: false
+        type: string
+      model_pack_part_03_bytes:
+        description: Model-pack part 03 byte size
+        required: false
+        type: number
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  trusted_proof:
+    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-proof.yml@7d1e0bfb90fb2a58d44540202ac1c4e807eb6a2d
+    with:
+      candidate_archive_url: ${{ inputs.candidate_archive_url }}
+      candidate_archive_sha256: ${{ inputs.candidate_archive_sha256 }}
+      candidate_archive_bytes: ${{ inputs.candidate_archive_bytes }}
+      candidate_manifest_url: ${{ inputs.candidate_manifest_url }}
+      candidate_manifest_sha256: ${{ inputs.candidate_manifest_sha256 }}
+      candidate_manifest_bytes: ${{ inputs.candidate_manifest_bytes }}
+      candidate_attestation_url: ${{ inputs.candidate_attestation_url }}
+      candidate_attestation_sha256: ${{ inputs.candidate_attestation_sha256 }}
+      candidate_attestation_bytes: ${{ inputs.candidate_attestation_bytes }}
+      candidate_evidence_url: ${{ inputs.candidate_evidence_url }}
+      candidate_evidence_sha256: ${{ inputs.candidate_evidence_sha256 }}
+      candidate_evidence_bytes: ${{ inputs.candidate_evidence_bytes }}
+      model_pack_url: ${{ inputs.model_pack_url }}
+      model_pack_sha256: ${{ inputs.model_pack_sha256 }}
+      model_pack_bytes: ${{ inputs.model_pack_bytes }}
+      model_pack_part_01_url: ${{ inputs.model_pack_part_01_url }}
+      model_pack_part_01_sha256: ${{ inputs.model_pack_part_01_sha256 }}
+      model_pack_part_01_bytes: ${{ inputs.model_pack_part_01_bytes }}
+      model_pack_part_02_url: ${{ inputs.model_pack_part_02_url }}
+      model_pack_part_02_sha256: ${{ inputs.model_pack_part_02_sha256 }}
+      model_pack_part_02_bytes: ${{ inputs.model_pack_part_02_bytes }}
+      model_pack_part_03_url: ${{ inputs.model_pack_part_03_url }}
+      model_pack_part_03_sha256: ${{ inputs.model_pack_part_03_sha256 }}
+      model_pack_part_03_bytes: ${{ inputs.model_pack_part_03_bytes }}
