@@ -1,6 +1,7 @@
 """Private installed-acceptance sink for completed AI regional evidence."""
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -13,6 +14,221 @@ from pathlib import Path
 _ATTEMPT_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _MAX_SIDECAR_BYTES = 512 * 1024
 _WINDOWS = os.name == "nt"
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", ctypes.c_uint32), ("dwHighDateTime", ctypes.c_uint32)]
+
+
+class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", ctypes.c_uint32),
+        ("ftCreationTime", _FILETIME),
+        ("ftLastAccessTime", _FILETIME),
+        ("ftLastWriteTime", _FILETIME),
+        ("dwVolumeSerialNumber", ctypes.c_uint32),
+        ("nFileSizeHigh", ctypes.c_uint32),
+        ("nFileSizeLow", ctypes.c_uint32),
+        ("nNumberOfLinks", ctypes.c_uint32),
+        ("nFileIndexHigh", ctypes.c_uint32),
+        ("nFileIndexLow", ctypes.c_uint32),
+    ]
+
+
+class _FILE_DISPOSITION_INFO(ctypes.Structure):
+    _fields_ = [("DeleteFile", ctypes.c_int)]
+
+
+class _WindowsEvidenceFileApi:
+    """Held-handle file operations for the Windows acceptance-only sink."""
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    DELETE = 0x00010000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    CREATE_NEW = 1
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    FILE_DISPOSITION_INFO = 4
+
+    def __init__(self, kernel32):
+        self._kernel32 = kernel32
+
+    @staticmethod
+    def _invalid(handle: object) -> bool:
+        invalid = ctypes.c_void_p(-1).value
+        return handle in {None, 0, -1, invalid}
+
+    def _open(
+        self, path: Path, access: int, creation: int, flags: int = FILE_ATTRIBUTE_NORMAL
+    ) -> int:
+        handle = self._kernel32.CreateFileW(
+            str(path),
+            access,
+            self.FILE_SHARE_READ,
+            None,
+            creation,
+            flags,
+            None,
+        )
+        if self._invalid(handle):
+            raise RuntimeError("ai_acceptance_evidence_windows_handle_open")
+        return int(handle)
+
+    def create_temporary(self, path: Path) -> int:
+        return self._open(
+            path,
+            self.GENERIC_READ | self.GENERIC_WRITE,
+            self.CREATE_NEW,
+        )
+
+    def open_read(self, path: Path) -> int:
+        return self._open(path, self.GENERIC_READ, self.OPEN_EXISTING)
+
+    def open_delete(self, path: Path) -> int:
+        return self._open(path, self.GENERIC_READ | self.DELETE, self.OPEN_EXISTING)
+
+    def open_directory(self, path: Path) -> int:
+        return self._open(
+            path,
+            self.GENERIC_READ,
+            self.OPEN_EXISTING,
+            self.FILE_FLAG_BACKUP_SEMANTICS,
+        )
+
+    def write_all(self, handle: int, payload: bytes) -> None:
+        offset = 0
+        while offset < len(payload):
+            chunk = payload[offset : offset + 64 * 1024]
+            buffer = ctypes.create_string_buffer(chunk)
+            written = ctypes.c_uint32()
+            if not self._kernel32.WriteFile(
+                handle, buffer, len(chunk), ctypes.byref(written), None
+            ) or written.value != len(chunk):
+                raise RuntimeError("ai_acceptance_evidence_windows_handle_write")
+            offset += written.value
+
+    def flush(self, handle: int) -> None:
+        if not self._kernel32.FlushFileBuffers(handle):
+            raise RuntimeError("ai_acceptance_evidence_windows_handle_flush")
+
+    def close(self, handle: int) -> None:
+        first_failed = False
+        for _attempt in range(2):
+            if self._kernel32.CloseHandle(handle):
+                if first_failed:
+                    raise RuntimeError("ai_acceptance_evidence_windows_handle_close")
+                return
+            first_failed = True
+        raise RuntimeError("ai_acceptance_evidence_windows_handle_close")
+
+    def hard_link(self, destination: Path, source: Path) -> None:
+        if not self._kernel32.CreateHardLinkW(str(destination), str(source), None):
+            raise RuntimeError("ai_acceptance_evidence_exists")
+
+    def information(self, handle: int) -> tuple[tuple[int, int, int], int]:
+        information = _BY_HANDLE_FILE_INFORMATION()
+        if not self._kernel32.GetFileInformationByHandle(
+            handle, ctypes.byref(information)
+        ):
+            raise RuntimeError("ai_acceptance_evidence_windows_handle_information")
+        return (
+            (
+                information.dwVolumeSerialNumber,
+                information.nFileIndexHigh,
+                information.nFileIndexLow,
+            ),
+            (information.nFileSizeHigh << 32) | information.nFileSizeLow,
+        )
+
+    def sha256(self, handle: int) -> bytes:
+        digest = hashlib.sha256()
+        while True:
+            buffer = ctypes.create_string_buffer(64 * 1024)
+            read = ctypes.c_uint32()
+            if not self._kernel32.ReadFile(
+                handle, buffer, len(buffer), ctypes.byref(read), None
+            ):
+                raise RuntimeError("ai_acceptance_evidence_windows_handle_read")
+            if read.value == 0:
+                return digest.digest()
+            digest.update(buffer.raw[: read.value])
+
+    def flush_directory(self, root: Path) -> None:
+        handle = self.open_directory(root)
+        try:
+            self.flush(handle)
+        finally:
+            self.close(handle)
+
+    def mark_delete(self, handle: int) -> None:
+        disposition = _FILE_DISPOSITION_INFO(1)
+        if not self._kernel32.SetFileInformationByHandle(
+            handle,
+            self.FILE_DISPOSITION_INFO,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            raise RuntimeError("ai_acceptance_evidence_windows_handle_delete")
+
+
+def _windows_kernel32_factory():
+    if not _WINDOWS or not hasattr(ctypes, "WinDLL"):
+        raise RuntimeError("ai_acceptance_evidence_windows_held_handle_unavailable")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.WriteFile.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_void_p,
+    ]
+    kernel32.WriteFile.restype = ctypes.c_int
+    kernel32.FlushFileBuffers.argtypes = [ctypes.c_void_p]
+    kernel32.FlushFileBuffers.restype = ctypes.c_int
+    kernel32.CreateHardLinkW.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_void_p
+    ]
+    kernel32.CreateHardLinkW.restype = ctypes.c_int
+    kernel32.GetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_BY_HANDLE_FILE_INFORMATION)
+    ]
+    kernel32.GetFileInformationByHandle.restype = ctypes.c_int
+    kernel32.ReadFile.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_void_p,
+    ]
+    kernel32.ReadFile.restype = ctypes.c_int
+    kernel32.SetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.SetFileInformationByHandle.restype = ctypes.c_int
+    return kernel32
+
+
+def _windows_file_api_factory() -> _WindowsEvidenceFileApi:
+    return _WindowsEvidenceFileApi(_windows_kernel32_factory())
 
 
 def _canonical(value: object) -> bytes:
@@ -143,19 +359,9 @@ def _raise_with_cleanup(
     raise ExceptionGroup("AI acceptance evidence publication failed", errors)
 
 
-def publish_completed_ai_regional_evidence(attempt_id: str, content: bytes) -> Path | None:
-    """Publish one already-committed sidecar; disabled unless an owner sets a root."""
-    root = _acceptance_root()
-    if root is None:
-        return None
-    if not _ATTEMPT_ID.fullmatch(attempt_id) or not 0 < len(content) <= _MAX_SIDECAR_BYTES:
-        raise RuntimeError("ai_acceptance_evidence_invalid")
-    try:
-        value = json.loads(content.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise RuntimeError("ai_acceptance_evidence_invalid") from exc
-    if _canonical(value) != content:
-        raise RuntimeError("ai_acceptance_evidence_noncanonical")
+def _publish_posix_ai_regional_evidence(
+    root: Path, attempt_id: str, content: bytes
+) -> Path:
     destination = root / f"{attempt_id}.regional-evidence.json"
     if destination.parent != root:
         raise RuntimeError("ai_acceptance_evidence_path_invalid")
@@ -219,3 +425,132 @@ def publish_completed_ai_regional_evidence(attempt_id: str, content: bytes) -> P
             cleanup(lambda: _fsync_directory(root))
         _raise_with_cleanup(primary, cleanup_errors)
     return destination
+
+
+def _publish_windows_ai_regional_evidence(
+    root: Path, attempt_id: str, content: bytes
+) -> Path:
+    """Publish under held Windows handles; no POSIX descriptor semantics leak here."""
+    destination = root / f"{attempt_id}.regional-evidence.json"
+    if destination.parent != root:
+        raise RuntimeError("ai_acceptance_evidence_path_invalid")
+    api = _windows_file_api_factory()
+    claim = _claim_empty_invocation_root(root, destination)
+    temporary = root / f".{attempt_id}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    source_handle = None
+    destination_handle = None
+    claim_handle = None
+    temporary_identity = None
+    published_identity = None
+    primary: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
+
+    def close_live(name: str) -> None:
+        nonlocal source_handle, destination_handle, claim_handle
+        handle = {
+            "source": source_handle,
+            "destination": destination_handle,
+            "claim": claim_handle,
+        }[name]
+        if handle is None:
+            return
+        if name == "source":
+            source_handle = None
+        elif name == "destination":
+            destination_handle = None
+        else:
+            claim_handle = None
+        api.close(handle)
+
+    def cleanup(action: Callable[[], None]) -> None:
+        try:
+            action()
+        except FileNotFoundError:
+            return
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+
+    def delete_owned(path: Path, identity: tuple[int, int, int] | None) -> None:
+        if identity is None:
+            return
+        handle = None
+        try:
+            handle = api.open_delete(path)
+            observed, _size = api.information(handle)
+            if observed != identity:
+                return
+            api.mark_delete(handle)
+        except RuntimeError:
+            return
+        finally:
+            if handle is not None:
+                api.close(handle)
+
+    try:
+        claim_handle = api.open_directory(claim)
+        source_handle = api.create_temporary(temporary)
+        temporary_identity, _temporary_initial_size = api.information(source_handle)
+        api.write_all(source_handle, content)
+        observed_identity, temporary_size = api.information(source_handle)
+        if observed_identity != temporary_identity:
+            raise RuntimeError("ai_acceptance_evidence_temporary_invalid")
+        if temporary_size != len(content):
+            raise RuntimeError("ai_acceptance_evidence_temporary_invalid")
+        api.flush(source_handle)
+        api.hard_link(destination, temporary)
+        destination_handle = api.open_read(destination)
+        published_identity, published_size = api.information(destination_handle)
+        if published_identity != temporary_identity or published_size != len(content):
+            raise RuntimeError("ai_acceptance_evidence_publish_invalid")
+        api.flush(destination_handle)
+        # Parent-directory durability is a best available Windows boundary;
+        # source, destination, and claim handles all remain held through it.
+        api.flush_directory(root)
+        final_identity, final_size = api.information(destination_handle)
+        if (
+            final_identity != temporary_identity
+            or final_size != len(content)
+            or api.sha256(destination_handle) != hashlib.sha256(content).digest()
+        ):
+            raise RuntimeError("ai_acceptance_evidence_final_fence_failed")
+        close_live("destination")
+        close_live("source")
+        delete_owned(temporary, temporary_identity)
+        close_live("claim")
+        claim.rmdir()
+    except BaseException as exc:
+        primary = exc
+    finally:
+        cleanup(lambda: close_live("destination"))
+        cleanup(lambda: close_live("source"))
+        cleanup(lambda: close_live("claim"))
+        if primary is None and cleanup_errors:
+            primary = cleanup_errors.pop(0)
+        if primary is not None:
+            cleanup(lambda: delete_owned(destination, published_identity))
+            cleanup(lambda: delete_owned(temporary, temporary_identity))
+            cleanup(claim.rmdir)
+            cleanup(lambda: delete_owned(destination, published_identity))
+            cleanup(lambda: delete_owned(temporary, temporary_identity))
+            cleanup(claim.rmdir)
+            cleanup(lambda: api.flush_directory(root))
+        _raise_with_cleanup(primary, cleanup_errors)
+    return destination
+
+
+def publish_completed_ai_regional_evidence(attempt_id: str, content: bytes) -> Path | None:
+    """Publish one already-committed sidecar; disabled unless an owner sets a root."""
+    root = _acceptance_root()
+    if root is None:
+        return None
+    if not _ATTEMPT_ID.fullmatch(attempt_id) or not 0 < len(content) <= _MAX_SIDECAR_BYTES:
+        raise RuntimeError("ai_acceptance_evidence_invalid")
+    try:
+        value = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError("ai_acceptance_evidence_invalid") from exc
+    if _canonical(value) != content:
+        raise RuntimeError("ai_acceptance_evidence_noncanonical")
+    if _WINDOWS:
+        return _publish_windows_ai_regional_evidence(root, attempt_id, content)
+    return _publish_posix_ai_regional_evidence(root, attempt_id, content)

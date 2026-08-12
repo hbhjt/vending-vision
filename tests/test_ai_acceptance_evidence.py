@@ -20,6 +20,291 @@ def canonical_sidecar() -> bytes:
     ).encode("utf-8") + b"\n"
 
 
+class FakeWindowsKernel32:
+    """Small filesystem-backed Kernel32 double for the sink's held-handle ABI."""
+
+    def __init__(self):
+        self.calls = []
+        self.handles = {}
+        self.next_handle = 100
+        self.write_failure = False
+        self.flush_failure = False
+        self.flush_failure_once = False
+        self.directory_flush_failure = False
+        self.directory_flush_hook = None
+        self.close_fail_once = False
+
+    def CreateFileW(self, path, access, share, _security, creation, flags, _template):
+        target = Path(path)
+        self.calls.append(("CreateFileW", target, access, share, creation, flags))
+        try:
+            if flags & acceptance_evidence._WindowsEvidenceFileApi.FILE_FLAG_BACKUP_SEMANTICS:
+                if not target.is_dir():
+                    return -1
+                stream = None
+            elif creation == acceptance_evidence._WindowsEvidenceFileApi.CREATE_NEW:
+                stream = target.open("x+b")
+            else:
+                stream = target.open("rb")
+        except OSError:
+            return -1
+        handle = self.next_handle
+        self.next_handle += 1
+        self.handles[handle] = {
+            "path": target,
+            "stream": stream,
+            "share": share,
+            "flags": flags,
+        }
+        return handle
+
+    def WriteFile(self, handle, buffer, size, written, _overlapped):
+        if self.write_failure:
+            return 0
+        stream = self.handles[handle]["stream"]
+        stream.write(buffer.raw[:size])
+        stream.flush()
+        written._obj.value = size
+        self.calls.append(("WriteFile", handle, size))
+        return 1
+
+    def FlushFileBuffers(self, handle):
+        self.calls.append(("FlushFileBuffers", handle))
+        stream = self.handles[handle]["stream"]
+        if stream is None and self.directory_flush_hook is not None:
+            self.directory_flush_hook()
+        if self.flush_failure:
+            return 0
+        if self.flush_failure_once:
+            self.flush_failure_once = False
+            return 0
+        if stream is None and self.directory_flush_failure:
+            return 0
+        if stream is not None:
+            stream.flush()
+            os.fsync(stream.fileno())
+        return 1
+
+    def CreateHardLinkW(self, destination, source, _security):
+        self.calls.append(("CreateHardLinkW", Path(destination), Path(source)))
+        try:
+            os.link(source, destination)
+        except OSError:
+            return 0
+        return 1
+
+    def GetFileInformationByHandle(self, handle, information):
+        entry = self.handles[handle]
+        facts = entry["path"].stat()
+        value = information._obj
+        value.dwVolumeSerialNumber = facts.st_dev & 0xFFFFFFFF
+        value.nFileIndexHigh = (facts.st_ino >> 32) & 0xFFFFFFFF
+        value.nFileIndexLow = facts.st_ino & 0xFFFFFFFF
+        value.nFileSizeHigh = (facts.st_size >> 32) & 0xFFFFFFFF
+        value.nFileSizeLow = facts.st_size & 0xFFFFFFFF
+        self.calls.append(("GetFileInformationByHandle", handle))
+        return 1
+
+    def ReadFile(self, handle, buffer, size, read, _overlapped):
+        stream = self.handles[handle]["stream"]
+        chunk = stream.read(size)
+        buffer.raw = chunk + b"\0" * (size - len(chunk))
+        read._obj.value = len(chunk)
+        self.calls.append(("ReadFile", handle, len(chunk)))
+        return 1
+
+    def SetFileInformationByHandle(self, handle, information_class, info, _size):
+        self.calls.append(("SetFileInformationByHandle", handle, information_class))
+        if information_class != acceptance_evidence._WindowsEvidenceFileApi.FILE_DISPOSITION_INFO:
+            return 0
+        if not info._obj.DeleteFile:
+            return 0
+        try:
+            self.handles[handle]["path"].unlink()
+        except OSError:
+            return 0
+        return 1
+
+    def CloseHandle(self, handle):
+        self.calls.append(("CloseHandle", handle))
+        if self.close_fail_once:
+            self.close_fail_once = False
+            return 0
+        entry = self.handles.pop(handle, None)
+        if entry is None:
+            return 0
+        if entry["stream"] is not None:
+            entry["stream"].close()
+        return 1
+
+    def mutation_is_blocked(self, path, share_flag):
+        target = Path(path)
+        target_identity = target.stat().st_dev, target.stat().st_ino
+        for entry in self.handles.values():
+            if entry["stream"] is None:
+                continue
+            facts = entry["path"].stat()
+            if (facts.st_dev, facts.st_ino) == target_identity:
+                return not entry["share"] & share_flag
+        return False
+
+    def atomic_replace(self, destination, replacement):
+        if self.mutation_is_blocked(
+            destination, acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_DELETE
+        ):
+            return False
+        os.replace(replacement, destination)
+        return True
+
+    def inplace_write(self, destination, content):
+        if self.mutation_is_blocked(
+            destination, acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_WRITE
+        ):
+            return False
+        destination.write_bytes(content)
+        return True
+
+
+def windows_sink(monkeypatch, kernel):
+    monkeypatch.setattr(acceptance_evidence, "_WINDOWS", True)
+    monkeypatch.setattr(
+        acceptance_evidence,
+        "_windows_file_api_factory",
+        lambda: acceptance_evidence._WindowsEvidenceFileApi(kernel),
+    )
+
+
+def test_windows_acceptance_sink_publishes_with_held_read_only_handles(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "acceptance"
+    root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(root))
+    kernel = FakeWindowsKernel32()
+    windows_sink(monkeypatch, kernel)
+    attempt_id = str(uuid4())
+
+    destination = publish_completed_ai_regional_evidence(
+        attempt_id, canonical_sidecar()
+    )
+
+    assert destination == root / f"{attempt_id}.regional-evidence.json"
+    assert destination.read_bytes() == canonical_sidecar()
+    assert {path.name for path in root.iterdir()} == {destination.name}
+    file_opens = [call for call in kernel.calls if call[0] == "CreateFileW"]
+    assert file_opens[1][3] == acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_READ
+    assert file_opens[2][3] == acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_READ
+    assert any(call[0] == "CreateHardLinkW" for call in kernel.calls)
+    assert any(call[0] == "ReadFile" for call in kernel.calls)
+    source_handle = kernel.next_handle - len(kernel.handles) - 3
+    read_index = next(
+        index
+        for index, call in enumerate(kernel.calls)
+        if call[0] == "ReadFile"
+    )
+    close_source_index = next(
+        index
+        for index, call in enumerate(kernel.calls)
+        if call == ("CloseHandle", source_handle)
+    )
+    assert close_source_index > read_index
+
+
+def test_windows_acceptance_sink_preserves_preexisting_destination(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "acceptance"
+    root.mkdir()
+    attempt_id = str(uuid4())
+    destination = root / f"{attempt_id}.regional-evidence.json"
+    destination.write_bytes(b"external publisher bytes\n")
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(root))
+    kernel = FakeWindowsKernel32()
+    windows_sink(monkeypatch, kernel)
+
+    with pytest.raises(RuntimeError, match="exists"):
+        publish_completed_ai_regional_evidence(attempt_id, canonical_sidecar())
+
+    assert destination.read_bytes() == b"external publisher bytes\n"
+    assert kernel.calls == []
+
+
+@pytest.mark.parametrize("mutation", ["atomic", "inplace"])
+def test_windows_acceptance_sink_held_handles_block_external_mutation(
+    tmp_path, monkeypatch, mutation
+):
+    root = tmp_path / "acceptance"
+    root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(root))
+    kernel = FakeWindowsKernel32()
+    windows_sink(monkeypatch, kernel)
+    attempt_id = str(uuid4())
+    destination = root / f"{attempt_id}.regional-evidence.json"
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(b"external publisher bytes\n")
+
+    def attempt_mutation():
+        if mutation == "atomic":
+            assert kernel.atomic_replace(destination, replacement) is False
+        else:
+            assert kernel.inplace_write(destination, b"in-place mutation\n") is False
+
+    kernel.directory_flush_hook = attempt_mutation
+    assert publish_completed_ai_regional_evidence(
+        attempt_id, canonical_sidecar()
+    ) == destination
+    assert destination.read_bytes() == canonical_sidecar()
+    assert {path.name for path in root.iterdir()} == {destination.name}
+
+
+def test_windows_acceptance_sink_rolls_back_on_write_flush_or_close_failure(
+    tmp_path, monkeypatch
+):
+    for failure in ("write", "flush", "close"):
+        root = tmp_path / failure
+        root.mkdir()
+        monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(root))
+        kernel = FakeWindowsKernel32()
+        if failure == "write":
+            kernel.write_failure = True
+        elif failure == "flush":
+            kernel.flush_failure_once = True
+        else:
+            kernel.close_fail_once = True
+        windows_sink(monkeypatch, kernel)
+
+        with pytest.raises(RuntimeError, match="windows_handle_(write|flush|close)"):
+            publish_completed_ai_regional_evidence(str(uuid4()), canonical_sidecar())
+
+        assert list(root.iterdir()) == []
+
+
+def test_windows_acceptance_sink_preserves_external_replacement_during_rollback(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "acceptance"
+    root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(root))
+    kernel = FakeWindowsKernel32()
+    windows_sink(monkeypatch, kernel)
+    attempt_id = str(uuid4())
+    destination = root / f"{attempt_id}.regional-evidence.json"
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(b"external publisher bytes\n")
+
+    def replace_then_fail_directory_flush():
+        os.replace(replacement, destination)
+
+    kernel.directory_flush_hook = replace_then_fail_directory_flush
+    kernel.directory_flush_failure = True
+
+    with pytest.raises(RuntimeError, match="windows_handle_flush"):
+        publish_completed_ai_regional_evidence(attempt_id, canonical_sidecar())
+
+    assert destination.read_bytes() == b"external publisher bytes\n"
+    assert {path.name for path in root.iterdir()} == {destination.name}
+
+
 def test_acceptance_sink_is_disabled_by_default(monkeypatch):
     monkeypatch.delenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", raising=False)
     assert publish_completed_ai_regional_evidence(str(uuid4()), canonical_sidecar()) is None
