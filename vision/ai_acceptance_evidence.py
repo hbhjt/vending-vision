@@ -429,8 +429,10 @@ def _publish_windows_ai_regional_evidence(
     if destination.parent != root:
         raise RuntimeError("ai_acceptance_evidence_path_invalid")
     api = _windows_file_api_factory()
-    claim = _claim_empty_invocation_root(root, destination)
+    claim = None
     temporary = root / f".{attempt_id}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    root_handle = None
+    root_identity = None
     source_handle = None
     destination_handle = None
     claim_handle = None
@@ -440,15 +442,18 @@ def _publish_windows_ai_regional_evidence(
     cleanup_errors: list[BaseException] = []
 
     def close_live(name: str) -> None:
-        nonlocal source_handle, destination_handle, claim_handle
+        nonlocal root_handle, source_handle, destination_handle, claim_handle
         handle = {
+            "root": root_handle,
             "source": source_handle,
             "destination": destination_handle,
             "claim": claim_handle,
         }[name]
         if handle is None:
             return
-        if name == "source":
+        if name == "root":
+            root_handle = None
+        elif name == "source":
             source_handle = None
         elif name == "destination":
             destination_handle = None
@@ -481,7 +486,22 @@ def _publish_windows_ai_regional_evidence(
         finally:
             api.close(handle)
 
+    def verify_root_path() -> None:
+        if root_identity is None:
+            raise RuntimeError("ai_acceptance_evidence_root_changed")
+        current_handle = api.open_directory(root)
+        try:
+            current_identity, _size = api.information(current_handle)
+        finally:
+            api.close(current_handle)
+        if current_identity != root_identity:
+            raise RuntimeError("ai_acceptance_evidence_root_changed")
+
     try:
+        root_handle = api.open_directory(root)
+        root_identity, _root_size = api.information(root_handle)
+        claim = _claim_empty_invocation_root(root, destination)
+        verify_root_path()
         claim_handle = api.open_directory(claim)
         source_handle = api.create_temporary(temporary)
         temporary_identity, _temporary_initial_size = api.information(source_handle)
@@ -492,6 +512,7 @@ def _publish_windows_ai_regional_evidence(
         if temporary_size != len(content):
             raise RuntimeError("ai_acceptance_evidence_temporary_invalid")
         api.flush(source_handle)
+        verify_root_path()
         api.hard_link(destination, temporary)
         destination_handle = api.open_read(destination)
         published_identity, published_size = api.information(destination_handle)
@@ -503,6 +524,7 @@ def _publish_windows_ai_regional_evidence(
         # privilege handle, so correctness is fenced by the flushed file and
         # held source/destination identities rather than a directory flush.
         api.flush(source_handle)
+        verify_root_path()
         final_identity, final_size = api.information(destination_handle)
         if (
             final_identity != temporary_identity
@@ -515,6 +537,10 @@ def _publish_windows_ai_regional_evidence(
         delete_owned(temporary, temporary_identity)
         close_live("claim")
         claim.rmdir()
+        verify_root_path()
+        # Success is not observable until every held handle, including the
+        # root rename/delete fence, reports a clean close.
+        close_live("root")
     except BaseException as exc:
         primary = exc
     finally:
@@ -526,10 +552,13 @@ def _publish_windows_ai_regional_evidence(
         if primary is not None:
             cleanup(lambda: delete_owned(destination, published_identity))
             cleanup(lambda: delete_owned(temporary, temporary_identity))
-            cleanup(claim.rmdir)
+            if claim is not None:
+                cleanup(claim.rmdir)
             cleanup(lambda: delete_owned(destination, published_identity))
             cleanup(lambda: delete_owned(temporary, temporary_identity))
-            cleanup(claim.rmdir)
+            if claim is not None:
+                cleanup(claim.rmdir)
+        cleanup(lambda: close_live("root"))
         _raise_with_cleanup(primary, cleanup_errors)
     return destination
 

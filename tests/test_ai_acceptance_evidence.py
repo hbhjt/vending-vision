@@ -151,8 +151,6 @@ class FakeWindowsKernel32:
         target = Path(path)
         target_identity = target.stat().st_dev, target.stat().st_ino
         for entry in self.handles.values():
-            if entry["stream"] is None:
-                continue
             facts = entry["path"].stat()
             if (facts.st_dev, facts.st_ino) == target_identity:
                 return not entry["share"] & share_flag
@@ -172,6 +170,15 @@ class FakeWindowsKernel32:
         ):
             return False
         destination.write_bytes(content)
+        return True
+
+    def rename_directory(self, root, old_root):
+        if self.mutation_is_blocked(
+            root, acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_DELETE
+        ):
+            return False
+        root.rename(old_root)
+        root.mkdir()
         return True
 
 
@@ -219,7 +226,12 @@ def test_windows_acceptance_sink_publishes_with_held_read_only_handles(
         acceptance_evidence._WindowsEvidenceFileApi.FILE_DISPOSITION_INFO,
         1,
     )
-    source_handle = kernel.next_handle - len(kernel.handles) - 3
+    source_open = next(
+        call
+        for call in file_opens
+        if call[4] == acceptance_evidence._WindowsEvidenceFileApi.CREATE_NEW
+    )
+    source_handle = 100 + file_opens.index(source_open)
     read_index = next(
         index
         for index, call in enumerate(kernel.calls)
@@ -249,7 +261,39 @@ def test_windows_acceptance_sink_preserves_preexisting_destination(
         publish_completed_ai_regional_evidence(attempt_id, canonical_sidecar())
 
     assert destination.read_bytes() == b"external publisher bytes\n"
-    assert kernel.calls == []
+    assert [call[0] for call in kernel.calls] == [
+        "CreateFileW",
+        "GetFileInformationByHandle",
+        "CloseHandle",
+    ]
+
+
+def test_windows_acceptance_sink_rejects_root_replacement_after_claim(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "acceptance"
+    root.mkdir()
+    old_root = tmp_path / "acceptance-old"
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(root))
+    kernel = FakeWindowsKernel32()
+    windows_sink(monkeypatch, kernel)
+    attempted = False
+
+    def replace_root_after_claim(_handle):
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            assert kernel.rename_directory(root, old_root) is False
+            kernel.flush_failure_once = True
+
+    kernel.flush_hook = replace_root_after_claim
+
+    with pytest.raises(RuntimeError, match="windows_handle_flush"):
+        publish_completed_ai_regional_evidence(str(uuid4()), canonical_sidecar())
+
+    assert attempted is True
+    assert old_root.exists() is False
+    assert list(root.iterdir()) == []
 
 
 @pytest.mark.parametrize("mutation", ["atomic", "inplace"])
