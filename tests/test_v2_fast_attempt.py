@@ -61,14 +61,20 @@ def _fast_block_first_broker_target(connection, config):
         connection.close()
 
 
-def _fast_block_then_slow_ready_broker_target(connection, config):
+def _fast_block_then_ready_barrier_broker_target(connection, config):
     starts = config["starts"]
     blocked_read_entered = config["blockedReadEntered"]
+    restart_ready_entered = config["restartReadyEntered"]
+    restart_ready_release = config["restartReadyRelease"]
     with starts.get_lock():
         starts.value += 1
         start_number = starts.value
-    if start_number > 1:
-        time.sleep(config["restartReadyDelay"])
+    if start_number == 2:
+        # This is a synchronization boundary, not a wall-clock delay.  It
+        # lets the parent prove whether cleanup waits for replacement readiness
+        # without charging arbitrary hosted spawn time to a 1s frame budget.
+        restart_ready_entered.set()
+        restart_ready_release.wait()
     try:
         connection.send(("ready", {"pid": os.getpid()}))
         while True:
@@ -1887,6 +1893,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
     monkeypatch.setattr(vision_app.settings, "FRONT_CAMERA_CONFIG", {
         "role": "profile_fast_try_on", "source": "dshow", "keep_open": True,
     })
+    monkeypatch.setattr(vision_app.settings, "CAMERA_READ_RETRY_COUNT", 0)
     monkeypatch.setattr(camera_manager, "get_camera_maintenance", lambda: Maintenance())
     monkeypatch.setattr(camera_manager, "DirectShowCameraBroker", lambda _role, _config: broker)
     camera_manager.release_all_cameras()
@@ -1941,6 +1948,8 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
     context = multiprocessing.get_context("spawn")
     starts = context.Value("i", 0)
     blocked_read_entered = context.Event()
+    restart_ready_entered = context.Event()
+    restart_ready_release = context.Event()
     broker = DirectShowCameraBroker(
         "front",
         {
@@ -1953,10 +1962,11 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
             "_brokerReadyHandshake": True,
             "starts": starts,
             "blockedReadEntered": blocked_read_entered,
-            "restartReadyDelay": 1.1,
+            "restartReadyEntered": restart_ready_entered,
+            "restartReadyRelease": restart_ready_release,
         },
         context=context,
-        target=_fast_block_then_slow_ready_broker_target,
+        target=_fast_block_then_ready_barrier_broker_target,
     )
 
     class Candidate:
@@ -1987,6 +1997,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
     monkeypatch.setattr(vision_app.settings, "FRONT_CAMERA_CONFIG", {
         "role": "profile_fast_try_on", "source": "dshow", "keep_open": True,
     })
+    monkeypatch.setattr(vision_app.settings, "CAMERA_READ_RETRY_COUNT", 0)
     monkeypatch.setattr(camera_manager, "get_camera_maintenance", lambda: Maintenance())
     monkeypatch.setattr(camera_manager, "DirectShowCameraBroker", lambda _role, _config: broker)
     if not prestart:
@@ -2005,6 +2016,11 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
             asyncio.to_thread(blocked_read_entered.wait), timeout=15.0
         )
         registry.cancel_event.set()
+        if prestart:
+            await asyncio.wait_for(
+                asyncio.to_thread(restart_ready_entered.wait), timeout=15.0
+            )
+            restart_ready_release.set()
         with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
             await asyncio.wait_for(blocked, timeout=15.0)
 
@@ -2012,13 +2028,23 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
         registry.cancel_event = asyncio.Event()
         second = vision_app.AttemptReceipt(str(uuid4()), "owner-2", 2)
         if not prestart:
-            # This is the hosted failure mode: the next generation's one
-            # second budget includes a >1s child readiness delay.
+            # This is the old behavior: the next generation enters its own
+            # ready barrier, so its one-second frame deadline expires.
+            next_read = asyncio.create_task(
+                vision_app._read_attempt_front_frame(second, timeout=1.0)
+            )
+            await asyncio.wait_for(
+                asyncio.to_thread(restart_ready_entered.wait), timeout=15.0
+            )
+            # The child is now definitely at the ready barrier.  Only the
+            # attempt's own one-second deadline remains to elapse.
+            await asyncio.sleep(1.05)
+            restart_ready_release.set()
             with pytest.raises(asyncio.TimeoutError):
-                await vision_app._read_attempt_front_frame(second, timeout=1.0)
+                await asyncio.wait_for(next_read, timeout=15.0)
             return
-        # The >1s startup delay was paid behind the canceled owner's cleanup
-        # barrier; the CI's one-second generation budget covers the read alone.
+        # Cleanup only returned after the replacement ready barrier was
+        # released, so the next generation's one-second budget covers a read.
         assert broker.active_request_count == 0
         frame, _source = await vision_app._read_attempt_front_frame(second, timeout=1.0)
         assert frame.shape == (80, 60, 3)
@@ -2026,6 +2052,10 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
     try:
         asyncio.run(scenario())
     finally:
+        # Never strand a child in its synchronization barrier when a prior
+        # assertion fails; the barrier is test-only and not the behavior
+        # being asserted.
+        restart_ready_release.set()
         assert asyncio.run(broker.abort_async(reason="test_cleanup"))
         with camera_manager._streams_lock:
             camera_manager._dshow_brokers.pop("front", None)
