@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import re
+import shutil
 import subprocess
 import sys
 
 import pytest
 
 from scripts.approve_candidate_source import approve_source
+from scripts.verify_trusted_builder_closure import ClosureError, verify as verify_closure
 from scripts.verify_release_tag_ruleset import verify_rulesets
 from scripts.workflow_yaml import load_workflow_yaml, workflow_run_scalars
 
@@ -17,6 +20,8 @@ TRUSTED_PROOF = (
     ROOT / ".github" / "workflows" / "trusted-precutover-companion-proof.yml"
 )
 COMPANION_BUILDER_COMMIT = "154dfd47b55ba13a5a968447b9f175d45f9ab990"
+BUILDER_CLOSURE = ROOT / "trusted-precutover-companion-builder-closure.json"
+BUILDER_CLOSURE_VERIFIER = ROOT / "scripts/verify_trusted_builder_closure.py"
 POLICY = ROOT / "scripts" / "check_trusted_precutover_proof_workflow.py"
 INPUTS = {
     f"{name}_{field}"
@@ -36,6 +41,87 @@ def test_trusted_windows_companion_proof_workflow_exists():
         "no trusted Windows workflow executes the frozen companion and attests "
         "its canonical proof"
     )
+
+
+def test_trusted_builder_requires_exact_canonical_source_closure_before_download():
+    builder = (
+        ROOT / ".github/workflows/trusted-precutover-companion-builder.yml"
+    ).read_text("utf-8")
+    assert BUILDER_CLOSURE.is_file(), "trusted builder has no exact source closure"
+    assert BUILDER_CLOSURE_VERIFIER.is_file(), "trusted builder has no closure verifier"
+    verify = "trusted-companion/scripts/verify_trusted_builder_closure.py"
+    assert verify in builder
+    assert builder.index(verify) < builder.index("download_verified_archive.py")
+    assert "archive_extractor_worker.py" in BUILDER_CLOSURE.read_text("utf-8")
+
+
+def _copy_builder_closure(tmp_path: Path) -> tuple[Path, Path, dict]:
+    manifest = json.loads(BUILDER_CLOSURE.read_text("utf-8"))
+    root = tmp_path / "source"
+    for item in manifest["files"]:
+        target = root / item["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / item["path"], target)
+    manifest_path = root / BUILDER_CLOSURE.name
+    manifest_path.write_bytes(BUILDER_CLOSURE.read_bytes())
+    return root, manifest_path, manifest
+
+
+@pytest.mark.parametrize(
+    "path",
+    json.loads(BUILDER_CLOSURE.read_text("utf-8"))["files"],
+    ids=lambda item: item["path"],
+)
+def test_trusted_builder_closure_rejects_every_direct_file_mutation(tmp_path, path):
+    root, manifest_path, _manifest = _copy_builder_closure(tmp_path)
+    candidate = root / path["path"]
+    candidate.write_bytes(candidate.read_bytes() + b"\nmutation")
+    with pytest.raises(ClosureError, match="closure_digest"):
+        verify_closure(root, manifest_path)
+
+
+@pytest.mark.parametrize("mutation", ["missing-worker", "extra", "reorder", "pretty"])
+def test_trusted_builder_closure_rejects_noncanonical_or_changed_file_set(
+    tmp_path, mutation
+):
+    root, manifest_path, manifest = _copy_builder_closure(tmp_path)
+    if mutation == "missing-worker":
+        manifest["files"] = [
+            item
+            for item in manifest["files"]
+            if item["path"] != "scripts/archive_extractor_worker.py"
+        ]
+    elif mutation == "extra":
+        manifest["files"].append({"path": "extra.txt", "sha256": "0" * 64})
+    elif mutation == "reorder":
+        manifest["files"][0], manifest["files"][1] = (
+            manifest["files"][1],
+            manifest["files"][0],
+        )
+    else:
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", "utf-8")
+        with pytest.raises(ClosureError, match="noncanonical"):
+            verify_closure(root, manifest_path)
+        return
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", "utf-8"
+    )
+    with pytest.raises(ClosureError, match="file_set"):
+        verify_closure(root, manifest_path)
+
+
+def test_trusted_builder_closure_rejects_new_spec_hidden_import(tmp_path):
+    root, manifest_path, manifest = _copy_builder_closure(tmp_path)
+    spec = root / "vending_vision_precutover_verifier.spec"
+    spec.write_text(spec.read_text("utf-8") + '\nhiddenimports += ["vision.hidden"]\n', "utf-8")
+    for item in manifest["files"]:
+        if item["path"] == spec.name:
+            item["sha256"] = __import__("hashlib").sha256(spec.read_bytes()).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", "utf-8"
+    )
+    with pytest.raises(ClosureError, match="unlisted_spec_module"):
+        verify_closure(root, manifest_path)
 
 
 def test_trusted_proof_has_closed_https_inputs_and_pins_companion_builder():

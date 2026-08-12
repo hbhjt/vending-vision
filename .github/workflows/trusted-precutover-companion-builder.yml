@@ -65,6 +65,11 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: trusted-companion
           persist-credentials: false
+      - name: Verify exact trusted builder source closure
+        shell: pwsh
+        run: |
+          python -I trusted-companion/scripts/verify_trusted_builder_closure.py --root trusted-companion --manifest trusted-companion/trusted-precutover-companion-builder-closure.json
+          if ($LASTEXITCODE -ne 0) { throw "trusted builder source closure verification failed" }
       - uses: actions/setup-python@v5
         with:
           python-version-file: trusted-companion/.python-version
