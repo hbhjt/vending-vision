@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 import zipfile
 
 import pytest
@@ -135,6 +136,346 @@ def test_archive_deadline_after_exact_digest_does_not_publish(tmp_path, monkeypa
     assert list(tmp_path.iterdir()) == []
 
 
+def test_archive_publish_race_rejects_and_preserves_other_destination(
+    tmp_path, monkeypatch
+):
+    from scripts import download_verified_archive as downloader
+
+    url = "https://example.invalid/race.zip"
+    payload = _zip("demo.whl")
+    destination = tmp_path / "wheelhouse"
+    real_publish = downloader._publish_directory_no_replace
+
+    def race_publish(source, target, check_deadline):
+        target.mkdir()
+        (target / "sentinel").write_text("other actor", "utf-8")
+        return real_publish(source, target, check_deadline)
+
+    monkeypatch.setattr(
+        "scripts.download_verified_archive._publish_directory_no_replace",
+        race_publish,
+        raising=False,
+    )
+    with pytest.raises(ArchiveError, match="archive_destination_exists"):
+        download_verified_archive(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            destination,
+            expected_bytes=len(payload),
+            opener=lambda _request, timeout: _Response(payload, url),
+        )
+
+    assert (destination / "sentinel").read_text("utf-8") == "other actor"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [destination.name]
+
+
+def test_windows_directory_publish_uses_movefileex_without_replace_flags(tmp_path):
+    from scripts import download_verified_archive as downloader
+
+    calls = []
+
+    class Kernel32:
+        def MoveFileExW(self, source, destination, flags):
+            calls.append((source, destination, flags))
+            return 1
+
+    api = downloader._WindowsMoveApi(Kernel32())
+    assert api.move_no_replace(tmp_path / "source", tmp_path / "destination") == (
+        True,
+        0,
+    )
+    assert calls == [(str(tmp_path / "source"), str(tmp_path / "destination"), 0)]
+
+    calls.clear()
+
+    class MoveApi:
+        def move_no_replace(self, source, destination):
+            calls.append((source, destination))
+            return False, 183
+
+    with pytest.raises(ArchiveError, match="archive_destination_exists"):
+        downloader._publish_directory_no_replace(
+            tmp_path / "source",
+            tmp_path / "destination",
+            platform="nt",
+            windows_api=MoveApi(),
+        )
+    assert calls == [(tmp_path / "source", tmp_path / "destination")]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group tracer")
+def test_archive_extract_deadline_kills_ignore_term_descendant_tree(tmp_path):
+    from scripts import download_verified_archive as downloader
+
+    url = "https://example.invalid/blocked.zip"
+    payload = _zip("demo.whl")
+    destination = tmp_path / "wheelhouse"
+    worker = tmp_path / "blocked-extractor.py"
+    child_pid = tmp_path / "child.pid"
+    worker.write_text(
+        "import os,signal,subprocess,sys,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "child=subprocess.Popen([sys.executable,'-c','import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'])\n"
+        "open(sys.argv[1],'w').write(str(child.pid))\n"
+        "time.sleep(30)\n",
+        "utf-8",
+    )
+    started = time.monotonic()
+    with pytest.raises(ArchiveError, match="archive_timeout"):
+        download_verified_archive(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            destination,
+            expected_bytes=len(payload),
+            opener=lambda _request, timeout: _Response(payload, url),
+            total_timeout_seconds=0.05,
+            extractor_command=[sys.executable, str(worker), str(child_pid)],
+        )
+
+    assert time.monotonic() - started < 2.0
+    assert child_pid.is_file()
+    pid = int(child_pid.read_text("utf-8"))
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError(f"extractor descendant still alive: {pid}")
+    assert not destination.exists()
+    assert {path.name for path in tmp_path.iterdir()} == {
+        child_pid.name,
+        worker.name,
+    }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group tracer")
+@pytest.mark.parametrize(
+    ("program", "expected"),
+    [
+        ("import sys; sys.exit(7)", "archive_extract_failed"),
+        ("import sys; sys.stdout.write('x'*70000)", "archive_process_output"),
+    ],
+)
+def test_archive_extractor_nonzero_and_output_cap_leave_no_partial(
+    tmp_path, program, expected
+):
+    url = "https://example.invalid/extractor-failure.zip"
+    payload = _zip("demo.whl")
+    destination = tmp_path / "wheelhouse"
+    with pytest.raises(ArchiveError, match=expected):
+        download_verified_archive(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            destination,
+            expected_bytes=len(payload),
+            opener=lambda _request, timeout: _Response(payload, url),
+            extractor_command=[sys.executable, "-c", program],
+        )
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+class _FakeWindowsJobApi:
+    def __init__(self, *, timeout=False):
+        self.timeout = timeout
+        self.events = []
+
+    def create_job(self):
+        self.events.append("create_job")
+        return "job"
+
+    def create_suspended(self, command):
+        self.events.append(("create_suspended", command))
+        return "process", "thread"
+
+    def assign(self, job, process):
+        self.events.append(("assign", job, process))
+
+    def resume(self, thread):
+        self.events.append(("resume", thread))
+
+    def wait(self, process, timeout):
+        self.events.append(("wait", process, timeout))
+        if self.timeout:
+            self.timeout = False
+            raise TimeoutError
+        return 0
+
+    def terminate(self, job):
+        self.events.append(("terminate", job))
+
+    def terminate_process(self, process):
+        self.events.append(("terminate_process", process))
+
+    def wait_active_zero(self, job, timeout):
+        self.events.append(("active_zero", job, timeout))
+
+    def close(self, handle):
+        self.events.append(("close", handle))
+
+
+def test_windows_job_supervisor_assigns_suspended_process_before_resume():
+    from scripts import download_verified_archive as downloader
+
+    api = _FakeWindowsJobApi()
+    downloader._run_windows_extractor(["extractor.exe"], 3.0, api)
+
+    assert api.events[:4] == [
+        "create_job",
+        ("create_suspended", ["extractor.exe"]),
+        ("assign", "job", "process"),
+        ("resume", "thread"),
+    ]
+    assert ("active_zero", "job", 1.0) in api.events
+    assert api.events[-3:] == [
+        ("close", "thread"),
+        ("close", "process"),
+        ("close", "job"),
+    ]
+
+
+def test_windows_job_supervisor_timeout_terminates_and_proves_tree_dead():
+    from scripts import download_verified_archive as downloader
+
+    api = _FakeWindowsJobApi(timeout=True)
+    with pytest.raises(ArchiveError, match="archive_timeout"):
+        downloader._run_windows_extractor(["extractor.exe"], 0.05, api)
+
+    assert ("terminate", "job") in api.events
+    assert ("active_zero", "job", 1.0) in api.events
+    assert api.events[-1] == ("close", "job")
+
+
+def test_windows_job_supervisor_assign_failure_terminates_suspended_leader():
+    from scripts import download_verified_archive as downloader
+
+    class AssignFailure(_FakeWindowsJobApi):
+        def assign(self, job, process):
+            super().assign(job, process)
+            raise ArchiveError("archive_windows_job_assign")
+
+    api = AssignFailure()
+    with pytest.raises(ArchiveError, match="archive_windows_job_assign"):
+        downloader._run_windows_extractor(["extractor.exe"], 3.0, api)
+
+    assert ("terminate_process", "process") in api.events
+    assert ("active_zero", "job", 1.0) in api.events
+    assert api.events[-1] == ("close", "job")
+
+
+def test_windows_job_supervisor_cleanup_failure_is_failclosed():
+    from scripts import download_verified_archive as downloader
+
+    class StubbornTree(_FakeWindowsJobApi):
+        def wait_active_zero(self, job, timeout):
+            super().wait_active_zero(job, timeout)
+            raise ArchiveError("archive_windows_tree_alive")
+
+    api = StubbornTree(timeout=True)
+    with pytest.raises(ArchiveError, match="archive_windows_cleanup_unproven"):
+        downloader._run_windows_extractor(["extractor.exe"], 0.05, api)
+
+    assert ("terminate", "job") in api.events
+    assert ("active_zero", "job", 1.0) in api.events
+    assert api.events[-1] == ("close", "job")
+
+
+def test_archive_cleanup_retries_before_no_replace_publish(tmp_path, monkeypatch):
+    from scripts import download_verified_archive as downloader
+
+    url = "https://example.invalid/retry.zip"
+    payload = _zip("demo.whl")
+    real_rmtree = downloader.shutil.rmtree
+    attempts = []
+
+    def transient_rmtree(path):
+        attempts.append(Path(path))
+        if len(attempts) == 1:
+            raise OSError("transient")
+        return real_rmtree(path)
+
+    monkeypatch.setattr(downloader.shutil, "rmtree", transient_rmtree)
+    destination = tmp_path / "wheelhouse"
+    download_verified_archive(
+        url,
+        hashlib.sha256(payload).hexdigest(),
+        destination,
+        expected_bytes=len(payload),
+        opener=lambda _request, timeout: _Response(payload, url),
+    )
+
+    assert len(attempts) == 2
+    assert (destination / "demo.whl").read_bytes() == b"wheel"
+
+
+def test_archive_cleanup_failure_does_not_publish_and_retry_can_succeed(
+    tmp_path, monkeypatch
+):
+    from scripts import download_verified_archive as downloader
+
+    url = "https://example.invalid/cleanup.zip"
+    payload = _zip("demo.whl")
+    destination = tmp_path / "wheelhouse"
+    real_rmtree = downloader.shutil.rmtree
+    monkeypatch.setattr(
+        downloader.shutil,
+        "rmtree",
+        lambda _path: (_ for _ in ()).throw(OSError("blocked")),
+    )
+    with pytest.raises(ArchiveError, match="archive_cleanup_failed"):
+        download_verified_archive(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            destination,
+            expected_bytes=len(payload),
+            opener=lambda _request, timeout: _Response(payload, url),
+        )
+    assert not destination.exists()
+
+    monkeypatch.setattr(downloader.shutil, "rmtree", real_rmtree)
+    for owned in tmp_path.glob(".wheelhouse-*"):
+        real_rmtree(owned)
+    download_verified_archive(
+        url,
+        hashlib.sha256(payload).hexdigest(),
+        destination,
+        expected_bytes=len(payload),
+        opener=lambda _request, timeout: _Response(payload, url),
+    )
+    assert (destination / "demo.whl").read_bytes() == b"wheel"
+
+
+def test_archive_deadline_is_checked_immediately_before_publish(tmp_path, monkeypatch):
+    from scripts import download_verified_archive as downloader
+
+    url = "https://example.invalid/publish-deadline.zip"
+    payload = _zip("demo.whl")
+    destination = tmp_path / "wheelhouse"
+    clock = _Clock()
+    real_publish = downloader._publish_directory_no_replace
+
+    def boundary(source, target, check_deadline):
+        clock.advance(2.0)
+        return real_publish(source, target, check_deadline)
+
+    monkeypatch.setattr(downloader, "_publish_directory_no_replace", boundary)
+    with pytest.raises(ArchiveError, match="archive_timeout"):
+        download_verified_archive(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            destination,
+            expected_bytes=len(payload),
+            opener=lambda _request, timeout: _Response(payload, url),
+            total_timeout_seconds=1.0,
+            monotonic=clock,
+        )
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), 3600.1, True])
 def test_archive_total_timeout_is_finite_positive_and_capped(tmp_path, timeout):
     with pytest.raises(ArchiveError, match="archive_timeout"):
@@ -242,13 +583,21 @@ def test_archive_downloader_imports_in_clean_stdlib_only_python(tmp_path):
     script = Path(__file__).parents[1] / "scripts" / "download_verified_archive.py"
 
     completed = subprocess.run(
-        [str(clean_python), str(script), "--help"],
+        [str(clean_python), "-I", str(script), "--help"],
         capture_output=True,
         text=True,
         check=False,
     )
 
     assert completed.returncode == 0, completed.stderr
+    worker = script.with_name("archive_extractor_worker.py")
+    worker_help = subprocess.run(
+        [str(clean_python), "-I", str(worker), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert worker_help.returncode == 0, worker_help.stderr
 
 
 def test_archive_downloader_aborts_oversized_stream_before_writing_chunk(tmp_path, monkeypatch):
