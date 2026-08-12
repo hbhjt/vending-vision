@@ -114,8 +114,10 @@ def test_publish_caller_pins_builder_a_and_signer_s_without_holding_supplier_sec
     assert f"ref: {TRUSTED_SIGNER_COMMIT}" in publish
     assert publish.count("actions/download-artifact@v4") == 2
     assert "--target $env:RELEASE_TARGET" in publish
-    assert "verify_release_tag_ruleset.py" in publish
-    assert "rulesets?targets=tag" in publish
+    assert "verify_hosted_release_authority.py" in publish
+    assert "--mode publish-admission" in publish
+    assert "--mode publish-complete" in publish
+    assert "rulesets?targets=tag" not in publish
 
 
 def test_trust_policy_rejects_mutable_caller_and_missing_or_wrong_signer_digest(tmp_path):

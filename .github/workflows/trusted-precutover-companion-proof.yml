@@ -137,6 +137,7 @@ jobs:
   execute:
     needs: companion_builder
     runs-on: windows-latest
+    environment: trusted-precutover
     timeout-minutes: 180
     permissions:
       contents: read
@@ -151,6 +152,13 @@ jobs:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
           path: trusted-proof
+          persist-credentials: false
+      - name: Checkout immutable hosted release authority
+        uses: actions/checkout@v4
+        with:
+          repository: hbhjt/vending-vision
+          ref: 41afbd9bd07b67df9f93de1dea1a9f9b0cea0228
+          path: hosted-authority
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -280,7 +288,7 @@ jobs:
           "MODEL_PACK_SHA256=$($identity.modelPack.sha256)" >> $env:GITHUB_ENV
           "MODEL_PACK_BYTES=$($identity.modelPack.byteSize)" >> $env:GITHUB_ENV
           "MODEL_DESCRIPTOR_SHA256=$($identity.modelPack.descriptorSha256)" >> $env:GITHUB_ENV
-      - name: Approve exact RC tag against protected main and active immutable-tag ruleset
+      - name: Approve exact RC tag and its existing release target
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -298,11 +306,12 @@ jobs:
           $sourceApproval = (Resolve-Path -LiteralPath trusted-proof/scripts/approve_candidate_source.py).Path
           & $env:TRUSTED_PYTHON $sourceApproval --git-dir proof-source-approval.git --source-commit $env:PROOF_SOURCE_COMMIT --source-ref $env:CALLER_REF --protected-main refs/remotes/origin/main
           if ($LASTEXITCODE -ne 0) { throw "proof source is not an exact protected-main RC tag" }
-          gh api --paginate --slurp -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10" "/repos/hbhjt/vending-vision/rulesets?targets=tag&includes_parents=true&per_page=100" | Set-Content -LiteralPath proof-tag-rulesets.json -Encoding utf8NoBOM
-          if ($LASTEXITCODE -ne 0) { throw "proof tag ruleset API unavailable" }
-          $tagPolicy = (Resolve-Path -LiteralPath trusted-proof/scripts/verify_release_tag_ruleset.py).Path
-          & $env:TRUSTED_PYTHON $tagPolicy --rulesets proof-tag-rulesets.json --repository hbhjt/vending-vision --source-ref $env:CALLER_REF
-          if ($LASTEXITCODE -ne 0) { throw "proof RC tag lacks active update and deletion protection" }
+          $releaseTag = $env:CALLER_REF -replace '^refs/tags/',''
+          gh api "/repos/hbhjt/vending-vision/releases/tags/$releaseTag" --jq '{tagName:.tag_name,targetCommitish:.target_commitish,isDraft:.draft,isPrerelease:.prerelease}' | Set-Content -LiteralPath proof-release.json -Encoding utf8NoBOM
+          if ($LASTEXITCODE -ne 0) { throw "proof release identity query failed" }
+          $hostedAuthority = (Resolve-Path -LiteralPath hosted-authority/scripts/verify_hosted_release_authority.py).Path
+          & $env:TRUSTED_PYTHON $hostedAuthority --release-query proof-release.json --mode proof --repository hbhjt/vending-vision --source-ref $env:CALLER_REF --source-commit $env:PROOF_SOURCE_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw "proof release target authority failed" }
       - name: Verify candidate GitHub provenance before executing frozen companion
         shell: pwsh
         env:
@@ -351,6 +360,7 @@ jobs:
       - companion_builder
       - execute
     runs-on: windows-latest
+    environment: trusted-precutover
     timeout-minutes: 180
     permissions:
       contents: read
@@ -368,6 +378,13 @@ jobs:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
           path: trusted-proof
+          persist-credentials: false
+      - name: Checkout immutable hosted release authority
+        uses: actions/checkout@v4
+        with:
+          repository: hbhjt/vending-vision
+          ref: 41afbd9bd07b67df9f93de1dea1a9f9b0cea0228
+          path: hosted-authority
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -519,11 +536,12 @@ jobs:
           $sourceApproval = (Resolve-Path -LiteralPath trusted-proof/scripts/approve_candidate_source.py).Path
           & $env:TRUSTED_PYTHON $sourceApproval --git-dir signer-source-approval.git --source-commit $env:PROOF_SOURCE_COMMIT --source-ref $env:CALLER_REF --protected-main refs/remotes/origin/main
           if ($LASTEXITCODE -ne 0) { throw "signer source approval failed" }
-          & $env:TRUSTED_GH api --paginate --slurp -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10" "/repos/hbhjt/vending-vision/rulesets?targets=tag&includes_parents=true&per_page=100" | Set-Content -LiteralPath signer-tag-rulesets.json -Encoding utf8NoBOM
-          if ($LASTEXITCODE -ne 0) { throw "signer tag ruleset API unavailable" }
-          $tagPolicy = (Resolve-Path -LiteralPath trusted-proof/scripts/verify_release_tag_ruleset.py).Path
-          & $env:TRUSTED_PYTHON $tagPolicy --rulesets signer-tag-rulesets.json --repository hbhjt/vending-vision --source-ref $env:CALLER_REF
-          if ($LASTEXITCODE -ne 0) { throw "signer RC tag protection failed" }
+          $releaseTag = $env:CALLER_REF -replace '^refs/tags/',''
+          & $env:TRUSTED_GH api "/repos/hbhjt/vending-vision/releases/tags/$releaseTag" --jq '{tagName:.tag_name,targetCommitish:.target_commitish,isDraft:.draft,isPrerelease:.prerelease}' | Set-Content -LiteralPath signer-release.json -Encoding utf8NoBOM
+          if ($LASTEXITCODE -ne 0) { throw "signer release identity query failed" }
+          $hostedAuthority = (Resolve-Path -LiteralPath hosted-authority/scripts/verify_hosted_release_authority.py).Path
+          & $env:TRUSTED_PYTHON $hostedAuthority --release-query signer-release.json --mode proof --repository hbhjt/vending-vision --source-ref $env:CALLER_REF --source-commit $env:PROOF_SOURCE_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw "signer release target authority failed" }
       - name: Fresh verify candidate GitHub provenance without execution
         shell: pwsh
         env:

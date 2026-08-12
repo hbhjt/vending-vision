@@ -414,14 +414,15 @@ def test_trusted_proof_workflow_passes_executable_trust_policy():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_trusted_proof_requires_real_tag_peel_main_ancestry_and_active_ruleset():
+def test_trusted_proof_requires_real_tag_peel_main_ancestry_and_release_authority():
     source = TRUSTED_PROOF.read_text("utf-8")
 
     assert "trusted-proof/scripts/approve_candidate_source.py" in source
     assert "--protected-main refs/remotes/origin/main" in source
     assert "+refs/heads/main:refs/remotes/origin/main" in source
-    assert "trusted-proof/scripts/verify_release_tag_ruleset.py" in source
-    assert "rulesets?targets=tag&includes_parents=true&per_page=100" in source
+    assert "hosted-authority/scripts/verify_hosted_release_authority.py" in source
+    assert source.count("--mode proof") == 2
+    assert "rulesets?targets=tag" not in source
     assert "^refs/(heads|tags)/" not in source
 
 
@@ -515,6 +516,7 @@ def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
     execute_permission = """  execute:
     needs: companion_builder
     runs-on: windows-latest
+    environment: trusted-precutover
     timeout-minutes: 180
     permissions:
       contents: read

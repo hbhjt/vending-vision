@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from scripts.verify_hosted_release_authority import AuthorityError, verify_release_fence
@@ -8,6 +10,8 @@ from scripts.verify_hosted_release_authority import AuthorityError, verify_relea
 REPOSITORY = "hbhjt/vending-vision"
 SOURCE_REF = "refs/tags/v1.2.3-rc.4"
 SOURCE_COMMIT = "a" * 40
+ROOT = Path(__file__).parents[1]
+AUTHORITY_COMMIT = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 
 
 def _release(value: object) -> dict:
@@ -117,3 +121,47 @@ def test_authority_rejects_repository_ref_and_digest_scope_drift(
             source_ref=source_ref,
             source_commit=source_commit,
         )
+
+
+def test_publish_and_proof_use_the_hosted_environment_and_release_fence_not_rulesets():
+    publisher = (ROOT / ".github/workflows/publish-candidate.yml").read_text("utf-8")
+    proof = (
+        ROOT / ".github/workflows/trusted-precutover-companion-proof.yml"
+    ).read_text("utf-8")
+
+    assert "rulesets?targets=tag" not in publisher
+    assert "rulesets?targets=tag" not in proof
+    publish_job = publisher[publisher.index("  publish:\n") :]
+    assert "environment: trusted-precutover" in publish_job.split("steps:", 1)[0]
+    assert f"ref: {AUTHORITY_COMMIT}" in publish_job
+    assert "verify_hosted_release_authority.py" in publish_job
+    assert "--mode publish-admission" in publish_job
+    assert "--mode publish-complete" in publish_job
+    assert publish_job.index("--mode publish-admission") < publish_job.index(
+        "gh release create"
+    ) < publish_job.index("--mode publish-complete")
+
+    execute = proof[proof.index("  execute:\n") : proof.index("  sign:\n")]
+    sign = proof[proof.index("  sign:\n") : proof.index("  verify:\n")]
+    for job in (execute, sign):
+        assert "environment: trusted-precutover" in job.split("steps:", 1)[0]
+        assert f"ref: {AUTHORITY_COMMIT}" in job
+        assert "verify_hosted_release_authority.py" in job
+        assert "--mode proof" in job
+        candidate_attestation = (
+            "gh attestation verify proof-input/candidate/candidate.zip"
+            if "  execute:\n" in job
+            else "attestation verify signer-proof-input/candidate/candidate.zip"
+        )
+        assert job.index("approve_candidate_source.py") < job.index(
+            "verify_hosted_release_authority.py"
+        ) < job.index(candidate_attestation)
+
+    combined = publisher + proof
+    for forbidden in (
+        "git tag -f",
+        "git push --delete",
+        "gh release delete",
+        "gh release edit",
+    ):
+        assert forbidden not in combined

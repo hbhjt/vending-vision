@@ -113,6 +113,7 @@ jobs:
   publish:
     needs: [verify, trusted_signer]
     runs-on: windows-latest
+    environment: trusted-precutover
     permissions:
       contents: write
     steps:
@@ -122,6 +123,13 @@ jobs:
           repository: hbhjt/vending-vision
           ref: fb006dccf178c738d99b3fac38d887767d999688
           path: trusted-policy
+          persist-credentials: false
+      - name: Checkout immutable hosted release authority
+        uses: actions/checkout@v4
+        with:
+          repository: hbhjt/vending-vision
+          ref: 41afbd9bd07b67df9f93de1dea1a9f9b0cea0228
+          path: hosted-authority
           persist-credentials: false
       - name: Download attested candidate artifact
         uses: actions/download-artifact@v4
@@ -175,12 +183,13 @@ jobs:
           $sourcePolicy = (Resolve-Path -LiteralPath trusted-policy/scripts/approve_candidate_source.py).Path
           & $python $sourcePolicy --git-dir release-authority.git --source-commit $env:SOURCE_COMMIT --source-ref $env:SOURCE_REF --protected-main refs/remotes/origin/main
           if ($LASTEXITCODE -ne 0) { throw "release tag moved or source left protected main" }
-          gh api --paginate --slurp -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10" "/repos/hbhjt/vending-vision/rulesets?targets=tag&includes_parents=true&per_page=100" | Set-Content -LiteralPath release-tag-rulesets.json -Encoding utf8NoBOM
-          if ($LASTEXITCODE -ne 0) { throw "release tag ruleset API unavailable" }
-          $tagPolicy = (Resolve-Path -LiteralPath trusted-policy/scripts/verify_release_tag_ruleset.py).Path
-          & $python $tagPolicy --rulesets release-tag-rulesets.json --repository hbhjt/vending-vision --source-ref $env:SOURCE_REF
-          if ($LASTEXITCODE -ne 0) { throw "release tag is not immutable by policy" }
           $releaseTag = $env:SOURCE_REF -replace '^refs/tags/',''
+          $query = 'query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){id}}}'
+          gh api graphql -f query=$query -F owner=hbhjt -F name=vending-vision -F tag=$releaseTag | Set-Content -LiteralPath release-admission.json -Encoding utf8NoBOM
+          if ($LASTEXITCODE -ne 0) { throw "release admission query failed" }
+          $hostedAuthority = (Resolve-Path -LiteralPath hosted-authority/scripts/verify_hosted_release_authority.py).Path
+          & $python $hostedAuthority --release-query release-admission.json --mode publish-admission --repository hbhjt/vending-vision --source-ref $env:SOURCE_REF --source-commit $env:SOURCE_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw "release tag name was already published" }
           "RELEASE_TAG=$releaseTag" >> $env:GITHUB_ENV
           "RELEASE_TARGET=$env:SOURCE_COMMIT" >> $env:GITHUB_ENV
       - name: Publish immutable prerelease only after trusted signing
@@ -191,3 +200,9 @@ jobs:
           Copy-Item -Path (Join-Path $PWD "signed-evidence/*") -Destination release/
           gh release create $env:RELEASE_TAG release/* --target $env:RELEASE_TARGET --prerelease --verify-tag --title "Vending Vision $env:RELEASE_TAG" --notes "Built by immutable trusted builder c90a965d117fea49f318b18e0fcd50aa047bc41; independently verified, source-approved and supplier-signed by immutable trusted signer fb006dccf178c738d99b3fac38d887767d999688."
           if ($LASTEXITCODE -ne 0) { throw "immutable candidate release failed" }
+          gh api "/repos/hbhjt/vending-vision/releases/tags/$env:RELEASE_TAG" --jq '{tagName:.tag_name,targetCommitish:.target_commitish,isDraft:.draft,isPrerelease:.prerelease}' | Set-Content -LiteralPath release-complete.json -Encoding utf8NoBOM
+          if ($LASTEXITCODE -ne 0) { throw "published release identity query failed" }
+          $python = (Get-Command python.exe -ErrorAction Stop).Source
+          $hostedAuthority = (Resolve-Path -LiteralPath hosted-authority/scripts/verify_hosted_release_authority.py).Path
+          & $python $hostedAuthority --release-query release-complete.json --mode publish-complete --repository hbhjt/vending-vision --source-ref "refs/tags/$env:RELEASE_TAG" --source-commit $env:RELEASE_TARGET
+          if ($LASTEXITCODE -ne 0) { throw "published release identity fence failed" }

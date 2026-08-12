@@ -20,6 +20,7 @@ COMPANION_BUILDER_CLOSURE = "trusted-precutover-companion-builder-closure.json"
 COMPANION_BUILDER_CLOSURE_VERIFIER = "scripts/verify_trusted_builder_closure.py"
 CANDIDATE_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
 CANDIDATE_BUILDER_SHA = "c90a965d117fea49f318b18e0fcd50aa047bc41"
+HOSTED_AUTHORITY_SHA = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 INPUTS = {
     f"{name}_{field}"
     for name in (
@@ -245,7 +246,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     )
     _require(sign.count("runs-on: windows-latest") == 1, "trusted_proof_sign_runner")
     _require(verify.count("runs-on: windows-latest") == 1, "trusted_proof_verify_runner")
-    _require(source.count("actions/checkout@v4") == 3, "trusted_proof_checkout_count")
+    _require(source.count("actions/checkout@v4") == 5, "trusted_proof_checkout_count")
     for block, label in (
         (execute, "execute"),
         (sign, "sign"),
@@ -258,6 +259,15 @@ def check(workflow_path: Path, repository_root: Path) -> None:
             "persist-credentials: false",
         ):
             _require(fragment in block, f"trusted_proof_{label}_checkout:{fragment}")
+    for block, label in ((execute, "execute"), (sign, "sign")):
+        for fragment in (
+            f"ref: {HOSTED_AUTHORITY_SHA}",
+            "path: hosted-authority",
+            "environment: trusted-precutover",
+        ):
+            _require(fragment in block, f"trusted_proof_{label}_hosted_authority:{fragment}")
+    _require("environment: trusted-precutover" not in verify, "trusted_proof_verify_environment")
+    _require("rulesets?targets=tag" not in source, "trusted_proof_unavailable_rulesets_api")
 
     execution_job = jobs["execute"]
     signing_job = jobs["sign"]
@@ -377,8 +387,8 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     source_approval = _step_index(
         execute, "trusted-proof/scripts/approve_candidate_source.py", "source_approval"
     )
-    tag_ruleset = _step_index(
-        execute, "trusted-proof/scripts/verify_release_tag_ruleset.py", "tag_ruleset"
+    release_authority = _step_index(
+        execute, "hosted-authority/scripts/verify_hosted_release_authority.py", "release_authority"
     )
     candidate_attestation = _step_index(
         execute,
@@ -404,7 +414,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         companion_attestation
         < companion_extract
         < source_approval
-        < tag_ruleset
+        < release_authority
         < candidate_attestation
         < frozen_execute
         < proof_bind
@@ -445,8 +455,8 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         "verify-proof --proof precutover-ai-proof.json",
         "+refs/heads/main:refs/remotes/origin/main",
         "--protected-main refs/remotes/origin/main",
-        "rulesets?targets=tag&includes_parents=true&per_page=100",
-        "--rulesets proof-tag-rulesets.json",
+        "--mode proof",
+        "--release-query proof-release.json",
     ):
         _require(fragment in execute, f"trusted_proof_execute_policy:{fragment}")
 
@@ -462,8 +472,8 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     sign_source = _step_index(
         sign, "trusted-proof/scripts/approve_candidate_source.py", "sign_source_approval"
     )
-    sign_ruleset = _step_index(
-        sign, "trusted-proof/scripts/verify_release_tag_ruleset.py", "sign_tag_ruleset"
+    sign_release = _step_index(
+        sign, "hosted-authority/scripts/verify_hosted_release_authority.py", "sign_release_authority"
     )
     sign_candidate = _step_index(
         sign,
@@ -488,7 +498,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         < sign_download
         < sign_inspect
         < sign_source
-        < sign_ruleset
+        < sign_release
         < sign_candidate
         < sign_download_handoff
         < sign_revalidate
@@ -534,7 +544,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
                 if command.startswith("& $env:TRUSTED_PYTHON "):
                     _require(
                         re.match(
-                            r"^& \$env:TRUSTED_PYTHON \$(?:verifier|downloader|proofTool|sourceApproval|tagPolicy)(?:\s|$)",
+                            r"^& \$env:TRUSTED_PYTHON \$(?:verifier|downloader|proofTool|sourceApproval|hostedAuthority)(?:\s|$)",
                             command,
                         )
                         is not None,
@@ -545,7 +555,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         "$downloader = (Resolve-Path -LiteralPath trusted-proof/scripts/download_verified_file.py).Path",
         "$proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path",
         "$sourceApproval = (Resolve-Path -LiteralPath trusted-proof/scripts/approve_candidate_source.py).Path",
-        "$tagPolicy = (Resolve-Path -LiteralPath trusted-proof/scripts/verify_release_tag_ruleset.py).Path",
+        "$hostedAuthority = (Resolve-Path -LiteralPath hosted-authority/scripts/verify_hosted_release_authority.py).Path",
     ):
         _require(assignment in sign, f"trusted_proof_sign_trusted_script:{assignment}")
     for fragment in (
@@ -558,7 +568,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         "inspect-inputs --input-root signer-proof-input",
         "+refs/heads/main:refs/remotes/origin/main",
         "--protected-main refs/remotes/origin/main",
-        "rulesets?targets=tag&includes_parents=true&per_page=100",
+        "--release-query signer-release.json --mode proof",
     ):
         _require(fragment in sign, f"trusted_proof_sign_policy:{fragment}")
 
