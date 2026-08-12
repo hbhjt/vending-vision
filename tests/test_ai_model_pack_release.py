@@ -3,6 +3,7 @@ import asyncio
 import json
 import struct
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -206,7 +207,7 @@ def test_precutover_proof_requires_actual_archive_and_installs_verified_bytes(tm
 def test_precutover_verifier_imports_with_the_pinned_stdlib_python():
     result = subprocess.run(
         [
-            "/usr/bin/python3.11",
+            sys.executable,
             "-I",
             "-c",
             (

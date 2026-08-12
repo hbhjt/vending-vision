@@ -529,11 +529,18 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
     }
     assert sidecar["verdict"] in {"passed", "regional_check_failed"}
 
+    # The explicit integration job supplies the pinned VEM contract module.
+    # A standalone Vision checkout must not depend on an incidental sibling
+    # repository layout.
+    contract_module = os.environ.get("VEM_REGIONAL_EVIDENCE_MODULE")
+    if contract_module is None:
+        return
+    contract_module_path = Path(contract_module).resolve()
+    assert contract_module_path.is_file()
+
     # This is the cross-repository contract: the real Vision worker sidecar
     # satisfies VEM identity validation before the intentionally pending
     # two-garment calibration gate rejects it.
-    vem_root = ROOT.parent / "vem"
-    assert (vem_root / "scripts/testbed/ai-regional-evidence.mjs").is_file()
     attempt_id = "0198f44e-21bd-7c62-8f52-b7c86cc2d099"
     artifact_root = work / "vem-artifacts"
     relative = f"regional/short/{attempt_id}.regional-evidence.json"
@@ -577,13 +584,13 @@ console.log(JSON.stringify(validateAiRegionalEvidence({
   track: "aiVirtualTryOn",
 }] })));
 """,
-            (vem_root / "scripts/testbed/ai-regional-evidence.mjs").as_uri(),
+            contract_module_path.as_uri(),
             str(artifact_root),
             str(artifact_sidecar),
             attempt_id,
             relative,
         ],
-        cwd=vem_root,
+        cwd=ROOT,
         capture_output=True,
         text=True,
         timeout=15,
@@ -594,6 +601,18 @@ console.log(JSON.stringify(validateAiRegionalEvidence({
         "ok": False,
         "reason": "AI regional evidence policy awaits Issue10 two-garment calibration",
     }
+
+
+def test_ci_declares_pinned_vem_regional_evidence_contract_job():
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text("utf-8")
+
+    assert "regional-evidence-contract:" in workflow
+    assert "repository: YKDZ/vem" in workflow
+    assert "ref: 8aea1994f25e5682f6f2a49d38c499961b74f75a" in workflow
+    assert "VEM_REGIONAL_EVIDENCE_MODULE:" in workflow
+    assert "scripts/testbed/ai-regional-evidence-policy.json" in workflow
+    assert workflow.count("fetch-depth: 0") == 4
+    assert "tests/test_ai_attempt_worker_boundary.py::test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png" in workflow
 
 
 @pytest.mark.parametrize(

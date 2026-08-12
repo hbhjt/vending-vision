@@ -11,6 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           lfs: true
       - uses: actions/setup-python@v5
         with:
@@ -37,6 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           lfs: true
       - uses: actions/setup-python@v5
         with:
@@ -69,3 +71,42 @@ jobs:
           name: vending-vision-main-${{ github.sha }}
           path: main-artifacts/*
           if-no-files-found: error
+
+  regional-evidence-contract:
+    name: VEM 区域证据合同
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Checkout pinned VEM regional evidence contract
+        uses: actions/checkout@v4
+        with:
+          repository: YKDZ/vem
+          ref: 8aea1994f25e5682f6f2a49d38c499961b74f75a
+          path: vem-contract
+          sparse-checkout: |
+            scripts/testbed/ai-regional-evidence.mjs
+            scripts/testbed/ai-regional-evidence-policy.json
+          sparse-checkout-cone-mode: false
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+          cache: pip
+      - name: 下载完整锁定 wheel 闭包
+        run: >-
+          python -m pip download --only-binary=:all: --require-hashes
+          --dest wheelhouse -r requirements.txt
+      - name: 离线安装并校验锁定闭包
+        run: |
+          python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
+          python scripts/dependency_lock.py --wheelhouse wheelhouse --python python
+      - name: 验证 Vision 区域证据与固定 VEM 合同
+        env:
+          VEM_REGIONAL_EVIDENCE_MODULE: ${{ github.workspace }}/vem-contract/scripts/testbed/ai-regional-evidence.mjs
+        run: >-
+          python -m pytest -q
+          tests/test_ai_attempt_worker_boundary.py::test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png
