@@ -418,6 +418,187 @@ def test_rollback_identity_check_to_unlink_race_preserves_replacement(
     assert [path.name for path in tmp_path.iterdir()] == [destination.name]
 
 
+def test_rollback_restore_race_preserves_both_replacements_with_recovery_path(
+    tmp_path, monkeypatch
+):
+    url = "https://example.invalid/two-replacements.bin"
+    payload = b"created rollback identity"
+    destination = tmp_path / "two-replacements.bin"
+    replacement_a = b"replacement A"
+    replacement_b = b"replacement B"
+    from scripts import download_verified_file as downloader
+
+    real_move = downloader._move_no_replace
+    moved_a = False
+
+    def race_restore(source, target):
+        nonlocal moved_a
+        source = Path(source)
+        target = Path(target)
+        if source == destination and not moved_a:
+            moved_a = True
+            candidate = tmp_path / "replacement-a.tmp"
+            candidate.write_bytes(replacement_a)
+            os.replace(candidate, destination)
+        if target == destination and "-recovery-" in source.name:
+            candidate = tmp_path / "replacement-b.tmp"
+            candidate.write_bytes(replacement_b)
+            os.link(candidate, destination)
+            candidate.unlink()
+        return real_move(source, target)
+
+    monkeypatch.setattr(downloader, "_move_no_replace", race_restore)
+    real_fsync = os.fsync
+    fsync_calls = 0
+
+    def fail_publish_parent_fsync(descriptor):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("primary publish failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(downloader.os, "fsync", fail_publish_parent_fsync)
+    with pytest.raises(OSError, match="primary publish failure") as raised:
+        download_verified_file(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            destination,
+            opener=lambda _request, timeout: Response(payload, url),
+        )
+
+    assert moved_a
+    assert destination.read_bytes() == replacement_b
+    recovery = [path for path in tmp_path.iterdir() if "recovery" in path.name]
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == replacement_a
+    assert str(recovery[0]) in str(raised.value.__cause__)
+    assert not list(tmp_path.glob(f".{destination.name}-rollback-*"))
+    owned = [
+        path
+        for path in tmp_path.glob(f".{destination.name}-*")
+        if "-recovery-" not in path.name
+    ]
+    assert not owned
+
+
+def test_rollback_restore_failure_recovers_replacement_and_preserves_primary(
+    tmp_path, monkeypatch
+):
+    url = "https://example.invalid/restore-failure.bin"
+    payload = b"created identity"
+    destination = tmp_path / "restore-failure.bin"
+    replacement = b"replacement needing recovery"
+    from scripts import download_verified_file as downloader
+
+    real_move = downloader._move_no_replace
+    moved = False
+    restore_failed = False
+
+    def fail_restore_once(source, target):
+        nonlocal moved, restore_failed
+        source, target = Path(source), Path(target)
+        if source == destination and not moved:
+            moved = True
+            candidate = tmp_path / "replacement.tmp"
+            candidate.write_bytes(replacement)
+            os.replace(candidate, destination)
+        if target == destination and "-recovery-" in source.name and not restore_failed:
+            restore_failed = True
+            raise OSError("injected restore failure")
+        return real_move(source, target)
+
+    monkeypatch.setattr(downloader, "_move_no_replace", fail_restore_once)
+    real_fsync = os.fsync
+    fsync_calls = 0
+
+    def primary_failure(descriptor):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("primary publish failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(downloader.os, "fsync", primary_failure)
+    with pytest.raises(OSError, match="primary publish failure") as raised:
+        download_verified_file(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            destination,
+            opener=lambda _request, timeout: Response(payload, url),
+        )
+
+    assert not destination.exists()
+    recovery = list(tmp_path.glob(f".{destination.name}-recovery-*"))
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == replacement
+    assert raised.value.__cause__ is not None
+    assert "injected restore failure" in repr(raised.value.__cause__.failures)
+    assert not list(tmp_path.glob(f".{destination.name}-rollback-*"))
+
+
+def test_recovery_durability_failure_is_reported_without_hiding_primary(
+    tmp_path, monkeypatch
+):
+    url = "https://example.invalid/recovery-durability.bin"
+    payload = b"created identity"
+    destination = tmp_path / "recovery-durability.bin"
+    replacement_a = b"replacement A"
+    replacement_b = b"replacement B"
+    from scripts import download_verified_file as downloader
+
+    real_move = downloader._move_no_replace
+    moved = False
+
+    def force_recovery(source, target):
+        nonlocal moved
+        source, target = Path(source), Path(target)
+        if source == destination and not moved:
+            moved = True
+            candidate = tmp_path / "replacement-a.tmp"
+            candidate.write_bytes(replacement_a)
+            os.replace(candidate, destination)
+        if target == destination and "-recovery-" in source.name:
+            candidate = tmp_path / "replacement-b.tmp"
+            candidate.write_bytes(replacement_b)
+            os.link(candidate, destination)
+            candidate.unlink()
+        return real_move(source, target)
+
+    monkeypatch.setattr(downloader, "_move_no_replace", force_recovery)
+    real_fsync = os.fsync
+    fsync_calls = 0
+
+    def fail_publish_and_recovery_fsync(descriptor):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("primary publish failure")
+        if fsync_calls == 3:
+            raise OSError("recovery durability failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(downloader.os, "fsync", fail_publish_and_recovery_fsync)
+    with pytest.raises(OSError, match="primary publish failure") as raised:
+        download_verified_file(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            destination,
+            opener=lambda _request, timeout: Response(payload, url),
+        )
+
+    assert destination.read_bytes() == replacement_b
+    recovery = list(tmp_path.glob(f".{destination.name}-recovery-*"))
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == replacement_a
+    cause = raised.value.__cause__
+    assert cause is not None
+    assert "recovery durability failure" in repr(cause.failures)
+
+
 def test_windows_integrity_handle_denies_write_share_and_flushes_directory():
     from scripts.download_verified_file import _WindowsFileApi
 
@@ -561,14 +742,18 @@ def test_rollback_cleanup_failure_never_returns_success(tmp_path, monkeypatch):
 
     def fail_first_temp_cleanup(path, *args, **kwargs):
         nonlocal temp_failed
-        if not temp_failed and Path(path).name.startswith(f".{destination.name}-"):
+        if (
+            not temp_failed
+            and Path(path).name.startswith(f".{destination.name}-")
+            and "-recovery-" not in Path(path).name
+        ):
             temp_failed = True
             raise OSError("temporary cleanup failure")
         return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr("scripts.download_verified_file.os.fsync", fail_rollback_parent_fsync)
     monkeypatch.setattr("scripts.download_verified_file.os.unlink", fail_first_temp_cleanup)
-    with pytest.raises(OSError):
+    with pytest.raises(OSError, match="publish parent fsync failure") as raised:
         download_verified_file(
             url,
             hashlib.sha256(payload).hexdigest(),
@@ -579,6 +764,8 @@ def test_rollback_cleanup_failure_never_returns_success(tmp_path, monkeypatch):
 
     assert not destination.exists()
     assert list(tmp_path.iterdir()) == []
+    assert raised.value.__cause__ is not None
+    assert "rollback parent fsync failure" in repr(raised.value.__cause__)
 
 
 def test_bounded_file_downloader_publishes_only_exact_https_identity(tmp_path):

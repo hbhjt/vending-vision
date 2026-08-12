@@ -9,7 +9,9 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
+import sys
 import tempfile
 import time
 from urllib.parse import urlsplit
@@ -25,6 +27,22 @@ MAX_TOTAL_TIMEOUT_SECONDS = 3600.0
 
 class DownloadError(RuntimeError):
     pass
+
+
+class DownloadRecoveryError(DownloadError):
+    def __init__(
+        self,
+        recovery: Path,
+        identity: tuple[int, int, int, int],
+        failures: tuple[BaseException, ...] = (),
+    ):
+        self.recovery = recovery
+        self.identity = identity
+        self.failures = failures
+        super().__init__(
+            f"download_replacement_recovered:{recovery}:"
+            f"{identity[0]}:{identity[1]}:{identity[2]}:{identity[3]}"
+        )
 
 
 def _file_identity(path: Path) -> tuple[int, int, int, int]:
@@ -156,19 +174,34 @@ def _move_no_replace(source: Path, destination: Path) -> None:
 
 def _rollback_created_destination(
     destination: Path,
-    rollback_root: Path,
     expected: tuple[int, int, int, int],
-) -> bool:
-    quarantine = rollback_root / "destination"
+) -> tuple[bool, DownloadRecoveryError | None]:
+    recovery = destination.parent / (
+        f".{destination.name}-recovery-{secrets.token_hex(8)}"
+    )
     try:
-        _move_no_replace(destination, quarantine)
+        _move_no_replace(destination, recovery)
     except FileNotFoundError:
-        return False
-    if _file_identity(quarantine) == expected:
-        quarantine.unlink()
-        return True
-    _move_no_replace(quarantine, destination)
-    return False
+        return False, None
+    if _file_identity(recovery) == expected:
+        recovery.unlink()
+        return True, None
+    replacement_identity = _file_identity(recovery)
+    try:
+        _move_no_replace(recovery, destination)
+        return False, None
+    except OSError as restore_failure:
+        try:
+            _fsync_directory(destination.parent)
+        except BaseException as durability_failure:
+            return False, DownloadRecoveryError(
+                recovery,
+                replacement_identity,
+                (restore_failure, durability_failure),
+            )
+        return False, DownloadRecoveryError(
+            recovery, replacement_identity, (restore_failure,)
+        )
 
 
 def download_verified_file(
@@ -223,10 +256,6 @@ def download_verified_file(
         prefix=f".{destination.name}-", dir=destination.parent
     )
     temporary = Path(temporary_name)
-    rollback_root = Path(
-        tempfile.mkdtemp(prefix=f".{destination.name}-rollback-", dir=destination.parent)
-    )
-    rollback_root.chmod(0o700)
     created_identity: tuple[int, int, int, int] | None = None
     held: _HeldFile | None = None
     temporary_removed = False
@@ -285,19 +314,33 @@ def download_verified_file(
             raise DownloadError("download_destination_identity")
         held.close()
         held = None
-    except BaseException:
+    except BaseException as primary:
+        rollback_failure: BaseException | None = None
         if created_identity is not None:
-            removed = _rollback_created_destination(
-                destination, rollback_root, created_identity
-            )
-            if removed:
-                _fsync_directory(destination.parent)
-        raise
+            try:
+                removed, recovery = _rollback_created_destination(
+                    destination, created_identity
+                )
+                if removed:
+                    _fsync_directory(destination.parent)
+                rollback_failure = recovery
+            except BaseException as exc:
+                rollback_failure = exc
+        if rollback_failure is not None:
+            primary.__cause__ = rollback_failure
+        raise primary
     finally:
+        cleanup_failures: list[BaseException] = []
         if held is not None:
-            held.close()
+            try:
+                held.close()
+            except BaseException as exc:
+                cleanup_failures.append(exc)
         if descriptor >= 0:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                cleanup_failures.append(exc)
         if not temporary_removed:
             cleanup_error: OSError | None = None
             for _attempt in range(2):
@@ -308,8 +351,17 @@ def download_verified_file(
                 except OSError as exc:
                     cleanup_error = exc
             if not temporary_removed and cleanup_error is not None:
-                raise cleanup_error
-        rollback_root.rmdir()
+                cleanup_failures.append(cleanup_error)
+        if cleanup_failures:
+            active = sys.exception()
+            if active is None:
+                if len(cleanup_failures) == 1:
+                    raise cleanup_failures[0]
+                raise ExceptionGroup("download_cleanup_failed", cleanup_failures)
+            active.add_note(
+                "download cleanup failures: "
+                + "; ".join(repr(item) for item in cleanup_failures)
+            )
 
 
 def main() -> int:
