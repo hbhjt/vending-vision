@@ -15,7 +15,7 @@ from workflow_yaml import WorkflowYamlError, load_workflow_yaml, workflow_run_sc
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 WORKFLOW_PATH = ".github/workflows/trusted-precutover-companion-proof.yml"
 COMPANION_BUILDER_PATH = ".github/workflows/trusted-precutover-companion-builder.yml"
-COMPANION_BUILDER_SHA = "b3ecbfae6654f09a15462af27629ed5e7ba457e9"
+COMPANION_BUILDER_SHA = "7521fd695b0f0984fc4f1869cab76721adc8a4dd"
 COMPANION_BUILDER_CLOSURE = "trusted-precutover-companion-builder-closure.json"
 COMPANION_BUILDER_CLOSURE_VERIFIER = "scripts/verify_trusted_builder_closure.py"
 CANDIDATE_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
