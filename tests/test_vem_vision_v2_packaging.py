@@ -112,6 +112,7 @@ def test_windows_pre_cutover_companion_is_a_separate_self_contained_build_artifa
     assert "Invoke-Checked $CompanionExe --help" in build
     assert '"scripts\\precutover_companion_descriptor.py") verify' in build
     assert "vending-vision-precutover-verifier" in builder
+    assert "    timeout-minutes: 180\n" in builder
     assert "precutover-companion-provenance.sigstore.json" in builder
     assert "archive_sha256" in builder
     assert "descriptor_sha256" in builder
@@ -123,6 +124,7 @@ def test_windows_pre_cutover_companion_is_a_separate_self_contained_build_artifa
     assert "candidate-manifest" not in builder
     assert "vending-vision-ai-worker" not in builder
     assert "--require-hashes" in builder
+    assert "--total-timeout-seconds 1800" in builder
     workflow = load_workflow_yaml(builder)
     assert set(workflow["on"]["workflow_call"]["inputs"]) == {
         "core_wheelhouse_url",

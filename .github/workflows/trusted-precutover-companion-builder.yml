@@ -44,6 +44,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 180
     permissions:
       contents: read
       id-token: write
@@ -82,7 +83,7 @@ jobs:
           if ($env:CORE_WHEELHOUSE_URL -notmatch '^https://') { throw "core wheelhouse URL must be HTTPS" }
           if ($env:CORE_WHEELHOUSE_SHA256 -notmatch '^[a-f0-9]{64}$') { throw "core wheelhouse SHA-256 is invalid" }
           if ($env:CORE_WHEELHOUSE_BYTES -notmatch '^[1-9][0-9]*$') { throw "core wheelhouse byte size is invalid" }
-          python trusted-companion/scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --expected-bytes $env:CORE_WHEELHOUSE_BYTES --destination core-wheelhouse
+          python trusted-companion/scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --expected-bytes $env:CORE_WHEELHOUSE_BYTES --destination core-wheelhouse --total-timeout-seconds 1800
           if ($LASTEXITCODE -ne 0) { throw "core wheelhouse materialization failed" }
           "TRUSTED_COMPANION_SHA=$env:TRUSTED_SHA" >> $env:GITHUB_ENV
       - name: Build only the self-contained companion in an isolated environment

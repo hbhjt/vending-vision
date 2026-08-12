@@ -1,5 +1,6 @@
 import hashlib
 import io
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -25,6 +26,128 @@ class _Response(io.BytesIO):
 
     def __exit__(self, *_args):
         self.close()
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class _SlowResponse(_Response):
+    def __init__(self, payload, url, clock):
+        super().__init__(payload, url)
+        self._clock = clock
+
+    def read(self, _size=-1):
+        self._clock.advance(0.4)
+        return super().read(1)
+
+
+class _ExitAdvancingResponse(_Response):
+    def __init__(self, payload, url, clock):
+        super().__init__(payload, url)
+        self._clock = clock
+
+    def __exit__(self, *_args):
+        super().__exit__(*_args)
+        self._clock.advance(2.0)
+
+
+def test_archive_total_deadline_aborts_slow_trickle_and_cleans_workdir(tmp_path):
+    url = "https://example.invalid/slow.zip"
+    payload = _zip("demo.whl")
+    destination = tmp_path / "wheelhouse"
+    clock = _Clock()
+    response = _SlowResponse(payload, url, clock)
+
+    with pytest.raises(ArchiveError, match="archive_timeout"):
+        download_verified_archive(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            destination,
+            expected_bytes=len(payload),
+            opener=lambda _request, timeout: response,
+            total_timeout_seconds=1.0,
+            monotonic=clock,
+        )
+
+    assert response.closed
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_archive_opener_uses_remaining_timeout_and_checks_post_open(tmp_path):
+    url = "https://example.invalid/open.zip"
+    payload = _zip("demo.whl")
+    destination = tmp_path / "wheelhouse"
+    clock = _Clock()
+    response = _Response(payload, url)
+    timeouts = []
+
+    def opener(_request, timeout):
+        timeouts.append(timeout)
+        clock.advance(5.1)
+        return response
+
+    with pytest.raises(ArchiveError, match="archive_timeout"):
+        download_verified_archive(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            destination,
+            expected_bytes=len(payload),
+            opener=opener,
+            total_timeout_seconds=5.0,
+            monotonic=clock,
+        )
+
+    assert timeouts == [pytest.approx(5.0)]
+    assert response.closed
+    assert not destination.exists()
+
+
+def test_archive_deadline_after_exact_digest_does_not_publish(tmp_path, monkeypatch):
+    url = "https://example.invalid/exact.zip"
+    payload = _zip("demo.whl")
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    destination = tmp_path / "wheelhouse"
+    clock = _Clock()
+    response = _ExitAdvancingResponse(payload, url, clock)
+
+    with pytest.raises(ArchiveError, match="archive_timeout"):
+        download_verified_archive(
+            url,
+            expected_sha256,
+            destination,
+            expected_bytes=len(payload),
+            opener=lambda _request, timeout: response,
+            total_timeout_seconds=1.0,
+            monotonic=clock,
+        )
+
+    assert response.closed
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), 3600.1, True])
+def test_archive_total_timeout_is_finite_positive_and_capped(tmp_path, timeout):
+    with pytest.raises(ArchiveError, match="archive_timeout"):
+        download_verified_archive(
+            "https://example.invalid/file.zip",
+            "0" * 64,
+            tmp_path / "wheelhouse",
+            expected_bytes=1,
+            opener=lambda _request, timeout: _Response(
+                b"x", "https://example.invalid/file.zip"
+            ),
+            total_timeout_seconds=timeout,
+        )
 
 
 def _zip(member):

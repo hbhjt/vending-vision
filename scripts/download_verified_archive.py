@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import os
 import shutil
 import stat
 import tarfile
 import tempfile
+import time
 import zipfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -20,6 +22,9 @@ class ArchiveError(RuntimeError):
 _MAX_EXTRACTED_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 100_000
+_SOCKET_TIMEOUT_SECONDS = 120.0
+_DEFAULT_TOTAL_TIMEOUT_SECONDS = 1800.0
+_MAX_TOTAL_TIMEOUT_SECONDS = 3600.0
 
 
 def _safe_relative(name: str) -> PurePosixPath:
@@ -118,6 +123,8 @@ def download_verified_archive(
     max_download_bytes: int = _MAX_DOWNLOAD_BYTES,
     max_extracted_bytes: int = _MAX_EXTRACTED_BYTES,
     max_members: int = _MAX_ARCHIVE_MEMBERS,
+    total_timeout_seconds: float = _DEFAULT_TOTAL_TIMEOUT_SECONDS,
+    monotonic=time.monotonic,
 ) -> None:
     parsed = urlsplit(url)
     if parsed.scheme != "https" or parsed.username or parsed.password or len(sha256) != 64:
@@ -136,6 +143,22 @@ def download_verified_archive(
         or max_members <= 0
     ):
         raise ArchiveError("archive_download_size")
+    if (
+        type(total_timeout_seconds) not in {int, float}
+        or not math.isfinite(total_timeout_seconds)
+        or total_timeout_seconds <= 0
+        or total_timeout_seconds > _MAX_TOTAL_TIMEOUT_SECONDS
+    ):
+        raise ArchiveError("archive_timeout")
+    deadline = monotonic() + total_timeout_seconds
+
+    def remaining() -> float:
+        value = deadline - monotonic()
+        if not math.isfinite(value) or value <= 0:
+            raise ArchiveError("archive_timeout")
+        return value
+
+    remaining()
     if destination.exists():
         raise ArchiveError("archive_destination_exists")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -146,27 +169,48 @@ def download_verified_archive(
     try:
         digest = hashlib.sha256()
         request = Request(url, headers={"User-Agent": "vem-release-archive-fetcher/1"})
-        with opener(request, timeout=120.0) as response:
-            if response.geturl() != url:
+        with opener(request, timeout=min(_SOCKET_TIMEOUT_SECONDS, remaining())) as response:
+            remaining()
+            response_url = response.geturl()
+            remaining()
+            if response_url != url:
                 raise ArchiveError("archive_redirect_identity")
             with archive_path.open("xb") as output:
                 downloaded = 0
-                for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                while True:
+                    remaining()
+                    chunk = response.read(
+                        min(1024 * 1024, expected_bytes - downloaded + 1)
+                    )
+                    remaining()
+                    if not chunk:
+                        break
                     if downloaded + len(chunk) > expected_bytes or downloaded + len(chunk) > max_download_bytes:
                         raise ArchiveError("archive_download_size")
                     output.write(chunk)
                     digest.update(chunk)
                     downloaded += len(chunk)
+                remaining()
+                output.flush()
+                remaining()
+                os.fsync(output.fileno())
+                remaining()
+        remaining()
         if downloaded != expected_bytes:
             raise ArchiveError("archive_download_size")
-        if digest.hexdigest() != sha256.lower():
+        remaining()
+        actual_sha256 = digest.hexdigest()
+        remaining()
+        if actual_sha256 != sha256.lower():
             raise ArchiveError("archive_digest")
+        remaining()
         _extract_archive(
             archive_path,
             extracted,
             max_extracted_bytes=max_extracted_bytes,
             max_members=max_members,
         )
+        remaining()
         os.replace(extracted, destination)
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -178,12 +222,14 @@ def main() -> int:
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--expected-bytes", required=True, type=int)
     parser.add_argument("--destination", required=True)
+    parser.add_argument("--total-timeout-seconds", required=True, type=float)
     args = parser.parse_args()
     download_verified_archive(
         args.url,
         args.sha256,
         Path(args.destination).resolve(),
         expected_bytes=args.expected_bytes,
+        total_timeout_seconds=args.total_timeout_seconds,
     )
     print("Verified archive extracted")
     return 0
