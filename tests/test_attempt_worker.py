@@ -123,6 +123,35 @@ def _delayed_ready_render_target(connection, starts, ready_gate):
         connection.close()
 
 
+def _ack_then_slow_native_teardown_target(connection, teardown_started):
+    connection.send(("ready", {"pid": os.getpid(), "poseReady": True}))
+    try:
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+    finally:
+        teardown_started.set()
+        time.sleep(5.0)
+        connection.close()
+
+
+def _invalid_shutdown_ack_target(connection, response_mode):
+    connection.send(("ready", {"pid": os.getpid(), "poseReady": True}))
+    while True:
+        command, _payload = connection.recv()
+        if command != "shutdown":
+            continue
+        if response_mode == "wrong_kind":
+            connection.send(("error", None))
+        elif response_mode == "wrong_generation":
+            connection._last_request_generation += 1
+            connection.send(("ok", None))
+        while True:
+            time.sleep(1.0)
+
+
 def _corrupt_ready_render_target(connection):
     message = {
         "kind": "ready",
@@ -1233,6 +1262,51 @@ def test_render_shutdown_waits_for_shared_start_then_stops_the_worker():
             if child.is_alive():
                 child.kill()
             child.join(timeout=2.0)
+
+
+def test_render_shutdown_reaps_worker_immediately_after_ack_before_native_teardown():
+    context = multiprocessing.get_context("spawn")
+    teardown_started = context.Event()
+
+    async def scenario():
+        broker = FastRenderBroker(
+            context=context,
+            target=_ack_then_slow_native_teardown_target,
+            target_args=(teardown_started,),
+        )
+        await broker.start()
+        started = time.monotonic()
+        await broker.shutdown()
+        return broker, time.monotonic() - started
+
+    broker, elapsed = asyncio.run(scenario())
+
+    assert teardown_started.is_set()
+    assert elapsed < 1.0
+    assert broker.pid is None
+    assert multiprocessing.active_children() == []
+
+
+@pytest.mark.parametrize("response_mode", ["wrong_kind", "wrong_generation", "none"])
+def test_render_shutdown_does_not_trust_invalid_or_missing_ack(response_mode):
+    context = multiprocessing.get_context("spawn")
+
+    async def scenario():
+        broker = FastRenderBroker(
+            context=context,
+            target=_invalid_shutdown_ack_target,
+            target_args=(response_mode,),
+        )
+        await broker.start()
+        started = time.monotonic()
+        await broker.shutdown()
+        return broker, time.monotonic() - started
+
+    broker, elapsed = asyncio.run(scenario())
+
+    assert elapsed >= 1.5
+    assert broker.pid is None
+    assert multiprocessing.active_children() == []
 
 
 def test_render_broker_can_start_a_new_generation_after_completed_shutdown():

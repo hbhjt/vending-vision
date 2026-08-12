@@ -588,16 +588,37 @@ class FastRenderBroker:
                 and process is not None
                 and _process_is_alive(process)
             ):
+                shutdown_request_generation = self._request_generation + 1
+                shutdown_acknowledged = False
                 try:
                     slot.submit(
                         "shutdown",
                         None,
                         process_generation=self._process_generation,
-                        request_generation=self._request_generation + 1,
+                        request_generation=shutdown_request_generation,
                     )
-                    wait_for_event(slot.config["responseEvent"], 0.25, process=process)
+                    if wait_for_event(
+                        slot.config["responseEvent"], 0.25, process=process
+                    ):
+                        kind, payload, _, _ = slot.recv_response(
+                            expected_process_generation=self._process_generation,
+                            expected_request_generation=shutdown_request_generation,
+                        )
+                        shutdown_acknowledged = kind == "ok" and payload is None
                 except Exception:
                     pass
+                if shutdown_acknowledged and _process_is_alive(process):
+                    # The child has completed its owned work and acknowledged
+                    # shutdown.  Do not wait for heavyweight native runtimes to
+                    # run interpreter-exit destructors: they can strand the
+                    # parent-owned IPC mapping under hosted-runner load.
+                    try:
+                        process.kill()
+                    except (AttributeError, NotImplementedError):
+                        terminate("terminate-after-shutdown-ack")
+                    except (OSError, PermissionError) as exc:
+                        record("kill-after-shutdown-ack", exc)
+                        terminate("terminate-after-shutdown-ack-error")
                 if _wait_process_dead(process, _GRACEFUL_STOP_CONFIRM_TIMEOUT_SECONDS):
                     _close_dead_process(process)
                     self._parent = None
