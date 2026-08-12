@@ -122,7 +122,7 @@ def test_trusted_builder_closure_rejects_new_spec_hidden_import(tmp_path):
     manifest_path.write_text(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", "utf-8"
     )
-    with pytest.raises(ClosureError, match="unlisted_spec_module"):
+    with pytest.raises(ClosureError, match="spec_hiddenimports"):
         verify_closure(root, manifest_path)
 
 
@@ -143,6 +143,40 @@ def test_builder_closure_rejects_new_tracked_local_import(tmp_path):
     subprocess.run(["git", "add", "-A"], cwd=export, check=True)
     with pytest.raises(ClosureError, match="dependency:vision/unlisted_local.py"):
         verify_closure(export, manifest_path)
+
+
+@pytest.mark.parametrize(
+    ("target", "appendix"),
+    [
+        ("vision/ai_model_pack.py", "\nfrom vision import unlisted_local\n"),
+        ("vision/ai_model_pack.py", "\nimport importlib\nimportlib.import_module('vision.unlisted_local')\n"),
+        ("vision/ai_model_pack.py", "\nimport importlib\nimportlib.import_module('vision.' + 'unlisted_local')\n"),
+        ("vision/ai_model_pack.py", "\nfrom importlib import import_module\nimport_module('vision.unlisted_local')\n"),
+        ("vision/ai_model_pack.py", "\nloader = __import__\nloader('vision.unlisted_local')\n"),
+        ("vision/ai_model_pack.py", "\n__import__('vision.' + 'unlisted_local')\n"),
+        ("vending_vision_precutover_verifier.spec", "\ndatas.append(('vision/unlisted_local.py','vision'))\n"),
+        ("vending_vision_precutover_verifier.spec", "\nhiddenimports.append('vision.' + 'unlisted_local')\n"),
+        ("vending_vision_precutover_verifier.spec", "\nbinaries.append(('tool.exe','.'))\n"),
+        ("vending_vision_precutover_verifier.spec", "\nruntime_hooks.append('vision/unlisted_local.py')\n"),
+    ],
+)
+def test_builder_closure_rejects_import_and_spec_mutation_bypasses(
+    tmp_path, target, appendix
+):
+    root, manifest_path, manifest = _copy_builder_closure(tmp_path)
+    unlisted = root / "vision/unlisted_local.py"
+    unlisted.write_text("VALUE = 1\n", "utf-8")
+    candidate = root / target
+    candidate.write_text(candidate.read_text("utf-8") + appendix, "utf-8")
+    for item in manifest["files"]:
+        if item["path"] == target:
+            item["sha256"] = __import__("hashlib").sha256(candidate.read_bytes()).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", "utf-8"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    with pytest.raises(ClosureError):
+        verify_closure(root, manifest_path)
 
 
 def test_trusted_proof_has_closed_https_inputs_and_pins_companion_builder():

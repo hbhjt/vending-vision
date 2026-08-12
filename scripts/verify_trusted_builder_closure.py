@@ -12,6 +12,17 @@ import subprocess
 
 
 SCHEMA = "vending-vision-trusted-companion-builder-closure/v1"
+SPEC_HIDDENIMPORTS = (
+    "scripts.ai_model_pack_release",
+    "scripts.candidate_artifact_manifest",
+    "scripts.verify_trusted_candidate_inputs",
+    "candidate_artifact_manifest",
+    "vision.ai_model_pack",
+    "vision.ai_runtime_descriptor",
+    "vision.precutover_companion",
+    "vision.process_supervisor",
+    "PyInstaller.archive.readers",
+)
 EXPECTED_PATHS = (
     ".github/workflows/trusted-precutover-companion-builder.yml",
     ".python-version",
@@ -101,28 +112,86 @@ def _resolve_module(name: str, modules: dict[str, str]) -> str | None:
 def _local_imports(path: Path, modules: dict[str, str]) -> set[str]:
     tree = ast.parse(path.read_text("utf-8"), filename=str(path))
     imported: set[str] = set()
+    import_call_names = {"__import__"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module":
+                    import_call_names.add(alias.asname or alias.name)
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in import_call_names
+        ):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    import_call_names.add(target.id)
     for node in ast.walk(tree):
         names: list[str] = []
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             names = [node.module]
+            names.extend(f"{node.module}.{alias.name}" for alias in node.names)
         for name in names:
             relative = _resolve_module(name, modules)
             if relative is not None:
                 imported.add(relative)
-        if (
+        dynamic_import = (
             isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "__import__"
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-        ):
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id in import_call_names)
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "importlib"
+                    and node.func.attr == "import_module"
+                )
+            )
+        )
+        if dynamic_import:
+            if (
+                len(node.args) != 1
+                or node.keywords
+                or not isinstance(node.args[0], ast.Constant)
+                or not isinstance(node.args[0].value, str)
+            ):
+                raise ClosureError(f"trusted_builder_closure_dynamic_import:{path}")
             relative = _resolve_module(node.args[0].value, modules)
             if relative is not None:
                 imported.add(relative)
+        elif (
+            isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id in import_call_names)
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "import_module"
+                )
+            )
+        ):
+            raise ClosureError(f"trusted_builder_closure_dynamic_import:{path}")
     return imported
+
+
+def _literal_strings(node: ast.AST) -> tuple[str, ...] | None:
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return None
+    values = []
+    for item in node.elts:
+        if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+            return None
+        values.append(item.value)
+    return tuple(values)
+
+
+def _call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _call_name(node.value)
+        return f"{base}.{node.attr}" if base else None
+    return None
 
 
 def _spec_local_modules(root: Path, modules: dict[str, str]) -> set[str]:
@@ -138,7 +207,71 @@ def _spec_local_modules(root: Path, modules: dict[str, str]) -> set[str]:
     ]
     if len(analyses) != 1:
         raise ClosureError("trusted_builder_closure_spec_analysis")
+    assignments: dict[str, list[ast.AST]] = {}
+    mutations: list[tuple[str, ast.AST]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments.setdefault(target.id, []).append(node.value)
+        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            mutations.append((node.target.id, node.value))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.attr in {"append", "extend", "insert", "remove", "pop", "clear"}
+        ):
+            mutations.append((node.func.value.id, node))
+    protected = {"hiddenimports", "datas", "binaries", "runtime_hooks", "hookspath"}
+    for name, node in mutations:
+        if name not in protected:
+            continue
+        if name == "hiddenimports":
+            if not (
+                isinstance(node, ast.Call)
+                and _call_name(node.func) == "collect_submodules"
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "packaging"
+                and not node.keywords
+            ):
+                raise ClosureError("trusted_builder_closure_spec_hiddenimports")
+        elif name == "datas":
+            if not (
+                isinstance(node, ast.Call)
+                and _call_name(node.func) == "copy_metadata"
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "package"
+                and not node.keywords
+            ):
+                raise ClosureError("trusted_builder_closure_spec_datas")
+        else:
+            raise ClosureError(f"trusted_builder_closure_spec_{name}")
+    if (
+        len(assignments.get("hiddenimports", [])) != 1
+        or _literal_strings(assignments["hiddenimports"][0]) != SPEC_HIDDENIMPORTS
+    ):
+        raise ClosureError("trusted_builder_closure_spec_hiddenimports")
+    if (
+        len(assignments.get("datas", [])) != 1
+        or not isinstance(assignments["datas"][0], ast.List)
+        or assignments["datas"][0].elts
+    ):
+        raise ClosureError("trusted_builder_closure_spec_datas")
+    for forbidden in ("binaries", "runtime_hooks", "hookspath"):
+        if assignments.get(forbidden):
+            raise ClosureError(f"trusted_builder_closure_spec_{forbidden}")
     keywords = {item.arg: item.value for item in analyses[0].keywords if item.arg}
+    if len(keywords) != len(analyses[0].keywords):
+        raise ClosureError("trusted_builder_closure_spec_analysis_keywords")
+    expected_keywords = {
+        "pathex", "binaries", "datas", "hiddenimports", "hookspath", "hooksconfig",
+        "runtime_hooks", "excludes", "noarchive", "optimize",
+    }
+    if set(keywords) != expected_keywords:
+        raise ClosureError("trusted_builder_closure_spec_analysis_keywords")
     binaries = keywords.get("binaries")
     datas = keywords.get("datas")
     hiddenimports = keywords.get("hiddenimports")
@@ -148,6 +281,11 @@ def _spec_local_modules(root: Path, modules: dict[str, str]) -> set[str]:
         raise ClosureError("trusted_builder_closure_spec_datas")
     if not isinstance(hiddenimports, ast.Name) or hiddenimports.id != "hiddenimports":
         raise ClosureError("trusted_builder_closure_spec_hiddenimports")
+    for empty in ("hookspath", "runtime_hooks"):
+        if not isinstance(keywords[empty], ast.List) or keywords[empty].elts:
+            raise ClosureError(f"trusted_builder_closure_spec_{empty}")
+    if not isinstance(keywords["hooksconfig"], ast.Dict) or keywords["hooksconfig"].keys:
+        raise ClosureError("trusted_builder_closure_spec_hooksconfig")
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             literal = node.value.replace("\\", "/")
