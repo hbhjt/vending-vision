@@ -40,6 +40,41 @@ class FakeWindowsKernel32:
         target = Path(path)
         self.calls.append(("CreateFileW", target, access, share, creation, flags))
         try:
+            if target.exists():
+                target_facts = target.stat()
+                target_identity = target_facts.st_dev, target_facts.st_ino
+                for entry in self.handles.values():
+                    entry_facts = entry["path"].stat()
+                    if (entry_facts.st_dev, entry_facts.st_ino) != target_identity:
+                        continue
+                    if (
+                        access & acceptance_evidence._WindowsEvidenceFileApi.GENERIC_READ
+                        and not entry["share"]
+                        & acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_READ
+                    ) or (
+                        access & acceptance_evidence._WindowsEvidenceFileApi.GENERIC_WRITE
+                        and not entry["share"]
+                        & acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_WRITE
+                    ) or (
+                        access & acceptance_evidence._WindowsEvidenceFileApi.DELETE
+                        and not entry["share"]
+                        & acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_DELETE
+                    ) or (
+                        entry["access"]
+                        & acceptance_evidence._WindowsEvidenceFileApi.GENERIC_READ
+                        and not share
+                        & acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_READ
+                    ) or (
+                        entry["access"]
+                        & acceptance_evidence._WindowsEvidenceFileApi.GENERIC_WRITE
+                        and not share
+                        & acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_WRITE
+                    ) or (
+                        entry["access"] & acceptance_evidence._WindowsEvidenceFileApi.DELETE
+                        and not share
+                        & acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_DELETE
+                    ):
+                        return -1
             if flags & acceptance_evidence._WindowsEvidenceFileApi.FILE_FLAG_BACKUP_SEMANTICS:
                 if not target.is_dir() or self.directory_open_failure:
                     return -1
@@ -92,6 +127,16 @@ class FakeWindowsKernel32:
 
     def CreateHardLinkW(self, destination, source, _security):
         self.calls.append(("CreateHardLinkW", Path(destination), Path(source)))
+        destination_parent = Path(destination).parent
+        for entry in self.handles.values():
+            if (
+                entry["flags"]
+                & acceptance_evidence._WindowsEvidenceFileApi.FILE_FLAG_BACKUP_SEMANTICS
+                and entry["path"] == destination_parent
+                and not entry["share"]
+                & acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_WRITE
+            ):
+                return 0
         try:
             os.link(source, destination)
         except OSError:
@@ -209,8 +254,36 @@ def test_windows_acceptance_sink_publishes_with_held_read_only_handles(
     assert destination.read_bytes() == canonical_sidecar()
     assert {path.name for path in root.iterdir()} == {destination.name}
     file_opens = [call for call in kernel.calls if call[0] == "CreateFileW"]
-    assert file_opens[1][3] == acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_READ
-    assert file_opens[2][3] == acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_READ
+    directory_opens = [
+        call
+        for call in file_opens
+        if call[5]
+        & acceptance_evidence._WindowsEvidenceFileApi.FILE_FLAG_BACKUP_SEMANTICS
+    ]
+    assert all(
+        call[3]
+        == (
+            acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_READ
+            | acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_WRITE
+        )
+        for call in directory_opens
+    )
+    regular_file_opens = [call for call in file_opens if call not in directory_opens]
+    published_read_opens = [
+        call
+        for call in regular_file_opens
+        if call[2] == acceptance_evidence._WindowsEvidenceFileApi.GENERIC_READ
+        and call[4] == acceptance_evidence._WindowsEvidenceFileApi.OPEN_EXISTING
+    ]
+    assert [call[3] for call in published_read_opens] == [
+        acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_READ
+        | acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_WRITE
+    ]
+    assert all(
+        call[3] == acceptance_evidence._WindowsEvidenceFileApi.FILE_SHARE_READ
+        for call in regular_file_opens
+        if call not in published_read_opens
+    )
     assert any(call[0] == "CreateHardLinkW" for call in kernel.calls)
     assert any(call[0] == "ReadFile" for call in kernel.calls)
     flushes = [call for call in kernel.calls if call[0] == "FlushFileBuffers"]

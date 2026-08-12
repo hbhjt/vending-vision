@@ -64,12 +64,17 @@ class _WindowsEvidenceFileApi:
         return handle in {None, 0, -1, invalid}
 
     def _open(
-        self, path: Path, access: int, creation: int, flags: int = FILE_ATTRIBUTE_NORMAL
+        self,
+        path: Path,
+        access: int,
+        creation: int,
+        flags: int = FILE_ATTRIBUTE_NORMAL,
+        share: int = FILE_SHARE_READ,
     ) -> int:
         handle = self._kernel32.CreateFileW(
             str(path),
             access,
-            self.FILE_SHARE_READ,
+            share,
             None,
             creation,
             flags,
@@ -87,7 +92,16 @@ class _WindowsEvidenceFileApi:
         )
 
     def open_read(self, path: Path) -> int:
-        return self._open(path, self.GENERIC_READ, self.OPEN_EXISTING)
+        # This view is opened while the writable source handle is still held.
+        # Windows requires a new handle's share mask to admit the access of all
+        # existing handles to the same file identity.  The source itself still
+        # denies external write/delete opens until both final-fence views close.
+        return self._open(
+            path,
+            self.GENERIC_READ,
+            self.OPEN_EXISTING,
+            share=self.FILE_SHARE_READ | self.FILE_SHARE_WRITE,
+        )
 
     def open_delete(self, path: Path) -> int:
         return self._open(path, self.GENERIC_READ | self.DELETE, self.OPEN_EXISTING)
@@ -98,6 +112,7 @@ class _WindowsEvidenceFileApi:
             self.GENERIC_READ,
             self.OPEN_EXISTING,
             self.FILE_FLAG_BACKUP_SEMANTICS,
+            self.FILE_SHARE_READ | self.FILE_SHARE_WRITE,
         )
 
     def write_all(self, handle: int, payload: bytes) -> None:
