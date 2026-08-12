@@ -10,6 +10,7 @@ import sys
 import pytest
 
 from scripts.verify_release_tag_ruleset import github_ref_name_matches, verify_rulesets
+from scripts.verify_trusted_script_set import verify as verify_trusted_script_set
 
 
 ROOT = Path(__file__).parents[1]
@@ -97,6 +98,18 @@ def test_trusted_signer_has_only_data_inputs_and_isolates_the_supplier_key():
         "*.exe",
     ):
         assert forbidden not in workflow
+
+
+def test_trusted_signer_descriptor_binds_the_path_aware_ruleset_authority():
+    verify_trusted_script_set(ROOT, ROOT / "trusted-signer-scripts.json")
+    descriptor = json.loads((ROOT / "trusted-signer-scripts.json").read_text("utf-8"))
+    ruleset = next(
+        item
+        for item in descriptor["scripts"]
+        if item["path"] == "scripts/verify_release_tag_ruleset.py"
+    )
+    assert ruleset["sha256"] == hashlib.sha256(TAG_RULESET.read_bytes()).hexdigest()
+    assert not github_ref_name_matches("refs/*", "refs/tags/v1.2.3-rc.1")
 
 
 def _git(directory: Path, *args: str) -> str:
