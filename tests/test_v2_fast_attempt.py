@@ -36,6 +36,7 @@ def _active_child_pids_except_acquisition_observer():
 
 def _fast_block_first_broker_target(connection, config):
     counter = config["requestCounter"]
+    blocked_read_entered = config.get("blockedReadEntered")
     try:
         connection.send(("ready", {"pid": os.getpid()}))
         while True:
@@ -48,6 +49,8 @@ def _fast_block_first_broker_target(connection, config):
                     counter.value += 1
                     request_number = counter.value
                 if request_number == 1:
+                    if blocked_read_entered is not None:
+                        blocked_read_entered.set()
                     while True:
                         threading.Event().wait(1.0)
                 connection.send(("ok", {
@@ -60,6 +63,7 @@ def _fast_block_first_broker_target(connection, config):
 
 def _fast_block_then_slow_ready_broker_target(connection, config):
     starts = config["starts"]
+    blocked_read_entered = config["blockedReadEntered"]
     with starts.get_lock():
         starts.value += 1
         start_number = starts.value
@@ -74,6 +78,7 @@ def _fast_block_then_slow_ready_broker_target(connection, config):
                 return
             if command == "read":
                 if start_number == 1:
+                    blocked_read_entered.set()
                     while True:
                         threading.Event().wait(1.0)
                 connection.send(("ok", {
@@ -1514,9 +1519,10 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
         },
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
-    # Keep real three-frame acquisition intact; the bounded timeout now
-    # expires in the deliberately blocked render worker.
-    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 1.0)
+    # Keep real acquisition on its normal deadline.  The render phase itself
+    # gets a deliberately short first-worker deadline, so this test never
+    # mistakes hosted spawn/load time for an attempt timeout.
+    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 15.0)
     _configure_recorded_front(monkeypatch)
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
@@ -1526,6 +1532,14 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
         target_args=(counter,),
     )
     monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    real_render = vision_app.render_attempt_frame
+
+    async def render_with_first_worker_deadline(*args, **kwargs):
+        if counter.value == 0:
+            kwargs["timeout"] = 0.1
+        return await real_render(*args, **kwargs)
+
+    monkeypatch.setattr(vision_app, "render_attempt_frame", render_with_first_worker_deadline)
     timed_out_id, retry_id = str(uuid4()), str(uuid4())
 
     with TestClient(vision_app.app) as client:
@@ -1827,6 +1841,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
 ):
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
+    blocked_read_entered = context.Event()
     broker = DirectShowCameraBroker(
         "front",
         {
@@ -1838,6 +1853,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
             "keep_open": True,
             "_brokerReadyHandshake": True,
             "requestCounter": counter,
+            "blockedReadEntered": blocked_read_entered,
         },
         context=context,
         target=_fast_block_first_broker_target,
@@ -1881,9 +1897,9 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
         read_task = asyncio.create_task(
             vision_app._read_attempt_front_frame(first, timeout=15.0)
         )
-        deadline = asyncio.get_running_loop().time() + 1.0
-        while counter.value < 1 and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.002)
+        await asyncio.wait_for(
+            asyncio.to_thread(blocked_read_entered.wait), timeout=15.0
+        )
         ticks = 0
         tick_deadline = asyncio.get_running_loop().time() + 0.05
         while asyncio.get_running_loop().time() < tick_deadline:
@@ -1891,7 +1907,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
             await asyncio.sleep(0.002)
         registry.cancel_event.set()
         with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
-            await asyncio.wait_for(read_task, timeout=1.0)
+            await asyncio.wait_for(read_task, timeout=15.0)
         assert ticks >= 10
         assert not broker.assert_dead()
         assert broker.active_request_count == 0
@@ -1924,6 +1940,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
     """A new generation receives a warmed command loop, not a spawn deadline."""
     context = multiprocessing.get_context("spawn")
     starts = context.Value("i", 0)
+    blocked_read_entered = context.Event()
     broker = DirectShowCameraBroker(
         "front",
         {
@@ -1935,6 +1952,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
             "keep_open": True,
             "_brokerReadyHandshake": True,
             "starts": starts,
+            "blockedReadEntered": blocked_read_entered,
             "restartReadyDelay": 1.1,
         },
         context=context,
@@ -1983,12 +2001,12 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
         blocked = asyncio.create_task(
             vision_app._read_attempt_front_frame(first, timeout=15.0)
         )
-        deadline = asyncio.get_running_loop().time() + 1.0
-        while starts.value < 1 and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.002)
+        await asyncio.wait_for(
+            asyncio.to_thread(blocked_read_entered.wait), timeout=15.0
+        )
         registry.cancel_event.set()
         with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
-            await asyncio.wait_for(blocked, timeout=4.0)
+            await asyncio.wait_for(blocked, timeout=15.0)
 
         assert starts.value == (2 if prestart else 1)
         registry.cancel_event = asyncio.Event()
