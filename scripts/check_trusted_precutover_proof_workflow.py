@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -13,7 +15,9 @@ from workflow_yaml import WorkflowYamlError, load_workflow_yaml, workflow_run_sc
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 WORKFLOW_PATH = ".github/workflows/trusted-precutover-companion-proof.yml"
 COMPANION_BUILDER_PATH = ".github/workflows/trusted-precutover-companion-builder.yml"
-COMPANION_BUILDER_SHA = "154dfd47b55ba13a5a968447b9f175d45f9ab990"
+COMPANION_BUILDER_SHA = "5047c67bf00e165ef67dc34cf93586dd6309a2a9"
+COMPANION_BUILDER_CLOSURE = "trusted-precutover-companion-builder-closure.json"
+COMPANION_BUILDER_CLOSURE_VERIFIER = "scripts/verify_trusted_builder_closure.py"
 CANDIDATE_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
 CANDIDATE_BUILDER_SHA = "be8fe434855b94f61511e8c6c926e02c54230a38"
 INPUTS = {
@@ -183,6 +187,46 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         check=False,
     )
     _require(committed.returncode == 0 and bool(committed.stdout), "trusted_proof_builder_commit_missing")
+    closure = subprocess.run(
+        ["git", "show", f"{COMPANION_BUILDER_SHA}:{COMPANION_BUILDER_CLOSURE}"],
+        cwd=repository_root,
+        capture_output=True,
+        check=False,
+    )
+    _require(closure.returncode == 0, "trusted_proof_builder_closure_missing")
+    try:
+        closure_value = json.loads(closure.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PolicyError("trusted_proof_builder_closure_json") from exc
+    canonical = json.dumps(
+        closure_value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    _require(closure.stdout == canonical, "trusted_proof_builder_closure_noncanonical")
+    files = closure_value.get("files") if isinstance(closure_value, dict) else None
+    _require(isinstance(files, list), "trusted_proof_builder_closure_shape")
+    closure_paths = {item.get("path") for item in files if isinstance(item, dict)}
+    _require(
+        COMPANION_BUILDER_PATH in closure_paths
+        and COMPANION_BUILDER_CLOSURE_VERIFIER in closure_paths
+        and "scripts/archive_extractor_worker.py" in closure_paths,
+        "trusted_proof_builder_closure_required_files",
+    )
+    for item in files:
+        _require(
+            isinstance(item, dict) and set(item) == {"path", "sha256"},
+            "trusted_proof_builder_closure_entry",
+        )
+        blob = subprocess.run(
+            ["git", "show", f"{COMPANION_BUILDER_SHA}:{item['path']}"],
+            cwd=repository_root,
+            capture_output=True,
+            check=False,
+        )
+        _require(
+            blob.returncode == 0
+            and hashlib.sha256(blob.stdout).hexdigest() == item["sha256"],
+            f"trusted_proof_builder_closure_digest:{item['path']}",
+        )
 
     execute = _job_block(source, "execute")
     sign = _job_block(source, "sign")

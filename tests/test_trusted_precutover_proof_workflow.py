@@ -19,7 +19,7 @@ ROOT = Path(__file__).parents[1]
 TRUSTED_PROOF = (
     ROOT / ".github" / "workflows" / "trusted-precutover-companion-proof.yml"
 )
-COMPANION_BUILDER_COMMIT = "154dfd47b55ba13a5a968447b9f175d45f9ab990"
+COMPANION_BUILDER_COMMIT = "5047c67bf00e165ef67dc34cf93586dd6309a2a9"
 BUILDER_CLOSURE = ROOT / "trusted-precutover-companion-builder-closure.json"
 BUILDER_CLOSURE_VERIFIER = ROOT / "scripts/verify_trusted_builder_closure.py"
 POLICY = ROOT / "scripts" / "check_trusted_precutover_proof_workflow.py"
@@ -302,6 +302,15 @@ def test_trusted_proof_policy_rejects_mutable_authority_and_execution_bypasses(t
         candidate.write_text(source, "utf-8")
         completed = _check_policy(candidate)
         assert completed.returncode != 0, name
+
+
+def test_trusted_proof_policy_rejects_retired_builder_pin(tmp_path):
+    trusted = TRUSTED_PROOF.read_text("utf-8")
+    retired = "154dfd47b55ba13a5a968447b9f175d45f9ab990"
+    candidate = tmp_path / "retired-builder.yml"
+    candidate.write_text(trusted.replace(COMPANION_BUILDER_COMMIT, retired), "utf-8")
+    completed = _check_policy(candidate)
+    assert completed.returncode != 0
 
 
 def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
