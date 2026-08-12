@@ -1926,6 +1926,44 @@ def test_front_read_cancellation_wins_when_waiter_scheduling_lags(monkeypatch):
         )
 
 
+def test_front_read_current_receipt_fence_wins_after_completed_frame(monkeypatch):
+    """A replacement after a read completes still fences that old frame."""
+
+    class Registry:
+        def __init__(self):
+            self.current_checks = 0
+
+        async def is_current(self, _receipt):
+            self.current_checks += 1
+            return self.current_checks == 1
+
+        async def cancel_event_for(self, _receipt):
+            return asyncio.Event()
+
+    async def completed_read(*_args, **_kwargs):
+        return np.zeros((80, 60, 3), dtype=np.uint8), {"source": "dshow"}
+
+    aborted = []
+
+    async def abort(role, *, reason):
+        aborted.append((role, reason))
+        return True
+
+    monkeypatch.setattr(vision_app, "_fast_attempt_registry", Registry())
+    monkeypatch.setattr(vision_app, "read_camera_with_source_async", completed_read)
+    monkeypatch.setattr(vision_app, "abort_camera_request", abort)
+    receipt = vision_app.AttemptReceipt(str(uuid4()), "owner", 1)
+
+    with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
+        asyncio.run(
+            vision_app._read_attempt_front_frame(
+                receipt, timeout=0.01, lease_token="test-current-fence"
+            )
+        )
+
+    assert aborted == [("front", "try_on_attempt_canceled")]
+
+
 def test_render_cancellation_wins_when_waiter_scheduling_lags(monkeypatch):
     """A fenced render result cannot win because the waiter has not run yet."""
 

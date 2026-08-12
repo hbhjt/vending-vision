@@ -316,7 +316,14 @@ async def _read_attempt_front_frame(
             # replacement or disconnected attempt.
             cancelled = cancel_event.is_set()
             if read_task in done and not cancelled:
-                return read_task.result()
+                frame = read_task.result()
+                # The event is only a local wake-up.  Re-check the registry
+                # immediately before handing a physical frame to the caller:
+                # a replacement may have fenced this receipt after the event
+                # snapshot but before the read task delivered its result.
+                if await _fast_attempt_registry.is_current(receipt):
+                    return frame
+                cancelled = True
 
             abort_reason = (
                 "try_on_attempt_canceled"
