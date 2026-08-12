@@ -2053,18 +2053,12 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
         registry.cancel_event = asyncio.Event()
         second = vision_app.AttemptReceipt(str(uuid4()), "owner-2", 2)
         if not prestart:
-            # This is the old behavior: the next generation enters its own
-            # ready barrier, so its one-second frame deadline expires.
-            next_read = asyncio.create_task(
-                vision_app._read_attempt_front_frame(second, timeout=1.0)
-            )
-            await _wait_for_raw_value(restart_ready_entered, timeout=15.0)
-            # The child is now definitely at the ready barrier.  Only the
-            # attempt's own one-second deadline remains to elapse.
-            await asyncio.sleep(1.05)
-            restart_ready_release.value = 1
+            # Without cleanup prestart, the next generation pays replacement
+            # startup from its own frame budget and times out.  Hosted spawn
+            # may consume that budget before the child reaches this test's
+            # ready barrier, so only assert the caller-visible result.
             with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(next_read, timeout=15.0)
+                await vision_app._read_attempt_front_frame(second, timeout=1.0)
             return
         # Cleanup only returned after the replacement ready barrier was
         # released, so the next generation's one-second budget covers a read.
