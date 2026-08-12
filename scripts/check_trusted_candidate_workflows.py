@@ -14,6 +14,8 @@ TRUSTED_BUILDER_COMMIT = "c90a965d117fea49f318b18e0fcd50aa047bc41"
 TRUSTED_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
 TRUSTED_SIGNER_COMMIT = "fb006dccf178c738d99b3fac38d887767d999688"
 TRUSTED_SIGNER_PATH = ".github/workflows/trusted-ai-candidate-signer.yml"
+HOSTED_AUTHORITY_COMMIT = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
+HOSTED_AUTHORITY_PATH = "scripts/verify_hosted_release_authority.py"
 BUILDER_INPUTS = {
     "source_commit",
     "core_wheelhouse_url",
@@ -141,6 +143,12 @@ def check_trusted_candidate_workflows(
         },
         repository_root=repository_root,
         label="trusted_signer",
+    )
+    _assert_files_are_immutable(
+        commit=HOSTED_AUTHORITY_COMMIT,
+        paths={HOSTED_AUTHORITY_PATH: repository_root / HOSTED_AUTHORITY_PATH},
+        repository_root=repository_root,
+        label="hosted_authority",
     )
     _require(_workflow_call_inputs(builder_source) == BUILDER_INPUTS, "trusted_builder_input_allowlist")
     for forbidden in ("secrets:", "artifact_path", "worker_path", "predicate", "custom_command"):
@@ -273,19 +281,25 @@ def check_trusted_candidate_workflows(
         "git init --bare release-authority.git",
         "+refs/heads/main:refs/remotes/origin/main",
         "trusted-policy/scripts/approve_candidate_source.py",
-        "rulesets?targets=tag&includes_parents=true&per_page=100",
-        "trusted-policy/scripts/verify_release_tag_ruleset.py",
+        f"ref: {HOSTED_AUTHORITY_COMMIT}",
+        "path: hosted-authority",
+        "hosted-authority/scripts/verify_hosted_release_authority.py",
+        "--mode publish-admission",
+        "--mode publish-complete",
+        "environment: trusted-precutover",
         "gh release create $env:RELEASE_TAG",
         "--target $env:RELEASE_TARGET",
         "--verify-tag",
     ):
         _require(fragment in publish, f"publisher_release_authority:{fragment}")
-    _require(publish.count("actions/checkout@v4") == 1, "publisher_trusted_policy_checkout")
+    _require(publish.count("actions/checkout@v4") == 2, "publisher_trusted_policy_checkout")
     for forbidden in (
         "VISION_SUPPLIER_PRIVATE_KEY_PEM",
-        "generate_candidate_evidence.py", "sign_candidate_evidence.py", "environment:",
+        "generate_candidate_evidence.py", "sign_candidate_evidence.py",
     ):
         _require(forbidden not in publish, f"publisher_forbidden_capability:{forbidden}")
+    _require("rulesets?targets=tag" not in publish, "publisher_unavailable_rulesets_api")
+    _require(publish.count("environment: trusted-precutover") == 1, "publisher_environment_authority")
     _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in publisher_source, "publisher_supplier_key_present")
     _assert_gh_attestation_flags_parse(repository_root)
 
