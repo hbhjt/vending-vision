@@ -548,6 +548,7 @@ def test_acceptance_sink_rejects_a_nonempty_invocation_root_without_touching_it(
     assert {path.name for path in root.iterdir()} == {stale.name}
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX unlink publication path")
 def test_acceptance_sink_rolls_back_post_link_temporary_unlink_failure(
     tmp_path, monkeypatch
 ):
@@ -602,6 +603,7 @@ def test_acceptance_sink_rolls_back_when_claim_cleanup_initially_fails(
     assert list(root.iterdir()) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync publication path")
 @pytest.mark.parametrize(
     ("failing_call", "message", "expected_calls"),
     [
@@ -633,6 +635,7 @@ def test_acceptance_sink_rolls_back_when_directory_fsync_fails(
     assert list(root.iterdir()) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX unlink publication path")
 def test_acceptance_sink_chains_claim_cleanup_without_hiding_post_link_failure(
     tmp_path, monkeypatch
 ):
@@ -675,6 +678,7 @@ def test_acceptance_sink_chains_claim_cleanup_without_hiding_post_link_failure(
     assert list(root.iterdir()) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX unlink publication path")
 def test_acceptance_sink_does_not_delete_an_external_post_link_replacement(
     tmp_path, monkeypatch
 ):
@@ -706,6 +710,7 @@ def test_acceptance_sink_does_not_delete_an_external_post_link_replacement(
     assert {path.name for path in root.iterdir()} == {destination.name}
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync publication path")
 def test_acceptance_sink_rejects_replacement_during_first_directory_fsync(
     tmp_path, monkeypatch
 ):
@@ -737,6 +742,7 @@ def test_acceptance_sink_rejects_replacement_during_first_directory_fsync(
     assert {path.name for path in root.iterdir()} == {destination.name}
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync publication path")
 def test_acceptance_sink_rejects_inplace_rewrite_during_first_directory_fsync(
     tmp_path, monkeypatch
 ):
@@ -765,6 +771,7 @@ def test_acceptance_sink_rejects_inplace_rewrite_during_first_directory_fsync(
     assert list(root.iterdir()) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="non-Windows Kernel32 absence")
 def test_acceptance_sink_fails_closed_without_a_windows_held_handle(
     tmp_path, monkeypatch
 ):
