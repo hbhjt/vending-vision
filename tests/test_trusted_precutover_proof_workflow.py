@@ -19,7 +19,7 @@ ROOT = Path(__file__).parents[1]
 TRUSTED_PROOF = (
     ROOT / ".github" / "workflows" / "trusted-precutover-companion-proof.yml"
 )
-COMPANION_BUILDER_COMMIT = "9b4a7b0ad496447a244c74c5ecce0d511cb18658"
+COMPANION_BUILDER_COMMIT = "83f8865b6a8f2147e9a96bb693512b974e7312fe"
 BUILDER_CLOSURE = ROOT / "trusted-precutover-companion-builder-closure.json"
 BUILDER_CLOSURE_VERIFIER = ROOT / "scripts/verify_trusted_builder_closure.py"
 POLICY = ROOT / "scripts" / "check_trusted_precutover_proof_workflow.py"
@@ -361,7 +361,7 @@ def test_trusted_proof_policy_rejects_mutable_authority_and_execution_bypasses(t
             1,
         ),
         "untrusted-companion-source-binding": trusted.replace(
-            '--companion-source-commit "9b4a7b0ad496447a244c74c5ecce0d511cb18658"',
+            '--companion-source-commit "83f8865b6a8f2147e9a96bb693512b974e7312fe"',
             "--companion-source-commit $env:CALLER_SHA",
             1,
         ),
