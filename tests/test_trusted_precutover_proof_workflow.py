@@ -64,6 +64,8 @@ def _copy_builder_closure(tmp_path: Path) -> tuple[Path, Path, dict]:
         shutil.copyfile(ROOT / item["path"], target)
     manifest_path = root / BUILDER_CLOSURE.name
     manifest_path.write_bytes(BUILDER_CLOSURE.read_bytes())
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
     return root, manifest_path, manifest
 
 
@@ -122,6 +124,25 @@ def test_trusted_builder_closure_rejects_new_spec_hidden_import(tmp_path):
     )
     with pytest.raises(ClosureError, match="unlisted_spec_module"):
         verify_closure(root, manifest_path)
+
+
+def test_builder_closure_rejects_new_tracked_local_import(tmp_path):
+    export, manifest_path, manifest = _copy_builder_closure(tmp_path)
+    unlisted = export / "vision/unlisted_local.py"
+    unlisted.write_text("VALUE = 1\n", "utf-8")
+    ai_model = export / "vision/ai_model_pack.py"
+    ai_model.write_text(
+        ai_model.read_text("utf-8") + "\nimport vision.unlisted_local\n", "utf-8"
+    )
+    for item in manifest["files"]:
+        if item["path"] == "vision/ai_model_pack.py":
+            item["sha256"] = __import__("hashlib").sha256(ai_model.read_bytes()).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", "utf-8"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=export, check=True)
+    with pytest.raises(ClosureError, match="dependency:vision/unlisted_local.py"):
+        verify_closure(export, manifest_path)
 
 
 def test_trusted_proof_has_closed_https_inputs_and_pins_companion_builder():
