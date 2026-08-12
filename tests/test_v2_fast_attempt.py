@@ -34,6 +34,33 @@ def _active_child_pids_except_acquisition_observer():
     }
 
 
+async def _wait_for_raw_value(value, *, timeout):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not value.value:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError()
+        await asyncio.sleep(min(0.01, remaining))
+
+
+def test_raw_value_wait_timeout_returns_from_asyncio_run_without_executor(monkeypatch):
+    """A missed child-entry signal must not strand asyncio.run on executor shutdown."""
+    entered = multiprocessing.get_context("spawn").RawValue("b", 0)
+
+    async def unexpected_to_thread(*_args, **_kwargs):
+        raise AssertionError("entry wait must not use the default executor")
+
+    monkeypatch.setattr(asyncio, "to_thread", unexpected_to_thread)
+
+    async def scenario():
+        await _wait_for_raw_value(entered, timeout=0.02)
+
+    started = time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(scenario())
+    assert time.monotonic() - started < 0.5
+
+
 def _fast_block_first_broker_target(connection, config):
     counter = config["requestCounter"]
     blocked_read_entered = config.get("blockedReadEntered")
@@ -50,7 +77,7 @@ def _fast_block_first_broker_target(connection, config):
                     request_number = counter.value
                 if request_number == 1:
                     if blocked_read_entered is not None:
-                        blocked_read_entered.set()
+                        blocked_read_entered.value = 1
                     while True:
                         threading.Event().wait(1.0)
                 connection.send(("ok", {
@@ -73,7 +100,7 @@ def _fast_block_then_ready_barrier_broker_target(connection, config):
         # This is a synchronization boundary, not a wall-clock delay.  It
         # lets the parent prove whether cleanup waits for replacement readiness
         # without charging arbitrary hosted spawn time to a 1s frame budget.
-        restart_ready_entered.set()
+        restart_ready_entered.value = 1
         # Do not wait on a multiprocessing.Condition here.  The production
         # timeout can kill this child while it is parked at the boundary;
         # notifying a condition whose waiter died can itself deadlock cleanup.
@@ -88,7 +115,7 @@ def _fast_block_then_ready_barrier_broker_target(connection, config):
                 return
             if command == "read":
                 if start_number == 1:
-                    blocked_read_entered.set()
+                    blocked_read_entered.value = 1
                     while True:
                         threading.Event().wait(1.0)
                 connection.send(("ok", {
@@ -1851,7 +1878,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
 ):
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
-    blocked_read_entered = context.Event()
+    blocked_read_entered = context.RawValue("b", 0)
     broker = DirectShowCameraBroker(
         "front",
         {
@@ -1908,9 +1935,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
         read_task = asyncio.create_task(
             vision_app._read_attempt_front_frame(first, timeout=15.0)
         )
-        await asyncio.wait_for(
-            asyncio.to_thread(blocked_read_entered.wait), timeout=15.0
-        )
+        await _wait_for_raw_value(blocked_read_entered, timeout=15.0)
         ticks = 0
         tick_deadline = asyncio.get_running_loop().time() + 0.05
         while asyncio.get_running_loop().time() < tick_deadline:
@@ -1951,8 +1976,8 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
     """A new generation receives a warmed command loop, not a spawn deadline."""
     context = multiprocessing.get_context("spawn")
     starts = context.Value("i", 0)
-    blocked_read_entered = context.Event()
-    restart_ready_entered = context.Event()
+    blocked_read_entered = context.RawValue("b", 0)
+    restart_ready_entered = context.RawValue("b", 0)
     restart_ready_release = context.RawValue("b", 0)
     broker = DirectShowCameraBroker(
         "front",
@@ -2016,14 +2041,10 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
         blocked = asyncio.create_task(
             vision_app._read_attempt_front_frame(first, timeout=15.0)
         )
-        await asyncio.wait_for(
-            asyncio.to_thread(blocked_read_entered.wait), timeout=15.0
-        )
+        await _wait_for_raw_value(blocked_read_entered, timeout=15.0)
         registry.cancel_event.set()
         if prestart:
-            await asyncio.wait_for(
-                asyncio.to_thread(restart_ready_entered.wait), timeout=15.0
-            )
+            await _wait_for_raw_value(restart_ready_entered, timeout=15.0)
             restart_ready_release.value = 1
         with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
             await asyncio.wait_for(blocked, timeout=15.0)
@@ -2037,9 +2058,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
             next_read = asyncio.create_task(
                 vision_app._read_attempt_front_frame(second, timeout=1.0)
             )
-            await asyncio.wait_for(
-                asyncio.to_thread(restart_ready_entered.wait), timeout=15.0
-            )
+            await _wait_for_raw_value(restart_ready_entered, timeout=15.0)
             # The child is now definitely at the ready barrier.  Only the
             # attempt's own one-second deadline remains to elapse.
             await asyncio.sleep(1.05)
