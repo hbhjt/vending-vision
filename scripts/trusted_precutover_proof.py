@@ -31,7 +31,7 @@ TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 TRUSTED_CANDIDATE_WORKFLOW = ".github/workflows/trusted-ai-candidate-builder.yml"
 TRUSTED_CANDIDATE_WORKFLOW_SHA = "be8fe434855b94f61511e8c6c926e02c54230a38"
 TRUSTED_PROOF_WORKFLOW = ".github/workflows/trusted-precutover-companion-proof.yml"
-TRUSTED_COMPANION_SOURCE = "ebefe97377e4597ab62bc7ea6ab4849219df6fdd"
+TRUSTED_COMPANION_SOURCE = "154dfd47b55ba13a5a968447b9f175d45f9ab990"
 CANDIDATE_INPUT_FILES = {
     "candidate.zip",
     "candidate-manifest.json",

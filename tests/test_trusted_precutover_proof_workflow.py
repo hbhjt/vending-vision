@@ -16,7 +16,7 @@ ROOT = Path(__file__).parents[1]
 TRUSTED_PROOF = (
     ROOT / ".github" / "workflows" / "trusted-precutover-companion-proof.yml"
 )
-COMPANION_BUILDER_COMMIT = "ebefe97377e4597ab62bc7ea6ab4849219df6fdd"
+COMPANION_BUILDER_COMMIT = "154dfd47b55ba13a5a968447b9f175d45f9ab990"
 POLICY = ROOT / "scripts" / "check_trusted_precutover_proof_workflow.py"
 INPUTS = {
     f"{name}_{field}"

@@ -13,7 +13,7 @@ from workflow_yaml import WorkflowYamlError, load_workflow_yaml, workflow_run_sc
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 WORKFLOW_PATH = ".github/workflows/trusted-precutover-companion-proof.yml"
 COMPANION_BUILDER_PATH = ".github/workflows/trusted-precutover-companion-builder.yml"
-COMPANION_BUILDER_SHA = "ebefe97377e4597ab62bc7ea6ab4849219df6fdd"
+COMPANION_BUILDER_SHA = "154dfd47b55ba13a5a968447b9f175d45f9ab990"
 CANDIDATE_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
 CANDIDATE_BUILDER_SHA = "be8fe434855b94f61511e8c6c926e02c54230a38"
 INPUTS = {
