@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from fnmatch import fnmatchcase
 import json
 from pathlib import Path
 import re
@@ -22,8 +21,26 @@ def _flatten_pages(value: object) -> list[dict]:
     return value
 
 
-def _pattern_matches(pattern: str, source_ref: str) -> bool:
-    return pattern == "~ALL" or fnmatchcase(source_ref, pattern)
+def github_ref_name_matches(pattern: str, source_ref: str) -> bool:
+    if pattern == "~ALL":
+        return True
+    expression = ["^"]
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "*":
+            if index + 1 < len(pattern) and pattern[index + 1] == "*":
+                expression.append(".*")
+                index += 2
+                continue
+            expression.append("[^/]*")
+        elif character == "?":
+            expression.append("[^/]")
+        else:
+            expression.append(re.escape(character))
+        index += 1
+    expression.append("$")
+    return re.fullmatch("".join(expression), source_ref) is not None
 
 
 def verify_rulesets(value: object, *, repository: str, source_ref: str) -> int:
@@ -45,9 +62,9 @@ def verify_rulesets(value: object, *, repository: str, source_ref: str) -> int:
             continue
         if not isinstance(excludes, list) or not all(isinstance(item, str) for item in excludes):
             continue
-        if not any(_pattern_matches(pattern, source_ref) for pattern in includes):
+        if not any(github_ref_name_matches(pattern, source_ref) for pattern in includes):
             continue
-        if any(_pattern_matches(pattern, source_ref) for pattern in excludes):
+        if any(github_ref_name_matches(pattern, source_ref) for pattern in excludes):
             continue
         rules = ruleset.get("rules")
         if not isinstance(rules, list) or not all(isinstance(item, dict) for item in rules):

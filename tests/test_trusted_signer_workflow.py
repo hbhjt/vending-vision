@@ -7,6 +7,10 @@ import re
 import subprocess
 import sys
 
+import pytest
+
+from scripts.verify_release_tag_ruleset import github_ref_name_matches, verify_rulesets
+
 
 ROOT = Path(__file__).parents[1]
 SIGNER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-signer.yml"
@@ -277,6 +281,70 @@ def test_release_tag_ruleset_fails_closed_without_active_non_bypass_update_and_d
             check=False,
         )
         assert (completed.returncode == 0) is accepted, completed.stdout
+
+
+def _protecting_ruleset(*, include: list[str], exclude: list[str] | None = None):
+    return {
+        "id": 73,
+        "target": "tag",
+        "enforcement": "active",
+        "bypass_actors": [],
+        "conditions": {
+            "ref_name": {"include": include, "exclude": exclude or []},
+        },
+        "rules": [{"type": "update"}, {"type": "deletion"}],
+    }
+
+
+def test_ruleset_single_star_does_not_cross_ref_path_separators():
+    with pytest.raises(AssertionError, match="no active"):
+        verify_rulesets(
+            [_protecting_ruleset(include=["refs/*"])],
+            repository="hbhjt/vending-vision",
+            source_ref="refs/tags/v1.2.3-rc.1",
+        )
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "refs/tags/v*",
+        "refs/tags/**",
+        "refs/tags/v1.2.3-rc.1",
+    ],
+)
+def test_ruleset_glob_and_literal_patterns_cover_exact_rc_tag(pattern):
+    assert (
+        verify_rulesets(
+            [_protecting_ruleset(include=[pattern])],
+            repository="hbhjt/vending-vision",
+            source_ref="refs/tags/v1.2.3-rc.1",
+        )
+        == 73
+    )
+
+
+def test_ruleset_double_star_crosses_nested_ref_levels():
+    assert not github_ref_name_matches(
+        "refs/tags/v*", "refs/tags/releases/v1.2.3-rc.1"
+    )
+    assert github_ref_name_matches(
+        "refs/tags/**", "refs/tags/releases/v1.2.3-rc.1"
+    )
+
+
+def test_ruleset_exclude_pattern_takes_precedence_over_include():
+    with pytest.raises(AssertionError, match="no active"):
+        verify_rulesets(
+            [
+                _protecting_ruleset(
+                    include=["refs/tags/**"],
+                    exclude=["refs/tags/v1.2.3-rc.1"],
+                )
+            ],
+            repository="hbhjt/vending-vision",
+            source_ref="refs/tags/v1.2.3-rc.1",
+        )
 
 
 def test_trusted_signer_generates_bound_evidence_from_zip_and_approved_git_data(tmp_path):
