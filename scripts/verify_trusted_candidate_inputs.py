@@ -11,7 +11,7 @@ from candidate_artifact_manifest import EMBEDDED_MANIFEST, verify_candidate_arch
 
 
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
-TRUSTED_BUILDER_COMMIT = "be8fe434855b94f61511e8c6c926e02c54230a38"
+TRUSTED_BUILDER_COMMIT = "c90a965d117fea49f318b18e0fcd50aa047bc41"
 TRUSTED_BUILDER_WORKFLOW = ".github/workflows/trusted-ai-candidate-builder.yml"
 
 

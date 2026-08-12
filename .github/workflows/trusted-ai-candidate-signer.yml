@@ -115,7 +115,7 @@ jobs:
         run: |
           $artifact = Join-Path $PWD "builder-input/$env:CANDIDATE_ARTIFACT_FILE"
           $bundle = Join-Path $PWD "builder-input/github-build-provenance.sigstore.json"
-          gh attestation verify $artifact --bundle $bundle --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "be8fe434855b94f61511e8c6c926e02c54230a38" --source-ref $env:SOURCE_REF --source-digest $env:SOURCE_COMMIT --deny-self-hosted-runners
+          gh attestation verify $artifact --bundle $bundle --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "c90a965d117fea49f318b18e0fcd50aa047bc41" --source-ref $env:SOURCE_REF --source-digest $env:SOURCE_COMMIT --deny-self-hosted-runners
           if ($LASTEXITCODE -ne 0) { throw "trusted builder attestation verification failed" }
       - name: Safely verify and extract only manifest-bound ZIP data
         shell: pwsh
