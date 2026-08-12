@@ -1,0 +1,339 @@
+name: Trusted Windows pre-cutover companion proof
+
+on:
+  workflow_call:
+    inputs:
+      candidate_archive_url:
+        description: Immutable HTTPS URL for the attested Windows candidate ZIP
+        required: true
+        type: string
+      candidate_archive_sha256:
+        description: Exact candidate ZIP SHA-256
+        required: true
+        type: string
+      candidate_archive_bytes:
+        description: Exact candidate ZIP byte size
+        required: true
+        type: number
+      candidate_manifest_url:
+        description: Immutable HTTPS URL for the canonical candidate manifest
+        required: true
+        type: string
+      candidate_manifest_sha256:
+        description: Exact candidate manifest SHA-256
+        required: true
+        type: string
+      candidate_manifest_bytes:
+        description: Exact candidate manifest byte size
+        required: true
+        type: number
+      candidate_attestation_url:
+        description: Immutable HTTPS URL for the candidate GitHub attestation bundle
+        required: true
+        type: string
+      candidate_attestation_sha256:
+        description: Exact candidate attestation bundle SHA-256
+        required: true
+        type: string
+      candidate_attestation_bytes:
+        description: Exact candidate attestation bundle byte size
+        required: true
+        type: number
+      candidate_evidence_url:
+        description: Immutable HTTPS URL for canonical trusted-builder evidence
+        required: true
+        type: string
+      candidate_evidence_sha256:
+        description: Exact trusted-builder evidence SHA-256
+        required: true
+        type: string
+      candidate_evidence_bytes:
+        description: Exact trusted-builder evidence byte size
+        required: true
+        type: number
+      model_pack_url:
+        description: Immutable HTTPS URL for the official model-pack ZIP
+        required: true
+        type: string
+      model_pack_sha256:
+        description: Exact official model-pack ZIP SHA-256
+        required: true
+        type: string
+      model_pack_bytes:
+        description: Exact official model-pack ZIP byte size
+        required: true
+        type: number
+    outputs:
+      artifact_name:
+        description: Fresh-runner verified proof artifact name
+        value: ${{ jobs.verify.outputs.artifact_name }}
+      proof_sha256:
+        description: Canonical companion proof SHA-256
+        value: ${{ jobs.verify.outputs.proof_sha256 }}
+      attestation_bundle_sha256:
+        description: GitHub proof attestation bundle SHA-256
+        value: ${{ jobs.verify.outputs.attestation_bundle_sha256 }}
+      companion_archive_sha256:
+        description: Frozen companion archive SHA-256
+        value: ${{ jobs.verify.outputs.companion_archive_sha256 }}
+      companion_descriptor_sha256:
+        description: Frozen companion descriptor SHA-256
+        value: ${{ jobs.verify.outputs.companion_descriptor_sha256 }}
+      source_commit:
+        description: Candidate and attestation source commit
+        value: ${{ jobs.verify.outputs.source_commit }}
+
+permissions:
+  contents: read
+
+jobs:
+  companion_builder:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-builder.yml@ebefe97377e4597ab62bc7ea6ab4849219df6fdd
+    with:
+      core_wheelhouse_url: ${{ vars.CORE_WHEELHOUSE_URL }}
+      core_wheelhouse_sha256: ${{ vars.CORE_WHEELHOUSE_SHA256 }}
+      core_wheelhouse_bytes: ${{ fromJSON(vars.CORE_WHEELHOUSE_BYTES) }}
+
+  prove:
+    needs: companion_builder
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      handoff_artifact_name: ${{ steps.identities.outputs.handoff_artifact_name }}
+      proof_sha256: ${{ steps.identities.outputs.proof_sha256 }}
+      attestation_bundle_sha256: ${{ steps.identities.outputs.attestation_bundle_sha256 }}
+      source_commit: ${{ steps.identities.outputs.source_commit }}
+    steps:
+      - name: Checkout immutable trusted proof implementation
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: trusted-proof
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: trusted-proof/.python-version
+      - name: Download independently built frozen companion
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.companion_builder.outputs.artifact_name }}
+          path: companion-input
+      - name: Verify companion artifact identity and GitHub provenance
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CALLER_SHA: ${{ github.sha }}
+          CALLER_REF: ${{ github.ref }}
+          TRUSTED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          TRUSTED_WORKFLOW_PATH: ${{ job.workflow_file_path }}
+          TRUSTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          COMPANION_ARCHIVE_FILE: ${{ needs.companion_builder.outputs.archive_file }}
+          COMPANION_ARCHIVE_SHA256: ${{ needs.companion_builder.outputs.archive_sha256 }}
+          COMPANION_DESCRIPTOR_FILE: ${{ needs.companion_builder.outputs.descriptor_file }}
+          COMPANION_DESCRIPTOR_SHA256: ${{ needs.companion_builder.outputs.descriptor_sha256 }}
+          COMPANION_ATTESTATION_FILE: ${{ needs.companion_builder.outputs.attestation_bundle_file }}
+          COMPANION_ATTESTATION_SHA256: ${{ needs.companion_builder.outputs.attestation_bundle_sha256 }}
+        run: |
+          if ($env:TRUSTED_WORKFLOW_REPOSITORY -cne "hbhjt/vending-vision" -or $env:TRUSTED_WORKFLOW_PATH -cne ".github/workflows/trusted-precutover-companion-proof.yml" -or $env:TRUSTED_WORKFLOW_SHA -notmatch '^[a-f0-9]{40}$') { throw "unexpected trusted proof workflow identity" }
+          if ($env:CALLER_SHA -notmatch '^[a-f0-9]{40}$' -or $env:CALLER_REF -notmatch '^refs/(heads|tags)/[A-Za-z0-9._/-]+$') { throw "proof caller source identity is invalid" }
+          if ($env:COMPANION_ARCHIVE_FILE -cne "vending-vision-precutover-verifier.zip" -or $env:COMPANION_DESCRIPTOR_FILE -cne "precutover-companion-descriptor.json" -or $env:COMPANION_ATTESTATION_FILE -cne "precutover-companion-provenance.sigstore.json") { throw "companion artifact filenames are invalid" }
+          if ($env:COMPANION_ARCHIVE_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:COMPANION_DESCRIPTOR_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:COMPANION_ATTESTATION_SHA256 -notmatch '^[a-f0-9]{64}$') { throw "companion artifact digests are invalid" }
+          $entries = @(Get-ChildItem -LiteralPath companion-input)
+          if ($entries.Count -ne 3 -or @($entries | Where-Object { $_.PSIsContainer -or $_.LinkType }).Count -ne 0) { throw "companion artifact contains non-regular members" }
+          $members = @($entries | ForEach-Object Name | Sort-Object)
+          $expected = @($env:COMPANION_ARCHIVE_FILE, $env:COMPANION_DESCRIPTOR_FILE, $env:COMPANION_ATTESTATION_FILE) | Sort-Object
+          if ((Compare-Object $members $expected).Count -ne 0) { throw "companion artifact exact member set mismatch" }
+          $archive = (Resolve-Path -LiteralPath "companion-input/$env:COMPANION_ARCHIVE_FILE").Path
+          $descriptor = (Resolve-Path -LiteralPath "companion-input/$env:COMPANION_DESCRIPTOR_FILE").Path
+          $bundle = (Resolve-Path -LiteralPath "companion-input/$env:COMPANION_ATTESTATION_FILE").Path
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:COMPANION_ARCHIVE_SHA256 -or (Get-FileHash -LiteralPath $descriptor -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:COMPANION_DESCRIPTOR_SHA256 -or (Get-FileHash -LiteralPath $bundle -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:COMPANION_ATTESTATION_SHA256) { throw "companion artifact digest mismatch" }
+          gh attestation verify $archive --bundle $bundle --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-builder.yml" --signer-digest "ebefe97377e4597ab62bc7ea6ab4849219df6fdd" --source-ref $env:CALLER_REF --source-digest $env:CALLER_SHA --deny-self-hosted-runners
+          if ($LASTEXITCODE -ne 0) { throw "trusted companion attestation verification failed" }
+          $python = (Get-Command python.exe -ErrorAction Stop).Source
+          $verifier = (Resolve-Path -LiteralPath trusted-proof/scripts/precutover_companion_descriptor.py).Path
+          & $python $verifier verify --archive $archive --destination verified-companion --expected-sha256 $env:COMPANION_ARCHIVE_SHA256 --expected-descriptor-sha256 $env:COMPANION_DESCRIPTOR_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "trusted companion archive verification failed" }
+          $companionDescriptor = Get-Content -LiteralPath $descriptor -Raw | ConvertFrom-Json
+          if ($companionDescriptor.sourceCommit -cne "ebefe97377e4597ab62bc7ea6ab4849219df6fdd") { throw "companion descriptor source identity mismatch" }
+          "TRUSTED_PYTHON=$python" >> $env:GITHUB_ENV
+          "TRUSTED_WORKFLOW_SHA=$env:TRUSTED_WORKFLOW_SHA" >> $env:GITHUB_ENV
+          "CALLER_SHA=$env:CALLER_SHA" >> $env:GITHUB_ENV
+          "CALLER_REF=$env:CALLER_REF" >> $env:GITHUB_ENV
+          "COMPANION_ARCHIVE_SHA256=$env:COMPANION_ARCHIVE_SHA256" >> $env:GITHUB_ENV
+          "COMPANION_DESCRIPTOR_SHA256=$env:COMPANION_DESCRIPTOR_SHA256" >> $env:GITHUB_ENV
+      - name: Bounded-download exact candidate and official model inputs
+        shell: pwsh
+        env:
+          CANDIDATE_ARCHIVE_URL: ${{ inputs.candidate_archive_url }}
+          CANDIDATE_ARCHIVE_SHA256: ${{ inputs.candidate_archive_sha256 }}
+          CANDIDATE_ARCHIVE_BYTES: ${{ inputs.candidate_archive_bytes }}
+          CANDIDATE_MANIFEST_URL: ${{ inputs.candidate_manifest_url }}
+          CANDIDATE_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
+          CANDIDATE_MANIFEST_BYTES: ${{ inputs.candidate_manifest_bytes }}
+          CANDIDATE_ATTESTATION_URL: ${{ inputs.candidate_attestation_url }}
+          CANDIDATE_ATTESTATION_SHA256: ${{ inputs.candidate_attestation_sha256 }}
+          CANDIDATE_ATTESTATION_BYTES: ${{ inputs.candidate_attestation_bytes }}
+          CANDIDATE_EVIDENCE_URL: ${{ inputs.candidate_evidence_url }}
+          CANDIDATE_EVIDENCE_SHA256: ${{ inputs.candidate_evidence_sha256 }}
+          CANDIDATE_EVIDENCE_BYTES: ${{ inputs.candidate_evidence_bytes }}
+          MODEL_PACK_URL: ${{ inputs.model_pack_url }}
+          MODEL_PACK_SHA256: ${{ inputs.model_pack_sha256 }}
+          MODEL_PACK_BYTES: ${{ inputs.model_pack_bytes }}
+        run: |
+          New-Item -ItemType Directory -Path proof-input/candidate -Force | Out-Null
+          New-Item -ItemType Directory -Path proof-input/model -Force | Out-Null
+          $downloader = (Resolve-Path -LiteralPath trusted-proof/scripts/download_verified_file.py).Path
+          $downloads = @(
+            @($env:CANDIDATE_ARCHIVE_URL, $env:CANDIDATE_ARCHIVE_SHA256, $env:CANDIDATE_ARCHIVE_BYTES, "proof-input/candidate/candidate.zip"),
+            @($env:CANDIDATE_MANIFEST_URL, $env:CANDIDATE_MANIFEST_SHA256, $env:CANDIDATE_MANIFEST_BYTES, "proof-input/candidate/candidate-manifest.json"),
+            @($env:CANDIDATE_ATTESTATION_URL, $env:CANDIDATE_ATTESTATION_SHA256, $env:CANDIDATE_ATTESTATION_BYTES, "proof-input/candidate/github-build-provenance.sigstore.json"),
+            @($env:CANDIDATE_EVIDENCE_URL, $env:CANDIDATE_EVIDENCE_SHA256, $env:CANDIDATE_EVIDENCE_BYTES, "proof-input/candidate/trusted-builder-evidence.json"),
+            @($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "proof-input/model/official-model-pack.zip")
+          )
+          foreach ($download in $downloads) {
+            & $env:TRUSTED_PYTHON $downloader --url $download[0] --sha256 $download[1] --expected-bytes $download[2] --destination $download[3]
+            if ($LASTEXITCODE -ne 0) { throw "trusted proof input download failed" }
+          }
+      - name: Derive exact candidate identities without executing candidate code
+        shell: pwsh
+        run: |
+          $proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path
+          & $env:TRUSTED_PYTHON $proofTool inspect-inputs --input-root proof-input --identity-output proof-input-identity.json
+          if ($LASTEXITCODE -ne 0) { throw "pre-cutover proof input identity failed" }
+          $identity = Get-Content -LiteralPath proof-input-identity.json -Raw | ConvertFrom-Json
+          if ($identity.candidate.sourceCommit -cne $env:CALLER_SHA) { throw "candidate source does not match workflow source" }
+          "PROOF_SOURCE_COMMIT=$($identity.candidate.sourceCommit)" >> $env:GITHUB_ENV
+          "CANDIDATE_SUBJECT_SHA256=$($identity.candidate.subjectSha256)" >> $env:GITHUB_ENV
+          "CANDIDATE_MANIFEST_SHA256=$($identity.candidate.manifestSha256)" >> $env:GITHUB_ENV
+          "CANDIDATE_ATTESTATION_SHA256=$($identity.candidate.attestationSha256)" >> $env:GITHUB_ENV
+          "MODEL_PACK_SHA256=$($identity.modelPack.sha256)" >> $env:GITHUB_ENV
+          "MODEL_PACK_BYTES=$($identity.modelPack.byteSize)" >> $env:GITHUB_ENV
+          "MODEL_DESCRIPTOR_SHA256=$($identity.modelPack.descriptorSha256)" >> $env:GITHUB_ENV
+      - name: Verify candidate GitHub provenance before executing frozen companion
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify proof-input/candidate/candidate.zip --bundle proof-input/candidate/github-build-provenance.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "be8fe434855b94f61511e8c6c926e02c54230a38" --source-ref $env:CALLER_REF --source-digest $env:PROOF_SOURCE_COMMIT --deny-self-hosted-runners
+          if ($LASTEXITCODE -ne 0) { throw "candidate GitHub attestation verification failed" }
+      - name: Execute only the verified frozen companion
+        shell: pwsh
+        run: |
+          $companionExe = (Resolve-Path -LiteralPath verified-companion/vending-vision-precutover-verifier.exe).Path
+          New-Item -ItemType Directory -Path private-proof -Force | Out-Null
+          & $companionExe --candidate-artifact proof-input/candidate/candidate.zip --candidate-manifest proof-input/candidate/candidate-manifest.json --github-attestation proof-input/candidate/github-build-provenance.sigstore.json --trusted-builder-evidence proof-input/candidate/trusted-builder-evidence.json --subject-sha256 $env:CANDIDATE_SUBJECT_SHA256 --manifest-sha256 $env:CANDIDATE_MANIFEST_SHA256 --attestation-bundle-sha256 $env:CANDIDATE_ATTESTATION_SHA256 --source-commit $env:PROOF_SOURCE_COMMIT --model-pack-archive proof-input/model/official-model-pack.zip --model-pack-byte-size $env:MODEL_PACK_BYTES --model-pack-sha256 $env:MODEL_PACK_SHA256 --model-descriptor-sha256 $env:MODEL_DESCRIPTOR_SHA256 --private-parent private-proof --report-output precutover-ai-proof.json --timeout 300
+          if ($LASTEXITCODE -ne 0) { throw "frozen companion proof failed" }
+      - name: Validate canonical proof bindings before attestation
+        shell: pwsh
+        run: |
+          $proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path
+          & $env:TRUSTED_PYTHON $proofTool verify-proof --proof precutover-ai-proof.json --identity proof-input-identity.json
+          if ($LASTEXITCODE -ne 0) { throw "canonical companion proof binding failed" }
+          $proofPath = (Resolve-Path -LiteralPath precutover-ai-proof.json).Path
+          "TRUSTED_PROOF_PATH=$proofPath" >> $env:GITHUB_ENV
+      - name: Attest only the verified canonical companion proof
+        id: attest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.TRUSTED_PROOF_PATH }}
+      - name: Seal exact proof handoff
+        id: identities
+        shell: pwsh
+        env:
+          PROOF_ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          if (-not (Test-Path -LiteralPath $env:PROOF_ATTESTATION_BUNDLE -PathType Leaf)) { throw "proof attestation bundle missing" }
+          New-Item -ItemType Directory -Path proof-handoff | Out-Null
+          Copy-Item -LiteralPath precutover-ai-proof.json -Destination proof-handoff/precutover-ai-proof.json
+          Copy-Item -LiteralPath $env:PROOF_ATTESTATION_BUNDLE -Destination proof-handoff/precutover-ai-proof.sigstore.json
+          $proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path
+          & $env:TRUSTED_PYTHON $proofTool seal-evidence --directory proof-handoff --identity proof-input-identity.json --workflow-sha $env:TRUSTED_WORKFLOW_SHA --companion-archive-sha256 $env:COMPANION_ARCHIVE_SHA256 --companion-descriptor-sha256 $env:COMPANION_DESCRIPTOR_SHA256 --output proof-handoff/trusted-precutover-proof-evidence.json
+          if ($LASTEXITCODE -ne 0) { throw "trusted proof evidence sealing failed" }
+          $proofSha = (Get-FileHash -LiteralPath proof-handoff/precutover-ai-proof.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          $bundleSha = (Get-FileHash -LiteralPath proof-handoff/precutover-ai-proof.sigstore.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          "handoff_artifact_name=trusted-precutover-proof-handoff-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_OUTPUT
+          "proof_sha256=$proofSha" >> $env:GITHUB_OUTPUT
+          "attestation_bundle_sha256=$bundleSha" >> $env:GITHUB_OUTPUT
+          "source_commit=$env:PROOF_SOURCE_COMMIT" >> $env:GITHUB_OUTPUT
+      - name: Upload cross-job proof handoff
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.identities.outputs.handoff_artifact_name }}
+          path: proof-handoff/*
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    needs: [companion_builder, prove]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      attestations: read
+    outputs:
+      artifact_name: ${{ steps.identity.outputs.artifact_name }}
+      proof_sha256: ${{ steps.identity.outputs.proof_sha256 }}
+      attestation_bundle_sha256: ${{ steps.identity.outputs.attestation_bundle_sha256 }}
+      companion_archive_sha256: ${{ steps.identity.outputs.companion_archive_sha256 }}
+      companion_descriptor_sha256: ${{ steps.identity.outputs.companion_descriptor_sha256 }}
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+    steps:
+      - name: Checkout immutable trusted proof verifier
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: trusted-proof
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: trusted-proof/.python-version
+      - name: Download fixed proof handoff
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.prove.outputs.handoff_artifact_name }}
+          path: proof-handoff
+      - name: Verify handoff exact set and canonical bindings
+        id: identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CALLER_SHA: ${{ github.sha }}
+          CALLER_REF: ${{ github.ref }}
+          TRUSTED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          TRUSTED_WORKFLOW_PATH: ${{ job.workflow_file_path }}
+          TRUSTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EXPECTED_PROOF_SHA256: ${{ needs.prove.outputs.proof_sha256 }}
+          EXPECTED_ATTESTATION_SHA256: ${{ needs.prove.outputs.attestation_bundle_sha256 }}
+          EXPECTED_SOURCE_COMMIT: ${{ needs.prove.outputs.source_commit }}
+          EXPECTED_COMPANION_ARCHIVE_SHA256: ${{ needs.companion_builder.outputs.archive_sha256 }}
+          EXPECTED_COMPANION_DESCRIPTOR_SHA256: ${{ needs.companion_builder.outputs.descriptor_sha256 }}
+        run: |
+          if ($env:TRUSTED_WORKFLOW_REPOSITORY -cne "hbhjt/vending-vision" -or $env:TRUSTED_WORKFLOW_PATH -cne ".github/workflows/trusted-precutover-companion-proof.yml" -or $env:TRUSTED_WORKFLOW_SHA -notmatch '^[a-f0-9]{40}$') { throw "unexpected fresh proof verifier identity" }
+          if ($env:CALLER_SHA -cne $env:EXPECTED_SOURCE_COMMIT -or $env:CALLER_REF -notmatch '^refs/(heads|tags)/[A-Za-z0-9._/-]+$') { throw "fresh proof source identity mismatch" }
+          $python = (Get-Command python.exe -ErrorAction Stop).Source
+          $proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path
+          & $python $proofTool verify-evidence --directory proof-handoff --workflow-sha $env:TRUSTED_WORKFLOW_SHA --proof-sha256 $env:EXPECTED_PROOF_SHA256 --attestation-sha256 $env:EXPECTED_ATTESTATION_SHA256 --source-commit $env:EXPECTED_SOURCE_COMMIT --companion-archive-sha256 $env:EXPECTED_COMPANION_ARCHIVE_SHA256 --companion-descriptor-sha256 $env:EXPECTED_COMPANION_DESCRIPTOR_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "fresh proof evidence verification failed" }
+          gh attestation verify proof-handoff/precutover-ai-proof.json --bundle proof-handoff/precutover-ai-proof.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-proof.yml" --signer-digest $env:TRUSTED_WORKFLOW_SHA --source-ref $env:CALLER_REF --source-digest $env:CALLER_SHA --deny-self-hosted-runners
+          if ($LASTEXITCODE -ne 0) { throw "trusted proof GitHub attestation verification failed" }
+          "artifact_name=vending-vision-precutover-proof-$env:EXPECTED_SOURCE_COMMIT" >> $env:GITHUB_OUTPUT
+          "proof_sha256=$env:EXPECTED_PROOF_SHA256" >> $env:GITHUB_OUTPUT
+          "attestation_bundle_sha256=$env:EXPECTED_ATTESTATION_SHA256" >> $env:GITHUB_OUTPUT
+          "companion_archive_sha256=$env:EXPECTED_COMPANION_ARCHIVE_SHA256" >> $env:GITHUB_OUTPUT
+          "companion_descriptor_sha256=$env:EXPECTED_COMPANION_DESCRIPTOR_SHA256" >> $env:GITHUB_OUTPUT
+          "source_commit=$env:EXPECTED_SOURCE_COMMIT" >> $env:GITHUB_OUTPUT
+      - name: Upload fresh-runner verified proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.identity.outputs.artifact_name }}
+          path: proof-handoff/*
+          if-no-files-found: error
+          retention-days: 30
