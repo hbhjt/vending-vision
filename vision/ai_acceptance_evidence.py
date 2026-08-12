@@ -1,6 +1,7 @@
 """Private installed-acceptance sink for completed AI regional evidence."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 
 _ATTEMPT_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _MAX_SIDECAR_BYTES = 512 * 1024
+_WINDOWS = os.name == "nt"
 
 
 def _canonical(value: object) -> bytes:
@@ -67,6 +69,10 @@ def _identity(path: Path) -> tuple[int, int] | None:
         info = path.lstat()
     except FileNotFoundError:
         return None
+    return _identity_from_stat(info)
+
+
+def _identity_from_stat(info: os.stat_result) -> tuple[int, int] | None:
     if not stat.S_ISREG(info.st_mode):
         return None
     return info.st_dev, info.st_ino
@@ -75,6 +81,55 @@ def _identity(path: Path) -> tuple[int, int] | None:
 def _unlink_created_file(path: Path, identity: tuple[int, int] | None) -> None:
     if identity is not None and _identity(path) == identity:
         path.unlink()
+
+
+def _open_held_temporary(temporary: Path) -> int:
+    if _WINDOWS:
+        # The CRT open used here cannot promise a read-only sharing mode for a
+        # handle held across the link and final fence.  Do not claim a Windows
+        # success until that boundary has an explicit CreateFile implementation.
+        raise RuntimeError("ai_acceptance_evidence_windows_held_handle_unavailable")
+    return os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+
+
+def _sha256_from_descriptor(descriptor: int) -> bytes:
+    offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 64 * 1024):
+            digest.update(chunk)
+        return digest.digest()
+    finally:
+        os.lseek(descriptor, offset, os.SEEK_SET)
+
+
+def _verify_final_destination(
+    destination: Path,
+    source_descriptor: int,
+    expected_size: int,
+    expected_digest: bytes,
+) -> None:
+    """Fence the published name against the source inode and canonical bytes."""
+    source_identity = _identity_from_stat(os.fstat(source_descriptor))
+    if source_identity is None or _identity(destination) != source_identity:
+        raise RuntimeError("ai_acceptance_evidence_final_fence_failed")
+    try:
+        destination_descriptor = os.open(
+            destination, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+    except OSError as exc:
+        raise RuntimeError("ai_acceptance_evidence_final_fence_failed") from exc
+    try:
+        info = os.fstat(destination_descriptor)
+        if (
+            _identity_from_stat(info) != source_identity
+            or info.st_size != expected_size
+            or _sha256_from_descriptor(destination_descriptor) != expected_digest
+        ):
+            raise RuntimeError("ai_acceptance_evidence_final_fence_failed")
+    finally:
+        os.close(destination_descriptor)
 
 
 def _raise_with_cleanup(
@@ -112,21 +167,29 @@ def publish_completed_ai_regional_evidence(attempt_id: str, content: bytes) -> P
     primary = None
     cleanup_errors: list[BaseException] = []
     try:
-        fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "wb", closefd=True) as stream:
-            fd = None
+        fd = _open_held_temporary(temporary)
+        with os.fdopen(os.dup(fd), "wb", closefd=True) as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        temporary_identity = _identity(temporary)
+        temporary_identity = _identity_from_stat(os.fstat(fd))
         if temporary_identity is None:
             raise RuntimeError("ai_acceptance_evidence_temporary_invalid")
         os.link(temporary, destination)
         published_identity = _identity(destination)
-        if published_identity is None:
+        if published_identity != temporary_identity:
             raise RuntimeError("ai_acceptance_evidence_publish_invalid")
         _fsync_directory(root)
         temporary.unlink()
+        # Keep the claim and source descriptor through this publication fence.
+        _fsync_directory(root)
+        _verify_final_destination(
+            destination,
+            fd,
+            len(content),
+            hashlib.sha256(content).digest(),
+        )
+        claim.rmdir()
     except FileExistsError as exc:
         primary = RuntimeError("ai_acceptance_evidence_exists")
         primary.__cause__ = exc
@@ -144,27 +207,15 @@ def publish_completed_ai_regional_evidence(attempt_id: str, content: bytes) -> P
 
         if fd is not None:
             cleanup(lambda: os.close(fd))
-        cleanup(lambda: _unlink_created_file(temporary, temporary_identity))
-        cleanup(claim.rmdir)
         if primary is None and cleanup_errors:
             primary = cleanup_errors.pop(0)
         if primary is not None:
             cleanup(lambda: _unlink_created_file(destination, published_identity))
             cleanup(lambda: _unlink_created_file(temporary, temporary_identity))
             cleanup(claim.rmdir)
-        try:
-            _fsync_directory(root)
-        except BaseException as exc:
-            if primary is None:
-                primary = exc
-                cleanup(lambda: _unlink_created_file(destination, published_identity))
-                cleanup(lambda: _unlink_created_file(temporary, temporary_identity))
-                cleanup(claim.rmdir)
-                try:
-                    _fsync_directory(root)
-                except BaseException as retry_error:
-                    cleanup_errors.append(retry_error)
-            else:
-                cleanup_errors.append(exc)
+            # Retry one transient cleanup failure without hiding its evidence.
+            cleanup(lambda: _unlink_created_file(temporary, temporary_identity))
+            cleanup(claim.rmdir)
+            cleanup(lambda: _fsync_directory(root))
         _raise_with_cleanup(primary, cleanup_errors)
     return destination

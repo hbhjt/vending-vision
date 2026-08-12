@@ -233,3 +233,76 @@ def test_acceptance_sink_does_not_delete_an_external_post_link_replacement(
     assert replaced is True
     assert destination.read_bytes() == b"external publisher bytes\n"
     assert {path.name for path in root.iterdir()} == {destination.name}
+
+
+def test_acceptance_sink_rejects_replacement_during_first_directory_fsync(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "acceptance"
+    root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(root))
+    attempt_id = str(uuid4())
+    destination = root / f"{attempt_id}.regional-evidence.json"
+    replacement = tmp_path / "external-replacement.json"
+    replacement.write_bytes(b"external publisher bytes\n")
+    fsync_calls = 0
+
+    def replace_on_first_fsync(path):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 1:
+            assert path == root
+            os.replace(replacement, destination)
+
+    monkeypatch.setattr(
+        acceptance_evidence, "_fsync_directory", replace_on_first_fsync
+    )
+
+    with pytest.raises(RuntimeError, match="final_fence_failed"):
+        publish_completed_ai_regional_evidence(attempt_id, canonical_sidecar())
+
+    assert fsync_calls >= 2
+    assert destination.read_bytes() == b"external publisher bytes\n"
+    assert {path.name for path in root.iterdir()} == {destination.name}
+
+
+def test_acceptance_sink_rejects_inplace_rewrite_during_first_directory_fsync(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "acceptance"
+    root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(root))
+    attempt_id = str(uuid4())
+    destination = root / f"{attempt_id}.regional-evidence.json"
+    fsync_calls = 0
+
+    def rewrite_on_first_fsync(path):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 1:
+            assert path == root
+            destination.write_bytes(b"in-place mutation\n")
+
+    monkeypatch.setattr(
+        acceptance_evidence, "_fsync_directory", rewrite_on_first_fsync
+    )
+
+    with pytest.raises(RuntimeError, match="final_fence_failed"):
+        publish_completed_ai_regional_evidence(attempt_id, canonical_sidecar())
+
+    assert fsync_calls >= 2
+    assert list(root.iterdir()) == []
+
+
+def test_acceptance_sink_fails_closed_without_a_windows_held_handle(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "acceptance"
+    root.mkdir()
+    monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(root))
+    monkeypatch.setattr(acceptance_evidence, "_WINDOWS", True)
+
+    with pytest.raises(RuntimeError, match="windows_held_handle_unavailable"):
+        publish_completed_ai_regional_evidence(str(uuid4()), canonical_sidecar())
+
+    assert list(root.iterdir()) == []
