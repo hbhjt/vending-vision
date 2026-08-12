@@ -113,7 +113,7 @@ jobs:
   publish:
     needs: [verify, trusted_signer]
     runs-on: windows-latest
-    environment: trusted-precutover
+    environment: experimental-candidate
     permissions:
       contents: write
     steps:

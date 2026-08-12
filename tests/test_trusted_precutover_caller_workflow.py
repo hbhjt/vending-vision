@@ -57,6 +57,7 @@ def test_caller_only_sha_pins_the_reusable_proof_and_forwards_all_inputs():
     assert "steps:" not in source
     assert "secrets:" not in source
     assert "environment:" not in source
+    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in source
 
 
 def test_caller_grants_only_reusable_proof_permissions_and_produces_its_exact_three_member_artifact():

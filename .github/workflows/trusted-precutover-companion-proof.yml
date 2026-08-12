@@ -137,7 +137,7 @@ jobs:
   execute:
     needs: companion_builder
     runs-on: windows-latest
-    environment: trusted-precutover
+    environment: experimental-candidate
     timeout-minutes: 180
     permissions:
       contents: read
@@ -360,7 +360,7 @@ jobs:
       - companion_builder
       - execute
     runs-on: windows-latest
-    environment: trusted-precutover
+    environment: experimental-candidate
     timeout-minutes: 180
     permissions:
       contents: read

@@ -516,7 +516,7 @@ def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
     execute_permission = """  execute:
     needs: companion_builder
     runs-on: windows-latest
-    environment: trusted-precutover
+    environment: experimental-candidate
     timeout-minutes: 180
     permissions:
       contents: read
