@@ -1884,6 +1884,73 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
+def test_front_read_cancellation_wins_when_waiter_scheduling_lags(monkeypatch):
+    """A fenced attempt cannot return a frame merely because its waiter lags."""
+
+    class DelayedCancellation:
+        def is_set(self):
+            return True
+
+        async def wait(self):
+            await asyncio.Event().wait()
+
+    class Registry:
+        async def is_current(self, _receipt):
+            return True
+
+        async def cancel_event_for(self, _receipt):
+            return DelayedCancellation()
+
+    async def blocked_read(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    async def aborted(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(vision_app, "_fast_attempt_registry", Registry())
+    monkeypatch.setattr(vision_app, "read_camera_with_source_async", blocked_read)
+    monkeypatch.setattr(vision_app, "abort_camera_request", aborted)
+    receipt = vision_app.AttemptReceipt(str(uuid4()), "owner", 1)
+
+    with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
+        asyncio.run(
+            vision_app._read_attempt_front_frame(
+                receipt, timeout=0.01, lease_token="test-cancel-fence"
+            )
+        )
+
+
+def test_render_cancellation_wins_when_waiter_scheduling_lags(monkeypatch):
+    """A fenced render result cannot win because the waiter has not run yet."""
+
+    class DelayedCancellation:
+        def is_set(self):
+            return True
+
+        async def wait(self):
+            await asyncio.Event().wait()
+
+    class Registry:
+        async def is_current(self, _receipt):
+            return True
+
+        async def cancel_event_for(self, _receipt):
+            return DelayedCancellation()
+
+    async def completed_render():
+        return b"rendered"
+
+    monkeypatch.setattr(vision_app, "_fast_attempt_registry", Registry())
+    receipt = vision_app.AttemptReceipt(str(uuid4()), "owner", 1)
+
+    with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
+        asyncio.run(
+            vision_app._run_owned_attempt_step(
+                receipt, completed_render(), timeout=0.01
+            )
+        )
+
+
 def test_v2_fast_result_store_rejects_self_too_large_without_publishing(monkeypatch):
     monkeypatch.setattr(vision_app, "_FAST_RESULT_MAX_BYTES", 8)
     image = _png_bytes()

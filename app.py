@@ -234,16 +234,17 @@ async def _run_owned_attempt_step(receipt: AttemptReceipt, operation, *, timeout
     if not await _fast_attempt_registry.is_current(receipt):
         raise GarmentFetchError("attempt_canceled")
     worker = asyncio.create_task(operation)
-    cancel_waiter = asyncio.create_task(
-        (await _fast_attempt_registry.cancel_event_for(receipt)).wait()
-    )
+    cancel_event = await _fast_attempt_registry.cancel_event_for(receipt)
+    cancel_waiter = asyncio.create_task(cancel_event.wait())
     try:
         done, _ = await asyncio.wait(
             {worker, cancel_waiter}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
         )
-        if worker in done:
+        # The registry's fence is authoritative; a completed worker may be a
+        # late result from an owner already replaced by the next attempt.
+        if worker in done and not cancel_event.is_set():
             return worker.result()
-        if cancel_waiter in done:
+        if cancel_event.is_set() or cancel_waiter in done:
             raise GarmentFetchError("attempt_canceled")
         raise asyncio.TimeoutError()
     except (asyncio.TimeoutError, asyncio.CancelledError, GarmentFetchError):
@@ -302,20 +303,25 @@ async def _read_attempt_front_frame(
                 "front", 1, timeout=max(0.001, deadline - loop.time())
             )
         )
-        cancel_waiter = asyncio.create_task(
-            (await _fast_attempt_registry.cancel_event_for(receipt)).wait()
-        )
+        cancel_event = await _fast_attempt_registry.cancel_event_for(receipt)
+        cancel_waiter = asyncio.create_task(cancel_event.wait())
         try:
             done, _ = await asyncio.wait(
                 {read_task, cancel_waiter},
                 timeout=max(0.001, deadline - loop.time()),
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if read_task in done:
+            # A cancellation fences this receipt even when its waiter has not
+            # yet been scheduled.  Never return a just-completed frame to a
+            # replacement or disconnected attempt.
+            cancelled = cancel_event.is_set()
+            if read_task in done and not cancelled:
                 return read_task.result()
 
             abort_reason = (
-                "try_on_attempt_canceled" if cancel_waiter in done else "try_on_attempt_timeout"
+                "try_on_attempt_canceled"
+                if cancelled or cancel_waiter in done
+                else "try_on_attempt_timeout"
             )
             abort_task = asyncio.create_task(
                 abort_camera_request("front", reason=abort_reason)
@@ -329,7 +335,7 @@ async def _read_attempt_front_frame(
                 )
             if not dead:
                 raise RuntimeError("front camera broker remained alive after abort")
-            if cancel_waiter in done:
+            if cancelled or cancel_waiter in done:
                 raise GarmentFetchError("attempt_canceled")
             raise asyncio.TimeoutError()
         except asyncio.CancelledError:
