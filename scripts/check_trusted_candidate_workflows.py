@@ -286,7 +286,7 @@ def check_trusted_candidate_workflows(
         "hosted-authority/scripts/verify_hosted_release_authority.py",
         "--mode publish-admission",
         "--mode publish-complete",
-        "environment: trusted-precutover",
+        "environment: experimental-candidate",
         "gh release create $env:RELEASE_TAG",
         "--target $env:RELEASE_TARGET",
         "--verify-tag",
@@ -299,7 +299,7 @@ def check_trusted_candidate_workflows(
     ):
         _require(forbidden not in publish, f"publisher_forbidden_capability:{forbidden}")
     _require("rulesets?targets=tag" not in publish, "publisher_unavailable_rulesets_api")
-    _require(publish.count("environment: trusted-precutover") == 1, "publisher_environment_authority")
+    _require(publish.count("environment: experimental-candidate") == 1, "publisher_environment_authority")
     _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in publisher_source, "publisher_supplier_key_present")
     _assert_gh_attestation_flags_parse(repository_root)
 

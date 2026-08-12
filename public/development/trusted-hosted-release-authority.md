@@ -9,10 +9,11 @@ of either candidate publication or pre-cutover proof.
 
 The hosted authority is the conjunction of these independently checked facts:
 
-1. The privileged job declares the `trusted-precutover` GitHub environment.
-   That environment must allow deployments only from custom tag pattern
-   `v*.*.*-rc.*`. Required reviewers should be enabled whenever the repository
-   plan supports them. A branch dispatch cannot enter the job.
+1. The privileged jobs share the existing `experimental-candidate` GitHub
+   environment with the candidate signer. Its deployment branch policy has
+   `protected_branches=false`, `custom_branch_policies=true`, and exactly one
+   custom policy `{type: tag, name: v*.*.*-rc.*}`. A branch dispatch cannot
+   enter the job.
 2. The job fetches `main`, the exact 40-character source commit, and the exact
    `refs/tags/vX.Y.Z-rc.N` ref into a fresh bare repository. The tag must peel to
    the claimed commit and that commit must be an ancestor of fetched `main`.
@@ -27,10 +28,16 @@ The hosted authority is the conjunction of these independently checked facts:
    fetched again in each fresh job. A moved tag therefore disagrees with the
    existing release target and fails closed.
 
-`trusted-precutover` is an admission authority, not a secret boundary. The
-manual caller has read-only repository permission, invokes only the SHA-pinned
-reusable proof, and neither executes candidate code itself nor receives the
-proof signing environment or its secrets.
+`experimental-candidate` is an admission authority, not a secret-transfer
+boundary. The manual caller has read-only repository permission and invokes
+only the SHA-pinned reusable proof. GitHub does not pass environment secrets
+through a reusable-workflow call, and the proof workflow never references
+`VISION_SUPPLIER_PRIVATE_KEY_PEM` or any other supplier-signing secret.
+
+Before release operation, an administrator or operator with permission to read
+environment policies should run the repository's read-only preflight. The
+workflow does not perform this API call because its ordinary `github.token`
+may receive `403` even though environment admission itself works.
 
 ## Repository governance constraint
 

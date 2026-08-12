@@ -263,10 +263,10 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         for fragment in (
             f"ref: {HOSTED_AUTHORITY_SHA}",
             "path: hosted-authority",
-            "environment: trusted-precutover",
+            "environment: experimental-candidate",
         ):
             _require(fragment in block, f"trusted_proof_{label}_hosted_authority:{fragment}")
-    _require("environment: trusted-precutover" not in verify, "trusted_proof_verify_environment")
+    _require("environment: experimental-candidate" not in verify, "trusted_proof_verify_environment")
     _require("rulesets?targets=tag" not in source, "trusted_proof_unavailable_rulesets_api")
 
     execution_job = jobs["execute"]

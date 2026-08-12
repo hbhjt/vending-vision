@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from scripts.verify_hosted_release_authority import AuthorityError, verify_release_fence
+from scripts.verify_hosted_environment import verify_environment
 
 
 REPOSITORY = "hbhjt/vending-vision"
@@ -132,7 +133,7 @@ def test_publish_and_proof_use_the_hosted_environment_and_release_fence_not_rule
     assert "rulesets?targets=tag" not in publisher
     assert "rulesets?targets=tag" not in proof
     publish_job = publisher[publisher.index("  publish:\n") :]
-    assert "environment: trusted-precutover" in publish_job.split("steps:", 1)[0]
+    assert "environment: experimental-candidate" in publish_job.split("steps:", 1)[0]
     assert f"ref: {AUTHORITY_COMMIT}" in publish_job
     assert "verify_hosted_release_authority.py" in publish_job
     assert "--mode publish-admission" in publish_job
@@ -144,7 +145,7 @@ def test_publish_and_proof_use_the_hosted_environment_and_release_fence_not_rule
     execute = proof[proof.index("  execute:\n") : proof.index("  sign:\n")]
     sign = proof[proof.index("  sign:\n") : proof.index("  verify:\n")]
     for job in (execute, sign):
-        assert "environment: trusted-precutover" in job.split("steps:", 1)[0]
+        assert "environment: experimental-candidate" in job.split("steps:", 1)[0]
         assert f"ref: {AUTHORITY_COMMIT}" in job
         assert "verify_hosted_release_authority.py" in job
         assert "--mode proof" in job
@@ -165,3 +166,30 @@ def test_publish_and_proof_use_the_hosted_environment_and_release_fence_not_rule
         "gh release edit",
     ):
         assert forbidden not in combined
+
+
+def test_operator_preflight_requires_the_exact_existing_rc_tag_environment_policy():
+    preflight = (ROOT / "scripts/verify_hosted_environment.py").read_text("utf-8")
+    assert "experimental-candidate" in preflight
+    assert "v*.*.*-rc.*" in preflight
+    assert "PUT" not in preflight and "POST" not in preflight and "DELETE" not in preflight
+
+    environment = {
+        "name": "experimental-candidate",
+        "deployment_branch_policy": {
+            "protected_branches": False,
+            "custom_branch_policies": True,
+        },
+    }
+    policies = {
+        "branch_policies": [{"id": 1, "type": "tag", "name": "v*.*.*-rc.*"}]
+    }
+    verify_environment(environment, policies)
+
+    for drift in (
+        {"branch_policies": []},
+        {"branch_policies": [*policies["branch_policies"], policies["branch_policies"][0]]},
+        {"branch_policies": [{"id": 1, "type": "branch", "name": "v*.*.*-rc.*"}]},
+    ):
+        with pytest.raises(AssertionError, match="configuration_drift"):
+            verify_environment(environment, drift)
