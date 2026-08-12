@@ -44,6 +44,7 @@ from vision.camera_manager import (
     read_camera_with_source,
     read_camera_with_source_async,
     release_all_cameras,
+    restart_camera_request,
     reset_camera,
 )
 from vision.camera_binding import (
@@ -342,6 +343,11 @@ async def _read_attempt_front_frame(
                 )
             if not dead:
                 raise RuntimeError("front camera broker remained alive after abort")
+            # The canceled request's own broker cleanup has now joined.  Make
+            # the replacement child command-loop ready before lifting this
+            # attempt's cleanup boundary, so the next generation's frame
+            # deadline measures a read rather than process bootstrap.
+            await restart_camera_request("front")
             if cancelled or cancel_waiter in done:
                 raise GarmentFetchError("attempt_canceled")
             raise asyncio.TimeoutError()
@@ -360,6 +366,7 @@ async def _read_attempt_front_frame(
                 )
             if not dead:
                 raise RuntimeError("front camera broker remained alive after cancel")
+            await _await_cleanup_uncancelled(restart_camera_request("front"))
             raise
         finally:
             cancel_waiter.cancel()

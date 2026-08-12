@@ -256,6 +256,12 @@ def directshow_broker_entry(connection: Connection, config: dict) -> None:
             lease = None
 
     try:
+        if config.get("_brokerReadyHandshake", False):
+            # Recovery starts this child before releasing the canceled attempt's
+            # cleanup barrier.  This signal proves the spawned runtime reached
+            # its command loop; the next attempt's frame budget never pays for
+            # import and process bootstrap.
+            connection.send(("ready", {"pid": os.getpid()}))
         while True:
             try:
                 command, payload = connection.recv()
@@ -322,6 +328,7 @@ class DirectShowCameraBroker:
         self._process = None
         self._request_threads: set[threading.Thread] = set()
         self._request_abort = threading.Event()
+        self._ready = False
         self._fatal_error: str | None = None
         self._quiesced = False
         self.opened_at: float | None = None
@@ -389,8 +396,57 @@ class DirectShowCameraBroker:
         self._parent = parent
         self._child = None
         self._process = process
+        self._ready = False
         self.opened_at = time.time()
         self.restart_count += 1
+
+    def _wait_ready(self, parent: Connection, process: Any, deadline: float) -> None:
+        if not self.config.get("_brokerReadyHandshake", False) or self._ready:
+            return
+        while time.monotonic() < deadline:
+            if self._request_abort.is_set():
+                raise RuntimeError("directshow broker startup was aborted")
+            if parent.poll(0.005):
+                kind, response = parent.recv()
+                if kind == "ready":
+                    if not isinstance(response, dict) or not isinstance(response.get("pid"), int):
+                        raise RuntimeError("directshow broker returned invalid startup readiness")
+                    self._ready = True
+                    return
+                raise RuntimeError(f"directshow broker startup failed: {response}")
+            if _is_process_alive(process) is _ProcessLiveness.DEAD:
+                _close_dead_process(process)
+                raise RuntimeError(
+                    f"directshow broker exited during startup with {process.exitcode}"
+                )
+        raise TimeoutError("directshow broker startup readiness deadline exceeded")
+
+    async def start_async(self, *, timeout: float = STOP_CONFIRM_TIMEOUT_SECONDS) -> None:
+        """Start and prove a replacement child is command-loop ready.
+
+        This is intentionally a recovery boundary, not a read timeout: callers
+        invoke it only after the canceled request thread has joined.
+        """
+        if not self._request_slot.acquire(blocking=False):
+            raise RuntimeError("directshow broker already has an active request")
+        self._request_abort.clear()
+        try:
+            with self._state_lock:
+                self._start_locked()
+                assert self._parent is not None
+                parent = self._parent
+                process = self._process
+            await asyncio.to_thread(
+                self._wait_ready,
+                parent,
+                process,
+                time.monotonic() + max(float(timeout), 0.001),
+            )
+        except BaseException:
+            await self.abort_async(reason="startup_readiness_failed")
+            raise
+        finally:
+            self._request_slot.release()
 
     def _stop_process(self, *, graceful: bool, reason: str) -> bool:
         """Stop and join the child without ever faking death or losing its handle."""
@@ -485,17 +541,21 @@ class DirectShowCameraBroker:
                 raise RuntimeError("directshow broker already has an active request")
             self._request_abort.clear()
         try:
-            with self._state_lock:
-                self._start_locked()
-                assert self._parent is not None
-                parent = self._parent
-                process = self._process
-                self._parent.send((command, payload))
             deadline = time.monotonic() + (
                 DEFAULT_READ_TIMEOUT_SECONDS
                 if timeout is None
                 else max(float(timeout), 0.001)
             )
+            with self._state_lock:
+                self._start_locked()
+                assert self._parent is not None
+                parent = self._parent
+                process = self._process
+            self._wait_ready(parent, process, deadline)
+            with self._state_lock:
+                if self._parent is not parent or self._process is not process:
+                    raise RuntimeError("directshow broker changed during startup")
+                self._parent.send((command, payload))
             while time.monotonic() < deadline:
                 if self._request_abort.is_set():
                     raise RuntimeError("directshow broker request was aborted")

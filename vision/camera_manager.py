@@ -357,6 +357,9 @@ class DirectShowFrameSource:
     def __init__(self, role: str, config: dict):
         self.role = role
         self.config = dict(config)
+        # A restarted physical-camera child must be command-loop ready before
+        # the canceled attempt releases its cleanup barrier.
+        self.config["_brokerReadyHandshake"] = True
 
     def _broker(self) -> DirectShowCameraBroker:
         with _streams_lock:
@@ -701,6 +704,25 @@ async def abort_camera_request(role: str, *, reason: str) -> bool:
             if _dshow_brokers.get(role) is broker:
                 _dshow_brokers.pop(role, None)
     return dead
+
+
+async def restart_camera_request(role: str) -> bool:
+    """Prestart a fresh DirectShow child after the prior request has joined."""
+    source = get_frame_source(role)
+    if not isinstance(source, DirectShowFrameSource):
+        return True
+    broker = await source._broker_async()
+    start = getattr(broker, "start_async", None)
+    if start is None:
+        return True
+    try:
+        await start()
+        return True
+    except Exception:
+        with _streams_lock:
+            if _dshow_brokers.get(role) is broker:
+                _dshow_brokers.pop(role, None)
+        raise
 
 
 async def abort_all_camera_requests(*, reason: str) -> dict[str, bool]:

@@ -37,6 +37,7 @@ def _active_child_pids_except_acquisition_observer():
 def _fast_block_first_broker_target(connection, config):
     counter = config["requestCounter"]
     try:
+        connection.send(("ready", {"pid": os.getpid()}))
         while True:
             command, _payload = connection.recv()
             if command == "shutdown":
@@ -47,6 +48,32 @@ def _fast_block_first_broker_target(connection, config):
                     counter.value += 1
                     request_number = counter.value
                 if request_number == 1:
+                    while True:
+                        threading.Event().wait(1.0)
+                connection.send(("ok", {
+                    "pid": os.getpid(),
+                    "image": np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8),
+                }))
+    finally:
+        connection.close()
+
+
+def _fast_block_then_slow_ready_broker_target(connection, config):
+    starts = config["starts"]
+    with starts.get_lock():
+        starts.value += 1
+        start_number = starts.value
+    if start_number > 1:
+        time.sleep(config["restartReadyDelay"])
+    try:
+        connection.send(("ready", {"pid": os.getpid()}))
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+            if command == "read":
+                if start_number == 1:
                     while True:
                         threading.Event().wait(1.0)
                 connection.send(("ok", {
@@ -1803,11 +1830,13 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
     broker = DirectShowCameraBroker(
         "front",
         {
-        "role": "profile_fast_try_on",
+            "role": "profile_fast_try_on",
+            "source": "dshow",
             "index": 9,
             "backend": "dshow",
             "stableId": "front-stable",
             "keep_open": True,
+            "_brokerReadyHandshake": True,
             "requestCounter": counter,
         },
         context=context,
@@ -1864,7 +1893,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
         with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
             await asyncio.wait_for(read_task, timeout=1.0)
         assert ticks >= 10
-        assert broker.assert_dead()
+        assert not broker.assert_dead()
         assert broker.active_request_count == 0
 
         for generation in range(2, 12):
@@ -1890,6 +1919,89 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
+def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monkeypatch):
+    """A new generation receives a warmed command loop, not a spawn deadline."""
+    context = multiprocessing.get_context("spawn")
+    starts = context.Value("i", 0)
+    broker = DirectShowCameraBroker(
+        "front",
+        {
+            "role": "profile_fast_try_on",
+            "source": "dshow",
+            "index": 9,
+            "backend": "dshow",
+            "stableId": "front-stable",
+            "keep_open": True,
+            "_brokerReadyHandshake": True,
+            "starts": starts,
+            "restartReadyDelay": 0.5,
+        },
+        context=context,
+        target=_fast_block_then_slow_ready_broker_target,
+    )
+
+    class Candidate:
+        index = 9
+        backend = "dshow"
+        stable_id = "front-stable"
+
+    class Maintenance:
+        def resolve(self, role):
+            assert role == "front"
+            return Candidate()
+
+        def refresh_after_read_failure(self):
+            return None
+
+    class Registry:
+        def __init__(self):
+            self.cancel_event = asyncio.Event()
+
+        async def is_current(self, _receipt):
+            return not self.cancel_event.is_set()
+
+        async def cancel_event_for(self, _receipt):
+            return self.cancel_event
+
+    registry = Registry()
+    monkeypatch.setattr(vision_app, "_fast_attempt_registry", registry)
+    monkeypatch.setattr(vision_app.settings, "FRONT_CAMERA_CONFIG", {
+        "role": "profile_fast_try_on", "source": "dshow", "keep_open": True,
+    })
+    monkeypatch.setattr(camera_manager, "get_camera_maintenance", lambda: Maintenance())
+    monkeypatch.setattr(camera_manager, "DirectShowCameraBroker", lambda _role, _config: broker)
+    camera_manager.release_all_cameras()
+
+    async def scenario():
+        first = vision_app.AttemptReceipt(str(uuid4()), "owner-1", 1)
+        blocked = asyncio.create_task(
+            vision_app._read_attempt_front_frame(first, timeout=15.0)
+        )
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while starts.value < 1 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.002)
+        registry.cancel_event.set()
+        with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
+            await asyncio.wait_for(blocked, timeout=4.0)
+
+        # The half-second startup delay was paid behind the canceled owner's
+        # cleanup barrier; the CI's one-second generation budget covers the read alone.
+        assert starts.value == 2
+        assert broker.active_request_count == 0
+        registry.cancel_event = asyncio.Event()
+        second = vision_app.AttemptReceipt(str(uuid4()), "owner-2", 2)
+        frame, _source = await vision_app._read_attempt_front_frame(second, timeout=1.0)
+        assert frame.shape == (80, 60, 3)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        assert asyncio.run(broker.abort_async(reason="test_cleanup"))
+        with camera_manager._streams_lock:
+            camera_manager._dshow_brokers.pop("front", None)
+    assert broker.assert_dead()
+
+
 def test_front_read_cancellation_wins_when_waiter_scheduling_lags(monkeypatch):
     """A fenced attempt cannot return a frame merely because its waiter lags."""
 
@@ -1913,9 +2025,13 @@ def test_front_read_cancellation_wins_when_waiter_scheduling_lags(monkeypatch):
     async def aborted(*_args, **_kwargs):
         return True
 
+    async def restart(_role):
+        return True
+
     monkeypatch.setattr(vision_app, "_fast_attempt_registry", Registry())
     monkeypatch.setattr(vision_app, "read_camera_with_source_async", blocked_read)
     monkeypatch.setattr(vision_app, "abort_camera_request", aborted)
+    monkeypatch.setattr(vision_app, "restart_camera_request", restart)
     receipt = vision_app.AttemptReceipt(str(uuid4()), "owner", 1)
 
     with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
@@ -1949,9 +2065,13 @@ def test_front_read_current_receipt_fence_wins_after_completed_frame(monkeypatch
         aborted.append((role, reason))
         return True
 
+    async def restart(_role):
+        return True
+
     monkeypatch.setattr(vision_app, "_fast_attempt_registry", Registry())
     monkeypatch.setattr(vision_app, "read_camera_with_source_async", completed_read)
     monkeypatch.setattr(vision_app, "abort_camera_request", abort)
+    monkeypatch.setattr(vision_app, "restart_camera_request", restart)
     receipt = vision_app.AttemptReceipt(str(uuid4()), "owner", 1)
 
     with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
