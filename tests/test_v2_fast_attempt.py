@@ -1755,7 +1755,13 @@ def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeyp
     async def is_current(_receipt):
         return True
 
+    async def cancel_event_for(_receipt):
+        return asyncio.Event()
+
     monkeypatch.setattr(vision_app._fast_attempt_registry, "is_current", is_current)
+    monkeypatch.setattr(
+        vision_app._fast_attempt_registry, "cancel_event_for", cancel_event_for
+    )
     monkeypatch.setattr(vision_app.settings, "FRONT_CAMERA_CONFIG", {
         "role": "profile_fast_try_on",
         "source": "dshow",
