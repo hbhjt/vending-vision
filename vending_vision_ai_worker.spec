@@ -8,11 +8,21 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, co
 
 ROOT = Path(SPECPATH)
 OFFICIAL_AI_SOURCE_DESCRIPTOR_PATH = ROOT / "official-ai-source-descriptor.json"
+REGIONAL_EVALUATOR_DESCRIPTOR_PATH = ROOT / "regional-evaluator-descriptor.json"
 OFFICIAL_AI_SOURCE_DATA_FILES = []
 for source in json.loads(OFFICIAL_AI_SOURCE_DESCRIPTOR_PATH.read_text("utf-8"))["sources"]:
     relative = source["path"]
     if relative.endswith(".py"):
         OFFICIAL_AI_SOURCE_DATA_FILES.append((str(ROOT / relative), str(Path(relative).parent)))
+REGIONAL_EVALUATOR_SOURCE_DATA_FILES = []
+official_source_paths = {
+    source["path"]
+    for source in json.loads(OFFICIAL_AI_SOURCE_DESCRIPTOR_PATH.read_text("utf-8"))["sources"]
+}
+for source in json.loads(REGIONAL_EVALUATOR_DESCRIPTOR_PATH.read_text("utf-8"))["sources"]:
+    relative = source["path"]
+    if relative.endswith(".py") and relative not in official_source_paths:
+        REGIONAL_EVALUATOR_SOURCE_DATA_FILES.append((str(ROOT / relative), str(Path(relative).parent)))
 
 datas = [
     (str(ROOT / "official-ai-model-pack-descriptor.json"), "."),
@@ -20,12 +30,16 @@ datas = [
     (str(ROOT / "requirements-ai.txt"), "."),
     (str(ROOT / "requirements-ai.lock.json"), "."),
     (str(ROOT / "official-ai-source-descriptor.json"), "."),
+    (str(ROOT / "regional-evaluator-descriptor.json"), "."),
     (str(ROOT / "vision" / "vendor" / "catvton" / "LICENSE"), "vision/vendor/catvton"),
     (str(ROOT / "vision" / "vendor" / "catvton" / "PROVENANCE.md"), "vision/vendor/catvton"),
     *OFFICIAL_AI_SOURCE_DATA_FILES,
+    *REGIONAL_EVALUATOR_SOURCE_DATA_FILES,
 ]
 hiddenimports = [
     "vision.ai_attempt_worker",
+    "vision.regional_evaluator",
+    "vision.regional_evaluator_provenance",
     "vision.ai_model_pack",
     "vision.ai_runtime_descriptor",
     "vision.ai_attempt_process",

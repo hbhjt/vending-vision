@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import hashlib
 import json
 import os
 import socket
@@ -22,6 +21,11 @@ from vision.ai_model_pack import (
     verify_ai_model_pack,
 )
 from vision.ai_runtime_descriptor import dependency_version_satisfies, expected_dependency_requirements
+from vision.regional_evaluator import RegionalEvaluatorError, write_regional_evidence
+from vision.regional_evaluator_provenance import (
+    regional_evaluator_descriptor_sha256,
+    verify_regional_evaluator_provenance,
+)
 from vision.source_provenance import verify_official_source_provenance
 
 _MAX_INPUT_BYTES = 20 * 1024 * 1024
@@ -42,21 +46,6 @@ class CatVTONWorkerError(RuntimeError):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _canonical_json(value: dict[str, object]) -> bytes:
-    return (
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        + "\n"
-    ).encode("utf-8")
 
 
 def _captured_source(raw: str | None) -> dict[str, object]:
@@ -91,38 +80,6 @@ def _captured_source(raw: str | None) -> dict[str, object]:
     return value
 
 
-def _rle(mask) -> dict[str, object]:
-    flat = (mask.reshape(-1) > 0).tolist()
-    runs: list[list[int]] = []
-    start = None
-    for index, selected in enumerate([*flat, False]):
-        if selected and start is None:
-            start = index
-        elif not selected and start is not None:
-            runs.append([start, index - start])
-            start = None
-    if not runs:
-        raise CatVTONWorkerError("official_catvton_regional_mask_empty")
-    return {"encoding": "rle-row-major/v1", "runs": runs}
-
-
-def _measurement(original, result, mask) -> dict[str, int]:
-    import numpy as np
-
-    selected = mask > 0
-    sampled = int(np.count_nonzero(selected))
-    if sampled == 0:
-        raise CatVTONWorkerError("official_catvton_regional_mask_empty")
-    delta = np.abs(result.astype(np.int16) - original.astype(np.int16))
-    changed = int(np.count_nonzero(np.any(delta > 0, axis=2) & selected))
-    return {
-        "changedFractionBps": changed * 10_000 // sampled,
-        "changedPixels": changed,
-        "meanDelta": int(delta[selected].sum()) // (sampled * 3),
-        "sampledPixels": sampled,
-    }
-
-
 def _write_regional_evidence(
     *,
     args: argparse.Namespace,
@@ -134,69 +91,27 @@ def _write_regional_evidence(
     source = _captured_source(args.captured_source)
     output_path = Path(args.output)
     evidence_path = Path(args.regional_evidence_output)
-    if evidence_path.parent.resolve() != output_path.parent.resolve() or evidence_path == output_path:
-        raise CatVTONWorkerError("official_catvton_regional_output_path_invalid")
-    upper_measurement = _measurement(original, result, upper_body)
-    protected_measurement = _measurement(original, result, protected)
-    source_descriptor = Path(__file__).resolve().parents[1] / "official-ai-source-descriptor.json"
-    upper_measurement["verdict"] = (
-        "changed" if upper_measurement["changedPixels"] > 0 else "insufficient_change"
-    )
-    protected_measurement["verdict"] = (
-        "preserved" if protected_measurement["changedPixels"] == 0 else "changed"
-    )
-    verdict = (
-        "passed"
-        if upper_measurement["verdict"] == "changed"
-        and protected_measurement["verdict"] == "preserved"
-        else "regional_check_failed"
-    )
-    sidecar = {
-        "attempt": {
-            "acquisitionSource": "direct_recorded_frame",
-            "decodedHeight": int(original.shape[0]),
-            "decodedWidth": int(original.shape[1]),
-            "garmentSha256": _sha256(Path(args.garment)),
-            "inputSha256": _sha256(Path(args.person)),
-            "recordedFixtureSha256": source["fixtureSha256"],
-            "resultSha256": _sha256(output_path),
-            "sourceCamera": "front",
-        },
-        "evaluator": {
-            "algorithm": "rgb-absolute-delta-rle/v1",
-            "atr": "schp-atr",
-            "lip": "schp-lip",
-            "pose": "mediapipe-pose",
-            "sourceDescriptorSha256": _sha256(source_descriptor),
-        },
-        "kind": "regional-evidence",
-        "masks": {
-            "height": int(original.shape[0]),
-            "protectedRegion": _rle(protected),
-            "upperBody": _rle(upper_body),
-            "width": int(original.shape[1]),
-        },
-        "measurements": {
-            "protectedRegion": protected_measurement,
-            "upperBody": upper_measurement,
-        },
-        "policy": {
-            "schemaVersion": "vem-ai-regional-evidence-policy/v1",
-            "sha256": "780b7adad8f9512635448a94d7f8cbc868abe2555a2fb601d421a2e5d73e2d35",
-        },
-        "schemaVersion": "vem-ai-regional-evidence/v1",
-        "verdict": verdict,
-    }
-    evidence_path.parent.mkdir(parents=True, exist_ok=True)
-    temp = evidence_path.with_name(f".{evidence_path.name}.{os.getpid()}.tmp")
     try:
-        with temp.open("xb") as stream:
-            stream.write(_canonical_json(sidecar))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, evidence_path)
-    finally:
-        temp.unlink(missing_ok=True)
+        if not verify_regional_evaluator_provenance():
+            raise CatVTONWorkerError("official_catvton_regional_evaluator_provenance_mismatch")
+        write_regional_evidence(
+            output_path=output_path,
+            evidence_path=evidence_path,
+            person_path=Path(args.person),
+            garment_path=Path(args.garment),
+            captured_source=source,
+            original=original,
+            result=result,
+            upper_body=upper_body,
+            protected=protected,
+            evaluator_source_descriptor_sha256=regional_evaluator_descriptor_sha256(),
+            policy={
+                "schemaVersion": "vem-ai-regional-evidence-policy/v1",
+                "sha256": "5f007b21e7b64d65bd878c9af08bc20b764e31fb16a03807bc8ddaab1bc22d6d",
+            },
+        )
+    except RegionalEvaluatorError as exc:
+        raise CatVTONWorkerError(str(exc)) from exc
 
 
 def _pack_path(root: Path, relative: str) -> Path:

@@ -457,7 +457,7 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
         "lip": "schp-lip",
         "pose": "mediapipe-pose",
         "sourceDescriptorSha256": hashlib.sha256(
-            (ROOT / "official-ai-source-descriptor.json").read_bytes()
+            (ROOT / "regional-evaluator-descriptor.json").read_bytes()
         ).hexdigest(),
     }
     assert sidecar["masks"]["width"] == 96
@@ -500,9 +500,75 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
             )
     assert sidecar["policy"] == {
         "schemaVersion": "vem-ai-regional-evidence-policy/v1",
-        "sha256": "780b7adad8f9512635448a94d7f8cbc868abe2555a2fb601d421a2e5d73e2d35",
+        "sha256": "5f007b21e7b64d65bd878c9af08bc20b764e31fb16a03807bc8ddaab1bc22d6d",
     }
     assert sidecar["verdict"] in {"passed", "regional_check_failed"}
+
+    # This is the cross-repository contract: the real Vision worker sidecar
+    # satisfies VEM identity validation before the intentionally pending
+    # two-garment calibration gate rejects it.
+    vem_root = ROOT.parent / "vem"
+    assert (vem_root / "scripts/testbed/ai-regional-evidence.mjs").is_file()
+    attempt_id = "0198f44e-21bd-7c62-8f52-b7c86cc2d099"
+    artifact_root = work / "vem-artifacts"
+    relative = f"regional/short/{attempt_id}.regional-evidence.json"
+    artifact_sidecar = artifact_root / relative
+    artifact_sidecar.parent.mkdir(parents=True)
+    artifact_sidecar.write_bytes(regional.read_bytes())
+    validation = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "-e",
+            """
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+const { validateAiRegionalEvidence } = await import(process.argv[1]);
+const [artifactRoot, sidecarPath, attemptId, relative] = process.argv.slice(2);
+const raw = readFileSync(sidecarPath);
+const sidecar = JSON.parse(raw);
+const sha256 = createHash("sha256").update(raw).digest("hex");
+console.log(JSON.stringify(validateAiRegionalEvidence({
+  attemptId,
+  caseKey: "short",
+  garment: { sha256: sidecar.attempt.garmentSha256 },
+  input: { sha256: sidecar.attempt.inputSha256 },
+  result: {
+    decodedHeight: sidecar.attempt.decodedHeight,
+    decodedWidth: sidecar.attempt.decodedWidth,
+    sha256: sidecar.attempt.resultSha256,
+  },
+  regionalEvidence: {
+    path: relative,
+    schemaVersion: "vem-ai-regional-evidence-reference/v1",
+    sha256,
+    verdict: sidecar.verdict,
+  },
+}, artifactRoot, { files: [{
+  byteLength: raw.byteLength,
+  kind: "supportingEvidence",
+  path: sidecarPath,
+  sha256,
+  track: "aiVirtualTryOn",
+}] })));
+""",
+            (vem_root / "scripts/testbed/ai-regional-evidence.mjs").as_uri(),
+            str(artifact_root),
+            str(artifact_sidecar),
+            attempt_id,
+            relative,
+        ],
+        cwd=vem_root,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert validation.returncode == 0, validation.stderr
+    assert json.loads(validation.stdout) == {
+        "ok": False,
+        "reason": "AI regional evidence policy awaits Issue10 two-garment calibration",
+    }
 
 
 @pytest.mark.parametrize(

@@ -415,6 +415,7 @@ def assert_ai_worker_layout(exe_path, *, required):
         internal / "ai-runtime-descriptor.json",
         internal / "requirements-ai.lock.json",
         internal / "official-ai-source-descriptor.json",
+        internal / "regional-evaluator-descriptor.json",
     ]
     missing = [str(path) for path in required_resources if not path.is_file()]
     if missing:

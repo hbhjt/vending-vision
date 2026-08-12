@@ -39,6 +39,7 @@ def test_frozen_spec_keeps_the_generated_v2_bundle_and_static_boundary_import():
 
     assert "CONTRACT_DATA_FILES" in spec
     assert "OFFICIAL_AI_SOURCE_DATA_FILES" in spec
+    assert "REGIONAL_EVALUATOR_SOURCE_DATA_FILES" in spec
     assert '(CONTRACT_ROOT / "manifest.json", "contracts/vem_vision_v2")' in spec
     assert '(CONTRACT_ROOT / "__init__.py", "contracts/vem_vision_v2")' in spec
     assert '(CONTRACT_ROOT / "python" / "__init__.py", "contracts/vem_vision_v2/python")' in spec
@@ -53,6 +54,7 @@ def test_frozen_spec_keeps_the_generated_v2_bundle_and_static_boundary_import():
     assert '"vision.ai_attempt_process"' in spec
     assert '"vision.catvton_preprocess"' in spec
     assert "official-ai-source-descriptor.json" in spec
+    assert "regional-evaluator-descriptor.json" in spec
     assert '"contracts.vem_vision_v2.python.vision_v2_models"' in spec
 
 
@@ -82,9 +84,11 @@ def test_ai_runtime_packaging_includes_worker_code_but_excludes_official_weights
     worker_spec = (ROOT / "vending_vision_ai_worker.spec").read_text("utf-8")
     assert 'name="vending-vision-ai-worker"' in worker_spec
     assert "OFFICIAL_AI_SOURCE_DATA_FILES" in worker_spec
+    assert "REGIONAL_EVALUATOR_SOURCE_DATA_FILES" in worker_spec
     assert "collect_submodules(\"vision.vendor.catvton\")" in worker_spec
     assert "official-ai-model-pack-descriptor.json" in worker_spec
     assert "official-ai-source-descriptor.json" in worker_spec
+    assert "regional-evaluator-descriptor.json" in worker_spec
     assert "model.safetensors" not in worker_spec
 
 
@@ -272,6 +276,7 @@ def test_packaged_verifier_ai_worker_layout_binds_descriptor_resources(tmp_path)
         "ai-runtime-descriptor.json",
         "requirements-ai.lock.json",
         "official-ai-source-descriptor.json",
+        "regional-evaluator-descriptor.json",
     ):
         (internal / name).write_text("{}", "utf-8")
 
