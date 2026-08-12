@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+import subprocess
 
 from scripts.workflow_yaml import load_workflow_yaml
 from scripts.trusted_precutover_proof import HANDOFF_FILES
@@ -8,7 +10,7 @@ from scripts.trusted_precutover_proof import HANDOFF_FILES
 
 ROOT = Path(__file__).parents[1]
 CALLER = ROOT / ".github/workflows/trusted-precutover-caller.yml"
-PROOF_SHA = "7d1e0bfb90fb2a58d44540202ac1c4e807eb6a2d"
+PROOF_SHA = "6f598fe01f1fb9af76ec6985fdc2df8fbbe95710"
 CANDIDATE_INPUTS = {
     f"{name}_{field}"
     for name in (
@@ -58,6 +60,45 @@ def test_caller_only_sha_pins_the_reusable_proof_and_forwards_all_inputs():
     assert "secrets:" not in source
     assert "environment:" not in source
     assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in source
+
+
+def test_caller_pinned_history_contains_the_environment_authority_and_secret_isolation():
+    source = CALLER.read_text("utf-8")
+    match = re.search(
+        r"uses: hbhjt/vending-vision/\.github/workflows/"
+        r"trusted-precutover-companion-proof\.yml@([a-f0-9]{40})",
+        source,
+    )
+    assert match is not None
+    pinned_sha = match.group(1)
+    completed = subprocess.run(
+        [
+            "git",
+            "show",
+            f"{pinned_sha}:.github/workflows/trusted-precutover-companion-proof.yml",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    pinned = completed.stdout
+    workflow = load_workflow_yaml(pinned)
+    assert workflow["jobs"]["execute"]["environment"] == "experimental-candidate"
+    assert workflow["jobs"]["sign"]["environment"] == "experimental-candidate"
+    assert "environment" not in workflow["jobs"]["verify"]
+    assert workflow["jobs"]["execute"]["permissions"] == {
+        "attestations": "read",
+        "contents": "read",
+    }
+    assert workflow["jobs"]["sign"]["permissions"] == {
+        "attestations": "write",
+        "contents": "read",
+        "id-token": "write",
+    }
+    assert "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228" in pinned
+    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in pinned
 
 
 def test_caller_grants_only_reusable_proof_permissions_and_produces_its_exact_three_member_artifact():
