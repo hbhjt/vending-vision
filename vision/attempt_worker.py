@@ -121,10 +121,11 @@ def _wait_process_dead(process: Any, timeout: float) -> bool:
                         join(timeout=0)
                     except (AssertionError, OSError, PermissionError, ValueError):
                         pass
-                try:
-                    return not _process_is_alive(process)
-                except (OSError, PermissionError):
-                    return True
+                # A readable multiprocessing sentinel is the operating-system
+                # proof that the process has physically exited.  is_alive()
+                # may still expose a stale parent-side reap/cache view under
+                # runner load and must not override that stronger proof.
+                return True
             return not _process_is_alive(process)
         except (AttributeError, OSError, PermissionError, ValueError):
             pass
@@ -639,7 +640,8 @@ class FastRenderBroker:
                 if slot is not None:
                     slot.close(unlink=True)
                 return True
-            if _process_is_alive(process):
+            physical_dead = not _process_is_alive(process)
+            if not physical_dead:
                 if _should_call_kill(process):
                     try:
                         process.kill()
@@ -650,20 +652,17 @@ class FastRenderBroker:
                         terminate("terminate-after-kill-error")
                 else:
                     terminate("terminate-fallback")
-                _wait_process_dead(process, _STOP_CONFIRM_TIMEOUT_SECONDS)
-            if _process_is_alive(process):
+                physical_dead = _wait_process_dead(
+                    process, _STOP_CONFIRM_TIMEOUT_SECONDS
+                )
+            if not physical_dead and _process_is_alive(process):
                 terminate("terminate")
-                _wait_process_dead(process, _STOP_CONFIRM_TIMEOUT_SECONDS)
-            if _process_is_alive(process):
-                if _wait_process_dead(process, 0.05):
-                    _close_dead_process(process)
-                    self._parent = None
-                    self._process = None
-                    self._slot = None
-                    self._fatal_error = None
-                    if slot is not None:
-                        slot.close(unlink=True)
-                    return True
+                physical_dead = _wait_process_dead(
+                    process, _STOP_CONFIRM_TIMEOUT_SECONDS
+                )
+            if not physical_dead and _process_is_alive(process):
+                physical_dead = _wait_process_dead(process, 0.05)
+            if not physical_dead:
                 self._parent = parent
                 self._process = process
                 self._slot = slot

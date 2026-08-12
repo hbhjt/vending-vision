@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import pytest
 
+import vision.attempt_worker as attempt_worker_module
 from vision.attempt_worker import AttemptWorkerError, FastRenderBroker, render_attempt_frame
 from vision.render_worker_target import _render, render_worker_entry
 from vision.shared_ipc_slot import _HEADER
@@ -1025,6 +1026,63 @@ def test_stubborn_kill_oserror_retains_handle_and_fails_closed_without_restart()
             await broker.start()
 
     asyncio.run(scenario())
+
+
+def test_render_shutdown_accepts_process_sentinel_before_is_alive_reap_catches_up(
+    monkeypatch,
+):
+    class ReapLagProcess:
+        pid = 9293
+        exitcode = 0
+
+        def __init__(self):
+            self.sentinel = object()
+            self.killed = False
+            self.terminate_calls = 0
+            self.join_calls = []
+            self.closed = False
+
+        def is_alive(self):
+            # multiprocessing's cached/reap view may lag the kernel sentinel
+            # under runner load. The sentinel remains the physical-death proof.
+            return True
+
+        def kill(self):
+            self.killed = True
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        def join(self, timeout=None):
+            self.join_calls.append(timeout)
+
+        def close(self):
+            self.closed = True
+
+    process = ReapLagProcess()
+
+    def wait_for_physical_death(sentinels, timeout):
+        assert sentinels == [process.sentinel]
+        return sentinels if process.killed else []
+
+    monkeypatch.setattr(
+        attempt_worker_module, "wait_for_sentinels", wait_for_physical_death
+    )
+
+    async def scenario():
+        broker = FastRenderBroker()
+        broker._process = process
+        broker._ready = True
+        await broker.shutdown()
+        return broker
+
+    broker = asyncio.run(scenario())
+
+    assert process.killed is True
+    assert process.terminate_calls == 0
+    assert process.join_calls == [0]
+    assert process.closed is True
+    assert broker.pid is None
 
 
 def test_render_shutdown_does_not_call_stubborn_blocking_join_before_dead():
