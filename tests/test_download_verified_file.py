@@ -366,6 +366,95 @@ def test_post_link_failure_preserves_an_identity_replacement(tmp_path, monkeypat
     assert [path.name for path in tmp_path.iterdir()] == [destination.name]
 
 
+def test_rollback_identity_check_to_unlink_race_preserves_replacement(
+    tmp_path, monkeypatch
+):
+    url = "https://example.invalid/rollback-race.bin"
+    payload = b"created rollback identity"
+    destination = tmp_path / "rollback-race.bin"
+    other = b"replacement after identity check"
+    from scripts import download_verified_file as downloader
+
+    real_move = downloader._move_no_replace
+    checked = False
+
+    def replace_at_destination_move(source, target):
+        nonlocal checked
+        if Path(source) == destination and not checked:
+            checked = True
+            replacement = tmp_path / "rollback-winner.tmp"
+            replacement.write_bytes(other)
+            os.replace(replacement, destination)
+        return real_move(source, target)
+
+    monkeypatch.setattr(
+        "scripts.download_verified_file._move_no_replace", replace_at_destination_move
+    )
+
+    real_fsync = os.fsync
+    fsync_calls = 0
+
+    def fail_publish_parent_fsync(descriptor):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("trigger rollback race")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        "scripts.download_verified_file.os.fsync", fail_publish_parent_fsync
+    )
+    with pytest.raises(OSError, match="trigger rollback race"):
+        download_verified_file(
+            url,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            destination,
+            opener=lambda _request, timeout: Response(payload, url),
+        )
+
+    assert checked
+    assert destination.read_bytes() == other
+    assert [path.name for path in tmp_path.iterdir()] == [destination.name]
+
+
+def test_windows_integrity_handle_denies_write_share_and_flushes_directory():
+    from scripts.download_verified_file import _WindowsFileApi
+
+    calls = []
+
+    class Kernel32:
+        def CreateFileW(self, path, access, share, security, creation, flags, template):
+            calls.append((path, access, share, creation, flags))
+            return 41
+
+        def FlushFileBuffers(self, handle):
+            calls.append(("flush", handle))
+            return 1
+
+        def CloseHandle(self, handle):
+            calls.append(("close", handle))
+            return 1
+
+    api = _WindowsFileApi(Kernel32())
+    file_handle = api.open_file(Path("C:/proof.bin"))
+    directory_handle = api.open_directory(Path("C:/proof"))
+    api.flush(directory_handle)
+    api.close(file_handle)
+    api.close(directory_handle)
+
+    assert calls[0] == (
+        "C:/proof.bin",
+        api.GENERIC_READ,
+        api.FILE_SHARE_READ | api.FILE_SHARE_DELETE,
+        api.OPEN_EXISTING,
+        api.FILE_ATTRIBUTE_NORMAL,
+    )
+    assert calls[1][-1] == api.FILE_FLAG_BACKUP_SEMANTICS
+    assert (calls[0][2] & 0x00000002) == 0  # no FILE_SHARE_WRITE
+    assert calls[2:] == [("flush", 41), ("close", 41), ("close", 41)]
+
+
 def test_final_identity_change_after_durable_cleanup_preserves_replacement(
     tmp_path, monkeypatch
 ):

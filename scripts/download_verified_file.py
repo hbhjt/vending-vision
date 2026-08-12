@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import math
 import os
@@ -32,7 +34,22 @@ def _file_identity(path: Path) -> tuple[int, int, int, int]:
     return facts.st_dev, facts.st_ino, facts.st_mode, facts.st_size
 
 
+def _descriptor_identity(descriptor: int) -> tuple[int, int, int, int]:
+    facts = os.fstat(descriptor)
+    if not stat.S_ISREG(facts.st_mode):
+        raise DownloadError("download_destination_identity")
+    return facts.st_dev, facts.st_ino, facts.st_mode, facts.st_size
+
+
 def _fsync_directory(directory: Path) -> None:
+    if os.name == "nt":
+        api = _WindowsFileApi()
+        handle = api.open_directory(directory)
+        try:
+            api.flush(handle)
+        finally:
+            api.close(handle)
+        return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     descriptor = os.open(directory, flags)
     try:
@@ -41,14 +58,117 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _unlink_if_identity(path: Path, expected: tuple[int, int, int, int]) -> bool:
+class _WindowsFileApi:
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+
+    def __init__(self, kernel32=None):
+        if kernel32 is None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel32 = kernel32
+
+    def _open(self, path: Path, flags: int):
+        handle = self.kernel32.CreateFileW(
+            str(path),
+            self.GENERIC_READ,
+            self.FILE_SHARE_READ | self.FILE_SHARE_DELETE,
+            None,
+            self.OPEN_EXISTING,
+            flags,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in {None, 0, -1, invalid}:
+            raise DownloadError("download_integrity_handle_open")
+        return handle
+
+    def open_file(self, path: Path):
+        return self._open(path, self.FILE_ATTRIBUTE_NORMAL)
+
+    def open_directory(self, path: Path):
+        return self._open(path, self.FILE_FLAG_BACKUP_SEMANTICS)
+
+    def flush(self, handle) -> None:
+        if not self.kernel32.FlushFileBuffers(handle):
+            raise DownloadError("download_directory_flush")
+
+    def close(self, handle) -> None:
+        if not self.kernel32.CloseHandle(handle):
+            raise DownloadError("download_integrity_handle_close")
+
+
+class _HeldFile:
+    def __init__(self, path: Path):
+        self.path = path
+        self.windows_api = _WindowsFileApi() if os.name == "nt" else None
+        if self.windows_api is not None:
+            self.handle = self.windows_api.open_file(path)
+            self.identity = _file_identity(path)
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            self.handle = os.open(path, flags)
+            self.identity = _descriptor_identity(self.handle)
+
+    def close(self) -> None:
+        if self.handle is None:
+            return
+        handle, self.handle = self.handle, None
+        if self.windows_api is not None:
+            self.windows_api.close(handle)
+        else:
+            os.close(handle)
+
+
+def _move_no_replace(source: Path, destination: Path) -> None:
+    if os.name == "nt":
+        os.rename(source, destination)
+        return
+    if os.name != "posix":
+        raise DownloadError("download_atomic_rollback_unsupported")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise DownloadError("download_atomic_rollback_unsupported")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    ) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination)
+        raise OSError(error, os.strerror(error), source)
+
+
+def _rollback_created_destination(
+    destination: Path,
+    rollback_root: Path,
+    expected: tuple[int, int, int, int],
+) -> bool:
+    quarantine = rollback_root / "destination"
     try:
-        if _file_identity(path) != expected:
-            return False
-        path.unlink()
-        return True
+        _move_no_replace(destination, quarantine)
     except FileNotFoundError:
         return False
+    if _file_identity(quarantine) == expected:
+        quarantine.unlink()
+        return True
+    _move_no_replace(quarantine, destination)
+    return False
 
 
 def download_verified_file(
@@ -103,7 +223,12 @@ def download_verified_file(
         prefix=f".{destination.name}-", dir=destination.parent
     )
     temporary = Path(temporary_name)
+    rollback_root = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}-rollback-", dir=destination.parent)
+    )
+    rollback_root.chmod(0o700)
     created_identity: tuple[int, int, int, int] | None = None
+    held: _HeldFile | None = None
     temporary_removed = False
     try:
         digest = hashlib.sha256()
@@ -144,12 +269,13 @@ def download_verified_file(
         if actual_sha256 != sha256:
             raise DownloadError("download_digest")
         remaining()
+        held = _HeldFile(temporary)
         try:
             os.link(temporary, destination)
         except FileExistsError as exc:
             raise DownloadError("download_destination") from exc
         created_identity = _file_identity(destination)
-        if created_identity != _file_identity(temporary):
+        if created_identity != held.identity:
             raise DownloadError("download_destination_identity")
         _fsync_directory(destination.parent)
         temporary.unlink()
@@ -157,13 +283,19 @@ def download_verified_file(
         _fsync_directory(destination.parent)
         if _file_identity(destination) != created_identity:
             raise DownloadError("download_destination_identity")
+        held.close()
+        held = None
     except BaseException:
         if created_identity is not None:
-            removed = _unlink_if_identity(destination, created_identity)
+            removed = _rollback_created_destination(
+                destination, rollback_root, created_identity
+            )
             if removed:
                 _fsync_directory(destination.parent)
         raise
     finally:
+        if held is not None:
+            held.close()
         if descriptor >= 0:
             os.close(descriptor)
         if not temporary_removed:
@@ -177,6 +309,7 @@ def download_verified_file(
                     cleanup_error = exc
             if not temporary_removed and cleanup_error is not None:
                 raise cleanup_error
+        rollback_root.rmdir()
 
 
 def main() -> int:
