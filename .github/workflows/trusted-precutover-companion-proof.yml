@@ -143,7 +143,7 @@ jobs:
           COMPANION_ATTESTATION_SHA256: ${{ needs.companion_builder.outputs.attestation_bundle_sha256 }}
         run: |
           if ($env:TRUSTED_WORKFLOW_REPOSITORY -cne "hbhjt/vending-vision" -or $env:TRUSTED_WORKFLOW_PATH -cne ".github/workflows/trusted-precutover-companion-proof.yml" -or $env:TRUSTED_WORKFLOW_SHA -notmatch '^[a-f0-9]{40}$') { throw "unexpected trusted proof workflow identity" }
-          if ($env:CALLER_SHA -notmatch '^[a-f0-9]{40}$' -or $env:CALLER_REF -notmatch '^refs/(heads|tags)/[A-Za-z0-9._/-]+$') { throw "proof caller source identity is invalid" }
+          if ($env:CALLER_SHA -notmatch '^[a-f0-9]{40}$' -or $env:CALLER_REF -notmatch '^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+$') { throw "proof caller source identity is invalid" }
           if ($env:COMPANION_ARCHIVE_FILE -cne "vending-vision-precutover-verifier.zip" -or $env:COMPANION_DESCRIPTOR_FILE -cne "precutover-companion-descriptor.json" -or $env:COMPANION_ATTESTATION_FILE -cne "precutover-companion-provenance.sigstore.json") { throw "companion artifact filenames are invalid" }
           if ($env:COMPANION_ARCHIVE_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:COMPANION_DESCRIPTOR_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:COMPANION_ATTESTATION_SHA256 -notmatch '^[a-f0-9]{64}$') { throw "companion artifact digests are invalid" }
           $entries = @(Get-ChildItem -LiteralPath companion-input)
@@ -217,6 +217,29 @@ jobs:
           "MODEL_PACK_SHA256=$($identity.modelPack.sha256)" >> $env:GITHUB_ENV
           "MODEL_PACK_BYTES=$($identity.modelPack.byteSize)" >> $env:GITHUB_ENV
           "MODEL_DESCRIPTOR_SHA256=$($identity.modelPack.descriptorSha256)" >> $env:GITHUB_ENV
+      - name: Approve exact RC tag against protected main and active immutable-tag ruleset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init --bare proof-source-approval.git
+          git --git-dir proof-source-approval.git remote add origin https://github.com/hbhjt/vending-vision.git
+          git --git-dir proof-source-approval.git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) { throw "protected main fetch failed" }
+          $commitRefspec = "+${env:PROOF_SOURCE_COMMIT}:refs/trusted/source-commit"
+          $tagRefspec = "+${env:CALLER_REF}:${env:CALLER_REF}"
+          git --git-dir proof-source-approval.git fetch --no-tags origin $commitRefspec
+          if ($LASTEXITCODE -ne 0) { throw "proof source commit fetch failed" }
+          git --git-dir proof-source-approval.git fetch --no-tags origin $tagRefspec
+          if ($LASTEXITCODE -ne 0) { throw "proof source tag fetch failed" }
+          $sourceApproval = (Resolve-Path -LiteralPath trusted-proof/scripts/approve_candidate_source.py).Path
+          & $env:TRUSTED_PYTHON $sourceApproval --git-dir proof-source-approval.git --source-commit $env:PROOF_SOURCE_COMMIT --source-ref $env:CALLER_REF --protected-main refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) { throw "proof source is not an exact protected-main RC tag" }
+          gh api --paginate --slurp -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10" "/repos/hbhjt/vending-vision/rulesets?targets=tag&includes_parents=true&per_page=100" | Set-Content -LiteralPath proof-tag-rulesets.json -Encoding utf8NoBOM
+          if ($LASTEXITCODE -ne 0) { throw "proof tag ruleset API unavailable" }
+          $tagPolicy = (Resolve-Path -LiteralPath trusted-proof/scripts/verify_release_tag_ruleset.py).Path
+          & $env:TRUSTED_PYTHON $tagPolicy --rulesets proof-tag-rulesets.json --repository hbhjt/vending-vision --source-ref $env:CALLER_REF
+          if ($LASTEXITCODE -ne 0) { throw "proof RC tag lacks active update and deletion protection" }
       - name: Verify candidate GitHub provenance before executing frozen companion
         shell: pwsh
         env:
@@ -317,7 +340,7 @@ jobs:
           EXPECTED_COMPANION_DESCRIPTOR_SHA256: ${{ needs.companion_builder.outputs.descriptor_sha256 }}
         run: |
           if ($env:TRUSTED_WORKFLOW_REPOSITORY -cne "hbhjt/vending-vision" -or $env:TRUSTED_WORKFLOW_PATH -cne ".github/workflows/trusted-precutover-companion-proof.yml" -or $env:TRUSTED_WORKFLOW_SHA -notmatch '^[a-f0-9]{40}$') { throw "unexpected fresh proof verifier identity" }
-          if ($env:CALLER_SHA -cne $env:EXPECTED_SOURCE_COMMIT -or $env:CALLER_REF -notmatch '^refs/(heads|tags)/[A-Za-z0-9._/-]+$') { throw "fresh proof source identity mismatch" }
+          if ($env:CALLER_SHA -cne $env:EXPECTED_SOURCE_COMMIT -or $env:CALLER_REF -notmatch '^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+$') { throw "fresh proof source identity mismatch" }
           $python = (Get-Command python.exe -ErrorAction Stop).Source
           $proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path
           & $python $proofTool verify-evidence --directory proof-handoff --workflow-sha $env:TRUSTED_WORKFLOW_SHA --proof-sha256 $env:EXPECTED_PROOF_SHA256 --attestation-sha256 $env:EXPECTED_ATTESTATION_SHA256 --source-commit $env:EXPECTED_SOURCE_COMMIT --companion-archive-sha256 $env:EXPECTED_COMPANION_ARCHIVE_SHA256 --companion-descriptor-sha256 $env:EXPECTED_COMPANION_DESCRIPTOR_SHA256

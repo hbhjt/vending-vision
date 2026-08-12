@@ -5,6 +5,10 @@ import re
 import subprocess
 import sys
 
+import pytest
+
+from scripts.approve_candidate_source import approve_source
+from scripts.verify_release_tag_ruleset import verify_rulesets
 from scripts.workflow_yaml import load_workflow_yaml, workflow_run_scalars
 
 
@@ -105,6 +109,17 @@ def test_trusted_proof_workflow_passes_executable_trust_policy():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_trusted_proof_requires_real_tag_peel_main_ancestry_and_active_ruleset():
+    source = TRUSTED_PROOF.read_text("utf-8")
+
+    assert "trusted-proof/scripts/approve_candidate_source.py" in source
+    assert "--protected-main refs/remotes/origin/main" in source
+    assert "+refs/heads/main:refs/remotes/origin/main" in source
+    assert "trusted-proof/scripts/verify_release_tag_ruleset.py" in source
+    assert "rulesets?targets=tag&includes_parents=true&per_page=100" in source
+    assert "^refs/(heads|tags)/" not in source
+
+
 def test_trusted_proof_policy_rejects_mutable_authority_and_execution_bypasses(tmp_path):
     trusted = TRUSTED_PROOF.read_text("utf-8")
     attest_match = re.search(
@@ -151,3 +166,91 @@ def test_trusted_proof_policy_rejects_mutable_authority_and_execution_bypasses(t
         candidate.write_text(source, "utf-8")
         completed = _check_policy(candidate)
         assert completed.returncode != 0, name
+
+
+def _git(repository: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _source_repository(root: Path) -> tuple[Path, str, str]:
+    root.mkdir()
+    _git(root, "init", "-b", "main")
+    _git(root, "config", "user.email", "precutover-proof@example.test")
+    _git(root, "config", "user.name", "Precutover Proof")
+    (root / "source.txt").write_text("approved\n", "utf-8")
+    _git(root, "add", "source.txt")
+    _git(root, "commit", "-m", "approved")
+    approved = _git(root, "rev-parse", "HEAD")
+    (root / "source.txt").write_text("main tip\n", "utf-8")
+    _git(root, "commit", "-am", "main tip")
+    main_tip = _git(root, "rev-parse", "HEAD")
+    return root, approved, main_tip
+
+
+@pytest.mark.parametrize("case", ["head-ref", "moved-tag", "non-main-ancestor"])
+def test_real_source_approval_rejects_branch_moved_tag_and_non_main_commit(tmp_path, case):
+    repository, approved, main_tip = _source_repository(tmp_path / "source")
+    source_commit = approved
+    source_ref = "refs/tags/v1.2.3-rc.1"
+    if case == "head-ref":
+        source_ref = "refs/heads/1.2.3-rc.1"
+    elif case == "moved-tag":
+        _git(repository, "tag", "-a", "v1.2.3-rc.1", "-m", "moved", main_tip)
+    else:
+        _git(repository, "checkout", "--orphan", "unapproved")
+        (repository / "source.txt").write_text("unapproved\n", "utf-8")
+        _git(repository, "add", "source.txt")
+        _git(repository, "commit", "-m", "unapproved")
+        source_commit = _git(repository, "rev-parse", "HEAD")
+        _git(repository, "tag", "-a", "v1.2.3-rc.1", "-m", "unapproved", source_commit)
+
+    with pytest.raises(AssertionError):
+        approve_source(
+            git_dir=repository / ".git",
+            source_commit=source_commit,
+            source_ref=source_ref,
+            protected_main="refs/heads/main",
+        )
+
+
+def test_real_source_approval_accepts_exact_protected_tag_only_with_failclosed_ruleset(
+    tmp_path,
+):
+    repository, approved, _ = _source_repository(tmp_path / "source")
+    source_ref = "refs/tags/v1.2.3-rc.1"
+    _git(repository, "tag", "-a", "v1.2.3-rc.1", "-m", "approved", approved)
+    approve_source(
+        git_dir=repository / ".git",
+        source_commit=approved,
+        source_ref=source_ref,
+        protected_main="refs/heads/main",
+    )
+    protected = {
+        "id": 91,
+        "target": "tag",
+        "enforcement": "active",
+        "bypass_actors": [],
+        "conditions": {
+            "ref_name": {"include": ["refs/tags/v*.*.*-rc.*"], "exclude": []}
+        },
+        "rules": [{"type": "update"}, {"type": "deletion"}],
+    }
+    assert verify_rulesets(
+        [protected], repository="hbhjt/vending-vision", source_ref=source_ref
+    ) == 91
+    for unsafe in (
+        [],
+        [{**protected, "enforcement": "disabled"}],
+        [{**protected, "bypass_actors": [{"actor_id": 1}]}],
+        [{**protected, "rules": [{"type": "update"}]}],
+    ):
+        with pytest.raises(AssertionError):
+            verify_rulesets(
+                unsafe, repository="hbhjt/vending-vision", source_ref=source_ref
+            )

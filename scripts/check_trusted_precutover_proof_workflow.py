@@ -153,6 +153,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         "predicate",
         "worker_path",
         "artifact_path",
+        "^refs/(heads|tags)/",
     ):
         _require(forbidden not in source, f"trusted_proof_forbidden:{forbidden}")
 
@@ -204,6 +205,12 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     companion_extract = _step_index(
         prove, "precutover_companion_descriptor.py).Path", "companion_archive_verify"
     )
+    source_approval = _step_index(
+        prove, "trusted-proof/scripts/approve_candidate_source.py", "source_approval"
+    )
+    tag_ruleset = _step_index(
+        prove, "trusted-proof/scripts/verify_release_tag_ruleset.py", "tag_ruleset"
+    )
     candidate_attestation = _step_index(
         prove,
         f'--signer-workflow "{TRUSTED_REPOSITORY}/{CANDIDATE_BUILDER_PATH}"',
@@ -216,7 +223,15 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     attest = _step_index(prove, "actions/attest-build-provenance@v4", "proof_attestation")
     handoff = _step_index(prove, "name: Upload cross-job proof handoff", "proof_handoff")
     _require(
-        companion_attestation < companion_extract < candidate_attestation < execute < proof_verify < attest < handoff,
+        companion_attestation
+        < companion_extract
+        < source_approval
+        < tag_ruleset
+        < candidate_attestation
+        < execute
+        < proof_verify
+        < attest
+        < handoff,
         "trusted_proof_prove_order",
     )
     _require(source.count("actions/attest-build-provenance@v4") == 1, "trusted_proof_attestation_count")
@@ -233,6 +248,10 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         "inspect-inputs --input-root proof-input",
         "verify-proof --proof precutover-ai-proof.json",
         "seal-evidence --directory proof-handoff",
+        "+refs/heads/main:refs/remotes/origin/main",
+        "--protected-main refs/remotes/origin/main",
+        "rulesets?targets=tag&includes_parents=true&per_page=100",
+        "--rulesets proof-tag-rulesets.json",
     ):
         _require(fragment in prove, f"trusted_proof_prove_policy:{fragment}")
 
