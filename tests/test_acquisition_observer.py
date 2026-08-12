@@ -78,22 +78,40 @@ def test_single_slot_observation_keeps_the_event_loop_responsive_until_cancel_cl
         worker = AcquisitionObservationWorker(
             context=multiprocessing.get_context("spawn"), target=_blocking_observer_target
         )
-        request = asyncio.create_task(worker.observe(np.zeros((8, 8, 3), dtype=np.uint8)))
-        await asyncio.sleep(0.05)
-        ticks = 0
-        deadline = asyncio.get_running_loop().time() + 0.04
-        while asyncio.get_running_loop().time() < deadline:
-            ticks += 1
-            await asyncio.sleep(0.001)
-        assert ticks >= 5
-        second = asyncio.create_task(worker.observe(object()))
-        with pytest.raises(RuntimeError, match="busy"):
-            await second
-        request.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(request, timeout=1)
-        assert worker.assert_dead
-        await worker.shutdown()
+        request = None
+        try:
+            request = asyncio.create_task(
+                worker.observe(np.zeros((8, 8, 3), dtype=np.uint8))
+            )
+            await asyncio.sleep(0.05)
+
+            # Prove the caller-visible property directly: another coroutine
+            # can be scheduled while the native observation remains blocked.
+            loop_responsive = asyncio.Event()
+
+            async def ping():
+                await asyncio.sleep(0)
+                loop_responsive.set()
+
+            asyncio.create_task(ping())
+            await asyncio.wait_for(loop_responsive.wait(), timeout=1.0)
+            assert not request.done()
+
+            second = asyncio.create_task(worker.observe(object()))
+            with pytest.raises(RuntimeError, match="busy"):
+                await second
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request, timeout=1)
+            assert worker.assert_dead
+        finally:
+            if request is not None and not request.done():
+                request.cancel()
+                try:
+                    await asyncio.wait_for(request, timeout=1)
+                except (asyncio.CancelledError, TimeoutError):
+                    pass
+            await worker.shutdown()
 
     asyncio.run(scenario())
 
@@ -404,9 +422,10 @@ def test_repeated_cancel_waits_for_delayed_observer_death_without_starving_loop(
         def __init__(self):
             self.killed_at = None
             self.closed = False
+            self.death_released = threading.Event()
 
         def is_alive(self):
-            return self.killed_at is None or time.monotonic() - self.killed_at < 0.30
+            return self.killed_at is None or not self.death_released.is_set()
 
         def kill(self):
             if self.killed_at is None:
@@ -454,21 +473,23 @@ def test_repeated_cancel_waits_for_delayed_observer_death_without_starving_loop(
         assert worker.active_request_count == 1
 
         request.cancel()
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(0)
         request.cancel()
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(0)
         request.cancel()
 
-        ticks = 0
-        while not request.done():
+        # Repeated cancellation must not bypass the physical-death barrier.
+        # Keep the fake process alive until the event loop has observed that
+        # stable state, instead of depending on Windows timer granularity.
+        for _iteration in range(3):
             assert worker.active_request_count == 1
             assert worker._process is process
-            ticks += 1
-            await asyncio.sleep(0.01)
+            assert not request.done()
+            await asyncio.sleep(0)
+        process.death_released.set()
         with pytest.raises(asyncio.CancelledError):
-            await request
+            await asyncio.wait_for(request, timeout=1)
 
-        assert ticks >= 10
         assert process.closed is True
         assert slot.closed is True
         assert worker.assert_dead

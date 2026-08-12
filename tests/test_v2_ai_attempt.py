@@ -2,6 +2,7 @@ import hashlib
 import inspect
 import json
 import asyncio
+import queue
 import threading
 import tempfile
 import time
@@ -19,6 +20,29 @@ from PIL import Image
 
 import app as vision_app
 from vision.ai_model_pack import OfficialAiReadinessSnapshot
+
+
+def _receive_json_with_timeout(socket, *, timeout=10.0):
+    """Bound a test-client receive without changing production deadlines."""
+    result = queue.Queue(maxsize=1)
+
+    def receive():
+        try:
+            result.put((True, socket.receive_json()))
+        except BaseException as exc:
+            result.put((False, exc))
+
+    reader = threading.Thread(target=receive, daemon=True)
+    reader.start()
+    try:
+        succeeded, value = result.get(timeout=timeout)
+    except queue.Empty:
+        socket.close()
+        reader.join(timeout=1)
+        pytest.fail(f"websocket receive exceeded {timeout:.1f}s test deadline")
+    if succeeded:
+        return value
+    raise value
 
 
 def _png_bytes(color=(20, 120, 220, 255), *, size=(48, 36)):
@@ -614,13 +638,13 @@ def test_v2_ai_admission_rechecks_current_root_after_prepare_barrier_becomes_uns
         with TestClient(vision_app.app) as client:
             with client.websocket_connect("/ws") as socket:
                 socket.send_json(_hello())
-                assert socket.receive_json()["payload"]["aiReady"] is True
+                assert _receive_json_with_timeout(socket)["payload"]["aiReady"] is True
                 toggler.start()
                 start = _start(attempt_id, reference, mode="ai")
                 socket.send_json(start)
-                terminal = socket.receive_json()
+                terminal = _receive_json_with_timeout(socket)
                 socket.send_json(start)
-                replay = socket.receive_json()
+                replay = _receive_json_with_timeout(socket)
 
         assert terminal == {
             "protocol": "vem.vision.v2",
