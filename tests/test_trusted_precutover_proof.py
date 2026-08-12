@@ -12,7 +12,9 @@ import pytest
 
 from scripts.candidate_artifact_manifest import BINDING_PATHS, LAYOUT
 from scripts.trusted_precutover_proof import (
+    ModelPackPart,
     ProofError,
+    assemble_model_pack,
     bind_execution_proof,
     inspect_inputs,
     seal_evidence,
@@ -172,6 +174,64 @@ def proof_for(identity: dict) -> dict:
         },
         "schemaVersion": "vending-vision-precutover-proof/v2",
     }
+
+
+def test_model_pack_assembler_reconstructs_the_exact_three_verified_parts(tmp_path):
+    parts_root = tmp_path / "model-parts"
+    parts_root.mkdir()
+    parts = (b"official-", b"model-", b"archive")
+    expected_parts = []
+    for index, raw in enumerate(parts, start=1):
+        name = f"official-model-pack.part{index:02d}"
+        (parts_root / name).write_bytes(raw)
+        expected_parts.append(
+            ModelPackPart(name=name, sha256=_sha(raw), byte_size=len(raw))
+        )
+    archive = b"".join(parts)
+    destination = tmp_path / "official-model-pack.zip"
+
+    assemble_model_pack(
+        parts_root,
+        destination,
+        parts=tuple(expected_parts),
+        expected_sha256=_sha(archive),
+        expected_bytes=len(archive),
+    )
+
+    assert destination.read_bytes() == archive
+
+
+@pytest.mark.parametrize("mutation", ["extra", "reordered", "rewritten-part"])
+def test_model_pack_assembler_rejects_extra_or_position_drift(tmp_path, mutation):
+    parts_root = tmp_path / "model-parts"
+    parts_root.mkdir()
+    raw_parts = (b"official-", b"model-", b"archive")
+    parts = tuple(
+        ModelPackPart(
+            name=f"official-model-pack.part{index:02d}",
+            sha256=_sha(raw),
+            byte_size=len(raw),
+        )
+        for index, raw in enumerate(raw_parts, start=1)
+    )
+    for part, raw in zip(parts, raw_parts, strict=True):
+        (parts_root / part.name).write_bytes(raw)
+    archive = b"".join(raw_parts)
+    if mutation == "extra":
+        (parts_root / "untrusted-extra.bin").write_bytes(b"extra")
+    elif mutation == "reordered":
+        parts = (parts[1], parts[0], parts[2])
+    else:
+        (parts_root / parts[1].name).write_bytes(b"rewritten")
+
+    with pytest.raises(ProofError):
+        assemble_model_pack(
+            parts_root,
+            tmp_path / "official-model-pack.zip",
+            parts=parts,
+            expected_sha256=_sha(archive),
+            expected_bytes=len(archive),
+        )
 
 
 def test_inspector_derives_identity_and_accepts_only_bound_canonical_frozen_proof(tmp_path):

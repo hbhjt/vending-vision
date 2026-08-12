@@ -53,7 +53,7 @@ on:
         type: number
       model_pack_url:
         description: Immutable HTTPS URL for the official model-pack ZIP
-        required: true
+        required: false
         type: string
       model_pack_sha256:
         description: Exact official model-pack ZIP SHA-256
@@ -62,6 +62,42 @@ on:
       model_pack_bytes:
         description: Exact official model-pack ZIP byte size
         required: true
+        type: number
+      model_pack_part_01_url:
+        description: Immutable HTTPS URL for official model-pack ZIP part 01
+        required: false
+        type: string
+      model_pack_part_01_sha256:
+        description: Exact SHA-256 for official model-pack ZIP part 01
+        required: false
+        type: string
+      model_pack_part_01_bytes:
+        description: Exact byte size for official model-pack ZIP part 01
+        required: false
+        type: number
+      model_pack_part_02_url:
+        description: Immutable HTTPS URL for official model-pack ZIP part 02
+        required: false
+        type: string
+      model_pack_part_02_sha256:
+        description: Exact SHA-256 for official model-pack ZIP part 02
+        required: false
+        type: string
+      model_pack_part_02_bytes:
+        description: Exact byte size for official model-pack ZIP part 02
+        required: false
+        type: number
+      model_pack_part_03_url:
+        description: Immutable HTTPS URL for official model-pack ZIP part 03
+        required: false
+        type: string
+      model_pack_part_03_sha256:
+        description: Exact SHA-256 for official model-pack ZIP part 03
+        required: false
+        type: string
+      model_pack_part_03_bytes:
+        description: Exact byte size for official model-pack ZIP part 03
+        required: false
         type: number
     outputs:
       artifact_name:
@@ -185,6 +221,15 @@ jobs:
           MODEL_PACK_URL: ${{ inputs.model_pack_url }}
           MODEL_PACK_SHA256: ${{ inputs.model_pack_sha256 }}
           MODEL_PACK_BYTES: ${{ inputs.model_pack_bytes }}
+          MODEL_PACK_PART_01_URL: ${{ inputs.model_pack_part_01_url }}
+          MODEL_PACK_PART_01_SHA256: ${{ inputs.model_pack_part_01_sha256 }}
+          MODEL_PACK_PART_01_BYTES: ${{ inputs.model_pack_part_01_bytes }}
+          MODEL_PACK_PART_02_URL: ${{ inputs.model_pack_part_02_url }}
+          MODEL_PACK_PART_02_SHA256: ${{ inputs.model_pack_part_02_sha256 }}
+          MODEL_PACK_PART_02_BYTES: ${{ inputs.model_pack_part_02_bytes }}
+          MODEL_PACK_PART_03_URL: ${{ inputs.model_pack_part_03_url }}
+          MODEL_PACK_PART_03_SHA256: ${{ inputs.model_pack_part_03_sha256 }}
+          MODEL_PACK_PART_03_BYTES: ${{ inputs.model_pack_part_03_bytes }}
         run: |
           New-Item -ItemType Directory -Path proof-input/candidate -Force | Out-Null
           New-Item -ItemType Directory -Path proof-input/model -Force | Out-Null
@@ -193,12 +238,32 @@ jobs:
             @($env:CANDIDATE_ARCHIVE_URL, $env:CANDIDATE_ARCHIVE_SHA256, $env:CANDIDATE_ARCHIVE_BYTES, "proof-input/candidate/candidate.zip"),
             @($env:CANDIDATE_MANIFEST_URL, $env:CANDIDATE_MANIFEST_SHA256, $env:CANDIDATE_MANIFEST_BYTES, "proof-input/candidate/candidate-manifest.json"),
             @($env:CANDIDATE_ATTESTATION_URL, $env:CANDIDATE_ATTESTATION_SHA256, $env:CANDIDATE_ATTESTATION_BYTES, "proof-input/candidate/github-build-provenance.sigstore.json"),
-            @($env:CANDIDATE_EVIDENCE_URL, $env:CANDIDATE_EVIDENCE_SHA256, $env:CANDIDATE_EVIDENCE_BYTES, "proof-input/candidate/trusted-builder-evidence.json"),
-            @($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "proof-input/model/official-model-pack.zip")
+            @($env:CANDIDATE_EVIDENCE_URL, $env:CANDIDATE_EVIDENCE_SHA256, $env:CANDIDATE_EVIDENCE_BYTES, "proof-input/candidate/trusted-builder-evidence.json")
           )
+          $partValues = @($env:MODEL_PACK_PART_01_URL, $env:MODEL_PACK_PART_01_SHA256, $env:MODEL_PACK_PART_01_BYTES, $env:MODEL_PACK_PART_02_URL, $env:MODEL_PACK_PART_02_SHA256, $env:MODEL_PACK_PART_02_BYTES, $env:MODEL_PACK_PART_03_URL, $env:MODEL_PACK_PART_03_SHA256, $env:MODEL_PACK_PART_03_BYTES)
+          $partValueCount = @($partValues | Where-Object { $_ -match '\S' -and $_ -ne '0' }).Count
+          $useMultipartModelPack = $false
+          if ($env:MODEL_PACK_URL -match '\S' -and $partValueCount -eq 0) {
+            $downloads += @(@($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "proof-input/model/official-model-pack.zip"))
+          } elseif ($env:MODEL_PACK_URL -notmatch '\S' -and $partValueCount -eq 9) {
+            New-Item -ItemType Directory -Path proof-input/model-parts -Force | Out-Null
+            $downloads += @(
+              @($env:MODEL_PACK_PART_01_URL, $env:MODEL_PACK_PART_01_SHA256, $env:MODEL_PACK_PART_01_BYTES, "proof-input/model-parts/official-model-pack.part01"),
+              @($env:MODEL_PACK_PART_02_URL, $env:MODEL_PACK_PART_02_SHA256, $env:MODEL_PACK_PART_02_BYTES, "proof-input/model-parts/official-model-pack.part02"),
+              @($env:MODEL_PACK_PART_03_URL, $env:MODEL_PACK_PART_03_SHA256, $env:MODEL_PACK_PART_03_BYTES, "proof-input/model-parts/official-model-pack.part03")
+            )
+            $useMultipartModelPack = $true
+          } else {
+            throw "model pack input must be one complete archive URL or exactly the three ordered part identities"
+          }
           foreach ($download in $downloads) {
             & $env:TRUSTED_PYTHON $downloader --url $download[0] --sha256 $download[1] --expected-bytes $download[2] --destination $download[3] --total-timeout-seconds 1800
             if ($LASTEXITCODE -ne 0) { throw "trusted proof input download failed" }
+          }
+          if ($useMultipartModelPack) {
+            $proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path
+            & $env:TRUSTED_PYTHON $proofTool assemble-model-pack --parts-root proof-input/model-parts --part-name official-model-pack.part01 --part-sha256 $env:MODEL_PACK_PART_01_SHA256 --part-bytes $env:MODEL_PACK_PART_01_BYTES --part-name official-model-pack.part02 --part-sha256 $env:MODEL_PACK_PART_02_SHA256 --part-bytes $env:MODEL_PACK_PART_02_BYTES --part-name official-model-pack.part03 --part-sha256 $env:MODEL_PACK_PART_03_SHA256 --part-bytes $env:MODEL_PACK_PART_03_BYTES --expected-sha256 $env:MODEL_PACK_SHA256 --expected-bytes $env:MODEL_PACK_BYTES --destination proof-input/model/official-model-pack.zip
+            if ($LASTEXITCODE -ne 0) { throw "trusted proof model-pack reconstruction failed" }
           }
       - name: Derive exact candidate identities without executing candidate code
         shell: pwsh
@@ -382,6 +447,15 @@ jobs:
           MODEL_PACK_URL: ${{ inputs.model_pack_url }}
           MODEL_PACK_SHA256: ${{ inputs.model_pack_sha256 }}
           MODEL_PACK_BYTES: ${{ inputs.model_pack_bytes }}
+          MODEL_PACK_PART_01_URL: ${{ inputs.model_pack_part_01_url }}
+          MODEL_PACK_PART_01_SHA256: ${{ inputs.model_pack_part_01_sha256 }}
+          MODEL_PACK_PART_01_BYTES: ${{ inputs.model_pack_part_01_bytes }}
+          MODEL_PACK_PART_02_URL: ${{ inputs.model_pack_part_02_url }}
+          MODEL_PACK_PART_02_SHA256: ${{ inputs.model_pack_part_02_sha256 }}
+          MODEL_PACK_PART_02_BYTES: ${{ inputs.model_pack_part_02_bytes }}
+          MODEL_PACK_PART_03_URL: ${{ inputs.model_pack_part_03_url }}
+          MODEL_PACK_PART_03_SHA256: ${{ inputs.model_pack_part_03_sha256 }}
+          MODEL_PACK_PART_03_BYTES: ${{ inputs.model_pack_part_03_bytes }}
         run: |
           New-Item -ItemType Directory -Path signer-proof-input/candidate -Force | Out-Null
           New-Item -ItemType Directory -Path signer-proof-input/model -Force | Out-Null
@@ -390,12 +464,32 @@ jobs:
             @($env:CANDIDATE_ARCHIVE_URL, $env:CANDIDATE_ARCHIVE_SHA256, $env:CANDIDATE_ARCHIVE_BYTES, "signer-proof-input/candidate/candidate.zip"),
             @($env:CANDIDATE_MANIFEST_URL, $env:CANDIDATE_MANIFEST_SHA256, $env:CANDIDATE_MANIFEST_BYTES, "signer-proof-input/candidate/candidate-manifest.json"),
             @($env:CANDIDATE_ATTESTATION_URL, $env:CANDIDATE_ATTESTATION_SHA256, $env:CANDIDATE_ATTESTATION_BYTES, "signer-proof-input/candidate/github-build-provenance.sigstore.json"),
-            @($env:CANDIDATE_EVIDENCE_URL, $env:CANDIDATE_EVIDENCE_SHA256, $env:CANDIDATE_EVIDENCE_BYTES, "signer-proof-input/candidate/trusted-builder-evidence.json"),
-            @($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "signer-proof-input/model/official-model-pack.zip")
+            @($env:CANDIDATE_EVIDENCE_URL, $env:CANDIDATE_EVIDENCE_SHA256, $env:CANDIDATE_EVIDENCE_BYTES, "signer-proof-input/candidate/trusted-builder-evidence.json")
           )
+          $partValues = @($env:MODEL_PACK_PART_01_URL, $env:MODEL_PACK_PART_01_SHA256, $env:MODEL_PACK_PART_01_BYTES, $env:MODEL_PACK_PART_02_URL, $env:MODEL_PACK_PART_02_SHA256, $env:MODEL_PACK_PART_02_BYTES, $env:MODEL_PACK_PART_03_URL, $env:MODEL_PACK_PART_03_SHA256, $env:MODEL_PACK_PART_03_BYTES)
+          $partValueCount = @($partValues | Where-Object { $_ -match '\S' -and $_ -ne '0' }).Count
+          $useMultipartModelPack = $false
+          if ($env:MODEL_PACK_URL -match '\S' -and $partValueCount -eq 0) {
+            $downloads += @(@($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "signer-proof-input/model/official-model-pack.zip"))
+          } elseif ($env:MODEL_PACK_URL -notmatch '\S' -and $partValueCount -eq 9) {
+            New-Item -ItemType Directory -Path signer-proof-input/model-parts -Force | Out-Null
+            $downloads += @(
+              @($env:MODEL_PACK_PART_01_URL, $env:MODEL_PACK_PART_01_SHA256, $env:MODEL_PACK_PART_01_BYTES, "signer-proof-input/model-parts/official-model-pack.part01"),
+              @($env:MODEL_PACK_PART_02_URL, $env:MODEL_PACK_PART_02_SHA256, $env:MODEL_PACK_PART_02_BYTES, "signer-proof-input/model-parts/official-model-pack.part02"),
+              @($env:MODEL_PACK_PART_03_URL, $env:MODEL_PACK_PART_03_SHA256, $env:MODEL_PACK_PART_03_BYTES, "signer-proof-input/model-parts/official-model-pack.part03")
+            )
+            $useMultipartModelPack = $true
+          } else {
+            throw "model pack input must be one complete archive URL or exactly the three ordered part identities"
+          }
           foreach ($download in $downloads) {
             & $env:TRUSTED_PYTHON $downloader --url $download[0] --sha256 $download[1] --expected-bytes $download[2] --destination $download[3] --total-timeout-seconds 1800
             if ($LASTEXITCODE -ne 0) { throw "signer proof input download failed" }
+          }
+          if ($useMultipartModelPack) {
+            $proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path
+            & $env:TRUSTED_PYTHON $proofTool assemble-model-pack --parts-root signer-proof-input/model-parts --part-name official-model-pack.part01 --part-sha256 $env:MODEL_PACK_PART_01_SHA256 --part-bytes $env:MODEL_PACK_PART_01_BYTES --part-name official-model-pack.part02 --part-sha256 $env:MODEL_PACK_PART_02_SHA256 --part-bytes $env:MODEL_PACK_PART_02_BYTES --part-name official-model-pack.part03 --part-sha256 $env:MODEL_PACK_PART_03_SHA256 --part-bytes $env:MODEL_PACK_PART_03_BYTES --expected-sha256 $env:MODEL_PACK_SHA256 --expected-bytes $env:MODEL_PACK_BYTES --destination signer-proof-input/model/official-model-pack.zip
+            if ($LASTEXITCODE -ne 0) { throw "signer proof model-pack reconstruction failed" }
           }
       - name: Fresh inspect candidate and model identities without execution
         shell: pwsh

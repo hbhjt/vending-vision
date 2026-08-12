@@ -31,6 +31,13 @@ INPUTS = {
     )
     for field in ("url", "sha256", "bytes")
 }
+MODEL_PART_INPUTS = {
+    f"model_pack_part_{index:02d}_{field}"
+    for index in range(1, 4)
+    for field in ("url", "sha256", "bytes")
+}
+INPUTS |= MODEL_PART_INPUTS
+REQUIRED_INPUTS = INPUTS - {"model_pack_url", *MODEL_PART_INPUTS}
 OUTPUTS = {
     "artifact_name",
     "proof_sha256",
@@ -119,7 +126,8 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         _require(
             isinstance(descriptor, dict)
             and set(descriptor) == {"description", "required", "type"}
-            and descriptor["required"] == "true"
+            and descriptor["required"]
+            == ("true" if name in REQUIRED_INPUTS else "false")
             and descriptor["type"] == ("number" if name.endswith("_bytes") else "string"),
             f"trusted_proof_input_contract:{name}",
         )
@@ -302,6 +310,42 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         ),
         "trusted_proof_download_total_timeout",
     )
+    for block, root, label in (
+        (execute, "proof-input", "execute"),
+        (sign, "signer-proof-input", "sign"),
+    ):
+        _require(
+            "$env:MODEL_PACK_URL -match '\\S' -and $partValueCount -eq 0" in block
+            and "$env:MODEL_PACK_URL -notmatch '\\S' -and $partValueCount -eq 9"
+            in block
+            and "model pack input must be one complete archive URL or exactly the three ordered part identities"
+            in block,
+            f"trusted_proof_model_input_mode:{label}",
+        )
+        _require(
+            block.count("assemble-model-pack --parts-root") == 1
+            and f"--parts-root {root}/model-parts" in block
+            and f"--destination {root}/model/official-model-pack.zip" in block,
+            f"trusted_proof_model_assembly:{label}",
+        )
+        for index in range(1, 4):
+            env = f"MODEL_PACK_PART_{index:02d}"
+            part = f"official-model-pack.part{index:02d}"
+            _require(
+                f"{env}_URL: ${{{{ inputs.model_pack_part_{index:02d}_url }}}}" in block
+                and f"{env}_SHA256: ${{{{ inputs.model_pack_part_{index:02d}_sha256 }}}}"
+                in block
+                and f"{env}_BYTES: ${{{{ inputs.model_pack_part_{index:02d}_bytes }}}}"
+                in block
+                and f"@($env:{env}_URL, $env:{env}_SHA256, $env:{env}_BYTES, \"{root}/model-parts/{part}\")"
+                in block
+                and (
+                    f"--part-name {part} --part-sha256 $env:{env}_SHA256 "
+                    f"--part-bytes $env:{env}_BYTES"
+                )
+                in block,
+                f"trusted_proof_model_part:{label}:{index}",
+            )
     write_capable = [
         name
         for name, job in jobs.items()

@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 import re
 import tempfile
 import zipfile
+from dataclasses import dataclass
 
 if __package__:
     from scripts.candidate_artifact_manifest import (
@@ -50,6 +51,16 @@ SHA256_RE = re.compile(r"[a-f0-9]{64}")
 COMMIT_RE = re.compile(r"[a-f0-9]{40}")
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_RESOURCE_BYTES = 64 * 1024 * 1024
+MAX_MODEL_PACK_BYTES = 8 * 1024 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ModelPackPart:
+    """One position-bound immutable model archive fragment."""
+
+    name: str
+    sha256: str
+    byte_size: int
 
 
 class ProofError(RuntimeError):
@@ -68,6 +79,95 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def assemble_model_pack(
+    parts_root: Path,
+    destination: Path,
+    *,
+    parts: tuple[ModelPackPart, ...],
+    expected_sha256: str,
+    expected_bytes: int,
+) -> None:
+    """Verify exactly three ordered fragments and publish their archive bytes.
+
+    The complete archive remains the sole input to the frozen model verifier.
+    Fragments are only a transport contract and never become an alternate model
+    identity or a variable-length collection.
+    """
+
+    expected_names = tuple(
+        f"official-model-pack.part{index:02d}" for index in range(1, 4)
+    )
+    if (
+        not isinstance(parts, tuple)
+        or len(parts) != 3
+        or not all(isinstance(part, ModelPackPart) for part in parts)
+        or tuple(part.name for part in parts) != expected_names
+        or any(
+            SHA256_RE.fullmatch(part.sha256) is None
+            or type(part.byte_size) is not int
+            or part.byte_size <= 0
+            for part in parts
+        )
+    ):
+        raise ProofError("model_parts_contract")
+    if (
+        SHA256_RE.fullmatch(expected_sha256) is None
+        or type(expected_bytes) is not int
+        or expected_bytes <= 0
+        or expected_bytes > MAX_MODEL_PACK_BYTES
+        or sum(part.byte_size for part in parts) != expected_bytes
+    ):
+        raise ProofError("model_archive_contract")
+    _regular_exact_set(parts_root, set(expected_names), "model_parts")
+    if (
+        destination.exists()
+        or destination.is_symlink()
+        or not destination.parent.is_dir()
+        or destination.parent.is_symlink()
+        or destination.parent.resolve() != destination.parent
+    ):
+        raise ProofError("model_archive_destination")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}-", dir=destination.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        archive_digest = hashlib.sha256()
+        archive_size = 0
+        with os.fdopen(descriptor, "wb") as output:
+            for part in parts:
+                path = parts_root / part.name
+                if (
+                    path.is_symlink()
+                    or not path.is_file()
+                    or path.stat().st_size != part.byte_size
+                ):
+                    raise ProofError("model_part_file")
+                part_digest = hashlib.sha256()
+                part_size = 0
+                with path.open("rb") as source:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        part_size += len(chunk)
+                        if part_size > part.byte_size:
+                            raise ProofError("model_part_size")
+                        part_digest.update(chunk)
+                        archive_size += len(chunk)
+                        if archive_size > expected_bytes:
+                            raise ProofError("model_archive_size")
+                        archive_digest.update(chunk)
+                        output.write(chunk)
+                if part_size != part.byte_size or part_digest.hexdigest() != part.sha256:
+                    raise ProofError("model_part_identity")
+            output.flush()
+            os.fsync(output.fileno())
+        if archive_size != expected_bytes or archive_digest.hexdigest() != expected_sha256:
+            raise ProofError("model_archive_identity")
+        os.link(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _unique_object(pairs):
@@ -562,6 +662,14 @@ def main() -> int:
     inspect = commands.add_parser("inspect-inputs")
     inspect.add_argument("--input-root", required=True, type=Path)
     inspect.add_argument("--identity-output", required=True, type=Path)
+    assemble = commands.add_parser("assemble-model-pack")
+    assemble.add_argument("--parts-root", required=True, type=Path)
+    assemble.add_argument("--part-name", required=True, action="append")
+    assemble.add_argument("--part-sha256", required=True, action="append")
+    assemble.add_argument("--part-bytes", required=True, action="append", type=int)
+    assemble.add_argument("--expected-sha256", required=True)
+    assemble.add_argument("--expected-bytes", required=True, type=int)
+    assemble.add_argument("--destination", required=True, type=Path)
     verify = commands.add_parser("verify-proof")
     verify.add_argument("--proof", required=True, type=Path)
     verify.add_argument("--identity", required=True, type=Path)
@@ -595,6 +703,26 @@ def main() -> int:
         if args.command == "inspect-inputs":
             identity = inspect_inputs(args.input_root.resolve())
             _write_exclusive(args.identity_output.resolve(), identity)
+        elif args.command == "assemble-model-pack":
+            if not (
+                len(args.part_name)
+                == len(args.part_sha256)
+                == len(args.part_bytes)
+                == 3
+            ):
+                raise ProofError("model_parts_contract")
+            assemble_model_pack(
+                args.parts_root.resolve(),
+                args.destination.resolve(),
+                parts=tuple(
+                    ModelPackPart(name=name, sha256=sha256, byte_size=byte_size)
+                    for name, sha256, byte_size in zip(
+                        args.part_name, args.part_sha256, args.part_bytes, strict=True
+                    )
+                ),
+                expected_sha256=args.expected_sha256,
+                expected_bytes=args.expected_bytes,
+            )
         elif args.command == "verify-proof":
             verify_proof(args.proof.resolve(), _load_identity(args.identity))
         elif args.command == "verify-execution-handoff":

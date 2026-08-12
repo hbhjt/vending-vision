@@ -34,6 +34,12 @@ INPUTS = {
     )
     for field in ("url", "sha256", "bytes")
 }
+MODEL_PART_INPUTS = {
+    f"model_pack_part_{index:02d}_{field}"
+    for index in range(1, 4)
+    for field in ("url", "sha256", "bytes")
+}
+INPUTS |= MODEL_PART_INPUTS
 
 
 def test_trusted_windows_companion_proof_workflow_exists():
@@ -191,6 +197,13 @@ def test_trusted_proof_has_closed_https_inputs_and_pins_companion_builder():
     )
     assert match is not None
     assert set(re.findall(r"(?m)^      ([a-z][a-z0-9_]*):$", match.group("body"))) == INPUTS
+    workflow = load_workflow_yaml(source)
+    inputs = workflow["on"]["workflow_call"]["inputs"]
+    assert inputs["model_pack_url"]["required"] == "false"
+    assert inputs["model_pack_sha256"]["required"] == "true"
+    assert inputs["model_pack_bytes"]["required"] == "true"
+    for name in MODEL_PART_INPUTS:
+        assert inputs[name]["required"] == "false"
     assert (
         "uses: hbhjt/vending-vision/.github/workflows/"
         f"trusted-precutover-companion-builder.yml@{COMPANION_BUILDER_COMMIT}"
@@ -243,6 +256,30 @@ def test_proof_jobs_and_downloads_have_fixed_total_deadlines():
     ]
     assert len(download_commands) == 2
     assert all("--total-timeout-seconds 1800" in line for line in download_commands)
+
+
+def test_proof_reconstructs_only_the_exact_three_model_parts_in_both_fresh_jobs():
+    source = TRUSTED_PROOF.read_text("utf-8")
+    execute = source[source.index("  execute:\n") : source.index("  sign:\n")]
+    sign = source[source.index("  sign:\n") : source.index("  verify:\n")]
+    for job, root in ((execute, "proof-input"), (sign, "signer-proof-input")):
+        assert "$env:MODEL_PACK_URL -match '\\S' -and $partValueCount -eq 0" in job
+        assert "$env:MODEL_PACK_URL -notmatch '\\S' -and $partValueCount -eq 9" in job
+        assert "model pack input must be one complete archive URL or exactly the three ordered part identities" in job
+        assert f"--parts-root {root}/model-parts" in job
+        assert f"--destination {root}/model/official-model-pack.zip" in job
+        for index in range(1, 4):
+            part = f"official-model-pack.part{index:02d}"
+            env = f"MODEL_PACK_PART_{index:02d}"
+            assert f"$env:{env}_URL" in job
+            assert f"$env:{env}_SHA256" in job
+            assert f"$env:{env}_BYTES" in job
+            assert f"{root}/model-parts/{part}" in job
+            assert (
+                f"--part-name {part} --part-sha256 $env:{env}_SHA256 "
+                f"--part-bytes $env:{env}_BYTES"
+            ) in job
+        assert job.count("assemble-model-pack --parts-root") == 1
 
 
 def test_proof_and_fresh_verify_jobs_use_only_immutable_trusted_code_and_safe_env():
@@ -363,6 +400,16 @@ def test_trusted_proof_policy_rejects_mutable_authority_and_execution_bypasses(t
         "untrusted-companion-source-binding": trusted.replace(
             '--companion-source-commit "83f8865b6a8f2147e9a96bb693512b974e7312fe"',
             "--companion-source-commit $env:CALLER_SHA",
+            1,
+        ),
+        "multipart-allows-mixed-inputs": trusted.replace(
+            "$env:MODEL_PACK_URL -match '\\S' -and $partValueCount -eq 0",
+            "$env:MODEL_PACK_URL -match '\\S' -and $partValueCount -ge 0",
+            1,
+        ),
+        "multipart-part-order-drift": trusted.replace(
+            "--part-name official-model-pack.part01 --part-sha256 $env:MODEL_PACK_PART_01_SHA256 --part-bytes $env:MODEL_PACK_PART_01_BYTES",
+            "--part-name official-model-pack.part02 --part-sha256 $env:MODEL_PACK_PART_01_SHA256 --part-bytes $env:MODEL_PACK_PART_01_BYTES",
             1,
         ),
         "attestation-before-proof-verify": attest_early,
