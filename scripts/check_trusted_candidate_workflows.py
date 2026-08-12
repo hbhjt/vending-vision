@@ -12,7 +12,7 @@ from workflow_yaml import WorkflowYamlError, workflow_run_scalars
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 TRUSTED_BUILDER_COMMIT = "be8fe434855b94f61511e8c6c926e02c54230a38"
 TRUSTED_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-TRUSTED_SIGNER_COMMIT = "222c55385c3ddae58247a8911f5c3c441f0cb290"
+TRUSTED_SIGNER_COMMIT = "f07a5342fb968230e8c3aa6a25edd57e5366a1d5"
 TRUSTED_SIGNER_PATH = ".github/workflows/trusted-ai-candidate-signer.yml"
 BUILDER_INPUTS = {
     "source_commit",
