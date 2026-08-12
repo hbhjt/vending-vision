@@ -250,12 +250,14 @@ jobs:
         run: |
           $companionExe = (Resolve-Path -LiteralPath verified-companion/vending-vision-precutover-verifier.exe).Path
           New-Item -ItemType Directory -Path private-proof -Force | Out-Null
-          & $companionExe --candidate-artifact proof-input/candidate/candidate.zip --candidate-manifest proof-input/candidate/candidate-manifest.json --github-attestation proof-input/candidate/github-build-provenance.sigstore.json --trusted-builder-evidence proof-input/candidate/trusted-builder-evidence.json --subject-sha256 $env:CANDIDATE_SUBJECT_SHA256 --manifest-sha256 $env:CANDIDATE_MANIFEST_SHA256 --attestation-bundle-sha256 $env:CANDIDATE_ATTESTATION_SHA256 --source-commit $env:PROOF_SOURCE_COMMIT --model-pack-archive proof-input/model/official-model-pack.zip --model-pack-byte-size $env:MODEL_PACK_BYTES --model-pack-sha256 $env:MODEL_PACK_SHA256 --model-descriptor-sha256 $env:MODEL_DESCRIPTOR_SHA256 --private-parent private-proof --report-output precutover-ai-proof.json --timeout 300
+          & $companionExe --candidate-artifact proof-input/candidate/candidate.zip --candidate-manifest proof-input/candidate/candidate-manifest.json --github-attestation proof-input/candidate/github-build-provenance.sigstore.json --trusted-builder-evidence proof-input/candidate/trusted-builder-evidence.json --subject-sha256 $env:CANDIDATE_SUBJECT_SHA256 --manifest-sha256 $env:CANDIDATE_MANIFEST_SHA256 --attestation-bundle-sha256 $env:CANDIDATE_ATTESTATION_SHA256 --source-commit $env:PROOF_SOURCE_COMMIT --model-pack-archive proof-input/model/official-model-pack.zip --model-pack-byte-size $env:MODEL_PACK_BYTES --model-pack-sha256 $env:MODEL_PACK_SHA256 --model-descriptor-sha256 $env:MODEL_DESCRIPTOR_SHA256 --private-parent private-proof --report-output companion-report.json --timeout 300
           if ($LASTEXITCODE -ne 0) { throw "frozen companion proof failed" }
       - name: Validate canonical proof bindings before attestation
         shell: pwsh
         run: |
           $proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path
+          & $env:TRUSTED_PYTHON $proofTool bind-execution-proof --source companion-report.json --identity proof-input-identity.json --companion-archive-sha256 $env:COMPANION_ARCHIVE_SHA256 --companion-descriptor-sha256 $env:COMPANION_DESCRIPTOR_SHA256 --companion-source-commit "9b4a7b0ad496447a244c74c5ecce0d511cb18658" --output precutover-ai-proof.json
+          if ($LASTEXITCODE -ne 0) { throw "trusted companion identity binding failed" }
           & $env:TRUSTED_PYTHON $proofTool verify-proof --proof precutover-ai-proof.json --identity proof-input-identity.json
           if ($LASTEXITCODE -ne 0) { throw "canonical companion proof binding failed" }
           $proofPath = (Resolve-Path -LiteralPath precutover-ai-proof.json).Path

@@ -268,6 +268,7 @@ def test_proof_and_fresh_verify_jobs_use_only_immutable_trusted_code_and_safe_en
     assert "$identity.modelPack.descriptorSha256" in execute
     assert "proof-input/candidate/trusted-builder-evidence.json" in execute
     assert "proof-input/model/official-model-pack.zip" in execute
+    assert "bind-execution-proof --source companion-report.json" in execute
     assert "actions/attest-build-provenance@v4" not in execute
     assert "vending-vision-precutover-verifier.exe" not in sign
     assert "verify-execution-handoff" in sign
@@ -352,6 +353,16 @@ def test_trusted_proof_policy_rejects_mutable_authority_and_execution_bypasses(t
         "json-emitter-instead-of-companion": trusted.replace(
             "& $companionExe --candidate-artifact",
             "Set-Content -LiteralPath precutover-ai-proof.json -Value '{}'\n          # removed frozen invocation --candidate-artifact",
+            1,
+        ),
+        "missing-signed-identity-binder": trusted.replace(
+            "& $env:TRUSTED_PYTHON $proofTool bind-execution-proof",
+            "# removed signed identity binder",
+            1,
+        ),
+        "untrusted-companion-source-binding": trusted.replace(
+            '--companion-source-commit "9b4a7b0ad496447a244c74c5ecce0d511cb18658"',
+            "--companion-source-commit $env:CALLER_SHA",
             1,
         ),
         "attestation-before-proof-verify": attest_early,

@@ -13,6 +13,7 @@ import pytest
 from scripts.candidate_artifact_manifest import BINDING_PATHS, LAYOUT
 from scripts.trusted_precutover_proof import (
     ProofError,
+    bind_execution_proof,
     inspect_inputs,
     seal_evidence,
     verify_evidence,
@@ -107,7 +108,7 @@ def build_inputs(root: Path) -> tuple[dict, dict]:
     expected = {
         "candidate": {
             "attestationSha256": _sha(attestation_raw),
-            "evidenceSha256": _sha(
+            "trustedBuilderEvidenceSha256": _sha(
                 (candidate_root / "trusted-builder-evidence.json").read_bytes()
             ),
             "manifestSha256": _sha(manifest_raw),
@@ -144,6 +145,9 @@ def proof_for(identity: dict) -> dict:
             "embeddedManifestSha256": identity["candidate"]["manifestSha256"],
             "sourceCommit": identity["candidate"]["sourceCommit"],
             "subjectSha256": identity["candidate"]["subjectSha256"],
+            "trustedBuilderEvidenceSha256": identity["candidate"][
+                "trustedBuilderEvidenceSha256"
+            ],
             "workerExecutableSha256": identity["resources"]["workerExecutableSha256"],
             "workerMode": "frozen-windows",
         },
@@ -161,7 +165,12 @@ def proof_for(identity: dict) -> dict:
             "runtimeDescriptorSha256": identity["resources"]["runtimeDescriptorSha256"],
             "sourceDescriptorSha256": identity["resources"]["sourceDescriptorSha256"],
         },
-        "schemaVersion": "vending-vision-precutover-proof/v1",
+        "companion": {
+            "archiveSha256": "c" * 64,
+            "descriptorSha256": "d" * 64,
+            "sourceCommit": "9b4a7b0ad496447a244c74c5ecce0d511cb18658",
+        },
+        "schemaVersion": "vending-vision-precutover-proof/v2",
     }
 
 
@@ -174,6 +183,34 @@ def test_inspector_derives_identity_and_accepts_only_bound_canonical_frozen_proo
     proof_path = tmp_path / "proof.json"
     proof_path.write_bytes(_canonical(proof) + b"\n")
     verify_proof(proof_path, identity)
+
+
+def test_execute_binds_verified_companion_and_builder_evidence_into_signed_proof(tmp_path):
+    identity, _ = build_inputs(tmp_path / "inputs")
+    final_proof = proof_for(identity)
+    companion_report = {**final_proof}
+    companion_report["candidate"] = {
+        key: value
+        for key, value in final_proof["candidate"].items()
+        if key != "trustedBuilderEvidenceSha256"
+    }
+    companion_report.pop("companion")
+    companion_report["schemaVersion"] = "vending-vision-precutover-proof/v1"
+    report_path = tmp_path / "companion-report.json"
+    report_path.write_bytes(_canonical(companion_report) + b"\n")
+    proof_path = tmp_path / "precutover-ai-proof.json"
+
+    actual = bind_execution_proof(
+        report_path,
+        identity,
+        companion_archive_sha256="c" * 64,
+        companion_descriptor_sha256="d" * 64,
+        companion_source_commit="9b4a7b0ad496447a244c74c5ecce0d511cb18658",
+        output=proof_path,
+    )
+
+    assert actual == final_proof
+    assert verify_proof(proof_path, identity) == final_proof
 
 
 @pytest.mark.parametrize(
@@ -239,6 +276,61 @@ def test_proof_evidence_round_trip_rejects_missing_and_extra_artifact_members(tm
     extra.unlink()
     evidence.unlink()
     with pytest.raises(ProofError, match="exact_set"):
+        verify_evidence(handoff, **arguments)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("archiveSha256", "1" * 64),
+        ("descriptorSha256", "2" * 64),
+        ("sourceCommit", "3" * 40),
+        ("trustedBuilderEvidenceSha256", "4" * 64),
+    ],
+)
+def test_signed_proof_rejects_rewritten_unsigned_identity_evidence(
+    tmp_path, field, replacement
+):
+    identity, _ = build_inputs(tmp_path / "inputs")
+    handoff = tmp_path / "handoff"
+    handoff.mkdir()
+    proof = handoff / "precutover-ai-proof.json"
+    proof.write_bytes(_canonical(proof_for(identity)) + b"\n")
+    bundle = handoff / "precutover-ai-proof.sigstore.json"
+    bundle.write_bytes(b'{"bundle":"fixture"}')
+    evidence_path = handoff / "trusted-precutover-proof-evidence.json"
+    arguments = {
+        "workflow_sha": "b" * 40,
+        "proof_sha256": hashlib.sha256(proof.read_bytes()).hexdigest(),
+        "attestation_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+        "source_commit": identity["candidate"]["sourceCommit"],
+        "companion_archive_sha256": "c" * 64,
+        "companion_descriptor_sha256": "d" * 64,
+    }
+    seal_evidence(
+        handoff,
+        identity,
+        workflow_sha=arguments["workflow_sha"],
+        companion_archive_sha256=arguments["companion_archive_sha256"],
+        companion_descriptor_sha256=arguments["companion_descriptor_sha256"],
+        output=evidence_path,
+    )
+    evidence = json.loads(evidence_path.read_bytes())
+    if field == "trustedBuilderEvidenceSha256":
+        evidence["inputIdentity"]["candidate"][field] = replacement
+    else:
+        evidence["companion"][field] = replacement
+        if field == "archiveSha256":
+            arguments["companion_archive_sha256"] = replacement
+        elif field == "descriptorSha256":
+            arguments["companion_descriptor_sha256"] = replacement
+        else:
+            # This value was never accepted as a verifier argument, so it was
+            # previously self-asserted by the evidence file alone.
+            pass
+    evidence_path.write_bytes(_canonical(evidence))
+
+    with pytest.raises(ProofError):
         verify_evidence(handoff, **arguments)
 
 

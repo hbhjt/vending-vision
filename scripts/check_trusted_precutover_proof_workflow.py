@@ -342,6 +342,9 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         "frozen_companion_execute",
     )
     proof_verify = _step_index(execute, "verify-proof --proof", "proof_binding_verify")
+    proof_bind = _step_index(
+        execute, "bind-execution-proof --source companion-report.json", "proof_identity_bind"
+    )
     handoff_verify = _step_index(
         execute, "verify-execution-handoff", "execution_handoff_verify"
     )
@@ -355,6 +358,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         < tag_ruleset
         < candidate_attestation
         < frozen_execute
+        < proof_bind
         < proof_verify
         < handoff_verify
         < handoff,
@@ -387,6 +391,8 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         "--deny-self-hosted-runners",
         "scripts/download_verified_file.py",
         "inspect-inputs --input-root proof-input",
+        "bind-execution-proof --source companion-report.json",
+        "--companion-source-commit \"9b4a7b0ad496447a244c74c5ecce0d511cb18658\"",
         "verify-proof --proof precutover-ai-proof.json",
         "+refs/heads/main:refs/remotes/origin/main",
         "--protected-main refs/remotes/origin/main",

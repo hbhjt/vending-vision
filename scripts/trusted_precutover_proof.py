@@ -25,7 +25,8 @@ else:
 
 
 INPUT_SCHEMA = "vending-vision-trusted-precutover-inputs/v1"
-PROOF_SCHEMA = "vending-vision-precutover-proof/v1"
+COMPANION_REPORT_SCHEMA = "vending-vision-precutover-proof/v1"
+PROOF_SCHEMA = "vending-vision-precutover-proof/v2"
 EVIDENCE_SCHEMA = "vending-vision-trusted-precutover-proof-evidence/v1"
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 TRUSTED_CANDIDATE_WORKFLOW = ".github/workflows/trusted-ai-candidate-builder.yml"
@@ -222,7 +223,7 @@ def inspect_inputs(root: Path) -> dict:
     return {
         "candidate": {
             "attestationSha256": attestation_sha,
-            "evidenceSha256": hashlib.sha256(evidence_raw).hexdigest(),
+            "trustedBuilderEvidenceSha256": hashlib.sha256(evidence_raw).hexdigest(),
             "manifestSha256": manifest_sha,
             "sourceCommit": source_commit,
             "subjectSha256": subject_sha,
@@ -251,10 +252,10 @@ def validate_identity(identity: dict) -> None:
         identity["candidate"],
         {
             "attestationSha256",
-            "evidenceSha256",
             "manifestSha256",
             "sourceCommit",
             "subjectSha256",
+            "trustedBuilderEvidenceSha256",
         },
         "identity_candidate",
     )
@@ -290,7 +291,7 @@ def validate_identity(identity: dict) -> None:
         raise ProofError("identity_value")
 
 
-def _expected_proof(identity: dict, proof: dict) -> dict:
+def _validate_probes(identity: dict, proof: dict) -> dict:
     probes = proof.get("probes")
     if not isinstance(probes, dict) or set(probes) != {"model", "runtime"}:
         raise ProofError("proof_probes_shape")
@@ -311,22 +312,31 @@ def _expected_proof(identity: dict, proof: dict) -> dict:
     for key in set(runtime) - {"probe"}:
         if runtime[key] != model[key] or not isinstance(runtime[key], str) or not runtime[key]:
             raise ProofError("proof_probe_value")
+    return probes
+
+
+def _expected_proof(identity: dict, proof: dict) -> dict:
+    probes = _validate_probes(identity, proof)
     return {
         "candidate": {
             "attestationBundleSha256": identity["candidate"]["attestationSha256"],
             "embeddedManifestSha256": identity["candidate"]["manifestSha256"],
             "sourceCommit": identity["candidate"]["sourceCommit"],
             "subjectSha256": identity["candidate"]["subjectSha256"],
+            "trustedBuilderEvidenceSha256": identity["candidate"][
+                "trustedBuilderEvidenceSha256"
+            ],
             "workerExecutableSha256": identity["resources"]["workerExecutableSha256"],
             "workerMode": "frozen-windows",
         },
+        "companion": proof.get("companion"),
         "modelPack": {
             "archive": {
                 "byteSize": identity["modelPack"]["byteSize"],
                 "sha256": identity["modelPack"]["sha256"],
             },
             "descriptorSha256": identity["modelPack"]["descriptorSha256"],
-            "sourceRevision": expected_revision,
+            "sourceRevision": identity["modelPack"]["sourceRevision"],
         },
         "probes": probes,
         "resources": {
@@ -343,9 +353,66 @@ def verify_proof(path: Path, identity: dict) -> dict:
     proof, raw = _load_json(path.resolve(), "companion_proof", canonical=True)
     if raw != canonical_bytes(proof) + b"\n":
         raise ProofError("companion_proof_newline")
+    companion = proof.get("companion")
+    if not isinstance(companion, dict):
+        raise ProofError("proof_companion_shape")
+    _require_exact(
+        companion,
+        {"archiveSha256", "descriptorSha256", "sourceCommit"},
+        "proof_companion",
+    )
+    if (
+        any(
+            not isinstance(companion[key], str)
+            or SHA256_RE.fullmatch(companion[key]) is None
+            for key in ("archiveSha256", "descriptorSha256")
+        )
+        or not isinstance(companion["sourceCommit"], str)
+        or COMMIT_RE.fullmatch(companion["sourceCommit"]) is None
+    ):
+        raise ProofError("proof_companion_identity")
     if proof != _expected_proof(identity, proof):
         raise ProofError("companion_proof_binding")
     return proof
+
+
+def bind_execution_proof(
+    source: Path,
+    identity: dict,
+    *,
+    companion_archive_sha256: str,
+    companion_descriptor_sha256: str,
+    companion_source_commit: str,
+    output: Path,
+) -> dict:
+    report, raw = _load_json(source.resolve(), "companion_report", canonical=True)
+    if raw != canonical_bytes(report) + b"\n":
+        raise ProofError("companion_report_newline")
+    if report.get("schemaVersion") != COMPANION_REPORT_SCHEMA:
+        raise ProofError("companion_report_schema")
+    expected = _expected_proof(identity, {**report, "companion": {}})
+    expected.pop("companion")
+    expected["candidate"].pop("trustedBuilderEvidenceSha256")
+    expected["schemaVersion"] = COMPANION_REPORT_SCHEMA
+    if report != expected:
+        raise ProofError("companion_report_binding")
+    proof = {
+        **report,
+        "candidate": {
+            **report["candidate"],
+            "trustedBuilderEvidenceSha256": identity["candidate"][
+                "trustedBuilderEvidenceSha256"
+            ],
+        },
+        "companion": {
+            "archiveSha256": companion_archive_sha256,
+            "descriptorSha256": companion_descriptor_sha256,
+            "sourceCommit": companion_source_commit,
+        },
+        "schemaVersion": PROOF_SCHEMA,
+    }
+    _write_exclusive_line(output, proof)
+    return verify_proof(output, identity)
 
 
 def verify_execution_handoff(directory: Path, identity: dict) -> dict:
@@ -362,6 +429,21 @@ def _write_exclusive(path: Path, value: dict) -> None:
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_exclusive_line(path: Path, value: dict) -> None:
+    if path.exists() or path.is_symlink():
+        raise ProofError("proof_output_exists")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(canonical_bytes(value) + b"\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.link(temporary, path)
@@ -389,19 +471,18 @@ def seal_evidence(
         raise ProofError("proof_handoff_preseal_set")
     proof = directory / "precutover-ai-proof.json"
     bundle = directory / "precutover-ai-proof.sigstore.json"
-    verify_proof(proof, identity)
-    for value in (companion_archive_sha256, companion_descriptor_sha256):
-        if SHA256_RE.fullmatch(value) is None:
-            raise ProofError("companion_identity")
+    bound_proof = verify_proof(proof, identity)
+    if bound_proof["companion"] != {
+        "archiveSha256": companion_archive_sha256,
+        "descriptorSha256": companion_descriptor_sha256,
+        "sourceCommit": TRUSTED_COMPANION_SOURCE,
+    }:
+        raise ProofError("companion_identity")
     if COMMIT_RE.fullmatch(workflow_sha) is None or bundle.is_symlink() or not bundle.is_file():
         raise ProofError("proof_attestation")
     evidence = {
         "attestation": {"sha256": sha256_file(bundle)},
-        "companion": {
-            "archiveSha256": companion_archive_sha256,
-            "descriptorSha256": companion_descriptor_sha256,
-            "sourceCommit": TRUSTED_COMPANION_SOURCE,
-        },
+        "companion": bound_proof["companion"],
         "inputIdentity": identity,
         "proof": {"byteSize": proof.stat().st_size, "sha256": sha256_file(proof)},
         "schemaVersion": EVIDENCE_SCHEMA,
@@ -440,14 +521,10 @@ def verify_evidence(
         "proof_evidence",
     )
     identity = evidence["inputIdentity"]
-    verify_proof(directory / "precutover-ai-proof.json", identity)
+    bound_proof = verify_proof(directory / "precutover-ai-proof.json", identity)
     expected = {
         "attestation": {"sha256": attestation_sha256},
-        "companion": {
-            "archiveSha256": companion_archive_sha256,
-            "descriptorSha256": companion_descriptor_sha256,
-            "sourceCommit": TRUSTED_COMPANION_SOURCE,
-        },
+        "companion": bound_proof["companion"],
         "inputIdentity": identity,
         "proof": {
             "byteSize": (directory / "precutover-ai-proof.json").stat().st_size,
@@ -491,6 +568,13 @@ def main() -> int:
     execution = commands.add_parser("verify-execution-handoff")
     execution.add_argument("--directory", required=True, type=Path)
     execution.add_argument("--identity", required=True, type=Path)
+    bind = commands.add_parser("bind-execution-proof")
+    bind.add_argument("--source", required=True, type=Path)
+    bind.add_argument("--identity", required=True, type=Path)
+    bind.add_argument("--companion-archive-sha256", required=True)
+    bind.add_argument("--companion-descriptor-sha256", required=True)
+    bind.add_argument("--companion-source-commit", required=True)
+    bind.add_argument("--output", required=True, type=Path)
     seal = commands.add_parser("seal-evidence")
     seal.add_argument("--directory", required=True, type=Path)
     seal.add_argument("--identity", required=True, type=Path)
@@ -515,6 +599,15 @@ def main() -> int:
             verify_proof(args.proof.resolve(), _load_identity(args.identity))
         elif args.command == "verify-execution-handoff":
             verify_execution_handoff(args.directory, _load_identity(args.identity))
+        elif args.command == "bind-execution-proof":
+            bind_execution_proof(
+                args.source.resolve(),
+                _load_identity(args.identity),
+                companion_archive_sha256=args.companion_archive_sha256,
+                companion_descriptor_sha256=args.companion_descriptor_sha256,
+                companion_source_commit=args.companion_source_commit,
+                output=args.output.resolve(),
+            )
         elif args.command == "seal-evidence":
             seal_evidence(
                 args.directory.resolve(),
