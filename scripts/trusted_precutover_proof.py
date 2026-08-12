@@ -44,6 +44,7 @@ HANDOFF_FILES = {
     "precutover-ai-proof.sigstore.json",
     "trusted-precutover-proof-evidence.json",
 }
+EXECUTION_HANDOFF_FILES = {"precutover-ai-proof.json"}
 SHA256_RE = re.compile(r"[a-f0-9]{64}")
 COMMIT_RE = re.compile(r"[a-f0-9]{40}")
 MAX_JSON_BYTES = 16 * 1024 * 1024
@@ -347,6 +348,11 @@ def verify_proof(path: Path, identity: dict) -> dict:
     return proof
 
 
+def verify_execution_handoff(directory: Path, identity: dict) -> dict:
+    _regular_exact_set(directory, EXECUTION_HANDOFF_FILES, "proof_execution_handoff")
+    return verify_proof(directory / "precutover-ai-proof.json", identity)
+
+
 def _write_exclusive(path: Path, value: dict) -> None:
     if path.exists() or path.is_symlink():
         raise ProofError("proof_output_exists")
@@ -482,6 +488,9 @@ def main() -> int:
     verify = commands.add_parser("verify-proof")
     verify.add_argument("--proof", required=True, type=Path)
     verify.add_argument("--identity", required=True, type=Path)
+    execution = commands.add_parser("verify-execution-handoff")
+    execution.add_argument("--directory", required=True, type=Path)
+    execution.add_argument("--identity", required=True, type=Path)
     seal = commands.add_parser("seal-evidence")
     seal.add_argument("--directory", required=True, type=Path)
     seal.add_argument("--identity", required=True, type=Path)
@@ -504,6 +513,8 @@ def main() -> int:
             _write_exclusive(args.identity_output.resolve(), identity)
         elif args.command == "verify-proof":
             verify_proof(args.proof.resolve(), _load_identity(args.identity))
+        elif args.command == "verify-execution-handoff":
+            verify_execution_handoff(args.directory, _load_identity(args.identity))
         elif args.command == "seal-evidence":
             seal_evidence(
                 args.directory.resolve(),

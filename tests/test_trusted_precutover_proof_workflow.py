@@ -55,29 +55,60 @@ def test_trusted_proof_has_closed_https_inputs_and_pins_companion_builder():
         assert forbidden not in source
 
 
+def test_candidate_execution_job_has_no_oidc_or_attestation_write_capability():
+    workflow = load_workflow_yaml(TRUSTED_PROOF.read_text("utf-8"))
+    jobs = workflow["jobs"]
+    execution = [
+        (name, job)
+        for name, job in jobs.items()
+        if isinstance(job, dict)
+        and any(
+            "vending-vision-precutover-verifier.exe" in step.get("run", "")
+            for step in job.get("steps", [])
+            if isinstance(step, dict)
+        )
+    ]
+    assert len(execution) == 1
+    name, job = execution[0]
+    assert name == "execute"
+    permissions = job["permissions"]
+    assert "id-token" not in permissions
+    assert permissions.get("attestations") != "write"
+
+    signing = jobs["sign"]
+    assert signing["needs"] == ["companion_builder", "execute"]
+    assert signing["permissions"]["id-token"] == "write"
+    assert signing["permissions"]["attestations"] == "write"
+
+
 def test_proof_and_fresh_verify_jobs_use_only_immutable_trusted_code_and_safe_env():
     source = TRUSTED_PROOF.read_text("utf-8")
     workflow = load_workflow_yaml(source)
     jobs = workflow["jobs"]
 
-    assert set(jobs) == {"companion_builder", "prove", "verify"}
-    assert jobs["prove"]["runs-on"] == "windows-latest"
+    assert set(jobs) == {"companion_builder", "execute", "sign", "verify"}
+    assert jobs["execute"]["runs-on"] == "windows-latest"
+    assert jobs["sign"]["runs-on"] == "windows-latest"
     assert jobs["verify"]["runs-on"] == "windows-latest"
-    assert source.count("repository: ${{ job.workflow_repository }}") == 2
-    assert source.count("ref: ${{ job.workflow_sha }}") == 2
+    assert source.count("repository: ${{ job.workflow_repository }}") == 3
+    assert source.count("ref: ${{ job.workflow_sha }}") == 3
     assert "path: source" not in source
     assert "ref: ${{ github.sha }}" not in source
     assert "actions/checkout@v4" in source
     assert all("${{" not in run for run in workflow_run_scalars(source))
 
-    prove = source[source.index("  prove:\n") : source.index("  verify:\n")]
+    execute = source[source.index("  execute:\n") : source.index("  sign:\n")]
+    sign = source[source.index("  sign:\n") : source.index("  verify:\n")]
     verify = source[source.index("  verify:\n") :]
-    assert "vending-vision-precutover-verifier.exe" in prove
-    assert "$identity.modelPack.descriptorSha256" in prove
-    assert "proof-input/candidate/trusted-builder-evidence.json" in prove
-    assert "proof-input/model/official-model-pack.zip" in prove
-    assert "actions/attest-build-provenance@v4" in prove
-    assert prove.index("vending-vision-precutover-verifier.exe") < prove.index(
+    assert "vending-vision-precutover-verifier.exe" in execute
+    assert "$identity.modelPack.descriptorSha256" in execute
+    assert "proof-input/candidate/trusted-builder-evidence.json" in execute
+    assert "proof-input/model/official-model-pack.zip" in execute
+    assert "actions/attest-build-provenance@v4" not in execute
+    assert "vending-vision-precutover-verifier.exe" not in sign
+    assert "verify-execution-handoff" in sign
+    assert "actions/attest-build-provenance@v4" in sign
+    assert sign.index("verify-execution-handoff") < sign.index(
         "actions/attest-build-provenance@v4"
     )
     assert "gh attestation verify" in verify
@@ -123,15 +154,16 @@ def test_trusted_proof_requires_real_tag_peel_main_ancestry_and_active_ruleset()
 def test_trusted_proof_policy_rejects_mutable_authority_and_execution_bypasses(tmp_path):
     trusted = TRUSTED_PROOF.read_text("utf-8")
     attest_match = re.search(
-        r"(?ms)^      - name: Attest only the verified canonical companion proof\n"
-        r".*?(?=^      - name: Seal exact proof handoff)",
+        r"(?ms)^      - name: Attest only the freshly revalidated canonical proof\n"
+        r".*?(?=^      - name: Seal exact signed proof handoff)",
         trusted,
     )
     assert attest_match is not None
     attest_step = attest_match.group(0)
     attest_early = trusted.replace(attest_step, "").replace(
-        "      - name: Validate canonical proof bindings before attestation\n",
-        attest_step + "      - name: Validate canonical proof bindings before attestation\n",
+        "      - name: Revalidate exact canonical execution proof before attestation\n",
+        attest_step
+        + "      - name: Revalidate exact canonical execution proof before attestation\n",
         1,
     )
     mutations = {
@@ -160,6 +192,70 @@ def test_trusted_proof_policy_rejects_mutable_authority_and_execution_bypasses(t
         ),
         "attestation-before-proof-verify": attest_early,
         "missing-final-upload": trusted[: trusted.index("      - name: Upload fresh-runner verified proof\n")],
+    }
+    for name, source in mutations.items():
+        candidate = tmp_path / f"{name}.yml"
+        candidate.write_text(source, "utf-8")
+        completed = _check_policy(candidate)
+        assert completed.returncode != 0, name
+
+
+def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
+    tmp_path,
+):
+    trusted = TRUSTED_PROOF.read_text("utf-8")
+    execute_permission = """  execute:
+    needs: companion_builder
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      attestations: read
+"""
+    execute_with_oidc = execute_permission.replace(
+        "      attestations: read\n",
+        "      attestations: read\n      id-token: write\n",
+    )
+    sign_execution_marker = (
+        "      - name: Untrusted candidate execution mutation\n"
+        "        shell: pwsh\n"
+        "        run: |\n"
+        "          & signer-verified-companion/vending-vision-precutover-verifier.exe --candidate-artifact signer-proof-input/candidate/candidate.zip\n"
+        "      - name: Download fixed execution handoff\n"
+    )
+    arbitrary_python_marker = (
+        "      - name: Untrusted Python mutation\n"
+        "        shell: pwsh\n"
+        "        run: |\n"
+        "          $candidateScript = (Resolve-Path -LiteralPath signer-proof-input/candidate/untrusted.py).Path\n"
+        "          & $env:TRUSTED_PYTHON $candidateScript\n"
+        "      - name: Download fixed execution handoff\n"
+    )
+    raw_handoff = trusted.replace(
+        "& $env:TRUSTED_PYTHON $proofTool verify-execution-handoff --directory execution-handoff --identity signer-proof-input-identity.json",
+        "Get-Content -LiteralPath execution-handoff/precutover-ai-proof.json | Out-Null",
+        1,
+    )
+    sign_start = trusted.index("  sign:\n")
+    verify_start = trusted.index("  verify:\n")
+    merged = trusted[:sign_start] + trusted[verify_start:].replace(
+        "      - companion_builder\n      - sign\n",
+        "      - companion_builder\n      - execute\n",
+        1,
+    )
+    mutations = {
+        "candidate-execution-job-gains-oidc": trusted.replace(
+            execute_permission, execute_with_oidc, 1
+        ),
+        "signing-job-executes-candidate": trusted.replace(
+            "      - name: Download fixed execution handoff\n", sign_execution_marker, 1
+        ),
+        "signing-job-executes-arbitrary-python": trusted.replace(
+            "      - name: Download fixed execution handoff\n",
+            arbitrary_python_marker,
+            1,
+        ),
+        "signing-job-trusts-raw-handoff": raw_handoff,
+        "execution-and-signing-jobs-merged": merged,
     }
     for name, source in mutations.items():
         candidate = tmp_path / f"{name}.yml"

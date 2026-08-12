@@ -126,7 +126,8 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     )
     jobs = workflow.get("jobs")
     _require(
-        isinstance(jobs, dict) and set(jobs) == {"companion_builder", "prove", "verify"},
+        isinstance(jobs, dict)
+        and set(jobs) == {"companion_builder", "execute", "sign", "verify"},
         "trusted_proof_job_set",
     )
     for run in workflow_run_scalars(source):
@@ -183,12 +184,21 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     )
     _require(committed.returncode == 0 and bool(committed.stdout), "trusted_proof_builder_commit_missing")
 
-    prove = _job_block(source, "prove")
+    execute = _job_block(source, "execute")
+    sign = _job_block(source, "sign")
     verify = _job_block(source, "verify")
-    _require(prove.count("runs-on: windows-latest") == 1, "trusted_proof_prove_runner")
+    _require(
+        execute.count("runs-on: windows-latest") == 1,
+        "trusted_proof_execute_runner",
+    )
+    _require(sign.count("runs-on: windows-latest") == 1, "trusted_proof_sign_runner")
     _require(verify.count("runs-on: windows-latest") == 1, "trusted_proof_verify_runner")
-    _require(source.count("actions/checkout@v4") == 2, "trusted_proof_checkout_count")
-    for block, label in ((prove, "prove"), (verify, "verify")):
+    _require(source.count("actions/checkout@v4") == 3, "trusted_proof_checkout_count")
+    for block, label in (
+        (execute, "execute"),
+        (sign, "sign"),
+        (verify, "verify"),
+    ):
         for fragment in (
             "repository: ${{ job.workflow_repository }}",
             "ref: ${{ job.workflow_sha }}",
@@ -197,46 +207,110 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         ):
             _require(fragment in block, f"trusted_proof_{label}_checkout:{fragment}")
 
+    execution_job = jobs["execute"]
+    signing_job = jobs["sign"]
+    _require(isinstance(execution_job, dict), "trusted_proof_execute_shape")
+    _require(isinstance(signing_job, dict), "trusted_proof_sign_shape")
+    execution_permissions = execution_job.get("permissions")
+    signing_permissions = signing_job.get("permissions")
+    _require(
+        isinstance(execution_permissions, dict)
+        and "id-token" not in execution_permissions
+        and execution_permissions.get("attestations") != "write",
+        "trusted_proof_execute_privilege",
+    )
+    _require(
+        isinstance(signing_permissions, dict)
+        and signing_permissions.get("id-token") == "write"
+        and signing_permissions.get("attestations") == "write",
+        "trusted_proof_sign_privilege",
+    )
+    _require(
+        signing_job.get("needs") == ["companion_builder", "execute"],
+        "trusted_proof_sign_needs_execute",
+    )
+    verify_job = jobs["verify"]
+    _require(
+        isinstance(verify_job, dict)
+        and verify_job.get("needs") == ["companion_builder", "sign"],
+        "trusted_proof_verify_needs_sign",
+    )
+    write_capable = [
+        name
+        for name, job in jobs.items()
+        if isinstance(job, dict)
+        and isinstance(job.get("permissions"), dict)
+        and (
+            job["permissions"].get("id-token") == "write"
+            or job["permissions"].get("attestations") == "write"
+        )
+    ]
+    _require(
+        write_capable == ["companion_builder", "sign"],
+        "trusted_proof_privileged_job_set",
+    )
+
     companion_attestation = _step_index(
-        prove,
+        execute,
         f'--signer-workflow "{TRUSTED_REPOSITORY}/{COMPANION_BUILDER_PATH}"',
         "companion_attestation",
     )
     companion_extract = _step_index(
-        prove, "precutover_companion_descriptor.py).Path", "companion_archive_verify"
+        execute, "precutover_companion_descriptor.py).Path", "companion_archive_verify"
     )
     source_approval = _step_index(
-        prove, "trusted-proof/scripts/approve_candidate_source.py", "source_approval"
+        execute, "trusted-proof/scripts/approve_candidate_source.py", "source_approval"
     )
     tag_ruleset = _step_index(
-        prove, "trusted-proof/scripts/verify_release_tag_ruleset.py", "tag_ruleset"
+        execute, "trusted-proof/scripts/verify_release_tag_ruleset.py", "tag_ruleset"
     )
     candidate_attestation = _step_index(
-        prove,
+        execute,
         f'--signer-workflow "{TRUSTED_REPOSITORY}/{CANDIDATE_BUILDER_PATH}"',
         "candidate_attestation",
     )
-    execute = _step_index(
-        prove, "vending-vision-precutover-verifier.exe).Path", "frozen_companion_execute"
+    frozen_execute = _step_index(
+        execute,
+        "vending-vision-precutover-verifier.exe).Path",
+        "frozen_companion_execute",
     )
-    proof_verify = _step_index(prove, "verify-proof --proof", "proof_binding_verify")
-    attest = _step_index(prove, "actions/attest-build-provenance@v4", "proof_attestation")
-    handoff = _step_index(prove, "name: Upload cross-job proof handoff", "proof_handoff")
+    proof_verify = _step_index(execute, "verify-proof --proof", "proof_binding_verify")
+    handoff_verify = _step_index(
+        execute, "verify-execution-handoff", "execution_handoff_verify"
+    )
+    handoff = _step_index(
+        execute, "name: Upload fixed exact execution handoff", "execution_handoff"
+    )
     _require(
         companion_attestation
         < companion_extract
         < source_approval
         < tag_ruleset
         < candidate_attestation
-        < execute
+        < frozen_execute
         < proof_verify
-        < attest
+        < handoff_verify
         < handoff,
-        "trusted_proof_prove_order",
+        "trusted_proof_execute_order",
     )
-    _require(source.count("actions/attest-build-provenance@v4") == 1, "trusted_proof_attestation_count")
-    _require("subject-path: ${{ env.TRUSTED_PROOF_PATH }}" in prove, "trusted_proof_subject")
-    _require("& $companionExe --candidate-artifact" in prove, "trusted_proof_frozen_companion_command")
+    _require(
+        "actions/attest-build-provenance" not in execute,
+        "trusted_proof_execute_self_attest",
+    )
+    _require(
+        "id-token: write" not in execute and "attestations: write" not in execute,
+        "trusted_proof_execute_write_permission",
+    )
+    _require(
+        "& $companionExe --candidate-artifact" in execute,
+        "trusted_proof_frozen_companion_command",
+    )
+    for fragment in (
+        "verify-execution-handoff --directory execution-handoff",
+        "path: execution-handoff/precutover-ai-proof.json",
+        "if-no-files-found: error",
+    ):
+        _require(fragment in execute, f"trusted_proof_execution_handoff:{fragment}")
     for fragment in (
         f'--signer-digest "{COMPANION_BUILDER_SHA}"',
         f'--signer-digest "{CANDIDATE_BUILDER_SHA}"',
@@ -247,13 +321,124 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         "scripts/download_verified_file.py",
         "inspect-inputs --input-root proof-input",
         "verify-proof --proof precutover-ai-proof.json",
-        "seal-evidence --directory proof-handoff",
         "+refs/heads/main:refs/remotes/origin/main",
         "--protected-main refs/remotes/origin/main",
         "rulesets?targets=tag&includes_parents=true&per_page=100",
         "--rulesets proof-tag-rulesets.json",
     ):
-        _require(fragment in prove, f"trusted_proof_prove_policy:{fragment}")
+        _require(fragment in execute, f"trusted_proof_execute_policy:{fragment}")
+
+    sign_companion = _step_index(
+        sign,
+        f'--signer-workflow "{TRUSTED_REPOSITORY}/{COMPANION_BUILDER_PATH}"',
+        "sign_companion_attestation",
+    )
+    sign_download = _step_index(
+        sign, "scripts/download_verified_file.py", "sign_fresh_download"
+    )
+    sign_inspect = _step_index(sign, "inspect-inputs", "sign_fresh_identity")
+    sign_source = _step_index(
+        sign, "trusted-proof/scripts/approve_candidate_source.py", "sign_source_approval"
+    )
+    sign_ruleset = _step_index(
+        sign, "trusted-proof/scripts/verify_release_tag_ruleset.py", "sign_tag_ruleset"
+    )
+    sign_candidate = _step_index(
+        sign,
+        f'--signer-workflow "{TRUSTED_REPOSITORY}/{CANDIDATE_BUILDER_PATH}"',
+        "sign_candidate_attestation",
+    )
+    sign_download_handoff = _step_index(
+        sign, "name: Download fixed execution handoff", "sign_download_handoff"
+    )
+    sign_revalidate = _step_index(
+        sign, "verify-execution-handoff", "sign_revalidate_handoff"
+    )
+    sign_attest = _step_index(
+        sign, "actions/attest-build-provenance@v4", "sign_proof_attestation"
+    )
+    sign_seal = _step_index(sign, "seal-evidence", "sign_seal_evidence")
+    sign_upload = _step_index(
+        sign, "name: Upload signed proof handoff", "sign_upload_handoff"
+    )
+    _require(
+        sign_companion
+        < sign_download
+        < sign_inspect
+        < sign_source
+        < sign_ruleset
+        < sign_candidate
+        < sign_download_handoff
+        < sign_revalidate
+        < sign_attest
+        < sign_seal
+        < sign_upload,
+        "trusted_proof_sign_order",
+    )
+    _require(
+        source.count("actions/attest-build-provenance@v4") == 1,
+        "trusted_proof_attestation_count",
+    )
+    _require(
+        "subject-path: ${{ env.TRUSTED_PROOF_PATH }}" in sign,
+        "trusted_proof_subject",
+    )
+    for forbidden in (
+        "& $companionExe",
+        "--candidate-artifact",
+        "path: source",
+        "candidate/scripts",
+        "Get-Command",
+    ):
+        _require(forbidden not in sign, f"trusted_proof_sign_execution:{forbidden}")
+    for step in signing_job.get("steps", []):
+        if not isinstance(step, dict) or not isinstance(step.get("run"), str):
+            continue
+        for line in step["run"].splitlines():
+            command = line.strip()
+            _require(
+                re.match(r"(?i)^(?:&\s*)?(?:gh|git|python(?:\.exe)?)\b", command)
+                is None,
+                "trusted_proof_sign_path_command",
+            )
+            if command.startswith("& "):
+                _require(
+                    re.match(
+                        r"^& \$env:TRUSTED_(?:PYTHON|GH|GIT)(?:\s|$)", command
+                    )
+                    is not None,
+                    "trusted_proof_sign_untrusted_call_operator",
+                )
+                if command.startswith("& $env:TRUSTED_PYTHON "):
+                    _require(
+                        re.match(
+                            r"^& \$env:TRUSTED_PYTHON \$(?:verifier|downloader|proofTool|sourceApproval|tagPolicy)(?:\s|$)",
+                            command,
+                        )
+                        is not None,
+                        "trusted_proof_sign_untrusted_python_script",
+                    )
+    for assignment in (
+        "$verifier = (Resolve-Path -LiteralPath trusted-proof/scripts/precutover_companion_descriptor.py).Path",
+        "$downloader = (Resolve-Path -LiteralPath trusted-proof/scripts/download_verified_file.py).Path",
+        "$proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path",
+        "$sourceApproval = (Resolve-Path -LiteralPath trusted-proof/scripts/approve_candidate_source.py).Path",
+        "$tagPolicy = (Resolve-Path -LiteralPath trusted-proof/scripts/verify_release_tag_ruleset.py).Path",
+    ):
+        _require(assignment in sign, f"trusted_proof_sign_trusted_script:{assignment}")
+    for fragment in (
+        'C:\\Program Files\\GitHub CLI\\gh.exe',
+        'C:\\Program Files\\Git\\cmd\\git.exe',
+        'Join-Path $env:pythonLocation "python.exe"',
+        "& $env:TRUSTED_GH attestation verify",
+        "& $env:TRUSTED_GIT --git-dir",
+        "& $env:TRUSTED_PYTHON $proofTool verify-execution-handoff",
+        "inspect-inputs --input-root signer-proof-input",
+        "+refs/heads/main:refs/remotes/origin/main",
+        "--protected-main refs/remotes/origin/main",
+        "rulesets?targets=tag&includes_parents=true&per_page=100",
+    ):
+        _require(fragment in sign, f"trusted_proof_sign_policy:{fragment}")
 
     evidence = _step_index(verify, "verify-evidence --directory proof-handoff", "fresh_evidence")
     gh_verify = _step_index(verify, "gh attestation verify", "fresh_attestation")

@@ -16,6 +16,7 @@ from scripts.trusted_precutover_proof import (
     inspect_inputs,
     seal_evidence,
     verify_evidence,
+    verify_execution_handoff,
     verify_proof,
 )
 
@@ -263,3 +264,23 @@ def test_trusted_proof_helper_cli_imports_with_stdlib_only(tmp_path):
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_execution_handoff_is_exactly_one_canonical_bound_proof(tmp_path):
+    identity, _ = build_inputs(tmp_path / "inputs")
+    handoff = tmp_path / "execution-handoff"
+    handoff.mkdir()
+    proof = handoff / "precutover-ai-proof.json"
+    proof.write_bytes(_canonical(proof_for(identity)) + b"\n")
+    verify_execution_handoff(handoff, identity)
+
+    extra = handoff / "self-asserted.json"
+    extra.write_text("{}", "utf-8")
+    with pytest.raises(ProofError, match="exact_set"):
+        verify_execution_handoff(handoff, identity)
+
+    extra.unlink()
+    symlink = tmp_path / "execution-handoff-link"
+    symlink.symlink_to(handoff, target_is_directory=True)
+    with pytest.raises(ProofError, match="root"):
+        verify_execution_handoff(symlink, identity)
