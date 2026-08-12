@@ -1,6 +1,7 @@
 import hashlib
 import asyncio
 import json
+import struct
 import subprocess
 import zipfile
 from pathlib import Path
@@ -75,6 +76,103 @@ def test_model_pack_zip_build_is_deterministic_and_verifiable(tmp_path):
             assert info.date_time == (1980, 1, 1, 0, 0, 0)
             assert info.extra == b""
             assert info.comment == b""
+
+
+def test_model_pack_zip_build_and_verify_supports_required_zip64_metadata(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    descriptor = mini_descriptor(source)
+    payload = b"large-for-test" * 128
+    model = source / "weights/model.bin"
+    model.write_bytes(payload)
+    descriptor["files"][1]["byteSize"] = len(payload)
+    descriptor["files"][1]["sha256"] = hashlib.sha256(payload).hexdigest()
+    descriptor["totalByteSize"] = sum(item["byteSize"] for item in descriptor["files"])
+    archive_path = tmp_path / "zip64-pack.zip"
+    monkeypatch.setattr(zipfile, "ZIP64_LIMIT", 1024)
+
+    digest = build_model_pack_zip(source, archive_path, descriptor)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        model_info = archive.getinfo("weights/model.bin")
+        assert model_info.extra.startswith(b"\x01\x00")
+    assert verify_model_pack_zip(archive_path, descriptor, outer_sha256=digest) == digest
+
+
+def test_model_pack_zip_build_and_verify_supports_required_zip64_offset_metadata(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    descriptor = mini_descriptor(source)
+    payload = b"large-for-test" * 128
+    original_model = source / "weights/model.bin"
+    original_model.unlink()
+    model = source / "a-large/model.bin"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(payload)
+    descriptor["files"][1]["path"] = "a-large/model.bin"
+    descriptor["files"][1]["upstreamPath"] = "a-large/model.bin"
+    descriptor["files"][1]["byteSize"] = len(payload)
+    descriptor["files"][1]["sha256"] = hashlib.sha256(payload).hexdigest()
+    descriptor["files"] = sorted(descriptor["files"], key=lambda item: item["path"])
+    descriptor["totalByteSize"] = sum(item["byteSize"] for item in descriptor["files"])
+    archive_path = tmp_path / "zip64-offset-pack.zip"
+    monkeypatch.setattr(zipfile, "ZIP64_LIMIT", 1024)
+
+    digest = build_model_pack_zip(source, archive_path, descriptor)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        large_info = archive.getinfo("a-large/model.bin")
+        later_small_info = archive.getinfo("a/config.json")
+        assert len(large_info.extra) == 20
+        assert later_small_info.file_size < zipfile.ZIP64_LIMIT
+        assert later_small_info.header_offset > zipfile.ZIP64_LIMIT
+        assert len(later_small_info.extra) == 12
+    assert verify_model_pack_zip(archive_path, descriptor, outer_sha256=digest) == digest
+
+
+def test_model_pack_zip_checker_rejects_zip64_entry_with_unknown_extra(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    descriptor = mini_descriptor(source)
+    payload = b"large-for-test" * 128
+    model = source / "weights/model.bin"
+    model.write_bytes(payload)
+    descriptor["files"][1]["byteSize"] = len(payload)
+    descriptor["files"][1]["sha256"] = hashlib.sha256(payload).hexdigest()
+    descriptor["totalByteSize"] = sum(item["byteSize"] for item in descriptor["files"])
+    archive_path = tmp_path / "zip64-pack.zip"
+    tampered = tmp_path / "zip64-extra.zip"
+    monkeypatch.setattr(zipfile, "ZIP64_LIMIT", 1024)
+    build_model_pack_zip(source, archive_path, descriptor)
+
+    with zipfile.ZipFile(archive_path) as src, zipfile.ZipFile(tampered, "w", allowZip64=True) as dst:
+        for info in src.infolist():
+            replacement = zipfile.ZipInfo(info.filename, info.date_time)
+            replacement.compress_type = info.compress_type
+            replacement.external_attr = info.external_attr
+            if info.filename == "weights/model.bin":
+                replacement.extra = b"\xfe\xca\x00\x00"
+            dst.writestr(replacement, src.read(info.filename))
+
+    with pytest.raises(AiModelPackError, match="ai_model_zip_metadata"):
+        verify_model_pack_zip(tampered, descriptor)
+
+
+@pytest.mark.parametrize("copies", [1, 2])
+def test_model_pack_zip_checker_rejects_unnecessary_or_duplicate_zip64_extra(tmp_path, copies):
+    source = tmp_path / "source"
+    descriptor = mini_descriptor(source)
+    archive_path = tmp_path / "noncanonical.zip"
+    zip64_extra = struct.pack("<HHQQ", 0x0001, 16, len(b"mini-weights"), len(b"mini-weights"))
+
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr(MANIFEST_NAME, canonical_ai_model_manifest_json(descriptor))
+        archive.writestr("a/config.json", b"{}")
+        info = zipfile.ZipInfo("weights/model.bin")
+        info.compress_type = zipfile.ZIP_STORED
+        info.external_attr = 0o100644 << 16
+        info.extra = zip64_extra * copies
+        archive.writestr(info, b"mini-weights")
+
+    with pytest.raises(AiModelPackError, match="ai_model_zip_metadata"):
+        verify_model_pack_zip(archive_path, descriptor)
 
 
 def test_precutover_proof_requires_actual_archive_and_installs_verified_bytes(tmp_path):
@@ -169,6 +267,22 @@ def test_model_pack_zip_checker_rejects_compressed_zip_bomb_before_extracting(tm
         archive.writestr(MANIFEST_NAME, canonical_ai_model_manifest_json(descriptor))
         archive.writestr("a/config.json", b"{}")
         archive.writestr("weights/model.bin", b"mini-weights")
+
+    with pytest.raises(AiModelPackError, match="ai_model_zip_metadata"):
+        verify_model_pack_zip(archive_path, descriptor)
+
+
+def test_model_pack_zip_checker_rejects_symlink_entry_before_extracting(tmp_path):
+    source = tmp_path / "source"
+    descriptor = mini_descriptor(source)
+    archive_path = tmp_path / "symlink.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr(MANIFEST_NAME, canonical_ai_model_manifest_json(descriptor))
+        archive.writestr("a/config.json", b"{}")
+        info = zipfile.ZipInfo("weights/model.bin")
+        info.compress_type = zipfile.ZIP_STORED
+        info.external_attr = 0o120777 << 16
+        archive.writestr(info, b"mini-weights")
 
     with pytest.raises(AiModelPackError, match="ai_model_zip_metadata"):
         verify_model_pack_zip(archive_path, descriptor)

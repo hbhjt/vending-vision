@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import unicodedata
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -64,6 +65,19 @@ def _safe_zip_name(name: str, seen: set[str]) -> PurePosixPath:
     return path
 
 
+def _has_canonical_zip64_extra(info: zipfile.ZipInfo) -> bool:
+    values: list[int] = []
+    if info.file_size > zipfile.ZIP64_LIMIT or info.compress_size > zipfile.ZIP64_LIMIT:
+        values.extend((info.file_size, info.compress_size))
+    if info.header_offset > zipfile.ZIP64_LIMIT:
+        values.append(info.header_offset)
+    expected = b""
+    if values:
+        payload = struct.pack(f"<{len(values)}Q", *values)
+        expected = struct.pack("<HH", 0x0001, len(payload)) + payload
+    return info.extra == expected
+
+
 def build_model_pack_zip(source_root: Path, output_zip: Path, descriptor: dict) -> str:
     manifest_bytes = canonical_ai_model_manifest_json(descriptor).encode("utf-8")
     entries = [(MANIFEST_NAME, len(manifest_bytes), None)]
@@ -113,7 +127,13 @@ def verify_model_pack_zip(zip_path: Path, descriptor: dict, *, outer_sha256: str
         for info in archive.infolist():
             path = _safe_zip_name(info.filename, seen)
             mode = (info.external_attr >> 16) & 0o170000
-            if info.is_dir() or mode == 0o120000 or info.compress_type != zipfile.ZIP_STORED or info.extra or info.comment:
+            if (
+                info.is_dir()
+                or mode == 0o120000
+                or info.compress_type != zipfile.ZIP_STORED
+                or not _has_canonical_zip64_extra(info)
+                or info.comment
+            ):
                 raise AiModelPackError("ai_model_zip_metadata")
             if info.file_size != info.compress_size:
                 raise AiModelPackError("ai_model_zip_metadata")
