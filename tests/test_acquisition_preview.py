@@ -172,13 +172,28 @@ def test_public_preview_stream_bounds_real_http_readers_and_releases_on_close():
             assert time.monotonic() - started < 0.5
             assert client.get(f"{url}&extra=1").status_code == 404
 
-            def reject_once(_):
-                response = client.get(url)
-                return response.status_code
+            reject_workers = 16
+            rejects_per_worker = 16
+            reject_barrier = threading.Barrier(reject_workers)
+
+            def reject_batch(_):
+                # Keep a small fixed connection pool per concurrent caller.  A
+                # new connection per one of thousands of requests measures the
+                # Windows ephemeral-port range rather than the route's reader
+                # admission boundary.
+                limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
+                with httpx.Client(timeout=2.0, limits=limits) as reject_client:
+                    reject_barrier.wait(timeout=2.0)
+                    return [
+                        reject_client.get(url).status_code
+                        for _request in range(rejects_per_worker)
+                    ]
 
             probe_started = time.monotonic()
-            with ThreadPoolExecutor(max_workers=64) as pool:
-                statuses = list(pool.map(reject_once, range(2000)))
+            with ThreadPoolExecutor(max_workers=reject_workers) as pool:
+                batches = list(pool.map(reject_batch, range(reject_workers)))
+            statuses = [status for batch in batches for status in batch]
+            assert len(statuses) == reject_workers * rejects_per_worker
             assert set(statuses) == {429}
             assert time.monotonic() - probe_started < 5
             assert asyncio.run(store.reader_count()) == 2
