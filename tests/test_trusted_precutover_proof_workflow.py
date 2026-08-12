@@ -122,7 +122,7 @@ def test_trusted_builder_closure_rejects_new_spec_hidden_import(tmp_path):
     manifest_path.write_text(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", "utf-8"
     )
-    with pytest.raises(ClosureError, match="spec_hiddenimports"):
+    with pytest.raises(ClosureError, match="spec_(?:ast|hiddenimports)"):
         verify_closure(root, manifest_path)
 
 
@@ -158,6 +158,11 @@ def test_builder_closure_rejects_new_tracked_local_import(tmp_path):
         ("vending_vision_precutover_verifier.spec", "\nhiddenimports.append('vision.' + 'unlisted_local')\n"),
         ("vending_vision_precutover_verifier.spec", "\nbinaries.append(('tool.exe','.'))\n"),
         ("vending_vision_precutover_verifier.spec", "\nruntime_hooks.append('vision/unlisted_local.py')\n"),
+        ("vending_vision_precutover_verifier.spec", "\nextra_datas = datas\nextra_datas.append(('local.dat','.'))\n"),
+        ("vending_vision_precutover_verifier.spec", "\nextra_hidden = hiddenimports\nextra_hidden.append('vision.unlisted_local')\n"),
+        ("vending_vision_precutover_verifier.spec", "\nextra_bins = binaries\nextra_bins.append(('tool.exe','.'))\n"),
+        ("vending_vision_precutover_verifier.spec", "\nextra_hooks = runtime_hooks\nextra_hooks.append('vision/unlisted_local.py')\n"),
+        ("vending_vision_precutover_verifier.spec", "\nextra_paths = hookspath\nextra_paths.append('local-hooks')\n"),
     ],
 )
 def test_builder_closure_rejects_import_and_spec_mutation_bypasses(

@@ -23,6 +23,7 @@ SPEC_HIDDENIMPORTS = (
     "vision.process_supervisor",
     "PyInstaller.archive.readers",
 )
+SPEC_AST_SHA256 = "81a561db229afb889b52fbc10730fcfdebcb1ef5970a9e239eaf1b0b91017478"
 EXPECTED_PATHS = (
     ".github/workflows/trusted-precutover-companion-builder.yml",
     ".python-version",
@@ -198,6 +199,11 @@ def _spec_local_modules(root: Path, modules: dict[str, str]) -> set[str]:
     spec_path = root / "vending_vision_precutover_verifier.spec"
     source = spec_path.read_text("utf-8")
     tree = ast.parse(source, filename=str(spec_path))
+    tree_digest = hashlib.sha256(
+        ast.dump(tree, annotate_fields=True, include_attributes=False).encode("utf-8")
+    ).hexdigest()
+    if tree_digest != SPEC_AST_SHA256:
+        raise ClosureError("trusted_builder_closure_spec_ast")
     analyses = [
         node
         for node in ast.walk(tree)
