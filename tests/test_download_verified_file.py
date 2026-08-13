@@ -599,7 +599,7 @@ def test_recovery_durability_failure_is_reported_without_hiding_primary(
     assert "recovery durability failure" in repr(cause.failures)
 
 
-def test_windows_integrity_handle_denies_write_share_and_flushes_directory():
+def test_windows_integrity_handle_denies_write_share():
     from scripts.download_verified_file import _WindowsFileApi
 
     calls = []
@@ -609,20 +609,13 @@ def test_windows_integrity_handle_denies_write_share_and_flushes_directory():
             calls.append((path, access, share, creation, flags))
             return 41
 
-        def FlushFileBuffers(self, handle):
-            calls.append(("flush", handle))
-            return 1
-
         def CloseHandle(self, handle):
             calls.append(("close", handle))
             return 1
 
     api = _WindowsFileApi(Kernel32())
     file_handle = api.open_file(Path("C:/proof.bin"))
-    directory_handle = api.open_directory(Path("C:/proof"))
-    api.flush(directory_handle)
     api.close(file_handle)
-    api.close(directory_handle)
 
     assert calls[0] == (
         "C:/proof.bin",
@@ -631,9 +624,27 @@ def test_windows_integrity_handle_denies_write_share_and_flushes_directory():
         api.OPEN_EXISTING,
         api.FILE_ATTRIBUTE_NORMAL,
     )
-    assert calls[1][-1] == api.FILE_FLAG_BACKUP_SEMANTICS
     assert (calls[0][2] & 0x00000002) == 0  # no FILE_SHARE_WRITE
-    assert calls[2:] == [("flush", 41), ("close", 41), ("close", 41)]
+    assert calls[1:] == [("close", 41)]
+
+
+def test_windows_directory_sync_is_not_attempted_when_directory_flush_is_unsupported(
+    tmp_path, monkeypatch
+):
+    """Windows does not support a POSIX-style durable directory flush."""
+    from scripts import download_verified_file as downloader
+
+    class WindowsApiWithoutDirectoryFlush:
+        def __init__(self):
+            raise AssertionError("Windows must not attempt a directory flush")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(downloader.os, "name", "nt")
+        scoped.setattr(
+            downloader, "_WindowsFileApi", WindowsApiWithoutDirectoryFlush
+        )
+
+        downloader._fsync_directory(tmp_path)
 
 
 def test_final_identity_change_after_durable_cleanup_preserves_replacement(

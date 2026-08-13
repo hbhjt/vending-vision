@@ -61,12 +61,8 @@ def _descriptor_identity(descriptor: int) -> tuple[int, int, int, int]:
 
 def _fsync_directory(directory: Path) -> None:
     if os.name == "nt":
-        api = _WindowsFileApi()
-        handle = api.open_directory(directory)
-        try:
-            api.flush(handle)
-        finally:
-            api.close(handle)
+        # Windows has no supported equivalent of fsyncing a directory handle.
+        # The verified file itself is flushed before exclusive publication.
         return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     descriptor = os.open(directory, flags)
@@ -82,7 +78,6 @@ class _WindowsFileApi:
     FILE_SHARE_DELETE = 0x00000004
     OPEN_EXISTING = 3
     FILE_ATTRIBUTE_NORMAL = 0x00000080
-    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 
     def __init__(self, kernel32=None):
         if kernel32 is None:
@@ -106,13 +101,6 @@ class _WindowsFileApi:
 
     def open_file(self, path: Path):
         return self._open(path, self.FILE_ATTRIBUTE_NORMAL)
-
-    def open_directory(self, path: Path):
-        return self._open(path, self.FILE_FLAG_BACKUP_SEMANTICS)
-
-    def flush(self, handle) -> None:
-        if not self.kernel32.FlushFileBuffers(handle):
-            raise DownloadError("download_directory_flush")
 
     def close(self, handle) -> None:
         if not self.kernel32.CloseHandle(handle):
