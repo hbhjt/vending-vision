@@ -63,7 +63,7 @@ def _ai_evidence_args(tmp_path):
                 "schemaVersion": "vending-vision-trusted-builder-evidence/v1",
                 "builderRepository": "hbhjt/vending-vision",
                 "builderWorkflow": ".github/workflows/trusted-ai-candidate-builder.yml",
-                "builderWorkflowSha": "c90a965d117fea49f318b18e0fcd50aa047bc41f",
+                "builderWorkflowSha": "3fe9e00c98d9df59c71ce9be5b980a713ddd3110",
                 "sourceCommit": "b" * 40,
                 "subjectSha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
                 "embeddedManifestSha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),

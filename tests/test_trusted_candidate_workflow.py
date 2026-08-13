@@ -12,9 +12,9 @@ import pytest
 ROOT = Path(__file__).parents[1]
 TRUSTED_BUILDER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder.yml"
 PUBLISHER = ROOT / ".github" / "workflows" / "publish-candidate.yml"
-TRUSTED_BUILDER_COMMIT = "c90a965d117fea49f318b18e0fcd50aa047bc41f"
+TRUSTED_BUILDER_COMMIT = "3fe9e00c98d9df59c71ce9be5b980a713ddd3110"
 TRUSTED_SIGNER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-signer.yml"
-TRUSTED_SIGNER_COMMIT = "fbb43d10bd65d477133d0005471a42b765ae39a5"
+TRUSTED_SIGNER_COMMIT = "af9f7bb766e8a467e8c9a24396a76b616fd68188"
 TRUST_POLICY = ROOT / "scripts" / "check_trusted_candidate_workflows.py"
 
 
