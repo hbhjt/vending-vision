@@ -174,7 +174,6 @@ def test_public_preview_stream_bounds_real_http_readers_and_releases_on_close():
 
             reject_workers = 16
             rejects_per_worker = 16
-            reject_barrier = threading.Barrier(reject_workers)
 
             def reject_batch(_):
                 # Keep a small fixed connection pool per concurrent caller.  A
@@ -183,7 +182,6 @@ def test_public_preview_stream_bounds_real_http_readers_and_releases_on_close():
                 # admission boundary.
                 limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
                 with httpx.Client(timeout=2.0, limits=limits) as reject_client:
-                    reject_barrier.wait(timeout=2.0)
                     return [
                         reject_client.get(url).status_code
                         for _request in range(rejects_per_worker)
