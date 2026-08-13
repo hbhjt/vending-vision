@@ -14,9 +14,9 @@ from scripts.workflow_yaml import load_workflow_yaml
 ROOT = Path(__file__).parents[1]
 TRUSTED_BUILDER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder.yml"
 PUBLISHER = ROOT / ".github" / "workflows" / "publish-candidate.yml"
-TRUSTED_BUILDER_COMMIT = "ccf38c95b3c33994d4c20039a506be062ebd2f99"
+TRUSTED_BUILDER_COMMIT = "691b5056e8b9bf2667bc527b2170780b05863946"
 TRUSTED_SIGNER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-signer.yml"
-TRUSTED_SIGNER_COMMIT = "6c4a378005fa44a134881846548727962a9e5c51"
+TRUSTED_SIGNER_COMMIT = "3bfaf22704ec62e6e467e50b012c51be2890a68b"
 TRUST_POLICY = ROOT / "scripts" / "check_trusted_candidate_workflows.py"
 
 
