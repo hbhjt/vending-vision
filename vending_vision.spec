@@ -47,6 +47,7 @@ datas = [
     (str(ROOT / "config"), "config"),
     (str(ROOT / "dashboard"), "dashboard"),
     (str(ROOT / "models"), "models"),
+    (str(ROOT / "vision" / "_build_version.py"), "vision"),
     (str(ROOT / "official-ai-model-pack-descriptor.json"), "."),
     (str(ROOT / "ai-runtime-descriptor.json"), "."),
     (str(ROOT / "requirements-ai.txt"), "."),

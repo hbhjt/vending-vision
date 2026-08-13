@@ -25,6 +25,7 @@ for source in json.loads(REGIONAL_EVALUATOR_DESCRIPTOR_PATH.read_text("utf-8"))[
         REGIONAL_EVALUATOR_SOURCE_DATA_FILES.append((str(ROOT / relative), str(Path(relative).parent)))
 
 datas = [
+    (str(ROOT / "vision" / "_build_version.py"), "vision"),
     (str(ROOT / "official-ai-model-pack-descriptor.json"), "."),
     (str(ROOT / "ai-runtime-descriptor.json"), "."),
     (str(ROOT / "requirements-ai.txt"), "."),

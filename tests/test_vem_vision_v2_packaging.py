@@ -54,6 +54,7 @@ def test_frozen_spec_keeps_the_generated_v2_bundle_and_static_boundary_import():
     assert "CONTRACT_DATA_FILES" in spec
     assert "OFFICIAL_AI_SOURCE_DATA_FILES" in spec
     assert "REGIONAL_EVALUATOR_SOURCE_DATA_FILES" in spec
+    assert '(str(ROOT / "vision" / "_build_version.py"), "vision")' in spec
     assert '(CONTRACT_ROOT / "manifest.json", "contracts/vem_vision_v2")' in spec
     assert '(CONTRACT_ROOT / "__init__.py", "contracts/vem_vision_v2")' in spec
     assert '(CONTRACT_ROOT / "python" / "__init__.py", "contracts/vem_vision_v2/python")' in spec
@@ -99,6 +100,7 @@ def test_ai_runtime_packaging_includes_worker_code_but_excludes_official_weights
     assert 'name="vending-vision-ai-worker"' in worker_spec
     assert "OFFICIAL_AI_SOURCE_DATA_FILES" in worker_spec
     assert "REGIONAL_EVALUATOR_SOURCE_DATA_FILES" in worker_spec
+    assert '(str(ROOT / "vision" / "_build_version.py"), "vision")' in worker_spec
     assert "collect_submodules(\"vision.vendor.catvton\")" in worker_spec
     assert "official-ai-model-pack-descriptor.json" in worker_spec
     assert "official-ai-source-descriptor.json" in worker_spec
