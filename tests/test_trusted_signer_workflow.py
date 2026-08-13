@@ -19,7 +19,7 @@ SOURCE_APPROVAL = ROOT / "scripts" / "approve_candidate_source.py"
 VERIFY_INPUTS = ROOT / "scripts" / "verify_trusted_candidate_inputs.py"
 GENERATE_EVIDENCE = ROOT / "scripts" / "generate_trusted_candidate_evidence.py"
 TAG_RULESET = ROOT / "scripts" / "verify_release_tag_ruleset.py"
-TRUSTED_BUILDER_COMMIT = "ee95191abdf5f22b1823b0625d9e700c4f41332e"
+TRUSTED_BUILDER_COMMIT = "c85ac3059c31d41b405282ecfc7641d0c1b88958"
 
 
 def _workflow_call_inputs(source: str) -> set[str]:
