@@ -544,6 +544,31 @@ def test_trusted_proof_policy_counts_only_real_candidate_attestations(tmp_path, 
     assert completed.returncode != 0
     assert "trusted_proof_candidate_builder_attestation" in completed.stdout
 
+
+@pytest.mark.parametrize(
+    ("executable", "valid"),
+    (
+        ("foogh", False),
+        ("mygh", False),
+        ("gh.bat", False),
+        ("'C:\\Program Files\\GitHub CLI\\gh.exe'", False),
+        ("/usr/local/bin/gh", True),
+        (r"& 'C:\\Program Files\\GitHub CLI\\gh.exe'", True),
+    ),
+)
+def test_trusted_proof_policy_accepts_only_real_gh_executables(tmp_path, executable, valid):
+    candidate = tmp_path / "trusted-proof.yml"
+    source = TRUSTED_PROOF.read_text("utf-8").replace(
+        "gh attestation verify proof-input/candidate/candidate.zip",
+        f"{executable} attestation verify proof-input/candidate/candidate.zip",
+        1,
+    )
+    candidate.write_text(source, "utf-8")
+
+    completed = _check_policy(candidate)
+
+    assert (completed.returncode == 0) is valid, completed.stdout + completed.stderr
+
 def test_trusted_proof_requires_real_tag_peel_main_ancestry_and_release_authority():
     source = TRUSTED_PROOF.read_text("utf-8")
 

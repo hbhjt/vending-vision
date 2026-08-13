@@ -127,7 +127,8 @@ def _assert_candidate_builder_authority_sync(source: str, repository_root: Path)
         "\n".join(workflow_run_scalars(source)), "pwsh"
     ):
         for statement, call_operator in _shell_statements(command, "pwsh"):
-            tokens = tuple(token for token, _ in _shell_tokens(statement, "pwsh"))
+            token_facts = _shell_tokens(statement, "pwsh")
+            tokens = tuple(token for token, _ in token_facts)
             if "--signer-workflow" not in tokens:
                 continue
             workflow_index = tokens.index("--signer-workflow")
@@ -137,10 +138,14 @@ def _assert_candidate_builder_authority_sync(source: str, repository_root: Path)
                 attestation_index = tokens.index("attestation")
             except ValueError:
                 raise PolicyError("trusted_proof_candidate_builder_attestation_shape")
+            executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+            supported_executable = executable in {"gh", "gh.exe"} or tokens[0] == "$env:TRUSTED_GH"
+            quoted_executable = token_facts[0][1]
             _require(
                 attestation_index + 1 < len(tokens)
                 and tokens[attestation_index + 1] == "verify"
-                and (call_operator or tokens[0].lower().endswith("gh")),
+                and supported_executable
+                and (not quoted_executable or call_operator),
                 "trusted_proof_candidate_builder_attestation_shape",
             )
             candidate_attestations.append(tokens)
