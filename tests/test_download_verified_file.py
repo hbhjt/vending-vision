@@ -303,6 +303,7 @@ def test_post_link_temp_unlink_failure_rolls_back_only_created_destination(
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync durability semantics")
 def test_post_link_parent_fsync_failure_rolls_back_destination(tmp_path, monkeypatch):
     url = "https://example.invalid/parent-fsync.bin"
     payload = b"parent fsync"
@@ -366,6 +367,7 @@ def test_post_link_failure_preserves_an_identity_replacement(tmp_path, monkeypat
     assert [path.name for path in tmp_path.iterdir()] == [destination.name]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync durability semantics")
 def test_rollback_identity_check_to_unlink_race_preserves_replacement(
     tmp_path, monkeypatch
 ):
@@ -418,6 +420,7 @@ def test_rollback_identity_check_to_unlink_race_preserves_replacement(
     assert [path.name for path in tmp_path.iterdir()] == [destination.name]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync durability semantics")
 def test_rollback_restore_race_preserves_both_replacements_with_recovery_path(
     tmp_path, monkeypatch
 ):
@@ -483,6 +486,7 @@ def test_rollback_restore_race_preserves_both_replacements_with_recovery_path(
     assert not owned
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync durability semantics")
 def test_rollback_restore_failure_recovers_replacement_and_preserves_primary(
     tmp_path, monkeypatch
 ):
@@ -539,6 +543,7 @@ def test_rollback_restore_failure_recovers_replacement_and_preserves_primary(
     assert not list(tmp_path.glob(f".{destination.name}-rollback-*"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync durability semantics")
 def test_recovery_durability_failure_is_reported_without_hiding_primary(
     tmp_path, monkeypatch
 ):
@@ -647,6 +652,7 @@ def test_windows_directory_sync_is_not_attempted_when_directory_flush_is_unsuppo
         downloader._fsync_directory(tmp_path)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync durability semantics")
 def test_final_identity_change_after_durable_cleanup_preserves_replacement(
     tmp_path, monkeypatch
 ):
@@ -685,6 +691,7 @@ def test_final_identity_change_after_durable_cleanup_preserves_replacement(
     assert [path.name for path in tmp_path.iterdir()] == [destination.name]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync durability semantics")
 def test_normal_publish_fsyncs_file_and_parent_around_temp_cleanup(
     tmp_path, monkeypatch
 ):
@@ -733,6 +740,7 @@ def test_normal_publish_fsyncs_file_and_parent_around_temp_cleanup(
     assert destination.read_bytes() == payload
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync durability semantics")
 def test_rollback_cleanup_failure_never_returns_success(tmp_path, monkeypatch):
     url = "https://example.invalid/rollback-failure.bin"
     payload = b"rollback failure"
