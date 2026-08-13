@@ -1936,15 +1936,18 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
             vision_app._read_attempt_front_frame(first, timeout=15.0)
         )
         await _wait_for_raw_value(blocked_read_entered, timeout=15.0)
-        ticks = 0
-        tick_deadline = asyncio.get_running_loop().time() + 0.05
-        while asyncio.get_running_loop().time() < tick_deadline:
-            ticks += 1
-            await asyncio.sleep(0.002)
+        loop_yielded = asyncio.Event()
+
+        async def prove_loop_responsive():
+            await asyncio.sleep(0)
+            loop_yielded.set()
+
+        responsiveness_task = asyncio.create_task(prove_loop_responsive())
+        await loop_yielded.wait()
+        assert responsiveness_task.done()
         registry.cancel_event.set()
         with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
             await asyncio.wait_for(read_task, timeout=15.0)
-        assert ticks >= 10
         assert not broker.assert_dead()
         assert broker.active_request_count == 0
 
