@@ -107,7 +107,7 @@ permissions:
 
 jobs:
   trusted_proof:
-    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-proof.yml@6bbecf56e2d6cc461deabc60cd2731eb0b07cb2f
+    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-proof.yml@a11e13a5899dfa3a83c8036251b14438a7ee02b6
     with:
       candidate_archive_url: ${{ inputs.candidate_archive_url }}
       candidate_archive_sha256: ${{ inputs.candidate_archive_sha256 }}
