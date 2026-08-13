@@ -398,9 +398,48 @@ def test_packaged_verifier_rejects_missing_release_version_runtime_marker(tmp_pa
 @pytest.mark.parametrize(
     "marker",
     (
+        'APP_VERSION = "1.2.3"\n',
+        'APP_VERSION = "1.2.3-rc.12"\n',
+        'APP_VERSION = "1.2.3-alpha-"\n',
+        'APP_VERSION = "1.2.3+build.7"\n',
+        'APP_VERSION = "1.2.3-rc.12+build.007"\n',
+    ),
+)
+def test_packaged_verifier_accepts_semver_release_version_runtime_marker(
+    tmp_path, marker
+):
+    from scripts.verify_packaged_exe import assert_ai_worker_layout
+
+    suffix = ".exe" if sys.platform == "win32" else ""
+    exe = tmp_path / "vending-vision" / f"vending-vision{suffix}"
+    worker = tmp_path / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}"
+    internal = worker.parent / "_internal"
+    exe.parent.mkdir()
+    internal.mkdir(parents=True)
+    exe.write_bytes(b"main")
+    worker.write_bytes(b"worker")
+    for name in (
+        "official-ai-model-pack-descriptor.json",
+        "ai-runtime-descriptor.json",
+        "requirements-ai.lock.json",
+        "official-ai-source-descriptor.json",
+    ):
+        (internal / name).write_text("{}", "utf-8")
+    materialize_regional_evaluator_resources(internal)
+    (internal / "vision" / "_build_version.py").write_text(marker, "utf-8")
+
+    assert_ai_worker_layout(exe, required=True)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    (
         'APP_VERSION = "1.2.3-.."\n',
         'APP_VERSION = "1.2.3-alpha..1"\n',
-        'APP_VERSION = "1.2.3-alpha-"\n',
+        'APP_VERSION = "1.2.3-01"\n',
+        'APP_VERSION = "1.2.3+build..7"\n',
+        'APP_VERSION = "1.2.3+build."\n',
+        'APP_VERSION = "1.2.3+build_7"\n',
     ),
 )
 def test_packaged_verifier_rejects_noncanonical_release_version_runtime_marker(
