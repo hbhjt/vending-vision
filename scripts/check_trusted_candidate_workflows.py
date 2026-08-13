@@ -10,9 +10,9 @@ from workflow_yaml import WorkflowYamlError, load_workflow_yaml, workflow_run_sc
 
 
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
-TRUSTED_BUILDER_COMMIT = "ee95191abdf5f22b1823b0625d9e700c4f41332e"
+TRUSTED_BUILDER_COMMIT = "c85ac3059c31d41b405282ecfc7641d0c1b88958"
 TRUSTED_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-TRUSTED_SIGNER_COMMIT = "7d3b3a42114160810a9514c4aa8bbbacedc1fa39"
+TRUSTED_SIGNER_COMMIT = "92e3473435bf6c98fc6d88cb77a14c6cf3268c48"
 TRUSTED_SIGNER_PATH = ".github/workflows/trusted-ai-candidate-signer.yml"
 HOSTED_AUTHORITY_COMMIT = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 HOSTED_AUTHORITY_PATH = "scripts/verify_hosted_release_authority.py"
