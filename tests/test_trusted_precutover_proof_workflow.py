@@ -424,6 +424,43 @@ def test_trusted_proof_workflow_passes_executable_trust_policy():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.parametrize(
+    ("constant", "error"),
+    [
+        ("COMPANION_BUILDER_SHA", "trusted_proof_companion_builder_commit_invalid"),
+        ("CANDIDATE_BUILDER_SHA", "trusted_proof_candidate_builder_commit_invalid"),
+        ("HOSTED_AUTHORITY_SHA", "trusted_proof_hosted_authority_commit_invalid"),
+    ],
+)
+def test_trusted_proof_policy_rejects_truncated_authority_constants(tmp_path, constant, error):
+    policy = tmp_path / "check_trusted_precutover_proof_workflow.py"
+    source = POLICY.read_text("utf-8")
+    match = re.search(rf'^{constant} = "([a-f0-9]{{40}})"$', source, re.MULTILINE)
+    assert match is not None
+    policy.write_text(
+        source[: match.start(1)] + match.group(1)[:-1] + source[match.end(1) :],
+        "utf-8",
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(policy),
+            "--workflow",
+            str(TRUSTED_PROOF),
+            "--repository-root",
+            str(ROOT),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "scripts")},
+    )
+
+    assert completed.returncode != 0
+    assert error in completed.stdout
+
+
 def test_trusted_proof_requires_real_tag_peel_main_ancestry_and_release_authority():
     source = TRUSTED_PROOF.read_text("utf-8")
 

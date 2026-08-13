@@ -115,6 +115,15 @@ def _assert_gh_flags_parse(repository_root: Path) -> None:
 
 
 def check(workflow_path: Path, repository_root: Path) -> None:
+    for label, commit in (
+        ("companion_builder", COMPANION_BUILDER_SHA),
+        ("candidate_builder", CANDIDATE_BUILDER_SHA),
+        ("hosted_authority", HOSTED_AUTHORITY_SHA),
+    ):
+        _require(
+            re.fullmatch(r"[a-f0-9]{40}", commit) is not None,
+            f"trusted_proof_{label}_commit_invalid",
+        )
     source = workflow_path.read_text("utf-8")
     workflow = load_workflow_yaml(source)
     on = workflow.get("on")
