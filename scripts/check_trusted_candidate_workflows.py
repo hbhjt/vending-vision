@@ -122,6 +122,39 @@ def _strip_shell_comment(line: str, dialect: str) -> str:
     return line.rstrip()
 
 
+def _pwsh_here_string_opener(line: str) -> str | None:
+    """Return an unquoted, unescaped PowerShell here-string delimiter, if any."""
+    quote = ""
+    escaped = False
+    for index, character in enumerate(line):
+        if quote == "'":
+            if character == "'":
+                quote = ""
+            continue
+        if escaped:
+            escaped = False
+            continue
+        if _is_shell_escape(
+            character, line[index + 1] if index + 1 < len(line) else None, "pwsh"
+        ):
+            escaped = True
+            continue
+        if character in {"'", '"'}:
+            if not quote:
+                quote = character
+            elif quote == character:
+                quote = ""
+            continue
+        if (
+            not quote
+            and character == "@"
+            and index + 1 < len(line)
+            and line[index + 1] in {"'", '"'}
+        ):
+            return line[index + 1]
+    return None
+
+
 def _logical_shell_commands(run: str, dialect: str) -> tuple[str, ...]:
     """Return executable shell statements, excluding comment-only source lines."""
     commands: list[str] = []
@@ -137,12 +170,8 @@ def _logical_shell_commands(run: str, dialect: str) -> tuple[str, ...]:
         if not line:
             continue
         if dialect == "pwsh":
-            match = re.fullmatch(
-                r"(?:\$[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)?\s*=\s*)?@(['\"])",
-                line,
-            )
-            if match is not None:
-                here_string_quote = match.group(1)
+            here_string_quote = _pwsh_here_string_opener(line) or ""
+            if here_string_quote:
                 continue
         continued = line.endswith("`" if dialect == "pwsh" else "\\")
         pending += (line[:-1] if continued else line) + " "

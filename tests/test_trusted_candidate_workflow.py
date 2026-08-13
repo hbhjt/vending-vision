@@ -127,6 +127,23 @@ def _has_post_attestation_subject_fence(run: str) -> bool:
     return digest in statements and comparison in statements
 
 
+def _hide_fence_in_here_string(source: str, opener: str) -> str:
+    fence = (
+        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }'
+    )
+    mutated = source.replace(
+        fence,
+        f"          {opener}\n"
+        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }\n'
+        "          '@",
+        1,
+    )
+    assert mutated != source
+    return mutated
+
+
 def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload():
     source = TRUSTED_BUILDER.read_text("utf-8")
     attest = source.index("actions/attest-build-provenance@v4")
@@ -157,16 +174,7 @@ def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload
     _, wrong_path_evidence = _workflow_step_run(wrong_path, "Record trusted builder evidence")
     assert not _has_post_attestation_subject_fence(wrong_path_evidence)
 
-    here_string = source.replace(
-        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
-        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }',
-        "          $fence = @'\n"
-        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
-        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }\n'
-        "          '@",
-        1,
-    )
-    assert here_string != source
+    here_string = _hide_fence_in_here_string(source, "$fence = @'")
     _, here_string_evidence = _workflow_step_run(here_string, "Record trusted builder evidence")
     assert not _has_post_attestation_subject_fence(here_string_evidence)
 
@@ -177,6 +185,21 @@ def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload
         double_here_string, "Record trusted builder evidence"
     )
     assert not _has_post_attestation_subject_fence(double_here_string_evidence)
+
+    for opener in ("$fence = [string]@'", "Write-Output @'", "$fence = @(@'"):
+        hidden = _hide_fence_in_here_string(source, opener)
+        _, hidden_evidence = _workflow_step_run(hidden, "Record trusted builder evidence")
+        assert not _has_post_attestation_subject_fence(hidden_evidence)
+
+    quoted_literal = source.replace(
+        '          $bundleFile = "github-build-provenance.sigstore.json"',
+        '          $literal = "@\'"\n          $bundleFile = "github-build-provenance.sigstore.json"',
+        1,
+    )
+    _, quoted_literal_evidence = _workflow_step_run(
+        quoted_literal, "Record trusted builder evidence"
+    )
+    assert _has_post_attestation_subject_fence(quoted_literal_evidence)
 
 
 def test_active_verified_archive_downloads_have_an_explicit_bounded_total_timeout():
