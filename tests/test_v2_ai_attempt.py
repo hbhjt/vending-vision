@@ -462,9 +462,8 @@ def _write_test_regional_sidecar(path, person, garment, output, captured_source)
         "schemaVersion": "vem-ai-regional-evidence/v1",
         "verdict": "regional_check_failed",
     }
-    path.write_text(
-        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
-        "utf-8",
+    path.write_bytes(
+        (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     )
 
 
@@ -480,7 +479,9 @@ def _receive_until_completed(socket):
     trace = []
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
-        message = socket.receive_json()
+        message = _receive_json_with_timeout(
+            socket, timeout=max(0.001, deadline - time.monotonic())
+        )
         trace.append(message)
         if message["type"] == "vision.try_on.attempt.completed":
             return trace, message
@@ -491,7 +492,9 @@ def _receive_until_ai_child_running(socket):
     trace = []
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
-        message = socket.receive_json()
+        message = _receive_json_with_timeout(
+            socket, timeout=max(0.001, deadline - time.monotonic())
+        )
         trace.append(message)
         if (
             message["type"] == "vision.try_on.attempt.generating"
@@ -505,7 +508,9 @@ def _receive_until_terminal(socket):
     trace = []
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
-        message = socket.receive_json()
+        message = _receive_json_with_timeout(
+            socket, timeout=max(0.001, deadline - time.monotonic())
+        )
         trace.append(message)
         if message["type"] in {
             "vision.try_on.attempt.completed",
