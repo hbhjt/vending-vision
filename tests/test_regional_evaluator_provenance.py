@@ -83,6 +83,39 @@ def test_regional_evaluator_descriptor_rejects_source_mutation_and_script_check(
     assert checked.returncode == 0, checked.stderr
 
 
+def test_release_version_materialization_preserves_regional_evaluator_provenance(
+    tmp_path,
+):
+    descriptor = build_regional_evaluator_descriptor()
+    for source in descriptor["sources"]:
+        source_path = Path(source["path"])
+        destination = tmp_path / source_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / source_path, destination)
+    build_version = tmp_path / "vision" / "_build_version.py"
+    shutil.copyfile(ROOT / "vision" / "_build_version.py", build_version)
+    (tmp_path / "regional-evaluator-descriptor.json").write_text(
+        REGIONAL_EVALUATOR_DESCRIPTOR_PATH.read_text("utf-8"), "utf-8"
+    )
+
+    materialized = subprocess.run(
+        [
+            sys.executable,
+            ROOT / "scripts" / "set_release_version.py",
+            "0.2.1-rc.12",
+            "--root",
+            tmp_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert materialized.returncode == 0, materialized.stderr
+    assert build_version.read_text("utf-8") == 'APP_VERSION = "0.2.1-rc.12"\n'
+    assert verify_regional_evaluator_provenance_at_root(tmp_path) is True
+
+
 def test_regional_evaluator_descriptor_rejects_an_unlisted_local_import(tmp_path):
     descriptor = build_regional_evaluator_descriptor()
     for source in descriptor["sources"]:

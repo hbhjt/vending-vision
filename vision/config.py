@@ -11,12 +11,34 @@
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 import jsonschema
 
-from vision._build_version import APP_VERSION as BUILD_APP_VERSION
+
+def _load_build_app_version() -> str:
+    """Read the release-materialized display version without importing its module.
+
+    The regional evaluator imports this configuration module through the pose
+    adapter.  Its provenance descriptor must bind evaluator code, while the
+    release-only display marker is deliberately materialized after checkout.
+    Parse the single trusted marker as data so that materialization cannot
+    invalidate that evaluator source closure.
+    """
+
+    try:
+        raw = Path(__file__).with_name("_build_version.py").read_text("utf-8")
+    except OSError as exc:
+        raise RuntimeError("build version marker is unavailable") from exc
+    match = re.fullmatch(r'APP_VERSION = "([0-9A-Za-z.-]+)"\n', raw)
+    if match is None:
+        raise RuntimeError("build version marker is invalid")
+    return match.group(1)
+
+
+BUILD_APP_VERSION = _load_build_app_version()
 
 # ---------------------------------------------------------------------------
 # 路径解析

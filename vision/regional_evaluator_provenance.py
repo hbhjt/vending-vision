@@ -13,7 +13,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 REGIONAL_EVALUATOR_DESCRIPTOR_PATH = REPO_ROOT / "regional-evaluator-descriptor.json"
 REGIONAL_EVALUATOR_DESCRIPTOR_SCHEMA_VERSION = "vem-ai-regional-evaluator-descriptor/v1"
 REGIONAL_EVALUATOR_SOURCE_PATHS = (
-    "vision/_build_version.py",
     "vision/catvton_pose_masks.py",
     "vision/catvton_preprocess.py",
     "vision/config.py",
