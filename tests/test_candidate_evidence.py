@@ -270,12 +270,24 @@ def test_win32_marked_lock_selects_a_complete_offline_wheel_closure(tmp_path):
 
 def test_windows_ci_and_candidate_publish_force_the_win32_offline_closure():
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    from scripts.workflow_yaml import load_workflow_yaml
+
+    ci_workflow = load_workflow_yaml(ci)
     publish = (ROOT / ".github/workflows/publish-candidate.yml").read_text(encoding="utf-8")
     builder = (ROOT / ".github/workflows/trusted-ai-candidate-builder.yml").read_text(encoding="utf-8")
 
     assert (ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.11.9"
-    assert ci.count("--target-sys-platform win32") == 1
-    assert "python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt" in ci
+    for job_name in ("windows-test", "windows-package"):
+        runs = "\n".join(
+            step.get("run", "")
+            for step in ci_workflow["jobs"][job_name]["steps"]
+            if isinstance(step, dict)
+        )
+        assert "--target-sys-platform win32" in runs
+        assert (
+            "python -m pip install --no-index --find-links wheelhouse "
+            "--require-hashes -r requirements.txt"
+        ) in runs
     assert "dependency_lock.py" not in publish
     assert "python -m pip install" not in publish
     assert "scripts/build_exe.ps1" not in publish

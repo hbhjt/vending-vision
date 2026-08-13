@@ -564,14 +564,36 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "--expected-candidate-manifest-sha256" not in publisher
 
 
-def test_windows_ci_materializes_the_digest_bound_ai_wheelhouse_before_packaging():
-    """Hosted packaging must feed build_exe the exact AI release closure."""
+def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_publish():
+    """Hosted publishing must join independent Windows test and packaging gates."""
     from scripts.workflow_yaml import load_workflow_yaml
 
     workflow = load_workflow_yaml(
         (ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
     )
-    steps = workflow["jobs"]["windows-test"]["steps"]
+    jobs = workflow["jobs"]
+    test_job = jobs["windows-test"]
+    package_job = jobs["windows-package"]
+    publish_job = jobs["publish-main-artifacts"]
+    assert "needs" not in test_job
+    assert "needs" not in package_job
+    assert publish_job["needs"] == [
+        "test",
+        "windows-test",
+        "regional-evidence-contract",
+        "windows-package",
+    ]
+    assert publish_job["if"] == "github.ref == 'refs/heads/main'"
+
+    test_runs = "\n".join(
+        step.get("run", "") for step in test_job["steps"] if isinstance(step, dict)
+    )
+    assert "python -m pytest -q" in test_runs
+    assert "python -m py_compile app.py run_vision_server.py vision/*.py scripts/*.py" in test_runs
+    assert "verify_model_manifest" in test_runs
+    assert "scripts/build_exe.ps1" not in test_runs
+
+    steps = package_job["steps"]
     named_steps = [step for step in steps if isinstance(step, dict) and "name" in step]
     materialize_index, materialize_step = next(
         (index, step)
@@ -610,6 +632,36 @@ def test_windows_ci_materializes_the_digest_bound_ai_wheelhouse_before_packaging
         "scripts/verify_packaged_exe.py"
     ) in build_run
     assert materialize_index < build_index
+    assert build_run.count("scripts/build_exe.ps1") == 1
+    assert build_run.count("scripts/verify_packaged_exe.py") == 1
+    assert build_run.count("scripts/package_main_artifacts.ps1") == 1
+    assert '-Commit "${{ github.sha }}"' in build_run
+
+    staging_upload = next(
+        step for step in steps if step.get("uses") == "actions/upload-artifact@v4"
+    )
+    assert staging_upload["with"] == {
+        "name": "vending-vision-main-staging-${{ github.sha }}",
+        "path": "main-artifacts/*",
+        "if-no-files-found": "error",
+    }
+
+    publish_steps = publish_job["steps"]
+    staging_download = next(
+        step for step in publish_steps if step.get("uses") == "actions/download-artifact@v4"
+    )
+    final_upload = next(
+        step for step in publish_steps if step.get("uses") == "actions/upload-artifact@v4"
+    )
+    assert staging_download["with"] == {
+        "name": "vending-vision-main-staging-${{ github.sha }}",
+        "path": "main-artifacts",
+    }
+    assert final_upload["with"] == {
+        "name": "vending-vision-main-${{ github.sha }}",
+        "path": "main-artifacts/*",
+        "if-no-files-found": "error",
+    }
     assert runtime_descriptor["requirementsAiLockSha256"] == hashlib.sha256(
         lock.read_bytes()
     ).hexdigest()

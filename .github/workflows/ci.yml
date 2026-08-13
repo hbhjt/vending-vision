@@ -58,6 +58,30 @@ jobs:
         run: python -m py_compile app.py run_vision_server.py vision/*.py scripts/*.py
       - name: 校验生产模型清单
         run: python -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
+
+  windows-package:
+    name: Windows 交付包构建
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+          cache: pip
+      - name: 下载完整锁定 wheel 闭包
+        run: >-
+          python -m pip download --only-binary=:all: --require-hashes
+          --dest wheelhouse -r requirements.txt
+      - name: 离线安装并校验锁定闭包
+        run: |
+          python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
+          python scripts/dependency_lock.py --wheelhouse wheelhouse --python python --target-sys-platform win32
       - name: 物化精确 AI wheel 闭包
         run: >-
           python scripts/materialize_ai_wheelhouse.py
@@ -70,11 +94,10 @@ jobs:
           ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse") -AiWheelhouse (Join-Path $PWD "ai-wheelhouse") -AiWheelhouseDescriptor (Join-Path $PWD "requirements-ai.lock.json")
           & (Join-Path $PWD ".venv-packaging-core\Scripts\python.exe") scripts/verify_packaged_exe.py
           ./scripts/package_main_artifacts.ps1 -Commit "${{ github.sha }}" -OutputDirectory (Join-Path $PWD "main-artifacts")
-      - name: 发布同提交 Vision artifacts
-        if: github.ref == 'refs/heads/main'
+      - name: 暂存同提交 Vision artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vending-vision-main-${{ github.sha }}
+          name: vending-vision-main-staging-${{ github.sha }}
           path: main-artifacts/*
           if-no-files-found: error
 
@@ -116,3 +139,23 @@ jobs:
         run: >-
           python -m pytest -q
           tests/test_ai_attempt_worker_boundary.py::test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png
+
+  publish-main-artifacts:
+    name: 发布同提交 Vision artifacts
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - test
+      - windows-test
+      - regional-evidence-contract
+      - windows-package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vending-vision-main-staging-${{ github.sha }}
+          path: main-artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vending-vision-main-${{ github.sha }}
+          path: main-artifacts/*
+          if-no-files-found: error

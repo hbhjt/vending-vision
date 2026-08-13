@@ -611,7 +611,7 @@ def test_ci_declares_pinned_vem_regional_evidence_contract_job():
     assert "ref: 22f067b427ba81ee0f47dafef151b1849a7545fb" in workflow
     assert "VEM_REGIONAL_EVIDENCE_MODULE:" in workflow
     assert "scripts/testbed/ai-regional-evidence-policy.json" in workflow
-    assert workflow.count("fetch-depth: 0") == 4
+    assert workflow.count("fetch-depth: 0") == 5
     assert "tests/test_ai_attempt_worker_boundary.py::test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png" in workflow
 
 
