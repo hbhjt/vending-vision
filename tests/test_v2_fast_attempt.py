@@ -2,6 +2,7 @@ import hashlib
 import asyncio
 import ast
 import importlib
+import inspect
 import json
 import multiprocessing
 import os
@@ -41,9 +42,15 @@ def test_fast_worker_fixture_is_spawn_safe():
     assert top_level_imports <= {"base64", "os", "threading", "time"}
     assert {
         "block_first_render",
+        "block_first_directshow",
+        "block_then_fail_restart_render",
         "block_then_barrier_restart_render",
         "block_then_ready_barrier_directshow",
     } <= set(vars(module))
+    directshow_source = inspect.getsource(module.block_first_directshow)
+    assert directshow_source.index('connection.send(("ready"') < directshow_source.index(
+        "import numpy as np"
+    )
 
 
 def _active_child_pids_except_acquisition_observer():
@@ -83,33 +90,6 @@ def test_raw_value_wait_timeout_returns_from_asyncio_run_without_executor(monkey
     assert time.monotonic() - started < 0.5
 
 
-def _fast_block_first_broker_target(connection, config):
-    counter = config["requestCounter"]
-    blocked_read_entered = config.get("blockedReadEntered")
-    try:
-        connection.send(("ready", {"pid": os.getpid()}))
-        while True:
-            command, _payload = connection.recv()
-            if command == "shutdown":
-                connection.send(("ok", None))
-                return
-            if command == "read":
-                with counter.get_lock():
-                    counter.value += 1
-                    request_number = counter.value
-                if request_number == 1:
-                    if blocked_read_entered is not None:
-                        blocked_read_entered.value = 1
-                    while True:
-                        threading.Event().wait(1.0)
-                connection.send(("ok", {
-                    "pid": os.getpid(),
-                    "image": np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8),
-                }))
-    finally:
-        connection.close()
-
-
 def _fast_pose_error_then_success_target(connection, counter):
     """A test-only worker fixture for public typed-attempt outcome coverage."""
     connection.send(("ready", {"pid": os.getpid(), "poseReady": True}))
@@ -126,28 +106,6 @@ def _fast_pose_error_then_success_target(connection, counter):
                 connection.send(("pose_error", "PoseUnavailableError: C:\\internal\\model"))
             else:
                 connection.send(("ok", _png_bytes()))
-    finally:
-        connection.close()
-
-
-def _fast_block_then_fail_restart_target(connection, starts, requests):
-    with starts.get_lock():
-        starts.value += 1
-        start_number = starts.value
-    if start_number > 1:
-        connection.close()
-        return
-    connection.send(("ready", {"pid": os.getpid()}))
-    try:
-        while True:
-            command, _payload = connection.recv()
-            if command == "shutdown":
-                connection.send(("ok", None))
-                return
-            with requests.get_lock():
-                requests.value += 1
-            while True:
-                threading.Event().wait(1.0)
     finally:
         connection.close()
 
@@ -985,7 +943,7 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
     requests = context.Value("i", 0)
     broker = FastRenderBroker(
         context=context,
-        target=_fast_block_then_fail_restart_target,
+        target=fast_worker_fixture.block_then_fail_restart_render,
         target_args=(starts, requests),
     )
     monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
@@ -1823,7 +1781,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
             "blockedReadEntered": blocked_read_entered,
         },
         context=context,
-        target=_fast_block_first_broker_target,
+        target=fast_worker_fixture.block_first_directshow,
     )
 
     class Candidate:

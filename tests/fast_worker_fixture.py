@@ -35,6 +35,29 @@ def block_first_render(connection, counter):
         connection.close()
 
 
+def block_then_fail_restart_render(connection, starts, requests):
+    """Block the first render, then make the replacement fail before ready."""
+    with starts.get_lock():
+        starts.value += 1
+        start_number = starts.value
+    if start_number > 1:
+        connection.close()
+        return
+    connection.send(("ready", {"pid": os.getpid()}))
+    try:
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+            with requests.get_lock():
+                requests.value += 1
+            while True:
+                threading.Event().wait(1.0)
+    finally:
+        connection.close()
+
+
 def block_then_barrier_restart_render(
     connection, starts, requests, restart_entered, restart_release, restart_fails
 ):
@@ -61,6 +84,43 @@ def block_then_barrier_restart_render(
                 while True:
                     threading.Event().wait(1.0)
             connection.send(("ok", _PNG_BYTES))
+    finally:
+        connection.close()
+
+
+def block_first_directshow(connection, config):
+    """Advertise readiness without importing numpy, then block the first read."""
+    counter = config["requestCounter"]
+    blocked_read_entered = config.get("blockedReadEntered")
+    try:
+        connection.send(("ready", {"pid": os.getpid()}))
+        while True:
+            command, _payload = connection.recv()
+            if command == "shutdown":
+                connection.send(("ok", None))
+                return
+            if command == "read":
+                with counter.get_lock():
+                    counter.value += 1
+                    request_number = counter.value
+                if request_number == 1:
+                    if blocked_read_entered is not None:
+                        blocked_read_entered.value = 1
+                    while True:
+                        threading.Event().wait(1.0)
+                import numpy as np
+
+                connection.send(
+                    (
+                        "ok",
+                        {
+                            "pid": os.getpid(),
+                            "image": np.full(
+                                (80, 60, 3), (235, 220, 205), dtype=np.uint8
+                            ),
+                        },
+                    )
+                )
     finally:
         connection.close()
 
