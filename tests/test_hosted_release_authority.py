@@ -1,22 +1,77 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import pytest
 
+ROOT = Path(__file__).parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from scripts.check_trusted_candidate_workflows import (
+    _logical_shell_commands,
+    _shell_statements,
+    _shell_tokens,
+)
+from scripts.check_trusted_precutover_proof_workflow import (
+    CANONICAL_GH_PATH,
+    _assert_candidate_builder_authority_sync,
+)
 from scripts.verify_hosted_release_authority import AuthorityError, verify_release_fence
 from scripts.verify_hosted_environment import verify_environment
+from scripts.workflow_yaml import load_workflow_yaml
 
 
 REPOSITORY = "hbhjt/vending-vision"
 SOURCE_REF = "refs/tags/v1.2.3-rc.4"
 SOURCE_COMMIT = "a" * 40
-ROOT = Path(__file__).parents[1]
 AUTHORITY_COMMIT = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 
 
 def _release(value: object) -> dict:
     return {"data": {"repository": {"release": value}}}
+
+
+def _steps(workflow: dict, job_name: str) -> list[dict]:
+    jobs = workflow["jobs"]
+    job = jobs[job_name]
+    steps = job["steps"]
+    assert isinstance(steps, list)
+    return steps
+
+
+def _named_step_index(steps: list[dict], name: str) -> int:
+    matches = [index for index, step in enumerate(steps) if step.get("name") == name]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _assert_real_guarded_candidate_attestation(step: dict, archive: str, message: str):
+    run = step["run"]
+    statements = [
+        (statement, call_operator, _shell_tokens(statement, "pwsh"))
+        for command in _logical_shell_commands(run, "pwsh")
+        for statement, call_operator in _shell_statements(command, "pwsh")
+    ]
+    guard = (
+        'if (-not (Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" '
+        f'-PathType Leaf)) {{ throw "{message}" }}'
+    )
+    guard_indexes = [
+        index for index, (statement, _, _) in enumerate(statements) if statement == guard
+    ]
+    calls = []
+    for index, (_, call_operator, token_facts) in enumerate(statements):
+        tokens = tuple(token for token, _ in token_facts)
+        if tokens[1:4] == ("attestation", "verify", archive):
+            calls.append((index, call_operator, token_facts))
+    assert len(guard_indexes) == 1
+    assert len(calls) == 1
+    call_index, call_operator, token_facts = calls[0]
+    executable, quoted = token_facts[0]
+    assert call_operator and quoted
+    assert executable.replace("/", "\\").casefold() == CANONICAL_GH_PATH
+    assert guard_indexes[0] < call_index
 
 
 def test_publish_admission_accepts_only_an_absent_release_for_the_exact_rc_tag():
@@ -142,21 +197,40 @@ def test_publish_and_proof_use_the_hosted_environment_and_release_fence_not_rule
         "gh release create"
     ) < publish_job.index("--mode publish-complete")
 
+    _assert_candidate_builder_authority_sync(proof, ROOT)
+    parsed_proof = load_workflow_yaml(proof)
     execute = proof[proof.index("  execute:\n") : proof.index("  sign:\n")]
     sign = proof[proof.index("  sign:\n") : proof.index("  verify:\n")]
-    for job in (execute, sign):
+    expected = (
+        (
+            "execute",
+            execute,
+            "Approve exact RC tag and its existing release target",
+            "Verify candidate GitHub provenance before executing frozen companion",
+            "proof-input/candidate/candidate.zip",
+            "candidate GitHub CLI is unavailable",
+        ),
+        (
+            "sign",
+            sign,
+            "Fresh approve exact protected source before signing",
+            "Fresh verify candidate GitHub provenance without execution",
+            "signer-proof-input/candidate/candidate.zip",
+            "signer candidate GitHub CLI is unavailable",
+        ),
+    )
+    for job_name, job, approval_name, attestation_name, archive, guard_message in expected:
         assert "environment: experimental-candidate" in job.split("steps:", 1)[0]
         assert f"ref: {AUTHORITY_COMMIT}" in job
         assert "verify_hosted_release_authority.py" in job
         assert "--mode proof" in job
-        candidate_attestation = (
-            "gh attestation verify proof-input/candidate/candidate.zip"
-            if "  execute:\n" in job
-            else "attestation verify signer-proof-input/candidate/candidate.zip"
+        steps = _steps(parsed_proof, job_name)
+        approval_index = _named_step_index(steps, approval_name)
+        attestation_index = _named_step_index(steps, attestation_name)
+        assert approval_index < attestation_index
+        _assert_real_guarded_candidate_attestation(
+            steps[attestation_index], archive, guard_message
         )
-        assert job.index("approve_candidate_source.py") < job.index(
-            "verify_hosted_release_authority.py"
-        ) < job.index(candidate_attestation)
 
     combined = publisher + proof
     for forbidden in (
