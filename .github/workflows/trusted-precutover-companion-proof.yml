@@ -317,7 +317,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh attestation verify proof-input/candidate/candidate.zip --bundle proof-input/candidate/github-build-provenance.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "c90a965d117fea49f318b18e0fcd50aa047bc41" --source-ref $env:CALLER_REF --source-digest $env:PROOF_SOURCE_COMMIT --deny-self-hosted-runners
+          gh attestation verify proof-input/candidate/candidate.zip --bundle proof-input/candidate/github-build-provenance.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "c90a965d117fea49f318b18e0fcd50aa047bc41f" --source-ref $env:CALLER_REF --source-digest $env:PROOF_SOURCE_COMMIT --deny-self-hosted-runners
           if ($LASTEXITCODE -ne 0) { throw "candidate GitHub attestation verification failed" }
       - name: Execute only the verified frozen companion
         shell: pwsh
@@ -547,7 +547,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          & $env:TRUSTED_GH attestation verify signer-proof-input/candidate/candidate.zip --bundle signer-proof-input/candidate/github-build-provenance.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "c90a965d117fea49f318b18e0fcd50aa047bc41" --source-ref $env:CALLER_REF --source-digest $env:PROOF_SOURCE_COMMIT --deny-self-hosted-runners
+          & $env:TRUSTED_GH attestation verify signer-proof-input/candidate/candidate.zip --bundle signer-proof-input/candidate/github-build-provenance.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "c90a965d117fea49f318b18e0fcd50aa047bc41f" --source-ref $env:CALLER_REF --source-digest $env:PROOF_SOURCE_COMMIT --deny-self-hosted-runners
           if ($LASTEXITCODE -ne 0) { throw "signer candidate attestation verification failed" }
       - name: Download fixed execution handoff
         uses: actions/download-artifact@v4

@@ -95,7 +95,7 @@ def build_inputs(root: Path) -> tuple[dict, dict]:
         "schemaVersion": "vending-vision-trusted-builder-evidence/v1",
         "builderRepository": "hbhjt/vending-vision",
         "builderWorkflow": ".github/workflows/trusted-ai-candidate-builder.yml",
-        "builderWorkflowSha": "c90a965d117fea49f318b18e0fcd50aa047bc41",
+        "builderWorkflowSha": "c90a965d117fea49f318b18e0fcd50aa047bc41f",
         "sourceCommit": source_commit,
         "subjectSha256": subject_sha,
         "embeddedManifestSha256": _sha(manifest_raw),

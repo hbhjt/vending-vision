@@ -10,9 +10,9 @@ from workflow_yaml import WorkflowYamlError, workflow_run_scalars
 
 
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
-TRUSTED_BUILDER_COMMIT = "c90a965d117fea49f318b18e0fcd50aa047bc41"
+TRUSTED_BUILDER_COMMIT = "c90a965d117fea49f318b18e0fcd50aa047bc41f"
 TRUSTED_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-TRUSTED_SIGNER_COMMIT = "fb006dccf178c738d99b3fac38d887767d999688"
+TRUSTED_SIGNER_COMMIT = "fbb43d10bd65d477133d0005471a42b765ae39a5"
 TRUSTED_SIGNER_PATH = ".github/workflows/trusted-ai-candidate-signer.yml"
 HOSTED_AUTHORITY_COMMIT = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 HOSTED_AUTHORITY_PATH = "scripts/verify_hosted_release_authority.py"
@@ -123,6 +123,15 @@ def _assert_gh_attestation_flags_parse(repository_root: Path) -> None:
 def check_trusted_candidate_workflows(
     *, builder: Path, signer: Path, publisher: Path, repository_root: Path
 ) -> None:
+    for name, commit in (
+        ("trusted_builder", TRUSTED_BUILDER_COMMIT),
+        ("trusted_signer", TRUSTED_SIGNER_COMMIT),
+        ("hosted_authority", HOSTED_AUTHORITY_COMMIT),
+    ):
+        _require(
+            re.fullmatch(r"[a-f0-9]{40}", commit) is not None,
+            f"{name}_commit_invalid",
+        )
     builder_source = builder.read_text("utf-8")
     signer_source = signer.read_text("utf-8")
     publisher_source = publisher.read_text("utf-8")

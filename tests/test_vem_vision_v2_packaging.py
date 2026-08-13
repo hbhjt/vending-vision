@@ -537,8 +537,8 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "attestations: write" in builder
     assert "secrets:" not in builder
 
-    assert "trusted-ai-candidate-builder.yml@c90a965d117fea49f318b18e0fcd50aa047bc41" in publisher
-    assert "trusted-ai-candidate-signer.yml@fb006dccf178c738d99b3fac38d887767d999688" in publisher
+    assert "trusted-ai-candidate-builder.yml@c90a965d117fea49f318b18e0fcd50aa047bc41f" in publisher
+    assert "trusted-ai-candidate-signer.yml@fbb43d10bd65d477133d0005471a42b765ae39a5" in publisher
     assert "scripts/build_exe.ps1" not in publisher
     assert "actions/attest-build-provenance" not in publisher
     assert "needs: trusted_builder" in publisher
@@ -548,7 +548,7 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "gh attestation verify" in publisher
     assert "--signer-repo" not in publisher
     assert "--signer-workflow \"hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml\"" in publisher
-    assert "--signer-digest \"c90a965d117fea49f318b18e0fcd50aa047bc41\"" in publisher
+    assert "--signer-digest \"c90a965d117fea49f318b18e0fcd50aa047bc41f\"" in publisher
     assert "--source-ref" in publisher
     assert "--source-digest" in publisher
     assert "--deny-self-hosted-runners" in publisher

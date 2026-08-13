@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import os
 import subprocess
 import sys
 
@@ -11,9 +12,9 @@ import pytest
 ROOT = Path(__file__).parents[1]
 TRUSTED_BUILDER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder.yml"
 PUBLISHER = ROOT / ".github" / "workflows" / "publish-candidate.yml"
-TRUSTED_BUILDER_COMMIT = "c90a965d117fea49f318b18e0fcd50aa047bc41"
+TRUSTED_BUILDER_COMMIT = "c90a965d117fea49f318b18e0fcd50aa047bc41f"
 TRUSTED_SIGNER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-signer.yml"
-TRUSTED_SIGNER_COMMIT = "fb006dccf178c738d99b3fac38d887767d999688"
+TRUSTED_SIGNER_COMMIT = "fbb43d10bd65d477133d0005471a42b765ae39a5"
 TRUST_POLICY = ROOT / "scripts" / "check_trusted_candidate_workflows.py"
 
 
@@ -118,6 +119,34 @@ def test_publish_caller_pins_builder_a_and_signer_s_without_holding_supplier_sec
     assert "--mode publish-admission" in publish
     assert "--mode publish-complete" in publish
     assert "rulesets?targets=tag" not in publish
+
+
+def test_trust_policy_rejects_truncated_immutable_workflow_identity(tmp_path):
+    truncated_policy = tmp_path / "check_trusted_candidate_workflows.py"
+    truncated_policy.write_text(
+        TRUST_POLICY.read_text("utf-8").replace(
+            TRUSTED_BUILDER_COMMIT, TRUSTED_BUILDER_COMMIT[:-1], 1
+        ),
+        "utf-8",
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(truncated_policy),
+            "--builder", str(TRUSTED_BUILDER),
+            "--signer", str(TRUSTED_SIGNER),
+            "--publisher", str(PUBLISHER),
+            "--repository-root", str(ROOT),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "scripts")},
+    )
+
+    assert completed.returncode != 0
+    assert "trusted_builder_commit_invalid" in completed.stdout
 
 
 def test_trust_policy_rejects_mutable_caller_and_missing_or_wrong_signer_digest(tmp_path):

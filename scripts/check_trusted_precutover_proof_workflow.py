@@ -19,7 +19,7 @@ COMPANION_BUILDER_SHA = "d8c93b50cac005a371d06badcc398638fd8acabb"
 COMPANION_BUILDER_CLOSURE = "trusted-precutover-companion-builder-closure.json"
 COMPANION_BUILDER_CLOSURE_VERIFIER = "scripts/verify_trusted_builder_closure.py"
 CANDIDATE_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-CANDIDATE_BUILDER_SHA = "c90a965d117fea49f318b18e0fcd50aa047bc41"
+CANDIDATE_BUILDER_SHA = "c90a965d117fea49f318b18e0fcd50aa047bc41f"
 HOSTED_AUTHORITY_SHA = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 INPUTS = {
     f"{name}_{field}"
