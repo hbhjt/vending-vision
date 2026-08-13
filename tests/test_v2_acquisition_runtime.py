@@ -26,6 +26,9 @@ from vision import camera_manager
 from vision import presence_runtime
 from vision.config import settings
 from vision.acquisition_observer import AcquisitionObservationWorker
+from vision.frame_source import RecordedVideoFrameSource
+from vision.presence_runtime import PresenceRuntime
+from vision.profile_state import get_departure_tracker, get_occupancy_gate, reset_active_track
 
 
 def _permanently_blocking_acquisition_observer(connection):
@@ -104,6 +107,73 @@ class _ReadyFastBroker:
         return None
 
 
+class _RecordedTopDepartureMonitor:
+    """Drive real PresenceRuntime state with the declared recorded top source.
+
+    The production detector's OpenCV/MediaPipe latency is not part of this
+    websocket ordering contract.  Each poll still decodes exactly one recorded
+    top frame; this boundary supplies the fixture's deterministic occupied then
+    absent detector facts to PresenceRuntime's real debounce and departure
+    tracker.
+    """
+
+    def __init__(self, config, *, present_polls):
+        self.source = RecordedVideoFrameSource("top", config)
+        self.present_polls = present_polls
+        self.poll_count = 0
+
+    def check_once(self, *, return_image, camera_role, return_source):
+        assert return_image and return_source and camera_role == "top"
+        image = self.source.read(warmup_frames=1)
+        self.poll_count += 1
+        if self.poll_count <= self.present_polls:
+            proximity = {
+                "present": True,
+                "close": True,
+                "rawCount": 1,
+                "personCount": 1,
+                "personPresent": True,
+                "largestPersonBox": {
+                    "centerX": 0.5,
+                    "centerY": 0.5,
+                    "width": 0.4,
+                    "height": 0.6,
+                },
+                "largestPersonRatio": 0.24,
+                "faceCount": 0,
+                "facePresent": False,
+                "bodyPresent": False,
+                "topOccupancy": {"occupancy": "single", "confidence": 0.9},
+            }
+        else:
+            proximity = {
+                "present": False,
+                "close": False,
+                "rawCount": 0,
+                "personCount": 0,
+                "personPresent": False,
+                "faceCount": 0,
+                "facePresent": False,
+                "bodyPresent": False,
+                "topOccupancy": {"occupancy": "none", "confidence": 0.9},
+            }
+        return proximity, image, self.source.last_frame()
+
+    def release(self):
+        self.source.release()
+
+
+def _reset_recorded_departure_state():
+    gate = get_occupancy_gate()
+    for _ in range(settings.PROFILE_OCCUPANCY_RESET_ABSENT_FRAMES):
+        gate.mark_absent()
+    reset_active_track()
+    tracker = get_departure_tracker()
+    tracker.active = False
+    tracker.absent_count = 0
+    tracker.departed_announced = False
+
+
 def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkeypatch):
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
@@ -146,11 +216,16 @@ def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkey
 def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_events(monkeypatch):
     """Production top presence cancels a public WS attempt; the stream keeps reporting Vision facts."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    recorded_manifest = json.loads(
+        (Path(__file__).parents[1] / "fixtures/recorded-video/expected-results.json").read_text(
+            "utf-8"
+        )
+    )
+    expected_polls = recorded_manifest["expected"]["top"]["departureWithinPolls"]
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", True)
-    # Replay the six-FPS fixture on its production timeline.  Consuming all
-    # 24 frames at a synthetic 10ms poll rate would invalidate the top-camera
-    # candidate before the real front sampler's one-second minimum can finish.
-    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 167)
+    # The deterministic top boundary reaches the fixture's departure edge in
+    # 23 polls while leaving the real front sampler time to publish its result.
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 250)
     monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 10)
     monkeypatch.setattr(vision_app, "_ACQUISITION_POLL_SECONDS", 0.01)
     monkeypatch.setattr(vision_app, "_ACQUISITION_STABLE_FRAMES", 1)
@@ -173,6 +248,14 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
     )
     _configure_recorded_top(monkeypatch)
     _configure_recorded_front(monkeypatch, "man-front.mp4")
+    _reset_recorded_departure_state()
+    monitor = _RecordedTopDepartureMonitor(
+        settings.TOP_CAMERA_CONFIG,
+        present_polls=expected_polls - 2,
+    )
+    runtime = PresenceRuntime(monitor=monitor)
+    monkeypatch.setattr(vision_app, "get_presence_runtime", lambda: runtime)
+    monkeypatch.setattr(presence_runtime, "get_presence_runtime", lambda: runtime)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _GarmentHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -204,11 +287,21 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
             missing.append("ambient observation")
         return missing
 
+    generating_started = threading.Event()
+    real_broadcast_profile_update = vision_app.broadcast_profile_update
+
+    async def broadcast_after_generating(update):
+        if update["message_type"] == "vision.profile_result":
+            assert await asyncio.to_thread(generating_started.wait, 2.0)
+        await real_broadcast_profile_update(update)
+
     async def unfinished_render(*_args, **_kwargs):
+        generating_started.set()
         await asyncio.sleep(30)
         return _png_bytes()
 
     monkeypatch.setattr(vision_app, "render_attempt_frame", unfinished_render)
+    monkeypatch.setattr(vision_app, "broadcast_profile_update", broadcast_after_generating)
     try:
         with TestClient(vision_app.app) as client:
             with client.websocket_connect("/ws") as socket:
@@ -278,11 +371,14 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                     for message_type in ["vision.presence_status", "vision.profile_result"]
                 )
                 assert post_cancel_presence
+                assert monitor.poll_count >= expected_polls + 1
+                assert monitor.source.frame_count == monitor.poll_count
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
+        monitor.release()
         camera_manager.release_all_cameras()
         monkeypatch.setattr(presence_runtime, "_runtime", None)
         if vision_app._acquisition_observer is not None:
