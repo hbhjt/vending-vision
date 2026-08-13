@@ -359,12 +359,45 @@ def verify_result_query_is_not_logged(base_url):
 
 
 def terminate_packaged_process(process, process_log, *, verification_failed=False):
-    process.terminate()
     try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
+        if sys.platform == "win32":
+            # A completed Popen handle is authoritative: do not taskkill a
+            # stale, potentially recycled PID merely because verification
+            # reached its finally block after an early server exit.
+            if process.poll() is None:
+                try:
+                    completed = subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError("packaged Windows server tree termination timed out") from exc
+                if completed.returncode != 0:
+                    raise RuntimeError("packaged Windows server tree did not terminate")
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("packaged Windows server tree did not exit") from exc
+        else:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+    except BaseException as cleanup_error:
+        process_log.seek(0)
+        output = process_log.read()
+        if output:
+            print(_safe_process_log(output), file=sys.stderr)
+        print(f"packaged process cleanup failed: {cleanup_error}", file=sys.stderr)
+        if verification_failed:
+            return output
+        raise
     process_log.seek(0)
     output = process_log.read()
     if output and (verification_failed or process.returncode not in {0, 1, -15}):

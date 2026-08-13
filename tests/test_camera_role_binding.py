@@ -611,6 +611,183 @@ def test_packaged_verifier_prints_captured_stdout_when_startup_wait_fails(
     assert "packaged startup entered camera discovery" in capsys.readouterr().err
 
 
+def test_packaged_verifier_reaps_an_already_exited_windows_server_without_taskkill(
+    monkeypatch, tmp_path, capsys
+):
+    from scripts import verify_packaged_exe
+
+    calls = []
+
+    class PackagedProcess:
+        pid = 4242
+        returncode = 23
+
+        def poll(self):
+            calls.append("poll")
+            return self.returncode
+
+        def terminate(self):
+            raise AssertionError("exited Windows leader must not be terminated by PID")
+
+        def wait(self, timeout):
+            calls.append(("wait", timeout))
+            return self.returncode
+
+    def taskkill(command, **kwargs):
+        raise AssertionError("exited Windows leader must not be taskkilled by PID")
+
+    monkeypatch.setattr(verify_packaged_exe.sys, "platform", "win32")
+    monkeypatch.setattr(verify_packaged_exe.subprocess, "run", taskkill)
+    process_log = (tmp_path / "packaged.log").open("w+", encoding="utf-8")
+    try:
+        process_log.write("actual packaged startup failure\n")
+        process_log.flush()
+        with pytest.raises(AssertionError, match="original verification failure"):
+            try:
+                raise AssertionError("original verification failure")
+            finally:
+                verify_packaged_exe.terminate_packaged_process(
+                    PackagedProcess(), process_log, verification_failed=True
+                )
+    finally:
+        process_log.close()
+
+    assert calls == ["poll", ("wait", 10)]
+    assert "actual packaged startup failure" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("outcome", ["nonzero", "taskkill_timeout", "wait_timeout"])
+def test_packaged_verifier_fails_closed_when_live_windows_tree_cannot_be_proven_dead(
+    monkeypatch, tmp_path, outcome
+):
+    from scripts import verify_packaged_exe
+
+    class PackagedProcess:
+        pid = 4242
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            if outcome == "wait_timeout":
+                raise verify_packaged_exe.subprocess.TimeoutExpired(
+                    "vending-vision.exe", timeout
+                )
+            self.returncode = 1
+            return self.returncode
+
+    def taskkill(command, **kwargs):
+        if outcome == "taskkill_timeout":
+            raise verify_packaged_exe.subprocess.TimeoutExpired(
+                command, kwargs["timeout"]
+            )
+
+        class Completed:
+            returncode = 1
+
+        return Completed()
+
+    monkeypatch.setattr(verify_packaged_exe.sys, "platform", "win32")
+    monkeypatch.setattr(verify_packaged_exe.subprocess, "run", taskkill)
+    process_log = (tmp_path / "packaged.log").open("w+", encoding="utf-8")
+    try:
+        with pytest.raises(RuntimeError, match="Windows server tree"):
+            verify_packaged_exe.terminate_packaged_process(PackagedProcess(), process_log)
+    finally:
+        process_log.close()
+
+
+def test_packaged_verifier_keeps_verification_failure_primary_when_windows_cleanup_fails(
+    monkeypatch, tmp_path, capsys
+):
+    from scripts import verify_packaged_exe
+
+    class PackagedProcess:
+        pid = 4242
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            raise AssertionError("cleanup must stop before leader wait")
+
+    class Completed:
+        returncode = 1
+
+    monkeypatch.setattr(verify_packaged_exe.sys, "platform", "win32")
+    monkeypatch.setattr(verify_packaged_exe.subprocess, "run", lambda *args, **kwargs: Completed())
+    process_log = (tmp_path / "packaged.log").open("w+", encoding="utf-8")
+    try:
+        process_log.write("actual packaged startup failure\n")
+        process_log.flush()
+        with pytest.raises(AssertionError, match="original verification failure"):
+            try:
+                raise AssertionError("original verification failure")
+            finally:
+                verify_packaged_exe.terminate_packaged_process(
+                    PackagedProcess(), process_log, verification_failed=True
+                )
+    finally:
+        process_log.close()
+
+    diagnostics = capsys.readouterr().err
+    assert "actual packaged startup failure" in diagnostics
+    assert "cleanup failed" in diagnostics
+
+
+def test_packaged_verifier_kills_and_joins_a_live_windows_server_tree(monkeypatch, tmp_path):
+    from scripts import verify_packaged_exe
+
+    calls = []
+
+    class PackagedProcess:
+        pid = 4242
+        returncode = None
+
+        def poll(self):
+            calls.append("poll")
+            return None
+
+        def wait(self, timeout):
+            calls.append(("wait", timeout))
+            self.returncode = 1
+            return self.returncode
+
+    def taskkill(command, **kwargs):
+        calls.append(("taskkill", command, kwargs))
+
+        class Completed:
+            returncode = 0
+
+        return Completed()
+
+    monkeypatch.setattr(verify_packaged_exe.sys, "platform", "win32")
+    monkeypatch.setattr(verify_packaged_exe.subprocess, "run", taskkill)
+    process_log = (tmp_path / "packaged.log").open("w+", encoding="utf-8")
+    try:
+        verify_packaged_exe.terminate_packaged_process(PackagedProcess(), process_log)
+    finally:
+        process_log.close()
+
+    assert calls == [
+        "poll",
+        (
+            "taskkill",
+            ["taskkill", "/PID", "4242", "/T", "/F"],
+            {
+                "stdin": verify_packaged_exe.subprocess.DEVNULL,
+                "stdout": verify_packaged_exe.subprocess.DEVNULL,
+                "stderr": verify_packaged_exe.subprocess.DEVNULL,
+                "timeout": 10,
+                "check": False,
+            },
+        ),
+        ("wait", 10),
+    ]
+
+
 def test_release_version_does_not_publish_camera_index(monkeypatch):
     from app import version
 
