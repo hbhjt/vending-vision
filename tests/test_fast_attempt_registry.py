@@ -1,9 +1,11 @@
 import asyncio
 import gc
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
+from vision import fast_attempt_registry
 from vision.fast_attempt_registry import FastAttemptRegistry
 
 
@@ -872,8 +874,15 @@ def test_repeated_outer_cancel_keeps_cleanup_barrier_until_old_owner_stops():
     asyncio.run(scenario())
 
 
-def test_terminal_ttl_prunes_all_expired_records_not_only_lru_head():
+def test_terminal_ttl_prunes_all_expired_records_not_only_lru_head(monkeypatch):
     """Replaying one terminal must not hide older expired records behind it."""
+    clock = [0.0]
+    monkeypatch.setattr(
+        fast_attempt_registry,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0]),
+    )
+
     async def scenario():
         registry = FastAttemptRegistry(terminal_ttl_seconds=0.05, terminal_max_count=10)
         oldest = str(uuid4())
@@ -886,7 +895,7 @@ def test_terminal_ttl_prunes_all_expired_records_not_only_lru_head():
                 send_lock=asyncio.Lock(),
                 terminal=_message("vision.try_on.attempt.failed", attempt_id, attempt_id),
             )
-            await asyncio.sleep(0.01)
+            clock[0] += 0.01
 
         # Move the oldest to the OrderedDict tail without extending its TTL.
         replay = await registry.reject_or_replay(
@@ -896,7 +905,7 @@ def test_terminal_ttl_prunes_all_expired_records_not_only_lru_head():
             terminal=_message("vision.try_on.attempt.failed", oldest, "ignored"),
         )
         assert replay.replay[0]["messageId"] == oldest
-        await asyncio.sleep(0.06)
+        clock[0] += 0.06
 
         retry = await registry.admit(
             attempt_id=oldest,
