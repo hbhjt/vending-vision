@@ -15,11 +15,11 @@ from workflow_yaml import WorkflowYamlError, load_workflow_yaml, workflow_run_sc
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 WORKFLOW_PATH = ".github/workflows/trusted-precutover-companion-proof.yml"
 COMPANION_BUILDER_PATH = ".github/workflows/trusted-precutover-companion-builder.yml"
-COMPANION_BUILDER_SHA = "d8c93b50cac005a371d06badcc398638fd8acabb"
+COMPANION_BUILDER_SHA = "ad09c328e2006f6ec787bd668640f3961febf5a9"
 COMPANION_BUILDER_CLOSURE = "trusted-precutover-companion-builder-closure.json"
 COMPANION_BUILDER_CLOSURE_VERIFIER = "scripts/verify_trusted_builder_closure.py"
 CANDIDATE_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-CANDIDATE_BUILDER_SHA = "3fe9e00c98d9df59c71ce9be5b980a713ddd3110"
+CANDIDATE_BUILDER_SHA = "08bdc994b1ab280eb265c392704f40da8cc88a00"
 HOSTED_AUTHORITY_SHA = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 INPUTS = {
     f"{name}_{field}"
@@ -460,7 +460,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         "scripts/download_verified_file.py",
         "inspect-inputs --input-root proof-input",
         "bind-execution-proof --source companion-report.json",
-        "--companion-source-commit \"d8c93b50cac005a371d06badcc398638fd8acabb\"",
+        "--companion-source-commit \"ad09c328e2006f6ec787bd668640f3961febf5a9\"",
         "verify-proof --proof precutover-ai-proof.json",
         "+refs/heads/main:refs/remotes/origin/main",
         "--protected-main refs/remotes/origin/main",
