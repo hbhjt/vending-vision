@@ -107,6 +107,7 @@ def _strip_shell_comment(line: str, dialect: str) -> str:
             continue
         if escaped:
             escaped = False
+            index += 1
             continue
         if _is_shell_escape(character, line[index + 1] if index + 1 < len(line) else None, dialect):
             escaped = True
@@ -126,32 +127,40 @@ def _pwsh_here_string_opener(line: str) -> str | None:
     """Return an unquoted, unescaped PowerShell here-string delimiter, if any."""
     quote = ""
     escaped = False
-    for index, character in enumerate(line):
-        if quote == "'":
-            if character == "'":
+    index = 0
+    while index < len(line):
+        character = line[index]
+        following = line[index + 1] if index + 1 < len(line) else None
+        if quote:
+            if quote == '"' and character == "`" and following is not None:
+                index += 2
+                continue
+            if quote == "'" and character == "'" and following == "'":
+                index += 2
+                continue
+            if character == quote:
                 quote = ""
+            index += 1
             continue
         if escaped:
             escaped = False
+            index += 1
             continue
-        if _is_shell_escape(
-            character, line[index + 1] if index + 1 < len(line) else None, "pwsh"
-        ):
+        if _is_shell_escape(character, following, "pwsh"):
             escaped = True
+            index += 1
             continue
         if character in {"'", '"'}:
-            if not quote:
-                quote = character
-            elif quote == character:
-                quote = ""
+            quote = character
+            index += 1
             continue
         if (
             not quote
             and character == "@"
-            and index + 1 < len(line)
-            and line[index + 1] in {"'", '"'}
+            and following in {"'", '"'}
         ):
-            return line[index + 1]
+            return following
+        index += 1
     return None
 
 
@@ -173,6 +182,14 @@ def _pwsh_without_block_comments(line: str, in_block_comment: bool) -> tuple[str
             continue
         if quote:
             output.append(character)
+            if quote == '"' and character == "`" and following is not None:
+                output.append(following)
+                index += 2
+                continue
+            if quote == "'" and character == "'" and following == "'":
+                output.append(following)
+                index += 2
+                continue
             if character == quote:
                 quote = ""
             index += 1

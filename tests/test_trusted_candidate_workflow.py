@@ -225,6 +225,20 @@ def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload
     )
     assert not _has_post_attestation_subject_fence(block_comment_evidence)
 
+    escaped_double_quote_block = source.replace(
+        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }',
+        '          $literal = "foo`"" <#\n'
+        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }\n'
+        '          #>',
+        1,
+    )
+    _, escaped_double_quote_evidence = _workflow_step_run(
+        escaped_double_quote_block, "Record trusted builder evidence"
+    )
+    assert not _has_post_attestation_subject_fence(escaped_double_quote_evidence)
+
     inline_block_comment = source.replace(
         '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
         '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }',
@@ -253,6 +267,16 @@ def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload
         quoted_block_literal, "Record trusted builder evidence"
     )
     assert _has_post_attestation_subject_fence(quoted_block_evidence)
+
+    doubled_single_quote_literal = source.replace(
+        '          $bundleFile = "github-build-provenance.sigstore.json"',
+        "          $literal = 'foo'' <# still literal'\n          $bundleFile = \"github-build-provenance.sigstore.json\"",
+        1,
+    )
+    _, doubled_single_quote_evidence = _workflow_step_run(
+        doubled_single_quote_literal, "Record trusted builder evidence"
+    )
+    assert _has_post_attestation_subject_fence(doubled_single_quote_evidence)
 
 
 def test_active_verified_archive_downloads_have_an_explicit_bounded_total_timeout():
