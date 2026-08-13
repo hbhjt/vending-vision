@@ -51,7 +51,7 @@ class SlowDripHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"x")
                 self.wfile.flush()
                 threading.Event().wait(0.25)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.closed.set()
 
     def log_message(self, *_):
