@@ -68,7 +68,7 @@ jobs:
         shell: pwsh
         run: |
           ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse") -AiWheelhouse (Join-Path $PWD "ai-wheelhouse") -AiWheelhouseDescriptor (Join-Path $PWD "requirements-ai.lock.json")
-          & (Join-Path $PWD ".venv-packaging\Scripts\python.exe") scripts/verify_packaged_exe.py
+          & (Join-Path $PWD ".venv-packaging-core\Scripts\python.exe") scripts/verify_packaged_exe.py
           ./scripts/package_main_artifacts.ps1 -Commit "${{ github.sha }}" -OutputDirectory (Join-Path $PWD "main-artifacts")
       - name: 发布同提交 Vision artifacts
         if: github.ref == 'refs/heads/main'

@@ -605,6 +605,10 @@ def test_windows_ci_materializes_the_digest_bound_ai_wheelhouse_before_packaging
 
     assert materialize in materialize_run
     assert build in build_run
+    assert (
+        '& (Join-Path $PWD ".venv-packaging-core\\Scripts\\python.exe") '
+        "scripts/verify_packaged_exe.py"
+    ) in build_run
     assert materialize_index < build_index
     assert runtime_descriptor["requirementsAiLockSha256"] == hashlib.sha256(
         lock.read_bytes()
