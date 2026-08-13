@@ -326,6 +326,12 @@ def test_ready_pack_hot_identity_change_fails_immediately_and_refreshes_once_off
         }],
     }
     (tmp_path / "ai-model-manifest.json").write_text(canonical_ai_model_manifest_json(descriptor), "utf-8")
+    change_time = {"value": 1}
+    monkeypatch.setattr(
+        ai_model_pack_module,
+        "_WINDOWS_CHANGE_TIME",
+        lambda _path: change_time["value"],
+    )
     monkeypatch.setattr(ai_model_pack_module, "load_official_ai_model_pack_descriptor", lambda: descriptor)
     monkeypatch.setattr("vision.ai_attempt_process.probe_ai_attempt_worker", lambda _pack: None)
     reset_official_ai_readiness_cache_for_tests()
@@ -335,6 +341,7 @@ def test_ready_pack_hot_identity_change_fails_immediately_and_refreshes_once_off
     original_stat = model.stat()
     model.write_bytes(b"evil-model")
     os.utime(model, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    change_time["value"] = 2
     original_compute = ai_model_pack_module._compute_official_ai_readiness_snapshot
     refresh_calls = []
 

@@ -427,11 +427,19 @@ def _compute_official_ai_readiness_snapshot(root: str | Path | None) -> Official
         )
     try:
         pack_identity = _pack_readiness_identity(pack_root, descriptor)
-        verify_ai_model_pack(pack_root, descriptor=descriptor)
     except (AiModelPackError, OSError, ValueError):
         return OfficialAiReadinessSnapshot(
             root=str(pack_root),
             identity=None,
+            ready=False,
+            diagnostic="model_pack_invalid",
+        )
+    try:
+        verify_ai_model_pack(pack_root, descriptor=descriptor)
+    except (AiModelPackError, OSError, ValueError):
+        return OfficialAiReadinessSnapshot(
+            root=str(pack_root),
+            identity=pack_identity + runtime_identity,
             ready=False,
             diagnostic="model_pack_invalid",
         )
