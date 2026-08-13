@@ -587,8 +587,15 @@ def test_trusted_proof_policy_accepts_only_real_gh_executables(tmp_path, executa
     (
         '# if (-not (Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" -PathType Leaf)) { throw "candidate GitHub CLI is unavailable" }',
         'Write-Output \'if (-not (Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" -PathType Leaf)) { throw "candidate GitHub CLI is unavailable" }\'',
+        'if ((Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" -PathType Leaf)) { Write-Output available }',
+        'if (-not (Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" -PathType Leaf)) { Write-Output missing }',
+        'if ((Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" -PathType Leaf)) { throw "candidate GitHub CLI is unavailable" }',
+        'if (-not (Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" -PathType Leaf)) { Write-Output missing }',
+        'if (-not (Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" -PathType Leaf)) { throw "candidate GitHub CLI is unavailable" } else { throw "unexpected" }',
+        'if (-not (Test-Path -LiteralPath "C:\\Temp\\gh.exe" -PathType Leaf)) { throw "candidate GitHub CLI is unavailable" }',
+        'if (-not (Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" -PathType Container)) { throw "candidate GitHub CLI is unavailable" }',
     ),
-    ids=("comment", "string"),
+    ids=("comment", "string", "positive-test", "missing-throw", "remove-not", "replace-throw", "else", "wrong-path", "wrong-type"),
 )
 def test_trusted_proof_policy_requires_a_real_canonical_gh_guard(tmp_path, replacement):
     candidate = tmp_path / "trusted-proof.yml"

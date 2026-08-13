@@ -124,24 +124,27 @@ def _assert_candidate_builder_authority_sync(source: str, repository_root: Path)
     """Keep attestation, static policy, and sealed-proof evidence on one builder."""
     expected_workflow = f"{TRUSTED_REPOSITORY}/{CANDIDATE_BUILDER_PATH}"
     candidate_attestations: list[tuple[str, ...]] = []
+    canonical_guard = re.compile(
+        r"""(?ix)
+        ^\s*if\s*\(
+          \s*-not\s*\(
+            \s*Test-Path\s+-LiteralPath\s+(?P<path_quote>["'])
+            (?P<path>[^"']+)(?P=path_quote)\s+-PathType\s+Leaf\s*
+          \)\s*
+        \)\s*\{\s*throw\s+(?P<message_quote>["'])
+          (?P<message>[^"']+)(?P=message_quote)\s*\}\s*$
+        """
+    )
     for run in workflow_run_scalars(source):
         canonical_guard_seen = False
         for command in _logical_shell_commands(run, "pwsh"):
             for statement, call_operator in _shell_statements(command, "pwsh"):
                 token_facts = _shell_tokens(statement, "pwsh")
                 tokens = tuple(token for token, _ in token_facts)
-                if (
-                    tokens
-                    and tokens[0].lower() == "if"
-                    and any(token.lstrip("(").lower() == "test-path" for token in tokens)
-                    and "-LiteralPath" in tokens
-                    and "-PathType" in tokens
-                    and "Leaf" in " ".join(tokens)
-                    and any(
-                        quoted
-                        and token.replace("/", "\\").casefold() == CANONICAL_GH_PATH
-                        for token, quoted in token_facts
-                    )
+                guard = canonical_guard.fullmatch(statement)
+                if guard is not None and (
+                    guard.group("path").replace("/", "\\").casefold()
+                    == CANONICAL_GH_PATH
                 ):
                     canonical_guard_seen = True
                     continue
