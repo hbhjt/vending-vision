@@ -123,52 +123,16 @@ def _strip_shell_comment(line: str, dialect: str) -> str:
     return line.rstrip()
 
 
-def _pwsh_here_string_opener(line: str) -> str | None:
-    """Return an unquoted, unescaped PowerShell here-string delimiter, if any."""
-    quote = ""
-    escaped = False
-    index = 0
-    while index < len(line):
-        character = line[index]
-        following = line[index + 1] if index + 1 < len(line) else None
-        if quote:
-            if quote == '"' and character == "`" and following is not None:
-                index += 2
-                continue
-            if quote == "'" and character == "'" and following == "'":
-                index += 2
-                continue
-            if character == quote:
-                quote = ""
-            index += 1
-            continue
-        if escaped:
-            escaped = False
-            index += 1
-            continue
-        if _is_shell_escape(character, following, "pwsh"):
-            escaped = True
-            index += 1
-            continue
-        if character in {"'", '"'}:
-            quote = character
-            index += 1
-            continue
-        if (
-            not quote
-            and character == "@"
-            and following in {"'", '"'}
-        ):
-            return following
-        index += 1
-    return None
-
-
-def _pwsh_without_block_comments(line: str, in_block_comment: bool) -> tuple[str, bool]:
-    """Remove real PowerShell block comments while preserving executable source."""
+def _pwsh_preprocess_line(
+    line: str,
+    *,
+    in_block_comment: bool,
+    quote: str,
+    escaped: bool,
+) -> tuple[str, bool, str, bool, str, bool]:
+    """Return executable PowerShell text and persistent lexical state for one line."""
     output: list[str] = []
-    quote = ""
-    escaped = False
+    spans_physical_line = bool(quote)
     index = 0
     while index < len(line):
         character = line[index]
@@ -180,11 +144,20 @@ def _pwsh_without_block_comments(line: str, in_block_comment: bool) -> tuple[str
                 continue
             index += 1
             continue
+        if quote and escaped:
+            output.append(character)
+            escaped = False
+            index += 1
+            continue
         if quote:
             output.append(character)
-            if quote == '"' and character == "`" and following is not None:
-                output.append(following)
-                index += 2
+            if quote == '"' and character == "`":
+                if following is None:
+                    escaped = True
+                    index += 1
+                else:
+                    output.append(following)
+                    index += 2
                 continue
             if quote == "'" and character == "'" and following == "'":
                 output.append(following)
@@ -212,6 +185,8 @@ def _pwsh_without_block_comments(line: str, in_block_comment: bool) -> tuple[str
                 quote = ""
             index += 1
             continue
+        if character == "@" and following in {"'", '"'}:
+            return "", in_block_comment, quote, escaped, following, True
         if character == "<" and following == "#":
             in_block_comment = True
             index += 2
@@ -220,7 +195,14 @@ def _pwsh_without_block_comments(line: str, in_block_comment: bool) -> tuple[str
             break
         output.append(character)
         index += 1
-    return "".join(output).rstrip(), in_block_comment
+    return (
+        "".join(output).rstrip(),
+        in_block_comment,
+        quote,
+        escaped,
+        "",
+        spans_physical_line or bool(quote),
+    )
 
 
 def _logical_shell_commands(run: str, dialect: str) -> tuple[str, ...]:
@@ -229,6 +211,8 @@ def _logical_shell_commands(run: str, dialect: str) -> tuple[str, ...]:
     pending = ""
     here_string_quote = ""
     block_comment = False
+    quote = ""
+    escaped = False
     for raw in run.splitlines():
         stripped = raw.strip()
         if here_string_quote:
@@ -236,17 +220,22 @@ def _logical_shell_commands(run: str, dialect: str) -> tuple[str, ...]:
                 here_string_quote = ""
             continue
         if dialect == "pwsh":
-            line, block_comment = _pwsh_without_block_comments(
-                stripped, block_comment
+            line, block_comment, quote, escaped, here_string_quote, quoted_line = (
+                _pwsh_preprocess_line(
+                    stripped,
+                    in_block_comment=block_comment,
+                    quote=quote,
+                    escaped=escaped,
+                )
             )
+            if here_string_quote:
+                continue
+            if quoted_line:
+                continue
         else:
             line = _strip_shell_comment(stripped, dialect)
         if not line:
             continue
-        if dialect == "pwsh":
-            here_string_quote = _pwsh_here_string_opener(line) or ""
-            if here_string_quote:
-                continue
         continued = line.endswith("`" if dialect == "pwsh" else "\\")
         pending += (line[:-1] if continued else line) + " "
         if not continued:
@@ -256,6 +245,8 @@ def _logical_shell_commands(run: str, dialect: str) -> tuple[str, ...]:
         raise TrustPolicyError("archive_downloader_unterminated_here_string")
     if block_comment:
         raise TrustPolicyError("archive_downloader_unterminated_block_comment")
+    if quote:
+        raise TrustPolicyError("archive_downloader_unterminated_quote")
     if pending:
         commands.append(pending.strip())
     return tuple(commands)

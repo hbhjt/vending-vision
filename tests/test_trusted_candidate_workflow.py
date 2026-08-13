@@ -162,6 +162,30 @@ def _hide_fence_in_block_comment(source: str, opener: str, closer: str) -> str:
     return mutated
 
 
+def _hide_fence_in_multiline_quote(source: str, quote: str) -> str:
+    fence = (
+        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }'
+    )
+    if quote == '"':
+        replacement = (
+            '          $literal = "start`\n'
+            '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+            '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }\n'
+            '          end"'
+        )
+    else:
+        replacement = (
+            "          $literal = 'start\n"
+            '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+            '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }\n'
+            "          end'"
+        )
+    mutated = source.replace(fence, replacement, 1)
+    assert mutated != source
+    return mutated
+
+
 def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload():
     source = TRUSTED_BUILDER.read_text("utf-8")
     attest = source.index("actions/attest-build-provenance@v4")
@@ -277,6 +301,35 @@ def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload
         doubled_single_quote_literal, "Record trusted builder evidence"
     )
     assert _has_post_attestation_subject_fence(doubled_single_quote_evidence)
+
+    for quote in ('"', "'"):
+        multiline_quote = _hide_fence_in_multiline_quote(source, quote)
+        _, multiline_quote_evidence = _workflow_step_run(
+            multiline_quote, "Record trusted builder evidence"
+        )
+        assert not _has_post_attestation_subject_fence(multiline_quote_evidence)
+
+    real_fence_after_quote = source.replace(
+        '          $bundleFile = "github-build-provenance.sigstore.json"',
+        '          $literal = "start`\n          decoy\n          end"\n'
+        '          $bundleFile = "github-build-provenance.sigstore.json"',
+        1,
+    )
+    _, real_fence_after_quote_evidence = _workflow_step_run(
+        real_fence_after_quote, "Record trusted builder evidence"
+    )
+    assert _has_post_attestation_subject_fence(real_fence_after_quote_evidence)
+
+    unterminated_quote = source.replace(
+        '          $bundleFile = "github-build-provenance.sigstore.json"',
+        '          $literal = "start`\n          $bundleFile = "github-build-provenance.sigstore.json"',
+        1,
+    )
+    _, unterminated_quote_evidence = _workflow_step_run(
+        unterminated_quote, "Record trusted builder evidence"
+    )
+    with pytest.raises(TrustPolicyError, match="unterminated_quote"):
+        _has_post_attestation_subject_fence(unterminated_quote_evidence)
 
 
 def test_active_verified_archive_downloads_have_an_explicit_bounded_total_timeout():
