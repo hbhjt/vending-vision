@@ -10,7 +10,7 @@ from scripts.trusted_precutover_proof import HANDOFF_FILES
 
 ROOT = Path(__file__).parents[1]
 CALLER = ROOT / ".github/workflows/trusted-precutover-caller.yml"
-PROOF_SHA = "f714e837ceb565a49c47a183444faecf9b7c0b9b"
+PROOF_SHA = "82ab2f8612c874aac8cdf33780af6898b530e5ce"
 CANDIDATE_INPUTS = {
     f"{name}_{field}"
     for name in (
