@@ -1,6 +1,7 @@
 import hashlib
 import asyncio
 import ast
+from decimal import Decimal
 import importlib
 import inspect
 import json
@@ -1421,7 +1422,12 @@ def test_v2_acquisition_observer_uses_remaining_attempt_deadline(monkeypatch, ga
         assert terminal["type"] == "vision.try_on.attempt.canceled"
         assert terminal["payload"]["reason"] == "timeout"
         assert observer.timeouts
-        assert max(observer.timeouts) <= 0.05
+        requested_deadline = Decimal("0.05")
+        float_clock_epsilon = Decimal("0.000000001")
+        assert all(
+            Decimal(str(timeout)) <= requested_deadline + float_clock_epsilon
+            for timeout in observer.timeouts
+        )
     finally:
         vision_app._acquisition_observer = None
 
