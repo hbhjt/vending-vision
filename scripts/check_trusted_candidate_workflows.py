@@ -6,7 +6,10 @@ import re
 import subprocess
 import tempfile
 
-from workflow_yaml import WorkflowYamlError, load_workflow_yaml, workflow_run_scalars
+if __package__:
+    from scripts.workflow_yaml import WorkflowYamlError, load_workflow_yaml, workflow_run_scalars
+else:
+    from workflow_yaml import WorkflowYamlError, load_workflow_yaml, workflow_run_scalars
 
 
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
@@ -123,15 +126,31 @@ def _logical_shell_commands(run: str, dialect: str) -> tuple[str, ...]:
     """Return executable shell statements, excluding comment-only source lines."""
     commands: list[str] = []
     pending = ""
+    here_string_quote = ""
     for raw in run.splitlines():
-        line = _strip_shell_comment(raw.strip(), dialect)
+        stripped = raw.strip()
+        if here_string_quote:
+            if stripped == f"{here_string_quote}@":
+                here_string_quote = ""
+            continue
+        line = _strip_shell_comment(stripped, dialect)
         if not line:
             continue
+        if dialect == "pwsh":
+            match = re.fullmatch(
+                r"(?:\$[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)?\s*=\s*)?@(['\"])",
+                line,
+            )
+            if match is not None:
+                here_string_quote = match.group(1)
+                continue
         continued = line.endswith("`" if dialect == "pwsh" else "\\")
         pending += (line[:-1] if continued else line) + " "
         if not continued:
             commands.append(pending.strip())
             pending = ""
+    if here_string_quote:
+        raise TrustPolicyError("archive_downloader_unterminated_here_string")
     if pending:
         commands.append(pending.strip())
     return tuple(commands)

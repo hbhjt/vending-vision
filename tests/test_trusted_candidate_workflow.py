@@ -9,6 +9,11 @@ import sys
 import pytest
 
 from scripts.workflow_yaml import load_workflow_yaml
+from scripts.check_trusted_candidate_workflows import (
+    _logical_shell_commands,
+    _shell_statements,
+    _shell_tokens,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -94,16 +99,32 @@ def _workflow_step_run(source: str, name: str) -> tuple[int, str]:
 
 
 def _has_post_attestation_subject_fence(run: str) -> bool:
-    digest = re.compile(
-        r"(?m)^\$subjectDigest = \(Get-FileHash -LiteralPath "
-        r"\$env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256\)\.Hash$"
+    statements = [
+        _shell_tokens(statement, "pwsh")
+        for command in _logical_shell_commands(run, "pwsh")
+        for statement, _ in _shell_statements(command, "pwsh")
+    ]
+    digest = (
+        ("$subjectDigest", False),
+        ("=", False),
+        ("(Get-FileHash", False),
+        ("-LiteralPath", False),
+        ("$env:TRUSTED_CANDIDATE_ARTIFACT", False),
+        ("-Algorithm", False),
+        ("SHA256).Hash", False),
     )
-    comparison = re.compile(
-        r"(?m)^if \(-not \[string\]::Equals\(\$subjectDigest, "
-        r"\$env:SUBJECT_SHA256, \[System\.StringComparison\]::OrdinalIgnoreCase\)\) "
-        r"\{ throw \"attested candidate subject digest changed\" \}$"
+    comparison = (
+        ("if", False),
+        ("(-not", False),
+        ("[string]::Equals($subjectDigest,", False),
+        ("$env:SUBJECT_SHA256,", False),
+        ("[System.StringComparison]::OrdinalIgnoreCase))", False),
+        ("{", False),
+        ("throw", False),
+        ("attested candidate subject digest changed", True),
+        ("}", False),
     )
-    return digest.search(run) is not None and comparison.search(run) is not None
+    return digest in statements and comparison in statements
 
 
 def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload():
@@ -135,6 +156,27 @@ def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload
     )
     _, wrong_path_evidence = _workflow_step_run(wrong_path, "Record trusted builder evidence")
     assert not _has_post_attestation_subject_fence(wrong_path_evidence)
+
+    here_string = source.replace(
+        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }',
+        "          $fence = @'\n"
+        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }\n'
+        "          '@",
+        1,
+    )
+    assert here_string != source
+    _, here_string_evidence = _workflow_step_run(here_string, "Record trusted builder evidence")
+    assert not _has_post_attestation_subject_fence(here_string_evidence)
+
+    double_here_string = here_string.replace("$fence = @'", '$fence = @"').replace(
+        "'@", '"@'
+    )
+    _, double_here_string_evidence = _workflow_step_run(
+        double_here_string, "Record trusted builder evidence"
+    )
+    assert not _has_post_attestation_subject_fence(double_here_string_evidence)
 
 
 def test_active_verified_archive_downloads_have_an_explicit_bounded_total_timeout():
