@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 import app as vision_app
 from vision import camera_manager
 from vision import presence_runtime
+from vision import profile_push
 from vision.config import settings
 from vision.acquisition_observer import AcquisitionObservationWorker
 from vision.frame_source import RecordedVideoFrameSource
@@ -117,13 +118,22 @@ class _RecordedTopDepartureMonitor:
     tracker.
     """
 
-    def __init__(self, config, *, present_polls):
+    def __init__(self, config, *, present_polls, front_sampling_started=None):
         self.source = RecordedVideoFrameSource("top", config)
         self.present_polls = present_polls
+        self.front_sampling_started = front_sampling_started
         self.poll_count = 0
+        self.front_sampling_observed = False
 
     def check_once(self, *, return_image, camera_role, return_source):
         assert return_image and return_source and camera_role == "top"
+        # The first recorded top frame creates the candidate.  Do not consume
+        # the finite departure fixture before that candidate has actually
+        # entered real front-camera sampling: under a busy Windows runner the
+        # profile worker otherwise may receive no sampling window at all.
+        if self.poll_count == 1 and self.front_sampling_started is not None:
+            self.front_sampling_started.wait()
+            self.front_sampling_observed = True
         image = self.source.read(warmup_frames=1)
         self.poll_count += 1
         if self.poll_count <= self.present_polls:
@@ -249,9 +259,22 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
     _configure_recorded_top(monkeypatch)
     _configure_recorded_front(monkeypatch, "man-front.mp4")
     _reset_recorded_departure_state()
+    front_sampling_started = threading.Event()
+    real_collect_best_profile_samples = profile_push.collect_best_profile_samples
+
+    def collect_best_after_front_sampling_started(*args, **kwargs):
+        front_sampling_started.set()
+        return real_collect_best_profile_samples(*args, **kwargs)
+
+    monkeypatch.setattr(
+        profile_push,
+        "collect_best_profile_samples",
+        collect_best_after_front_sampling_started,
+    )
     monitor = _RecordedTopDepartureMonitor(
         settings.TOP_CAMERA_CONFIG,
         present_polls=expected_polls - 2,
+        front_sampling_started=front_sampling_started,
     )
     runtime = PresenceRuntime(monitor=monitor)
     monkeypatch.setattr(vision_app, "get_presence_runtime", lambda: runtime)
@@ -371,6 +394,7 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                     for message_type in ["vision.presence_status", "vision.profile_result"]
                 )
                 assert post_cancel_presence
+                assert monitor.front_sampling_observed
                 assert monitor.poll_count >= expected_polls + 1
                 assert monitor.source.frame_count == monitor.poll_count
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
