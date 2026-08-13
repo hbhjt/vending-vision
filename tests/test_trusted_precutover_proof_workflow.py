@@ -548,14 +548,18 @@ def test_trusted_proof_policy_counts_only_real_candidate_attestations(tmp_path, 
 @pytest.mark.parametrize(
     ("executable", "valid"),
     (
-        ("gh", True),
+        ("gh", False),
         ("foogh", False),
         ("mygh", False),
         ("gh.bat", False),
+        (r'& "C:\Program Files\GitHub CLI\gh.exe"', True),
+        (r'& "c:/program files/github cli/GH.EXE"', True),
+        (r'& "C:\Temp\gh.exe"', False),
+        (r'& "D:\GitHub CLI\gh.exe"', False),
         ("/usr/local/bin/gh", False),
-        ("& /usr/local/bin/gh", True),
+        ("& /usr/local/bin/gh", False),
         ("'C:\\Program Files\\GitHub CLI\\gh.exe'", False),
-        (r"& 'C:\\Program Files\\GitHub CLI\\gh.exe'", True),
+        (r"& 'C:\Program Files\GitHub CLI\gh.exe'", True),
         ("$env:TRUSTED_GH", False),
         ("& $env:TRUSTED_GH", False),
         ("${env:TRUSTED_GH}", False),
@@ -567,7 +571,7 @@ def test_trusted_proof_policy_counts_only_real_candidate_attestations(tmp_path, 
 def test_trusted_proof_policy_accepts_only_real_gh_executables(tmp_path, executable, valid):
     candidate = tmp_path / "trusted-proof.yml"
     source = TRUSTED_PROOF.read_text("utf-8").replace(
-        "gh attestation verify proof-input/candidate/candidate.zip",
+        '& "C:\\Program Files\\GitHub CLI\\gh.exe" attestation verify proof-input/candidate/candidate.zip',
         f"{executable} attestation verify proof-input/candidate/candidate.zip",
         1,
     )
@@ -576,6 +580,30 @@ def test_trusted_proof_policy_accepts_only_real_gh_executables(tmp_path, executa
     completed = _check_policy(candidate)
 
     assert (completed.returncode == 0) is valid, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        '# if (-not (Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" -PathType Leaf)) { throw "candidate GitHub CLI is unavailable" }',
+        'Write-Output \'if (-not (Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" -PathType Leaf)) { throw "candidate GitHub CLI is unavailable" }\'',
+    ),
+    ids=("comment", "string"),
+)
+def test_trusted_proof_policy_requires_a_real_canonical_gh_guard(tmp_path, replacement):
+    candidate = tmp_path / "trusted-proof.yml"
+    source = TRUSTED_PROOF.read_text("utf-8").replace(
+        'if (-not (Test-Path -LiteralPath "C:\\Program Files\\GitHub CLI\\gh.exe" -PathType Leaf)) { throw "candidate GitHub CLI is unavailable" }',
+        replacement,
+        1,
+    )
+    candidate.write_text(source, "utf-8")
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode != 0
+    assert "trusted_proof_candidate_builder_attestation_shape" in completed.stdout
+
 
 def test_trusted_proof_requires_real_tag_peel_main_ancestry_and_release_authority():
     source = TRUSTED_PROOF.read_text("utf-8")

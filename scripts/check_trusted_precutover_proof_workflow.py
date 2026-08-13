@@ -25,6 +25,7 @@ COMPANION_BUILDER_CLOSURE = "trusted-precutover-companion-builder-closure.json"
 COMPANION_BUILDER_CLOSURE_VERIFIER = "scripts/verify_trusted_builder_closure.py"
 CANDIDATE_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
 CANDIDATE_BUILDER_SHA = "c85ac3059c31d41b405282ecfc7641d0c1b88958"
+CANONICAL_GH_PATH = r"c:\program files\github cli\gh.exe"
 HOSTED_AUTHORITY_SHA = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 INPUTS = {
     f"{name}_{field}"
@@ -123,35 +124,48 @@ def _assert_candidate_builder_authority_sync(source: str, repository_root: Path)
     """Keep attestation, static policy, and sealed-proof evidence on one builder."""
     expected_workflow = f"{TRUSTED_REPOSITORY}/{CANDIDATE_BUILDER_PATH}"
     candidate_attestations: list[tuple[str, ...]] = []
-    for command in _logical_shell_commands(
-        "\n".join(workflow_run_scalars(source)), "pwsh"
-    ):
-        for statement, call_operator in _shell_statements(command, "pwsh"):
-            token_facts = _shell_tokens(statement, "pwsh")
-            tokens = tuple(token for token, _ in token_facts)
-            if "--signer-workflow" not in tokens:
-                continue
-            workflow_index = tokens.index("--signer-workflow")
-            if workflow_index + 1 >= len(tokens) or tokens[workflow_index + 1] != expected_workflow:
-                continue
-            try:
-                attestation_index = tokens.index("attestation")
-            except ValueError:
-                raise PolicyError("trusted_proof_candidate_builder_attestation_shape")
-            executable_token = tokens[0]
-            executable = executable_token.replace("\\", "/").rsplit("/", 1)[-1].lower()
-            supported_executable = executable in {"gh", "gh.exe"}
-            quoted_executable = token_facts[0][1]
-            bare_executable = executable_token.lower() in {"gh", "gh.exe"}
-            _require(
-                attestation_index + 1 < len(tokens)
-                and tokens[attestation_index + 1] == "verify"
-                and supported_executable
-                and (bare_executable or call_operator)
-                and (not quoted_executable or call_operator),
-                "trusted_proof_candidate_builder_attestation_shape",
-            )
-            candidate_attestations.append(tokens)
+    for run in workflow_run_scalars(source):
+        canonical_guard_seen = False
+        for command in _logical_shell_commands(run, "pwsh"):
+            for statement, call_operator in _shell_statements(command, "pwsh"):
+                token_facts = _shell_tokens(statement, "pwsh")
+                tokens = tuple(token for token, _ in token_facts)
+                if (
+                    tokens
+                    and tokens[0].lower() == "if"
+                    and any(token.lstrip("(").lower() == "test-path" for token in tokens)
+                    and "-LiteralPath" in tokens
+                    and "-PathType" in tokens
+                    and "Leaf" in " ".join(tokens)
+                    and any(
+                        quoted
+                        and token.replace("/", "\\").casefold() == CANONICAL_GH_PATH
+                        for token, quoted in token_facts
+                    )
+                ):
+                    canonical_guard_seen = True
+                    continue
+                if "--signer-workflow" not in tokens:
+                    continue
+                workflow_index = tokens.index("--signer-workflow")
+                if workflow_index + 1 >= len(tokens) or tokens[workflow_index + 1] != expected_workflow:
+                    continue
+                try:
+                    attestation_index = tokens.index("attestation")
+                except ValueError:
+                    raise PolicyError("trusted_proof_candidate_builder_attestation_shape")
+                executable_token, quoted_executable = token_facts[0]
+                _require(
+                    attestation_index + 1 < len(tokens)
+                    and tokens[attestation_index + 1] == "verify"
+                    and call_operator
+                    and quoted_executable
+                    and executable_token.replace("/", "\\").casefold()
+                    == CANONICAL_GH_PATH
+                    and canonical_guard_seen,
+                    "trusted_proof_candidate_builder_attestation_shape",
+                )
+                candidate_attestations.append(tokens)
     _require(
         len(candidate_attestations) == 2,
         "trusted_proof_candidate_builder_attestation_count",
