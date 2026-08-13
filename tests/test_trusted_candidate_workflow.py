@@ -22,7 +22,7 @@ TRUSTED_BUILDER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder
 PUBLISHER = ROOT / ".github" / "workflows" / "publish-candidate.yml"
 TRUSTED_BUILDER_COMMIT = "691b5056e8b9bf2667bc527b2170780b05863946"
 TRUSTED_SIGNER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-signer.yml"
-TRUSTED_SIGNER_COMMIT = "3bfaf22704ec62e6e467e50b012c51be2890a68b"
+TRUSTED_SIGNER_COMMIT = "43226e057afc5cda782a5ae837e727663a6625b1"
 TRUST_POLICY = ROOT / "scripts" / "check_trusted_candidate_workflows.py"
 
 
@@ -664,6 +664,7 @@ def test_publish_caller_pins_builder_a_and_signer_s_without_holding_supplier_sec
         f"trusted-ai-candidate-signer.yml@{TRUSTED_SIGNER_COMMIT}"
     )
     assert literal_signer in workflow
+    assert "signer_identity: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}" in workflow
     assert f'--signer-digest "{TRUSTED_BUILDER_COMMIT}"' in workflow
     assert "--signer-repo" not in workflow
     assert (
@@ -733,6 +734,13 @@ def test_trust_policy_rejects_mutable_caller_and_missing_or_wrong_signer_digest(
         "mutable-signer": trusted.replace(
             f"trusted-ai-candidate-signer.yml@{TRUSTED_SIGNER_COMMIT}",
             "trusted-ai-candidate-signer.yml@${{ github.sha }}",
+        ),
+        "missing-signer-identity": trusted.replace(
+            "      signer_identity: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}\n", ""
+        ),
+        "wrong-signer-identity": trusted.replace(
+            "signer_identity: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}",
+            "signer_identity: ${{ vars.WRONG_SIGNER_IDENTITY }}",
         ),
         "raw-input-injection": trusted.replace(
             "run: |\n          if ($env:SOURCE_COMMIT",

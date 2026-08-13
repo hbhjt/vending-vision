@@ -15,7 +15,7 @@ else:
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 TRUSTED_BUILDER_COMMIT = "691b5056e8b9bf2667bc527b2170780b05863946"
 TRUSTED_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-TRUSTED_SIGNER_COMMIT = "3bfaf22704ec62e6e467e50b012c51be2890a68b"
+TRUSTED_SIGNER_COMMIT = "43226e057afc5cda782a5ae837e727663a6625b1"
 TRUSTED_SIGNER_PATH = ".github/workflows/trusted-ai-candidate-signer.yml"
 HOSTED_AUTHORITY_COMMIT = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 HOSTED_AUTHORITY_PATH = "scripts/verify_hosted_release_authority.py"
@@ -32,6 +32,7 @@ SIGNER_INPUTS = {
     "subject_sha256",
     "manifest_sha256",
     "attestation_bundle_sha256",
+    "signer_identity",
 }
 TRUSTED_SIGNER_FILES = {
     TRUSTED_SIGNER_PATH,
@@ -68,6 +69,79 @@ def _job_block(source: str, job: str) -> str:
     _require(match is not None, f"publisher_job_missing:{job}")
     assert match is not None
     return match.group(0)
+
+
+def _workflow_jobs(source: str, label: str) -> dict[str, object]:
+    try:
+        workflow = load_workflow_yaml(source)
+    except WorkflowYamlError as error:
+        raise TrustPolicyError(f"{label}_yaml_invalid") from error
+    jobs = workflow.get("jobs")
+    _require(isinstance(jobs, dict), f"{label}_jobs_missing")
+    return jobs
+
+
+def _job_steps(job: object, label: str) -> dict[str, dict[str, object]]:
+    _require(isinstance(job, dict), f"{label}_job_invalid")
+    steps = job.get("steps")
+    _require(isinstance(steps, list), f"{label}_steps_missing")
+    named: dict[str, dict[str, object]] = {}
+    for step in steps:
+        _require(isinstance(step, dict), f"{label}_step_invalid")
+        name = step.get("name")
+        _require(isinstance(name, str) and name not in named, f"{label}_step_name_invalid")
+        named[name] = step
+    return named
+
+
+def _step_env(step: object, label: str) -> dict[str, object]:
+    _require(isinstance(step, dict), f"{label}_step_invalid")
+    env = step.get("env")
+    _require(isinstance(env, dict), f"{label}_env_missing")
+    return env
+
+
+def _assert_signer_identity_channel(signer_source: str, publisher_source: str) -> None:
+    signer_jobs = _workflow_jobs(signer_source, "trusted_signer")
+    verify = signer_jobs.get("verify_evidence")
+    sign = signer_jobs.get("sign_evidence")
+    _require(isinstance(verify, dict), "trusted_signer_verify_job_missing")
+    _require(isinstance(sign, dict), "trusted_signer_sign_job_missing")
+    _require("environment" not in verify, "trusted_signer_verify_environment")
+    _require(sign.get("environment") == "experimental-candidate", "trusted_signer_sign_environment")
+    verify_steps = _job_steps(verify, "trusted_signer_verify")
+    sign_steps = _job_steps(sign, "trusted_signer_sign")
+    for label, steps, step_name in (
+        ("trusted_signer_verify", verify_steps, "Validate identities without shell interpolation"),
+        ("trusted_signer_sign", sign_steps, "Revalidate signer identity on the fresh runner"),
+    ):
+        env = _step_env(steps.get(step_name), label)
+        _require(
+            env.get("VISION_SUPPLIER_SIGNER_IDENTITY") == "${{ inputs.signer_identity }}",
+            f"{label}_signer_identity_input",
+        )
+    _require(
+        "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in str(verify),
+        "trusted_signer_verify_secret",
+    )
+    key_env = _step_env(
+        sign_steps.get("Sign only verified evidence with the protected supplier key"),
+        "trusted_signer_key",
+    )
+    _require(
+        key_env == {"VISION_SUPPLIER_PRIVATE_KEY_PEM": "${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}"},
+        "trusted_signer_key_scope",
+    )
+
+    publisher_jobs = _workflow_jobs(publisher_source, "publisher")
+    signer_call = publisher_jobs.get("trusted_signer")
+    _require(isinstance(signer_call, dict), "publisher_signer_job_missing")
+    signer_with = signer_call.get("with")
+    _require(isinstance(signer_with, dict), "publisher_signer_inputs_missing")
+    _require(
+        signer_with.get("signer_identity") == "${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}",
+        "publisher_signer_identity_repository_var",
+    )
 
 
 def _assert_no_untrusted_run_expressions(source: str, label: str) -> None:
@@ -561,6 +635,7 @@ def check_trusted_candidate_workflows(
         _require(forbidden not in builder_source, f"trusted_builder_forbidden_input:{forbidden}")
 
     _require(_workflow_call_inputs(signer_source) == SIGNER_INPUTS, "trusted_signer_input_allowlist")
+    _assert_signer_identity_channel(signer_source, publisher_source)
     for forbidden in (
         "source_path", "artifact_path", "custom_command", "predicate", "private_key",
     ):
