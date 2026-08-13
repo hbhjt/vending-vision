@@ -4,6 +4,7 @@ import os
 import asyncio
 import time
 import threading
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -363,6 +364,62 @@ def test_ready_pack_hot_identity_change_fails_immediately_and_refreshes_once_off
 
     asyncio.run(exercise())
     assert refresh_calls == [str(tmp_path.resolve())]
+
+
+def test_windows_quick_identity_uses_change_time_when_size_and_times_are_restored(
+    monkeypatch,
+):
+    """NTFS ChangeTime fences an in-place overwrite hidden by SetFileTime."""
+    change_time = {"value": 100}
+
+    class WindowsFile:
+        def resolve(self):
+            return "C:/pack/weight.bin"
+
+        def stat(self):
+            return SimpleNamespace(
+                st_size=4096,
+                st_mtime_ns=1,
+                st_ctime_ns=1,
+                st_ino=7,
+                st_dev=9,
+            )
+
+    monkeypatch.setattr(
+        ai_model_pack_module,
+        "_WINDOWS_CHANGE_TIME",
+        lambda _path: change_time["value"],
+        raising=False,
+    )
+    before = ai_model_pack_module._quick_file_identity(WindowsFile())
+    change_time["value"] = 200
+    after = ai_model_pack_module._quick_file_identity(WindowsFile())
+
+    assert before != after
+
+
+def test_windows_change_time_api_preserves_wide_handles_and_requires_close():
+    calls = []
+
+    class Kernel32:
+        def CreateFileW(self, *arguments):
+            calls.append(("open", arguments))
+            return 1 << 40
+
+        def GetFileInformationByHandleEx(self, handle, kind, result, size):
+            calls.append(("facts", handle, kind, size))
+            result._obj.ChangeTime = 123456789
+            return 1
+
+        def CloseHandle(self, handle):
+            calls.append(("close", handle))
+            return 1
+
+    api = ai_model_pack_module._WindowsFileIdentityApi(Kernel32())
+
+    assert api.change_time(Path("C:/pack/weight.bin")) == 123456789
+    assert calls[1][1] == 1 << 40
+    assert calls[2] == ("close", 1 << 40)
 
 
 def test_ready_pack_selection_change_atomically_replaces_snapshot(tmp_path, monkeypatch):

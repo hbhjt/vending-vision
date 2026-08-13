@@ -8,7 +8,9 @@ Hugging Face snapshot cannot accidentally become a production dependency.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
+import os
 import unicodedata
 import hashlib
 import threading
@@ -71,7 +73,88 @@ def _digest(path: Path) -> str:
     return value.hexdigest()
 
 
-def _quick_file_identity(path: Path) -> tuple[str, int, int, int, int | None, int | None]:
+class _WindowsFileBasicInfo(ctypes.Structure):
+    _fields_ = [
+        ("CreationTime", ctypes.c_longlong),
+        ("LastAccessTime", ctypes.c_longlong),
+        ("LastWriteTime", ctypes.c_longlong),
+        ("ChangeTime", ctypes.c_longlong),
+        ("FileAttributes", ctypes.c_uint32),
+    ]
+
+
+class _WindowsFileIdentityApi:
+    FILE_READ_ATTRIBUTES = 0x80
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    FileBasicInfo = 0
+
+    def __init__(self, kernel32=None):
+        if kernel32 is None:
+            if os.name != "nt":
+                raise OSError("Windows file identity unavailable")
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.GetFileInformationByHandleEx.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+        self._kernel32 = kernel32
+
+    def change_time(self, path: Path) -> int:
+        handle = self._kernel32.CreateFileW(
+            str(path),
+            self.FILE_READ_ATTRIBUTES,
+            self.FILE_SHARE_READ | self.FILE_SHARE_WRITE | self.FILE_SHARE_DELETE,
+            None,
+            self.OPEN_EXISTING,
+            self.FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in {None, 0, -1, invalid}:
+            raise OSError(ctypes.get_last_error(), "CreateFileW")
+        failure = None
+        try:
+            facts = _WindowsFileBasicInfo()
+            if not self._kernel32.GetFileInformationByHandleEx(
+                handle, self.FileBasicInfo, ctypes.byref(facts), ctypes.sizeof(facts)
+            ):
+                raise OSError(ctypes.get_last_error(), "GetFileInformationByHandleEx")
+            return facts.ChangeTime
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            if not self._kernel32.CloseHandle(handle) and failure is None:
+                raise OSError(ctypes.get_last_error(), "CloseHandle")
+
+
+def _WINDOWS_CHANGE_TIME(path: Path) -> int | None:
+    """Return NTFS ChangeTime, which SetFileTime cannot restore after a write."""
+    return _WindowsFileIdentityApi().change_time(path) if os.name == "nt" else None
+
+
+def _quick_file_identity(path: Path) -> tuple[str, int, int, int, int | None, int | None, int | None]:
     stat = path.stat()
     return (
         str(path.resolve()),
@@ -80,10 +163,11 @@ def _quick_file_identity(path: Path) -> tuple[str, int, int, int, int | None, in
         stat.st_ctime_ns,
         getattr(stat, "st_ino", None),
         getattr(stat, "st_dev", None),
+        _WINDOWS_CHANGE_TIME(path),
     )
 
 
-def _pack_files_identity(pack_root: Path, descriptor: dict) -> tuple[tuple[str, int, int, int, int | None, int | None], ...]:
+def _pack_files_identity(pack_root: Path, descriptor: dict) -> tuple[tuple[str, int, int, int, int | None, int | None, int | None], ...]:
     identities = []
     for item in descriptor["files"]:
         identities.append(_quick_file_identity(pack_root / item["path"]))
