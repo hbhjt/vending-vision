@@ -71,6 +71,301 @@ def test_trusted_builder_has_a_closed_raw_material_interface_and_owns_attestatio
     assert verify < attest < upload
 
 
+def test_active_verified_archive_downloads_have_an_explicit_bounded_total_timeout():
+    completed = _check_policy(PUBLISHER)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "mutate", "expected_error"),
+    (
+        (
+            "missing",
+            lambda source: source.replace(" --total-timeout-seconds 1800", "", 1),
+            "publisher_archive_downloader_timeout_count",
+        ),
+        (
+            "commented-only",
+            lambda source: source.replace(
+                "          python trusted-verifier/scripts/download_verified_archive.py",
+                "          # python trusted-verifier/scripts/download_verified_archive.py",
+                1,
+            ),
+            "publisher_archive_downloader_count",
+        ),
+        (
+            "string-only",
+            lambda source: source.replace(
+                "          python trusted-verifier/scripts/download_verified_archive.py",
+                "          Write-Output \"python trusted-verifier/scripts/download_verified_archive.py",
+                1,
+            ).replace("--total-timeout-seconds 1800\n", "--total-timeout-seconds 1800\"\n", 1),
+            "publisher_archive_downloader_count",
+        ),
+        (
+            "commented-timeout",
+            lambda source: source.replace(
+                " --total-timeout-seconds 1800",
+                " # --total-timeout-seconds 1800",
+                1,
+            ),
+            "publisher_archive_downloader_timeout_count",
+        ),
+        (
+            "duplicate",
+            lambda source: source.replace(
+                "--total-timeout-seconds 1800",
+                "--total-timeout-seconds 1800 --total-timeout-seconds 1800",
+                1,
+            ),
+            "publisher_archive_downloader_timeout_count",
+        ),
+        (
+            "zero",
+            lambda source: source.replace("--total-timeout-seconds 1800", "--total-timeout-seconds 0", 1),
+            "publisher_archive_downloader_timeout_bounds",
+        ),
+        (
+            "too-large",
+            lambda source: source.replace("--total-timeout-seconds 1800", "--total-timeout-seconds 3601", 1),
+            "publisher_archive_downloader_timeout_bounds",
+        ),
+        (
+            "second-downloader-without-timeout",
+            lambda source: source.replace(
+                "--total-timeout-seconds 1800",
+                "--total-timeout-seconds 1800; python trusted-verifier/scripts/"
+                "download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL "
+                "--sha256 $env:CORE_WHEELHOUSE_SHA256 --expected-bytes "
+                "$env:CORE_WHEELHOUSE_BYTES --destination verifier-wheelhouse",
+                1,
+            ),
+            "publisher_archive_downloader_count",
+        ),
+        (
+            "timeout-in-another-statement",
+            lambda source: source.replace(
+                " --total-timeout-seconds 1800",
+                "; Write-Output --total-timeout-seconds 1800",
+                1,
+            ),
+            "publisher_archive_downloader_timeout_count",
+        ),
+        (
+            "escaped-quoted-timeout-in-another-statement",
+            lambda source: source.replace(
+                " --total-timeout-seconds 1800",
+                "; Write-Output `\"--total-timeout-seconds 1800`\"",
+                1,
+            ),
+            "publisher_archive_downloader_timeout_count",
+        ),
+        (
+            "absolute-fourth-downloader",
+            lambda source: source.replace(
+                "--total-timeout-seconds 1800",
+                "--total-timeout-seconds 1800; /usr/bin/python "
+                "trusted-verifier/scripts/download_verified_archive.py "
+                "--url $env:CORE_WHEELHOUSE_URL --sha256 "
+                "$env:CORE_WHEELHOUSE_SHA256 --expected-bytes "
+                "$env:CORE_WHEELHOUSE_BYTES --destination verifier-wheelhouse "
+                "--total-timeout-seconds 1800",
+                1,
+            ),
+            "publisher_archive_downloader_count",
+        ),
+        (
+            "malformed-downloader-invocation",
+            lambda source: source.replace(
+                "python trusted-verifier/scripts/download_verified_archive.py",
+                "Write-Output trusted-verifier/scripts/download_verified_archive.py",
+                1,
+            ),
+            "archive_downloader_unsupported_invocation",
+        ),
+        (
+            "unknown-downloader-shell",
+            lambda source: source.replace(
+                "      - name: Safely extract and run the full candidate verifier\n"
+                "        shell: pwsh",
+                "      - name: Safely extract and run the full candidate verifier\n"
+                "        shell: cmd",
+                1,
+            ),
+            "archive_downloader_shell_unknown",
+        ),
+        (
+            "single-quoted-backslash-does-not-hide-second-downloader",
+            lambda source: source.replace(
+                "--total-timeout-seconds 1800",
+                "--total-timeout-seconds 1800; Write-Output 'x\\'; python "
+                "trusted-verifier/scripts/download_verified_archive.py "
+                "--url $env:CORE_WHEELHOUSE_URL --sha256 "
+                "$env:CORE_WHEELHOUSE_SHA256 --expected-bytes "
+                "$env:CORE_WHEELHOUSE_BYTES --destination verifier-wheelhouse",
+                1,
+            ),
+            "publisher_archive_downloader_count",
+        ),
+        (
+            "single-quoted-backtick-does-not-hide-second-downloader",
+            lambda source: source.replace(
+                "--total-timeout-seconds 1800",
+                "--total-timeout-seconds 1800; Write-Output 'x`'; python "
+                "trusted-verifier/scripts/download_verified_archive.py "
+                "--url $env:CORE_WHEELHOUSE_URL --sha256 "
+                "$env:CORE_WHEELHOUSE_SHA256 --expected-bytes "
+                "$env:CORE_WHEELHOUSE_BYTES --destination verifier-wheelhouse",
+                1,
+            ),
+            "publisher_archive_downloader_count",
+        ),
+    ),
+)
+def test_trust_policy_rejects_non_executable_or_unbounded_archive_downloader(
+    tmp_path, name, mutate, expected_error
+):
+    candidate = tmp_path / f"{name}.yml"
+    candidate.write_text(mutate(PUBLISHER.read_text("utf-8")), "utf-8")
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode != 0
+    assert expected_error in completed.stdout
+
+
+@pytest.mark.parametrize("continuation", ("`", "\\"))
+def test_trust_policy_accepts_a_continued_archive_downloader(tmp_path, continuation):
+    candidate = tmp_path / "continued.yml"
+    source = PUBLISHER.read_text("utf-8")
+    if continuation == "\\":
+        source = source.replace(
+            "      - name: Safely extract and run the full candidate verifier\n"
+            "        shell: pwsh",
+            "      - name: Safely extract and run the full candidate verifier\n"
+            "        shell: bash",
+            1,
+        )
+    candidate.write_text(
+        source.replace(
+            "--destination verifier-wheelhouse --total-timeout-seconds 1800",
+            f"--destination verifier-wheelhouse {continuation}\n"
+            "          --total-timeout-seconds 1800",
+            1,
+        ),
+        "utf-8",
+    )
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_trust_policy_ignores_quoted_statement_separators(tmp_path):
+    candidate = tmp_path / "quoted-separator.yml"
+    candidate.write_text(
+        PUBLISHER.read_text("utf-8").replace(
+            "          python trusted-verifier/scripts/download_verified_archive.py",
+            "          Write-Output '; && || | &' ; python trusted-verifier/"
+            "scripts/download_verified_archive.py",
+            1,
+        ),
+        "utf-8",
+    )
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    "executable",
+    ("/usr/bin/python", r"& C:\Python311\python.exe"),
+)
+def test_trust_policy_accepts_an_absolute_python_downloader_invocation(tmp_path, executable):
+    candidate = tmp_path / "absolute-python.yml"
+    candidate.write_text(
+        PUBLISHER.read_text("utf-8").replace(
+            "python trusted-verifier/scripts/download_verified_archive.py",
+            f"{executable} trusted-verifier/scripts/download_verified_archive.py",
+            1,
+        ),
+        "utf-8",
+    )
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_trust_policy_rejects_a_pwsh_quoted_python_without_call_operator(tmp_path):
+    candidate = tmp_path / "quoted-pwsh-no-call.yml"
+    candidate.write_text(
+        PUBLISHER.read_text("utf-8").replace(
+            "python trusted-verifier/scripts/download_verified_archive.py",
+            r"'C:\Python311\python.exe' trusted-verifier/scripts/download_verified_archive.py",
+            1,
+        ),
+        "utf-8",
+    )
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode != 0
+    assert "archive_downloader_unsupported_invocation" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ("'&' ", '"&" ', "`& "),
+)
+def test_trust_policy_rejects_a_non_syntactic_pwsh_call_operator(tmp_path, prefix):
+    candidate = tmp_path / "non-syntactic-call-operator.yml"
+    candidate.write_text(
+        PUBLISHER.read_text("utf-8").replace(
+            "python trusted-verifier/scripts/download_verified_archive.py",
+            prefix + "python trusted-verifier/scripts/download_verified_archive.py",
+            1,
+        ),
+        "utf-8",
+    )
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode != 0
+    assert "archive_downloader_unsupported_invocation" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("shell", "executable"),
+    (
+        ("pwsh", r"& 'C:\Python311\python.exe'"),
+        ("bash", r"'C:\Python311\python.exe'"),
+    ),
+)
+def test_trust_policy_accepts_a_quoted_python_for_its_shell(tmp_path, shell, executable):
+    candidate = tmp_path / f"quoted-{shell}.yml"
+    source = PUBLISHER.read_text("utf-8").replace(
+        "      - name: Safely extract and run the full candidate verifier\n"
+        "        shell: pwsh",
+        "      - name: Safely extract and run the full candidate verifier\n"
+        f"        shell: {shell}",
+        1,
+    )
+    candidate.write_text(
+        source.replace(
+            "python trusted-verifier/scripts/download_verified_archive.py",
+            f"{executable} trusted-verifier/scripts/download_verified_archive.py",
+            1,
+        ),
+        "utf-8",
+    )
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def _check_policy(
     publisher: Path, *, builder: Path = TRUSTED_BUILDER, signer: Path = TRUSTED_SIGNER
 ) -> subprocess.CompletedProcess[str]:

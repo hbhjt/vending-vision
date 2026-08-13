@@ -6,7 +6,7 @@ import re
 import subprocess
 import tempfile
 
-from workflow_yaml import WorkflowYamlError, workflow_run_scalars
+from workflow_yaml import WorkflowYamlError, load_workflow_yaml, workflow_run_scalars
 
 
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
@@ -74,6 +74,266 @@ def _assert_no_untrusted_run_expressions(source: str, label: str) -> None:
         _require("${{" not in block, f"{label}_workflow_expression_in_run")
 
 
+_PYTHON_EXECUTABLE = re.compile(r"python(?:3(?:\.\d+)?)?(?:\.exe)?", re.IGNORECASE)
+
+
+def _shell_dialect(shell: object) -> str:
+    if not isinstance(shell, str):
+        raise TrustPolicyError("archive_downloader_shell_unknown")
+    normalized = shell.lower()
+    if normalized in {"pwsh", "powershell"}:
+        return "pwsh"
+    if normalized in {"bash", "sh"}:
+        return "bash"
+    raise TrustPolicyError("archive_downloader_shell_unknown")
+
+
+def _is_shell_escape(character: str, following: str | None, dialect: str) -> bool:
+    if dialect == "pwsh":
+        return character == "`" and following is not None
+    return character == "\\" and following in {" ", "\t", "#", ";", "|", "&", "'", '"', "\\"}
+
+
+def _strip_shell_comment(line: str, dialect: str) -> str:
+    quote = ""
+    escaped = False
+    for index, character in enumerate(line):
+        if quote == "'":
+            if character == "'":
+                quote = ""
+            continue
+        if escaped:
+            escaped = False
+            continue
+        if _is_shell_escape(character, line[index + 1] if index + 1 < len(line) else None, dialect):
+            escaped = True
+            continue
+        if character in {"'", '"'}:
+            if not quote:
+                quote = character
+            elif quote == character:
+                quote = ""
+            continue
+        if character == "#" and not quote and (index == 0 or line[index - 1].isspace()):
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
+def _logical_shell_commands(run: str, dialect: str) -> tuple[str, ...]:
+    """Return executable shell statements, excluding comment-only source lines."""
+    commands: list[str] = []
+    pending = ""
+    for raw in run.splitlines():
+        line = _strip_shell_comment(raw.strip(), dialect)
+        if not line:
+            continue
+        continued = line.endswith("`" if dialect == "pwsh" else "\\")
+        pending += (line[:-1] if continued else line) + " "
+        if not continued:
+            commands.append(pending.strip())
+            pending = ""
+    if pending:
+        commands.append(pending.strip())
+    return tuple(commands)
+
+
+def _shell_statements(command: str, dialect: str) -> tuple[tuple[str, bool], ...]:
+    """Split executable shell statements without treating quoted/escaped operators as syntax."""
+    statements: list[tuple[str, bool]] = []
+    current: list[str] = []
+    call_operator = False
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if quote == "'":
+            current.append(character)
+            if character == "'":
+                quote = ""
+            index += 1
+            continue
+        if escaped:
+            current.append(character)
+            escaped = False
+            index += 1
+            continue
+        if _is_shell_escape(character, command[index + 1] if index + 1 < len(command) else None, dialect):
+            current.append(character)
+            escaped = True
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            current.append(character)
+            if not quote:
+                quote = character
+            elif quote == character:
+                quote = ""
+            index += 1
+            continue
+        if character == "#" and not quote and (not current or current[-1].isspace()):
+            break
+        if not quote and character in {";", "|", "&"}:
+            if (
+                character == "&"
+                and not "".join(current).strip()
+                and not (index + 1 < len(command) and command[index + 1] == "&")
+            ):
+                call_operator = True
+                index += 1
+                continue
+            statement = "".join(current).strip()
+            if statement:
+                statements.append((statement, call_operator))
+            current = []
+            call_operator = False
+            if index + 1 < len(command) and command[index + 1] == character and character in {"|", "&"}:
+                index += 1
+            index += 1
+            continue
+        current.append(character)
+        index += 1
+    statement = "".join(current).strip()
+    if statement:
+        statements.append((statement, call_operator))
+    return tuple(statements)
+
+
+def _shell_tokens(statement: str, dialect: str) -> tuple[tuple[str, bool], ...]:
+    tokens: list[tuple[str, bool]] = []
+    current: list[str] = []
+    quote = ""
+    quoted = False
+    escaped = False
+    index = 0
+    while index < len(statement):
+        character = statement[index]
+        if quote == "'":
+            if character == "'":
+                quote = ""
+            else:
+                current.append(character)
+            index += 1
+            continue
+        if escaped:
+            current.append(character)
+            escaped = False
+            index += 1
+            continue
+        if _is_shell_escape(character, statement[index + 1] if index + 1 < len(statement) else None, dialect):
+            escaped = True
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            if not quote:
+                quote = character
+                quoted = True
+            elif quote == character:
+                quote = ""
+            else:
+                current.append(character)
+            index += 1
+            continue
+        if character.isspace() and not quote:
+            if current:
+                tokens.append(("".join(current), quoted))
+                current = []
+                quoted = False
+            index += 1
+            continue
+        current.append(character)
+        index += 1
+    if current:
+        tokens.append(("".join(current), quoted))
+    return tuple(tokens)
+
+
+def _normalized_basename(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _archive_downloader_timeout_values(
+    statement: str, dialect: str, call_operator: bool
+) -> tuple[str, ...] | None:
+    tokens = _shell_tokens(statement, dialect)
+    has_downloader = any(
+        _normalized_basename(token) == "download_verified_archive.py" for token, _ in tokens
+    )
+    if not has_downloader:
+        return None
+    executable_index = 0
+    script_index = executable_index + 1
+    if (
+        len(tokens) <= script_index
+        or (call_operator and dialect != "pwsh")
+        or _PYTHON_EXECUTABLE.fullmatch(_normalized_basename(tokens[executable_index][0])) is None
+        or _normalized_basename(tokens[script_index][0]) != "download_verified_archive.py"
+        or (dialect == "pwsh" and tokens[executable_index][1] and not call_operator)
+    ):
+        raise TrustPolicyError("archive_downloader_unsupported_invocation")
+    values: list[str] = []
+    for index, (token, _) in enumerate(tokens):
+        if token == "--total-timeout-seconds":
+            if index + 1 < len(tokens):
+                values.append(tokens[index + 1][0])
+            continue
+        if token.startswith("--total-timeout-seconds="):
+            values.append(token.removeprefix("--total-timeout-seconds="))
+    return tuple(values)
+
+
+def _workflow_run_steps(source: str) -> tuple[tuple[str, object], ...]:
+    workflow = load_workflow_yaml(source)
+    jobs = workflow.get("jobs")
+    if not isinstance(jobs, dict):
+        raise WorkflowYamlError("jobs_not_mapping")
+    steps_with_shell: list[tuple[str, object]] = []
+    for job_name, job in jobs.items():
+        if not isinstance(job, dict):
+            raise WorkflowYamlError(f"job_not_mapping:{job_name}")
+        steps = job.get("steps")
+        if steps is None:
+            continue
+        if not isinstance(steps, list):
+            raise WorkflowYamlError(f"steps_not_sequence:{job_name}")
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                raise WorkflowYamlError(f"step_not_mapping:{job_name}:{index}")
+            run = step.get("run")
+            if run is None:
+                continue
+            if not isinstance(run, str):
+                raise WorkflowYamlError(f"run_not_string:{job_name}:{index}")
+            steps_with_shell.append((run, step.get("shell")))
+    return tuple(steps_with_shell)
+
+
+def _archive_downloader_timeouts(source: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    invocations: list[tuple[str, tuple[str, ...]]] = []
+    for run, shell in _workflow_run_steps(source):
+        if "download_verified_archive.py" not in run:
+            continue
+        dialect = _shell_dialect(shell)
+        for command in _logical_shell_commands(run, dialect):
+            for statement, call_operator in _shell_statements(command, dialect):
+                values = _archive_downloader_timeout_values(statement, dialect, call_operator)
+                if values is not None:
+                    invocations.append((statement, values))
+    return tuple(invocations)
+
+
+def _require_bounded_archive_downloads(source: str, label: str, expected_count: int) -> None:
+    invocations = _archive_downloader_timeouts(source)
+    _require(len(invocations) == expected_count, f"{label}_archive_downloader_count")
+    for _, values in invocations:
+        _require(len(values) == 1, f"{label}_archive_downloader_timeout_count")
+        try:
+            timeout = int(values[0])
+        except ValueError:
+            raise TrustPolicyError(f"{label}_archive_downloader_timeout_numeric") from None
+        _require(0 < timeout <= 3600, f"{label}_archive_downloader_timeout_bounds")
+
+
 def _assert_files_are_immutable(
     *, commit: str, paths: dict[str, Path], repository_root: Path, label: str
 ) -> None:
@@ -135,6 +395,28 @@ def check_trusted_candidate_workflows(
     builder_source = builder.read_text("utf-8")
     signer_source = signer.read_text("utf-8")
     publisher_source = publisher.read_text("utf-8")
+    _require_bounded_archive_downloads(builder_source, "trusted_builder", 1)
+    _require_bounded_archive_downloads(publisher_source, "publisher", 1)
+    active_archive_invocations = []
+    workflow_directory = repository_root / ".github" / "workflows"
+    for workflow in sorted(workflow_directory.glob("*.yml")):
+        source = {
+            TRUSTED_BUILDER_PATH: builder_source,
+            TRUSTED_SIGNER_PATH: signer_source,
+            ".github/workflows/publish-candidate.yml": publisher_source,
+        }.get(workflow.relative_to(repository_root).as_posix(), workflow.read_text("utf-8"))
+        active_archive_invocations.extend(_archive_downloader_timeouts(source))
+    _require(
+        len(active_archive_invocations) == 3,
+        "active_archive_downloader_count",
+    )
+    for _, values in active_archive_invocations:
+        _require(len(values) == 1, "active_archive_downloader_timeout_count")
+        try:
+            timeout = int(values[0])
+        except ValueError:
+            raise TrustPolicyError("active_archive_downloader_timeout_numeric") from None
+        _require(0 < timeout <= 3600, "active_archive_downloader_timeout_bounds")
     _assert_no_untrusted_run_expressions(builder_source, "trusted_builder")
     _assert_no_untrusted_run_expressions(signer_source, "trusted_signer")
     _assert_no_untrusted_run_expressions(publisher_source, "publisher")

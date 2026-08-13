@@ -86,7 +86,7 @@ jobs:
         run: |
           if ($env:ARTIFACT_FILE -notmatch '^vending-vision-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+-windows-x86_64\.zip$') { throw "candidate artifact file output is invalid" }
           if ($env:SUBJECT_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:MANIFEST_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:SOURCE_COMMIT -notmatch '^[a-f0-9]{40}$') { throw "candidate verifier output identity is invalid" }
-          python trusted-verifier/scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --expected-bytes $env:CORE_WHEELHOUSE_BYTES --destination verifier-wheelhouse
+          python trusted-verifier/scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --expected-bytes $env:CORE_WHEELHOUSE_BYTES --destination verifier-wheelhouse --total-timeout-seconds 1800
           if ($LASTEXITCODE -ne 0) { throw "verifier wheelhouse materialization failed" }
           python -m venv .venv-candidate-verifier
           $VerifyPython = Join-Path $PWD ".venv-candidate-verifier\Scripts\python.exe"
