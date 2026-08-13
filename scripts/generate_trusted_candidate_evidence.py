@@ -13,7 +13,7 @@ SEMVER_RC = re.compile(
 )
 FULL_SHA = re.compile(r"^[a-f0-9]{40}$")
 SIGNER_IDENTITY = re.compile(r"^spki-sha256:[a-f0-9]{64}$")
-TRUSTED_BUILDER_COMMIT = "3fe9e00c98d9df59c71ce9be5b980a713ddd3110"
+TRUSTED_BUILDER_COMMIT = "08bdc994b1ab280eb265c392704f40da8cc88a00"
 TRUSTED_BUILDER_WORKFLOW = ".github/workflows/trusted-ai-candidate-builder.yml"
 SOURCE_FILES = (
     "requirements.txt",
