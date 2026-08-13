@@ -23,7 +23,12 @@ if str(ROOT) not in sys.path:
 
 from scripts.candidate_artifact_manifest import LAYOUT, verify_candidate_archive
 from vision.regional_evaluator_provenance import (
+    load_regional_evaluator_descriptor,
     verify_regional_evaluator_provenance_at_root,
+)
+from vision.source_provenance import (
+    load_official_source_descriptor,
+    verify_official_source_provenance_at_root,
 )
 
 
@@ -39,7 +44,9 @@ PROFILE_FIELDS = {
     "confidence",
 }
 BUILD_VERSION_MARKER_RE = re.compile(
-    r'^APP_VERSION = "(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?"\n$'
+    r'^APP_VERSION = "(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+    r'(?:-(?:0|[1-9][0-9]*|[A-Za-z](?:[0-9A-Za-z-]*[0-9A-Za-z])?)'
+    r'(?:\.(?:0|[1-9][0-9]*|[A-Za-z](?:[0-9A-Za-z-]*[0-9A-Za-z])?))*)?"\n$'
 )
 
 
@@ -452,6 +459,33 @@ def assert_release_version_runtime_marker(internal):
         raise AssertionError("invalid release version runtime marker")
 
 
+def assert_regional_evaluator_resource_closure(internal):
+    """Bind physical Vision resources to both source descriptors and the marker."""
+    if not (
+        verify_official_source_provenance_at_root(internal)
+        and verify_regional_evaluator_provenance_at_root(internal)
+    ):
+        raise AssertionError("packaged regional evaluator resources are invalid")
+    declared = {
+        source["path"]
+        for descriptor in (
+            load_official_source_descriptor(internal),
+            load_regional_evaluator_descriptor(internal),
+        )
+        for source in descriptor["sources"]
+        if source["path"].startswith("vision/")
+    }
+    declared.add("vision/_build_version.py")
+    vision_root = internal / "vision"
+    actual = {
+        path.relative_to(internal).as_posix()
+        for path in vision_root.rglob("*")
+        if path.is_file()
+    }
+    if actual != declared or len({path.casefold() for path in actual}) != len(actual):
+        raise AssertionError("packaged regional evaluator resources are invalid")
+
+
 def assert_ai_worker_layout(exe_path, *, required):
     candidates = _candidate_ai_worker_paths(exe_path)
     worker = next((path for path in candidates if path.is_file()), None)
@@ -471,8 +505,7 @@ def assert_ai_worker_layout(exe_path, *, required):
     if missing:
         raise AssertionError(f"missing packaged AI worker resources: {missing}")
     assert_release_version_runtime_marker(internal)
-    if not verify_regional_evaluator_provenance_at_root(internal):
-        raise AssertionError("packaged regional evaluator resources are invalid")
+    assert_regional_evaluator_resource_closure(internal)
     digest = __import__("hashlib").sha256(worker.read_bytes()).hexdigest()
     return {"path": worker, "sha256": digest}
 

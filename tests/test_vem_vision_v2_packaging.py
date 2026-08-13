@@ -15,16 +15,20 @@ ROOT = Path(__file__).parents[1]
 
 
 def materialize_regional_evaluator_resources(internal: Path) -> None:
-    descriptor = json.loads((ROOT / "regional-evaluator-descriptor.json").read_text("utf-8"))
-    (internal / "regional-evaluator-descriptor.json").write_text(
-        json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        + "\n",
-        "utf-8",
-    )
-    for source in descriptor["sources"]:
-        destination = internal / source["path"]
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes((ROOT / source["path"]).read_bytes())
+    for descriptor_name in (
+        "official-ai-source-descriptor.json",
+        "regional-evaluator-descriptor.json",
+    ):
+        descriptor = json.loads((ROOT / descriptor_name).read_text("utf-8"))
+        (internal / descriptor_name).write_text(
+            json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\n",
+            "utf-8",
+        )
+        for source in descriptor["sources"]:
+            destination = internal / source["path"]
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((ROOT / source["path"]).read_bytes())
     marker = internal / "vision" / "_build_version.py"
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_bytes((ROOT / "vision" / "_build_version.py").read_bytes())
@@ -330,6 +334,42 @@ def test_packaged_verifier_rejects_missing_regional_evaluator_source(tmp_path):
         assert_ai_worker_layout(exe, required=True)
 
 
+@pytest.mark.parametrize(
+    ("relative", "contents"),
+    (
+        ("vision/regional_evaluator_unlisted.py", "UNTRUSTED = True\n"),
+        ("vision/Regional_Evaluator.py", "DUPLICATE = True\n"),
+        ("vision/vendor/catvton/unlisted.py", "UNTRUSTED = True\n"),
+    ),
+)
+def test_packaged_verifier_rejects_unlisted_regional_evaluator_resource(
+    tmp_path, relative, contents
+):
+    from scripts.verify_packaged_exe import assert_ai_worker_layout
+
+    suffix = ".exe" if sys.platform == "win32" else ""
+    exe = tmp_path / "vending-vision" / f"vending-vision{suffix}"
+    worker = tmp_path / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}"
+    internal = worker.parent / "_internal"
+    exe.parent.mkdir()
+    internal.mkdir(parents=True)
+    exe.write_bytes(b"main")
+    worker.write_bytes(b"worker")
+    for name in (
+        "official-ai-model-pack-descriptor.json",
+        "ai-runtime-descriptor.json",
+        "requirements-ai.lock.json",
+    ):
+        (internal / name).write_text("{}", "utf-8")
+    materialize_regional_evaluator_resources(internal)
+    extra = internal / relative
+    extra.parent.mkdir(parents=True, exist_ok=True)
+    extra.write_text(contents, "utf-8")
+
+    with pytest.raises(AssertionError, match="regional evaluator resources are invalid"):
+        assert_ai_worker_layout(exe, required=True)
+
+
 def test_packaged_verifier_rejects_missing_release_version_runtime_marker(tmp_path):
     from scripts.verify_packaged_exe import assert_ai_worker_layout
 
@@ -355,7 +395,17 @@ def test_packaged_verifier_rejects_missing_release_version_runtime_marker(tmp_pa
         assert_ai_worker_layout(exe, required=True)
 
 
-def test_packaged_verifier_rejects_noncanonical_release_version_runtime_marker(tmp_path):
+@pytest.mark.parametrize(
+    "marker",
+    (
+        'APP_VERSION = "1.2.3-.."\n',
+        'APP_VERSION = "1.2.3-alpha..1"\n',
+        'APP_VERSION = "1.2.3-alpha-"\n',
+    ),
+)
+def test_packaged_verifier_rejects_noncanonical_release_version_runtime_marker(
+    tmp_path, marker
+):
     from scripts.verify_packaged_exe import assert_ai_worker_layout
 
     suffix = ".exe" if sys.platform == "win32" else ""
@@ -374,9 +424,7 @@ def test_packaged_verifier_rejects_noncanonical_release_version_runtime_marker(t
     ):
         (internal / name).write_text("{}", "utf-8")
     materialize_regional_evaluator_resources(internal)
-    (internal / "vision" / "_build_version.py").write_text(
-        'APP_VERSION = "untrusted"\n', "utf-8"
-    )
+    (internal / "vision" / "_build_version.py").write_text(marker, "utf-8")
 
     with pytest.raises(AssertionError, match="invalid release version runtime marker"):
         assert_ai_worker_layout(exe, required=True)

@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from vision.regional_evaluator_provenance import (
     REGIONAL_EVALUATOR_DESCRIPTOR_PATH,
     REGIONAL_EVALUATOR_SOURCE_PATHS,
@@ -138,6 +140,29 @@ def test_regional_evaluator_descriptor_rejects_an_unlisted_local_import(tmp_path
         )
         + "\n",
         "utf-8",
+    )
+
+    assert verify_regional_evaluator_provenance_at_root(tmp_path) is False
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        "vision/catvton_pose_masks.py",
+        "vision/Config.py",
+        "vision/vendor/../config.py",
+    ),
+)
+def test_regional_evaluator_descriptor_rejects_duplicate_case_or_path_variant(tmp_path, replacement):
+    descriptor = build_regional_evaluator_descriptor()
+    for source in descriptor["sources"]:
+        source_path = Path(source["path"])
+        destination = tmp_path / source_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / source_path, destination)
+    descriptor["sources"][-1]["path"] = replacement
+    (tmp_path / "regional-evaluator-descriptor.json").write_text(
+        canonical_regional_evaluator_descriptor_json(descriptor) + "\n", "utf-8"
     )
 
     assert verify_regional_evaluator_provenance_at_root(tmp_path) is False
