@@ -669,6 +669,7 @@ def _init_guard_repo(root: Path) -> None:
     (root / BINARY_ALLOWLIST_NAME).write_text(
         '{"entries":[],"schemaVersion":"vem-hard-cutover-binary-allowlist/v1"}\n',
         encoding="utf-8",
+        newline="\n",
     )
     subprocess.run(["git", "add", BINARY_ALLOWLIST_NAME], cwd=root, check=True)
 
@@ -678,6 +679,7 @@ def _write_binary_allowlist(root: Path, entries: list[dict[str, str]]) -> None:
     (root / BINARY_ALLOWLIST_NAME).write_text(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
+        newline="\n",
     )
     subprocess.run(["git", "add", BINARY_ALLOWLIST_NAME], cwd=root, check=True)
 
@@ -966,6 +968,7 @@ def test_binary_allowlist_rejects_new_executable_and_manifest_mutations(tmp_path
         (root / BINARY_ALLOWLIST_NAME).write_text(
             json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
+            newline="\n",
         )
         subprocess.run(
             ["git", "add", BINARY_ALLOWLIST_NAME, *relative_paths],
@@ -992,6 +995,7 @@ def test_binary_allowlist_rejects_new_executable_and_manifest_mutations(tmp_path
         )
         + "\n",
         encoding="utf-8",
+        newline="\n",
     )
     subprocess.run(
         ["git", "add", BINARY_ALLOWLIST_NAME, *relative_paths],
@@ -1005,6 +1009,7 @@ def test_binary_allowlist_rejects_new_executable_and_manifest_mutations(tmp_path
     (noncanonical_root / BINARY_ALLOWLIST_NAME).write_text(
         "[{}]\n",
         encoding="utf-8",
+        newline="\n",
     )
     subprocess.run(
         ["git", "add", BINARY_ALLOWLIST_NAME],

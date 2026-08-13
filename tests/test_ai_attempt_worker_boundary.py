@@ -455,8 +455,8 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
     assert pipeline_call["device"] == "cpu"
     assert pipeline_call["local_files_only"] is True
     assert pipeline_call["skip_safety_check"] is True
-    assert pipeline_call["base_ckpt"].endswith("/inpainting")
-    assert pipeline_call["vae_ckpt"].endswith("/vae")
+    assert Path(pipeline_call["base_ckpt"]).name == "inpainting"
+    assert Path(pipeline_call["vae_ckpt"]).name == "vae"
     assert "CatVTON" in pipeline_call["attn_ckpt"]
 
     raw_regional = regional.read_text("utf-8")

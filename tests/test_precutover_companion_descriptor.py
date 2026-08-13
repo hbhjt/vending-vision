@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import stat
 import zipfile
@@ -119,7 +120,18 @@ def test_companion_archive_rejects_tamper_and_unsafe_member_shapes(tmp_path, mut
     assert not (tmp_path / f"verified-{mutation}").exists()
 
 
-@pytest.mark.parametrize("kind", ["symlink", "special"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "symlink",
+        pytest.param(
+            "special",
+            marks=pytest.mark.skipif(
+                not hasattr(os, "mkfifo"), reason="POSIX FIFO fixture"
+            ),
+        ),
+    ],
+)
 def test_descriptor_builder_rejects_non_regular_payload_members(tmp_path, kind):
     root = (tmp_path / "payload").resolve()
     root.mkdir()
@@ -131,8 +143,6 @@ def test_descriptor_builder_rejects_non_regular_payload_members(tmp_path, kind):
         unsafe.mkdir()
         # A directory is allowed, so replace it with a FIFO to exercise a special file.
         unsafe.rmdir()
-        import os
-
         os.mkfifo(unsafe)
 
     with pytest.raises(AssertionError, match="symlink|special"):

@@ -109,12 +109,16 @@ def test_trusted_builder_closure_rejects_noncanonical_or_changed_file_set(
             manifest["files"][0],
         )
     else:
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", "utf-8")
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", "utf-8", newline="\n"
+        )
         with pytest.raises(ClosureError, match="noncanonical"):
             verify_closure(root, manifest_path)
         return
     manifest_path.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", "utf-8"
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        "utf-8",
+        newline="\n",
     )
     with pytest.raises(ClosureError, match="file_set"):
         verify_closure(root, manifest_path)
@@ -128,7 +132,9 @@ def test_trusted_builder_closure_rejects_new_spec_hidden_import(tmp_path):
         if item["path"] == spec.name:
             item["sha256"] = __import__("hashlib").sha256(spec.read_bytes()).hexdigest()
     manifest_path.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", "utf-8"
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        "utf-8",
+        newline="\n",
     )
     with pytest.raises(ClosureError, match="spec_(?:ast|hiddenimports)"):
         verify_closure(root, manifest_path)
@@ -146,7 +152,9 @@ def test_builder_closure_rejects_new_tracked_local_import(tmp_path):
         if item["path"] == "vision/ai_model_pack.py":
             item["sha256"] = __import__("hashlib").sha256(ai_model.read_bytes()).hexdigest()
     manifest_path.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", "utf-8"
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        "utf-8",
+        newline="\n",
     )
     subprocess.run(["git", "add", "-A"], cwd=export, check=True)
     with pytest.raises(ClosureError, match="dependency:vision/unlisted_local.py"):
@@ -185,7 +193,9 @@ def test_builder_closure_rejects_import_and_spec_mutation_bypasses(
         if item["path"] == target:
             item["sha256"] = __import__("hashlib").sha256(candidate.read_bytes()).hexdigest()
     manifest_path.write_text(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", "utf-8"
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        "utf-8",
+        newline="\n",
     )
     subprocess.run(["git", "add", "-A"], cwd=root, check=True)
     with pytest.raises(ClosureError):

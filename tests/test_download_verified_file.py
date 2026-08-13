@@ -623,7 +623,7 @@ def test_windows_integrity_handle_denies_write_share():
     api.close(file_handle)
 
     assert calls[0] == (
-        "C:/proof.bin",
+        str(Path("C:/proof.bin")),
         api.GENERIC_READ,
         api.FILE_SHARE_READ | api.FILE_SHARE_DELETE,
         api.OPEN_EXISTING,

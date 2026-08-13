@@ -233,26 +233,45 @@ def test_exact_json_emitter_is_not_accepted_as_a_frozen_windows_worker(tmp_path)
         raise AssertionError("a JSON emitter must not be a packaged worker")
 
 
-def test_production_cli_is_windows_only_and_has_no_source_mode_or_fake_worker_flag():
+def test_production_cli_is_windows_only_and_has_no_source_mode_or_fake_worker_flag(tmp_path):
+    candidate_root = tmp_path / "candidate"
+    candidate_root.mkdir()
+    candidate_artifact = candidate_root / "candidate.zip"
+    candidate_manifest = candidate_root / "candidate-manifest.json"
+    attestation = candidate_root / "attestation.json"
+    evidence = candidate_root / "evidence.json"
+    for path, content in (
+        (candidate_artifact, b"not a candidate archive"),
+        (candidate_manifest, b"{}"),
+        (attestation, b"{}"),
+        (evidence, b"{}"),
+    ):
+        path.write_bytes(content)
+    model_pack = tmp_path / "model.zip"
+    model_pack.write_bytes(b"not a model archive")
     arguments = [
-        "--candidate-artifact", "candidate.zip",
-        "--candidate-manifest", "candidate-manifest.json",
-        "--github-attestation", "attestation.json",
-        "--trusted-builder-evidence", "evidence.json",
-        "--subject-sha256", "a" * 64,
-        "--manifest-sha256", "b" * 64,
-        "--attestation-bundle-sha256", "c" * 64,
+        "--candidate-artifact", str(candidate_artifact),
+        "--candidate-manifest", str(candidate_manifest),
+        "--github-attestation", str(attestation),
+        "--trusted-builder-evidence", str(evidence),
+        "--subject-sha256", sha256(candidate_artifact),
+        "--manifest-sha256", sha256(candidate_manifest),
+        "--attestation-bundle-sha256", sha256(attestation),
         "--source-commit", "d" * 40,
-        "--model-pack-archive", "model.zip",
-        "--model-pack-byte-size", "1",
-        "--model-pack-sha256", "e" * 64,
+        "--model-pack-archive", str(model_pack),
+        "--model-pack-byte-size", str(model_pack.stat().st_size),
+        "--model-pack-sha256", sha256(model_pack),
         "--model-descriptor-sha256", "f" * 64,
-        "--private-parent", ".",
-        "--report-output", "proof.json",
+        "--private-parent", str(tmp_path),
+        "--report-output", str(tmp_path / "proof.json"),
     ]
 
-    with pytest.raises(SystemExit, match="windows_required"):
-        companion_main(arguments)
+    if os.name == "nt":
+        with pytest.raises(SystemExit, match=r"PRECUTOVER_COMPANION=FAIL:(?!windows_required)"):
+            companion_main(arguments)
+    else:
+        with pytest.raises(SystemExit, match="windows_required"):
+            companion_main(arguments)
     with pytest.raises(SystemExit):
         companion_main([*arguments, "--fake-worker", "emitter.exe"])
 

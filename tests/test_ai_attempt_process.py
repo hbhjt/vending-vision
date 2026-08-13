@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -32,7 +33,8 @@ def test_nonofficial_child_probe_fails_closed_and_joins_before_return(tmp_path):
 def test_frozen_official_ai_child_uses_packaged_worker_entrypoint(monkeypatch, tmp_path):
     runtime = tmp_path / "vending-vision"
     runtime.write_text("main", "utf-8")
-    worker = tmp_path / "vending-vision-ai-worker"
+    suffix = ".exe" if os.name == "nt" else ""
+    worker = tmp_path / f"vending-vision-ai-worker{suffix}"
     worker.write_text("worker", "utf-8")
     monkeypatch.setattr("sys.frozen", True, raising=False)
     monkeypatch.setattr("sys.executable", str(runtime))

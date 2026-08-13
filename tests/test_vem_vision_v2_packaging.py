@@ -2,6 +2,7 @@ from pathlib import Path
 import hashlib
 import json
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -450,9 +451,18 @@ def test_packaged_verifier_rejects_worker_that_does_not_emit_runtime_probe_json(
     internal = worker.parent / "_internal"
     exe.parent.mkdir()
     internal.mkdir(parents=True)
-    exe.write_text("#!/usr/bin/env python3\nprint('not-json')\n", "utf-8")
-    worker.write_text("#!/usr/bin/env python3\nprint('not-json')\n", "utf-8")
-    worker.chmod(0o755)
+    if sys.platform == "win32":
+        # A Windows fixture must be executable; a POSIX shebang is WinError 216.
+        shutil.copyfile(sys.executable, worker)
+        runtime_dll = Path(sys.base_prefix) / (
+            f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+        )
+        shutil.copyfile(runtime_dll, worker.parent / runtime_dll.name)
+        exe.write_bytes(b"MZ-test-entry")
+    else:
+        exe.write_text("#!/usr/bin/env python3\nprint('not-json')\n", "utf-8")
+        worker.write_text("#!/usr/bin/env python3\nprint('not-json')\n", "utf-8")
+        worker.chmod(0o755)
     for name in (
         "official-ai-model-pack-descriptor.json",
         "ai-runtime-descriptor.json",

@@ -44,6 +44,7 @@ def test_supervisor_drains_large_stdout_stderr_without_deadlock_and_bounds_tail(
     assert len(result.stderr_tail) <= 64 * 1024
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group descendant semantics")
 def test_linux_timeout_kills_grandchild_and_great_grandchild_that_ignore_term(tmp_path):
     pidfile = tmp_path / "pids.txt"
     script = f"""
@@ -64,6 +65,7 @@ time.sleep(60)
     assert all(not alive(pid) for pid in pids)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group descendant semantics")
 def test_linux_leader_zero_with_active_descendant_is_killed_and_failed(tmp_path):
     pidfile = tmp_path / "pids.txt"
     script = f"""
