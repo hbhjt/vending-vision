@@ -95,7 +95,7 @@ def build_inputs(root: Path) -> tuple[dict, dict]:
         "schemaVersion": "vending-vision-trusted-builder-evidence/v1",
         "builderRepository": "hbhjt/vending-vision",
         "builderWorkflow": ".github/workflows/trusted-ai-candidate-builder.yml",
-        "builderWorkflowSha": "c85ac3059c31d41b405282ecfc7641d0c1b88958",
+        "builderWorkflowSha": "ccf38c95b3c33994d4c20039a506be062ebd2f99",
         "sourceCommit": source_commit,
         "subjectSha256": subject_sha,
         "embeddedManifestSha256": _sha(manifest_raw),
@@ -170,7 +170,7 @@ def proof_for(identity: dict) -> dict:
         "companion": {
             "archiveSha256": "c" * 64,
             "descriptorSha256": "d" * 64,
-            "sourceCommit": "ba348caeb3c54629c7f393eb3e1d7bcff0280190",
+            "sourceCommit": "3abc93b61b5eaa7d4302117f593641dccf1d969c",
         },
         "schemaVersion": "vending-vision-precutover-proof/v2",
     }
@@ -276,7 +276,7 @@ def test_execute_binds_verified_companion_and_builder_evidence_into_signed_proof
         identity,
         companion_archive_sha256="c" * 64,
         companion_descriptor_sha256="d" * 64,
-        companion_source_commit="ba348caeb3c54629c7f393eb3e1d7bcff0280190",
+        companion_source_commit="3abc93b61b5eaa7d4302117f593641dccf1d969c",
         output=proof_path,
     )
 

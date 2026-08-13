@@ -21,7 +21,7 @@ ROOT = Path(__file__).parents[1]
 TRUSTED_PROOF = (
     ROOT / ".github" / "workflows" / "trusted-precutover-companion-proof.yml"
 )
-COMPANION_BUILDER_COMMIT = "ba348caeb3c54629c7f393eb3e1d7bcff0280190"
+COMPANION_BUILDER_COMMIT = "3abc93b61b5eaa7d4302117f593641dccf1d969c"
 BUILDER_CLOSURE = ROOT / "trusted-precutover-companion-builder-closure.json"
 BUILDER_CLOSURE_VERIFIER = ROOT / "scripts/verify_trusted_builder_closure.py"
 POLICY = ROOT / "scripts" / "check_trusted_precutover_proof_workflow.py"
@@ -506,30 +506,30 @@ def test_trusted_proof_policy_rejects_candidate_builder_authority_drift(tmp_path
     "mutation",
     (
         lambda source: source.replace(
-            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            '--signer-digest "ccf38c95b3c33994d4c20039a506be062ebd2f99"',
             '--signer-digest "ee95191abdf5f22b1823b0625d9e700c4f41332e"\n'
-            '          # --signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            '          # --signer-digest "ccf38c95b3c33994d4c20039a506be062ebd2f99"',
             1,
         ).replace(
-            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            '--signer-digest "ccf38c95b3c33994d4c20039a506be062ebd2f99"',
             '--signer-digest "ee95191abdf5f22b1823b0625d9e700c4f41332e"\n'
-            '          # --signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            '          # --signer-digest "ccf38c95b3c33994d4c20039a506be062ebd2f99"',
             1,
         ),
         lambda source: source.replace(
-            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
-            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958" '
-            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            '--signer-digest "ccf38c95b3c33994d4c20039a506be062ebd2f99"',
+            '--signer-digest "ccf38c95b3c33994d4c20039a506be062ebd2f99" '
+            '--signer-digest "ccf38c95b3c33994d4c20039a506be062ebd2f99"',
             1,
         ),
         lambda source: source.replace(
-            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
-            '; Write-Output --signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            '--signer-digest "ccf38c95b3c33994d4c20039a506be062ebd2f99"',
+            '; Write-Output --signer-digest "ccf38c95b3c33994d4c20039a506be062ebd2f99"',
             1,
         ),
         lambda source: source.replace(
-            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
-            'Write-Output "--signer-digest c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            '--signer-digest "ccf38c95b3c33994d4c20039a506be062ebd2f99"',
+            'Write-Output "--signer-digest ccf38c95b3c33994d4c20039a506be062ebd2f99"',
             1,
         ),
     ),
@@ -669,7 +669,7 @@ def test_trusted_proof_policy_rejects_mutable_authority_and_execution_bypasses(t
             1,
         ),
         "untrusted-companion-source-binding": trusted.replace(
-            '--companion-source-commit "ba348caeb3c54629c7f393eb3e1d7bcff0280190"',
+            '--companion-source-commit "3abc93b61b5eaa7d4302117f593641dccf1d969c"',
             "--companion-source-commit $env:CALLER_SHA",
             1,
         ),

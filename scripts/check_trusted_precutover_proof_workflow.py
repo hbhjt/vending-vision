@@ -20,11 +20,11 @@ from check_trusted_candidate_workflows import (
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 WORKFLOW_PATH = ".github/workflows/trusted-precutover-companion-proof.yml"
 COMPANION_BUILDER_PATH = ".github/workflows/trusted-precutover-companion-builder.yml"
-COMPANION_BUILDER_SHA = "ba348caeb3c54629c7f393eb3e1d7bcff0280190"
+COMPANION_BUILDER_SHA = "3abc93b61b5eaa7d4302117f593641dccf1d969c"
 COMPANION_BUILDER_CLOSURE = "trusted-precutover-companion-builder-closure.json"
 COMPANION_BUILDER_CLOSURE_VERIFIER = "scripts/verify_trusted_builder_closure.py"
 CANDIDATE_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-CANDIDATE_BUILDER_SHA = "c85ac3059c31d41b405282ecfc7641d0c1b88958"
+CANDIDATE_BUILDER_SHA = "ccf38c95b3c33994d4c20039a506be062ebd2f99"
 CANONICAL_GH_PATH = r"c:\program files\github cli\gh.exe"
 HOSTED_AUTHORITY_SHA = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 INPUTS = {
@@ -545,7 +545,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         "scripts/download_verified_file.py",
         "inspect-inputs --input-root proof-input",
         "bind-execution-proof --source companion-report.json",
-        "--companion-source-commit \"ba348caeb3c54629c7f393eb3e1d7bcff0280190\"",
+        "--companion-source-commit \"3abc93b61b5eaa7d4302117f593641dccf1d969c\"",
         "verify-proof --proof precutover-ai-proof.json",
         "+refs/heads/main:refs/remotes/origin/main",
         "--protected-main refs/remotes/origin/main",
