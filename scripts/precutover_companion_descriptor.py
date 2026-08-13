@@ -49,7 +49,7 @@ def _payload(root: Path) -> list[tuple[str, Path]]:
     if root.is_symlink() or not root.is_dir() or root.resolve() != root:
         raise AssertionError("companion root is unsafe")
     files: list[tuple[str, Path]] = []
-    for path in sorted(root.rglob("*")):
+    for path in sorted(root.rglob("*"), key=lambda candidate: candidate.relative_to(root).as_posix()):
         if path.is_symlink():
             raise AssertionError("companion payload symlink")
         if path.is_dir():
