@@ -27,7 +27,7 @@ from vision.precutover_companion import main as companion_main
 
 SOURCE_COMMIT = "a" * 40
 SOURCE_REVISION = "3b795364a4d2f3b5adb365f39cdea376d20bc53c"
-TRUSTED_BUILDER_COMMIT = "08bdc994b1ab280eb265c392704f40da8cc88a00"
+TRUSTED_BUILDER_COMMIT = "ee95191abdf5f22b1823b0625d9e700c4f41332e"
 
 
 def sha256(path: Path) -> str:

@@ -128,7 +128,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-builder.yml@ad09c328e2006f6ec787bd668640f3961febf5a9
+    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-builder.yml@717833a0e02e1df370dcc0e0617f9c99543eb225
     with:
       core_wheelhouse_url: ${{ vars.CORE_WHEELHOUSE_URL }}
       core_wheelhouse_sha256: ${{ vars.CORE_WHEELHOUSE_SHA256 }}
@@ -197,14 +197,14 @@ jobs:
           $descriptor = (Resolve-Path -LiteralPath "companion-input/$env:COMPANION_DESCRIPTOR_FILE").Path
           $bundle = (Resolve-Path -LiteralPath "companion-input/$env:COMPANION_ATTESTATION_FILE").Path
           if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:COMPANION_ARCHIVE_SHA256 -or (Get-FileHash -LiteralPath $descriptor -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:COMPANION_DESCRIPTOR_SHA256 -or (Get-FileHash -LiteralPath $bundle -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:COMPANION_ATTESTATION_SHA256) { throw "companion artifact digest mismatch" }
-          gh attestation verify $archive --bundle $bundle --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-builder.yml" --signer-digest "ad09c328e2006f6ec787bd668640f3961febf5a9" --source-ref $env:CALLER_REF --source-digest $env:CALLER_SHA --deny-self-hosted-runners
+          gh attestation verify $archive --bundle $bundle --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-builder.yml" --signer-digest "717833a0e02e1df370dcc0e0617f9c99543eb225" --source-ref $env:CALLER_REF --source-digest $env:CALLER_SHA --deny-self-hosted-runners
           if ($LASTEXITCODE -ne 0) { throw "trusted companion attestation verification failed" }
           $python = (Get-Command python.exe -ErrorAction Stop).Source
           $verifier = (Resolve-Path -LiteralPath trusted-proof/scripts/precutover_companion_descriptor.py).Path
           & $python $verifier verify --archive $archive --destination verified-companion --expected-sha256 $env:COMPANION_ARCHIVE_SHA256 --expected-descriptor-sha256 $env:COMPANION_DESCRIPTOR_SHA256
           if ($LASTEXITCODE -ne 0) { throw "trusted companion archive verification failed" }
           $companionDescriptor = Get-Content -LiteralPath $descriptor -Raw | ConvertFrom-Json
-          if ($companionDescriptor.sourceCommit -cne "ad09c328e2006f6ec787bd668640f3961febf5a9") { throw "companion descriptor source identity mismatch" }
+          if ($companionDescriptor.sourceCommit -cne "717833a0e02e1df370dcc0e0617f9c99543eb225") { throw "companion descriptor source identity mismatch" }
           "TRUSTED_PYTHON=$python" >> $env:GITHUB_ENV
           "TRUSTED_WORKFLOW_SHA=$env:TRUSTED_WORKFLOW_SHA" >> $env:GITHUB_ENV
           "CALLER_SHA=$env:CALLER_SHA" >> $env:GITHUB_ENV
@@ -317,7 +317,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh attestation verify proof-input/candidate/candidate.zip --bundle proof-input/candidate/github-build-provenance.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "08bdc994b1ab280eb265c392704f40da8cc88a00" --source-ref $env:CALLER_REF --source-digest $env:PROOF_SOURCE_COMMIT --deny-self-hosted-runners
+          gh attestation verify proof-input/candidate/candidate.zip --bundle proof-input/candidate/github-build-provenance.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "ee95191abdf5f22b1823b0625d9e700c4f41332e" --source-ref $env:CALLER_REF --source-digest $env:PROOF_SOURCE_COMMIT --deny-self-hosted-runners
           if ($LASTEXITCODE -ne 0) { throw "candidate GitHub attestation verification failed" }
       - name: Execute only the verified frozen companion
         shell: pwsh
@@ -330,7 +330,7 @@ jobs:
         shell: pwsh
         run: |
           $proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path
-          & $env:TRUSTED_PYTHON $proofTool bind-execution-proof --source companion-report.json --identity proof-input-identity.json --companion-archive-sha256 $env:COMPANION_ARCHIVE_SHA256 --companion-descriptor-sha256 $env:COMPANION_DESCRIPTOR_SHA256 --companion-source-commit "ad09c328e2006f6ec787bd668640f3961febf5a9" --output precutover-ai-proof.json
+          & $env:TRUSTED_PYTHON $proofTool bind-execution-proof --source companion-report.json --identity proof-input-identity.json --companion-archive-sha256 $env:COMPANION_ARCHIVE_SHA256 --companion-descriptor-sha256 $env:COMPANION_DESCRIPTOR_SHA256 --companion-source-commit "717833a0e02e1df370dcc0e0617f9c99543eb225" --output precutover-ai-proof.json
           if ($LASTEXITCODE -ne 0) { throw "trusted companion identity binding failed" }
           & $env:TRUSTED_PYTHON $proofTool verify-proof --proof precutover-ai-proof.json --identity proof-input-identity.json
           if ($LASTEXITCODE -ne 0) { throw "canonical companion proof binding failed" }
@@ -437,13 +437,13 @@ jobs:
           $descriptor = (Resolve-Path -LiteralPath "signer-companion-input/$env:COMPANION_DESCRIPTOR_FILE").Path
           $bundle = (Resolve-Path -LiteralPath "signer-companion-input/$env:COMPANION_ATTESTATION_FILE").Path
           if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:COMPANION_ARCHIVE_SHA256 -or (Get-FileHash -LiteralPath $descriptor -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:COMPANION_DESCRIPTOR_SHA256 -or (Get-FileHash -LiteralPath $bundle -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:COMPANION_ATTESTATION_SHA256) { throw "signer companion digest mismatch" }
-          & $env:TRUSTED_GH attestation verify $archive --bundle $bundle --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-builder.yml" --signer-digest "ad09c328e2006f6ec787bd668640f3961febf5a9" --source-ref $env:CALLER_REF --source-digest $env:CALLER_SHA --deny-self-hosted-runners
+          & $env:TRUSTED_GH attestation verify $archive --bundle $bundle --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-builder.yml" --signer-digest "717833a0e02e1df370dcc0e0617f9c99543eb225" --source-ref $env:CALLER_REF --source-digest $env:CALLER_SHA --deny-self-hosted-runners
           if ($LASTEXITCODE -ne 0) { throw "signer companion attestation verification failed" }
           $verifier = (Resolve-Path -LiteralPath trusted-proof/scripts/precutover_companion_descriptor.py).Path
           & $env:TRUSTED_PYTHON $verifier verify --archive $archive --destination signer-verified-companion --expected-sha256 $env:COMPANION_ARCHIVE_SHA256 --expected-descriptor-sha256 $env:COMPANION_DESCRIPTOR_SHA256
           if ($LASTEXITCODE -ne 0) { throw "signer companion archive verification failed" }
           $companionDescriptor = Get-Content -LiteralPath $descriptor -Raw | ConvertFrom-Json
-          if ($companionDescriptor.sourceCommit -cne "ad09c328e2006f6ec787bd668640f3961febf5a9") { throw "signer companion descriptor source mismatch" }
+          if ($companionDescriptor.sourceCommit -cne "717833a0e02e1df370dcc0e0617f9c99543eb225") { throw "signer companion descriptor source mismatch" }
           "COMPANION_ARCHIVE_SHA256=$env:COMPANION_ARCHIVE_SHA256" >> $env:GITHUB_ENV
           "COMPANION_DESCRIPTOR_SHA256=$env:COMPANION_DESCRIPTOR_SHA256" >> $env:GITHUB_ENV
       - name: Fresh bounded-download candidate and model data for signing
@@ -547,7 +547,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          & $env:TRUSTED_GH attestation verify signer-proof-input/candidate/candidate.zip --bundle signer-proof-input/candidate/github-build-provenance.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "08bdc994b1ab280eb265c392704f40da8cc88a00" --source-ref $env:CALLER_REF --source-digest $env:PROOF_SOURCE_COMMIT --deny-self-hosted-runners
+          & $env:TRUSTED_GH attestation verify signer-proof-input/candidate/candidate.zip --bundle signer-proof-input/candidate/github-build-provenance.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "ee95191abdf5f22b1823b0625d9e700c4f41332e" --source-ref $env:CALLER_REF --source-digest $env:PROOF_SOURCE_COMMIT --deny-self-hosted-runners
           if ($LASTEXITCODE -ne 0) { throw "signer candidate attestation verification failed" }
       - name: Download fixed execution handoff
         uses: actions/download-artifact@v4
