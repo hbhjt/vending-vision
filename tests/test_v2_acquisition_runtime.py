@@ -31,6 +31,13 @@ from vision.frame_source import RecordedVideoFrameSource
 from vision.presence_runtime import PresenceRuntime
 from vision.profile_state import get_departure_tracker, get_occupancy_gate, reset_active_track
 
+_RECORDED_FIXTURE_WATCHDOG_SECONDS = 5.0
+
+
+def _wait_for_recorded_fixture_event(event, *, timeout=_RECORDED_FIXTURE_WATCHDOG_SECONDS):
+    """Bound a test-only cross-thread barrier without changing Vision deadlines."""
+    return event.wait(timeout)
+
 
 def _permanently_blocking_acquisition_observer(connection):
     connection.send(("ready", None))
@@ -118,22 +125,41 @@ class _RecordedTopDepartureMonitor:
     tracker.
     """
 
-    def __init__(self, config, *, present_polls, front_sampling_started=None):
+    def __init__(
+        self,
+        config,
+        *,
+        present_polls,
+        front_sampling_started=None,
+        profile_result_broadcasted=None,
+    ):
         self.source = RecordedVideoFrameSource("top", config)
         self.present_polls = present_polls
         self.front_sampling_started = front_sampling_started
+        self.profile_result_broadcasted = profile_result_broadcasted
         self.poll_count = 0
         self.front_sampling_observed = False
+        self.profile_result_broadcast_observed = False
 
     def check_once(self, *, return_image, camera_role, return_source):
         assert return_image and return_source and camera_role == "top"
         # The first recorded top frame creates the candidate.  Do not consume
         # the finite departure fixture before that candidate has actually
-        # entered real front-camera sampling: under a busy Windows runner the
-        # profile worker otherwise may receive no sampling window at all.
-        if self.poll_count == 1 and self.front_sampling_started is not None:
-            self.front_sampling_started.wait()
-            self.front_sampling_observed = True
+        # entered real front-camera sampling and then broadcast its profile
+        # result. Under a busy Windows runner, merely entering sampling leaves
+        # it possible for the real collector to be canceled by departure
+        # before it commits its public result.
+        if self.poll_count == 1:
+            if self.front_sampling_started is not None:
+                assert _wait_for_recorded_fixture_event(self.front_sampling_started), (
+                    "recorded departure fixture timed out before front sampling started"
+                )
+                self.front_sampling_observed = True
+            if self.profile_result_broadcasted is not None:
+                assert _wait_for_recorded_fixture_event(self.profile_result_broadcasted), (
+                    "recorded departure fixture timed out before profile result broadcast"
+                )
+                self.profile_result_broadcast_observed = True
         image = self.source.read(warmup_frames=1)
         self.poll_count += 1
         if self.poll_count <= self.present_polls:
@@ -182,6 +208,26 @@ def _reset_recorded_departure_state():
     tracker.active = False
     tracker.absent_count = 0
     tracker.departed_announced = False
+
+
+def test_recorded_departure_fixture_watchdog_unblocks_asyncio_run():
+    """An unmet test barrier must not strand asyncio's default executor."""
+    unset = threading.Event()
+    waiter_finished = threading.Event()
+
+    async def scenario():
+        def wait_for_unset_fixture_barrier():
+            try:
+                return _wait_for_recorded_fixture_event(unset, timeout=0.02)
+            finally:
+                waiter_finished.set()
+
+        return await asyncio.to_thread(wait_for_unset_fixture_barrier)
+
+    started = time.monotonic()
+    assert asyncio.run(scenario()) is False
+    assert waiter_finished.is_set()
+    assert time.monotonic() - started < 0.5
 
 
 def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkeypatch):
@@ -260,6 +306,7 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
     _configure_recorded_front(monkeypatch, "man-front.mp4")
     _reset_recorded_departure_state()
     front_sampling_started = threading.Event()
+    profile_result_broadcasted = threading.Event()
     real_collect_best_profile_samples = profile_push.collect_best_profile_samples
 
     def collect_best_after_front_sampling_started(*args, **kwargs):
@@ -275,6 +322,7 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
         settings.TOP_CAMERA_CONFIG,
         present_polls=expected_polls - 2,
         front_sampling_started=front_sampling_started,
+        profile_result_broadcasted=profile_result_broadcasted,
     )
     runtime = PresenceRuntime(monitor=monitor)
     monkeypatch.setattr(vision_app, "get_presence_runtime", lambda: runtime)
@@ -315,8 +363,12 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
 
     async def broadcast_after_generating(update):
         if update["message_type"] == "vision.profile_result":
-            assert await asyncio.to_thread(generating_started.wait, 2.0)
+            assert await asyncio.to_thread(
+                _wait_for_recorded_fixture_event, generating_started
+            ), "recorded departure fixture timed out before attempt generation"
         await real_broadcast_profile_update(update)
+        if update["message_type"] == "vision.profile_result":
+            profile_result_broadcasted.set()
 
     async def unfinished_render(*_args, **_kwargs):
         generating_started.set()
@@ -395,10 +447,17 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                 )
                 assert post_cancel_presence
                 assert monitor.front_sampling_observed
+                assert monitor.profile_result_broadcast_observed
                 assert monitor.poll_count >= expected_polls + 1
                 assert monitor.source.frame_count == monitor.poll_count
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
     finally:
+        # Release every fixture barrier before shutting down TestClient.  A
+        # failing assertion must never leave an asyncio default-executor
+        # worker blocked on an unset Event.
+        front_sampling_started.set()
+        profile_result_broadcasted.set()
+        generating_started.set()
         server.shutdown()
         server.server_close()
         thread.join()
