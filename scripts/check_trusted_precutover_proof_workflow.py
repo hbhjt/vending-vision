@@ -19,7 +19,7 @@ COMPANION_BUILDER_SHA = "ba348caeb3c54629c7f393eb3e1d7bcff0280190"
 COMPANION_BUILDER_CLOSURE = "trusted-precutover-companion-builder-closure.json"
 COMPANION_BUILDER_CLOSURE_VERIFIER = "scripts/verify_trusted_builder_closure.py"
 CANDIDATE_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-CANDIDATE_BUILDER_SHA = "ee95191abdf5f22b1823b0625d9e700c4f41332e"
+CANDIDATE_BUILDER_SHA = "c85ac3059c31d41b405282ecfc7641d0c1b88958"
 HOSTED_AUTHORITY_SHA = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 INPUTS = {
     f"{name}_{field}"
@@ -114,6 +114,28 @@ def _assert_gh_flags_parse(repository_root: Path) -> None:
     )
 
 
+def _assert_candidate_builder_authority_sync(source: str, repository_root: Path) -> None:
+    """Keep attestation, static policy, and sealed-proof evidence on one builder."""
+    expected = f'--signer-digest "{CANDIDATE_BUILDER_SHA}"'
+    _require(
+        source.count(expected) == 2,
+        "trusted_proof_candidate_builder_attestation_sync",
+    )
+    proof_tool = repository_root / "scripts" / "trusted_precutover_proof.py"
+    try:
+        proof_source = proof_tool.read_text("utf-8")
+    except OSError as exc:
+        raise PolicyError("trusted_proof_candidate_builder_proof_tool_missing") from exc
+    _require(
+        re.search(
+            rf'^TRUSTED_CANDIDATE_WORKFLOW_SHA = "{CANDIDATE_BUILDER_SHA}"$',
+            proof_source,
+            re.MULTILINE,
+        ) is not None,
+        "trusted_proof_candidate_builder_evidence_sync",
+    )
+
+
 def check(workflow_path: Path, repository_root: Path) -> None:
     for label, commit in (
         ("companion_builder", COMPANION_BUILDER_SHA),
@@ -125,6 +147,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
             f"trusted_proof_{label}_commit_invalid",
         )
     source = workflow_path.read_text("utf-8")
+    _assert_candidate_builder_authority_sync(source, repository_root)
     workflow = load_workflow_yaml(source)
     on = workflow.get("on")
     _require(isinstance(on, dict), "trusted_proof_on_shape")

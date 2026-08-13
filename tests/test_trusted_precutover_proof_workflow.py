@@ -461,6 +461,47 @@ def test_trusted_proof_policy_rejects_truncated_authority_constants(tmp_path, co
     assert error in completed.stdout
 
 
+def test_trusted_proof_policy_rejects_candidate_builder_authority_drift(tmp_path):
+    policy = tmp_path / "check_trusted_precutover_proof_workflow.py"
+    source = POLICY.read_text("utf-8")
+    current = re.search(
+        r'^CANDIDATE_BUILDER_SHA = "([a-f0-9]{40})"$', source, re.MULTILINE
+    )
+    assert current is not None
+    policy.write_text(
+        source[: current.start(1)] + "0" * 40 + source[current.end(1) :],
+        "utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(policy),
+            "--workflow",
+            str(TRUSTED_PROOF),
+            "--repository-root",
+            str(ROOT),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "scripts")},
+    )
+
+    assert completed.returncode != 0
+    assert "trusted_proof_candidate_builder_attestation_sync" in completed.stdout
+
+    workflow = tmp_path / "trusted-proof.yml"
+    workflow.write_text(
+        TRUSTED_PROOF.read_text("utf-8").replace(current.group(1), "0" * 40),
+        "utf-8",
+    )
+    completed = _check_policy(workflow)
+    assert completed.returncode != 0
+    assert "trusted_proof_candidate_builder_attestation_sync" in completed.stdout
+
+
 def test_trusted_proof_requires_real_tag_peel_main_ancestry_and_release_authority():
     source = TRUSTED_PROOF.read_text("utf-8")
 
