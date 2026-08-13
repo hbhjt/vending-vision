@@ -31,9 +31,9 @@ PROOF_SCHEMA = "vending-vision-precutover-proof/v2"
 EVIDENCE_SCHEMA = "vending-vision-trusted-precutover-proof-evidence/v1"
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 TRUSTED_CANDIDATE_WORKFLOW = ".github/workflows/trusted-ai-candidate-builder.yml"
-TRUSTED_CANDIDATE_WORKFLOW_SHA = "08bdc994b1ab280eb265c392704f40da8cc88a00"
+TRUSTED_CANDIDATE_WORKFLOW_SHA = "c85ac3059c31d41b405282ecfc7641d0c1b88958"
 TRUSTED_PROOF_WORKFLOW = ".github/workflows/trusted-precutover-companion-proof.yml"
-TRUSTED_COMPANION_SOURCE = "717833a0e02e1df370dcc0e0617f9c99543eb225"
+TRUSTED_COMPANION_SOURCE = "ba348caeb3c54629c7f393eb3e1d7bcff0280190"
 CANDIDATE_INPUT_FILES = {
     "candidate.zip",
     "candidate-manifest.json",
