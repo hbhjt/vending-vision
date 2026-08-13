@@ -10,6 +10,11 @@ import subprocess
 import tempfile
 
 from workflow_yaml import WorkflowYamlError, load_workflow_yaml, workflow_run_scalars
+from check_trusted_candidate_workflows import (
+    _logical_shell_commands,
+    _shell_statements,
+    _shell_tokens,
+)
 
 
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
@@ -116,11 +121,43 @@ def _assert_gh_flags_parse(repository_root: Path) -> None:
 
 def _assert_candidate_builder_authority_sync(source: str, repository_root: Path) -> None:
     """Keep attestation, static policy, and sealed-proof evidence on one builder."""
-    expected = f'--signer-digest "{CANDIDATE_BUILDER_SHA}"'
+    expected_workflow = f"{TRUSTED_REPOSITORY}/{CANDIDATE_BUILDER_PATH}"
+    candidate_attestations: list[tuple[str, ...]] = []
+    for command in _logical_shell_commands(
+        "\n".join(workflow_run_scalars(source)), "pwsh"
+    ):
+        for statement, call_operator in _shell_statements(command, "pwsh"):
+            tokens = tuple(token for token, _ in _shell_tokens(statement, "pwsh"))
+            if "--signer-workflow" not in tokens:
+                continue
+            workflow_index = tokens.index("--signer-workflow")
+            if workflow_index + 1 >= len(tokens) or tokens[workflow_index + 1] != expected_workflow:
+                continue
+            try:
+                attestation_index = tokens.index("attestation")
+            except ValueError:
+                raise PolicyError("trusted_proof_candidate_builder_attestation_shape")
+            _require(
+                attestation_index + 1 < len(tokens)
+                and tokens[attestation_index + 1] == "verify"
+                and (call_operator or tokens[0].lower().endswith("gh")),
+                "trusted_proof_candidate_builder_attestation_shape",
+            )
+            candidate_attestations.append(tokens)
     _require(
-        source.count(expected) == 2,
-        "trusted_proof_candidate_builder_attestation_sync",
+        len(candidate_attestations) == 2,
+        "trusted_proof_candidate_builder_attestation_count",
     )
+    for tokens in candidate_attestations:
+        digests = [
+            tokens[index + 1]
+            for index, token in enumerate(tokens)
+            if token == "--signer-digest" and index + 1 < len(tokens)
+        ]
+        _require(
+            digests == [CANDIDATE_BUILDER_SHA],
+            "trusted_proof_candidate_builder_attestation_sync",
+        )
     proof_tool = repository_root / "scripts" / "trusted_precutover_proof.py"
     try:
         proof_source = proof_tool.read_text("utf-8")

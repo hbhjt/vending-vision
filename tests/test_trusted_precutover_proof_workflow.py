@@ -502,6 +502,48 @@ def test_trusted_proof_policy_rejects_candidate_builder_authority_drift(tmp_path
     assert "trusted_proof_candidate_builder_attestation_sync" in completed.stdout
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda source: source.replace(
+            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            '--signer-digest "ee95191abdf5f22b1823b0625d9e700c4f41332e"\n'
+            '          # --signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            1,
+        ).replace(
+            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            '--signer-digest "ee95191abdf5f22b1823b0625d9e700c4f41332e"\n'
+            '          # --signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            1,
+        ),
+        lambda source: source.replace(
+            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958" '
+            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            1,
+        ),
+        lambda source: source.replace(
+            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            '; Write-Output --signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            1,
+        ),
+        lambda source: source.replace(
+            '--signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            'Write-Output "--signer-digest c85ac3059c31d41b405282ecfc7641d0c1b88958"',
+            1,
+        ),
+    ),
+    ids=("commented-old", "duplicate", "other-statement", "string",),
+)
+def test_trusted_proof_policy_counts_only_real_candidate_attestations(tmp_path, mutation):
+    candidate = tmp_path / "trusted-proof.yml"
+    candidate.write_text(mutation(TRUSTED_PROOF.read_text("utf-8")), "utf-8")
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode != 0
+    assert "trusted_proof_candidate_builder_attestation" in completed.stdout
+
 def test_trusted_proof_requires_real_tag_peel_main_ancestry_and_release_authority():
     source = TRUSTED_PROOF.read_text("utf-8")
 
