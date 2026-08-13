@@ -564,6 +564,53 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "--expected-candidate-manifest-sha256" not in publisher
 
 
+def test_windows_ci_materializes_the_digest_bound_ai_wheelhouse_before_packaging():
+    """Hosted packaging must feed build_exe the exact AI release closure."""
+    from scripts.workflow_yaml import load_workflow_yaml
+
+    workflow = load_workflow_yaml(
+        (ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    )
+    steps = workflow["jobs"]["windows-test"]["steps"]
+    named_steps = [step for step in steps if isinstance(step, dict) and "name" in step]
+    materialize_index, materialize_step = next(
+        (index, step)
+        for index, step in enumerate(named_steps)
+        if step["name"] == "物化精确 AI wheel 闭包"
+    )
+    build_index, build_step = next(
+        (index, step)
+        for index, step in enumerate(named_steps)
+        if step["name"] == "构建并验证 Windows runtime 与录播交付包"
+    )
+    materialize_run = " ".join(materialize_step["run"].split())
+    build_run = " ".join(build_step["run"].split())
+    lock = ROOT / "requirements-ai.lock.json"
+    runtime_descriptor = json.loads(
+        (ROOT / "ai-runtime-descriptor.json").read_text("utf-8")
+    )
+
+    materialize = (
+        "python scripts/materialize_ai_wheelhouse.py "
+        "--descriptor requirements-ai.lock.json "
+        "--runtime-descriptor ai-runtime-descriptor.json "
+        "--destination ai-wheelhouse"
+    )
+    build = (
+        "./scripts/build_exe.ps1 "
+        "-Wheelhouse (Join-Path $PWD \"wheelhouse\") "
+        "-AiWheelhouse (Join-Path $PWD \"ai-wheelhouse\") "
+        "-AiWheelhouseDescriptor (Join-Path $PWD \"requirements-ai.lock.json\")"
+    )
+
+    assert materialize in materialize_run
+    assert build in build_run
+    assert materialize_index < build_index
+    assert runtime_descriptor["requirementsAiLockSha256"] == hashlib.sha256(
+        lock.read_bytes()
+    ).hexdigest()
+
+
 def test_worker_probe_executes_production_observation_and_render_ipc():
     probe = subprocess.run(
         [sys.executable, str(ROOT / "run_vision_server.py"), "--verify-v2-try-on-workers"],
