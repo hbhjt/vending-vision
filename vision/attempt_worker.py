@@ -118,13 +118,13 @@ def _wait_process_dead(process: Any, timeout: float) -> bool:
                 join = getattr(process, "join", None)
                 if join is not None:
                     try:
-                        join(timeout=0)
+                        join()
                     except (AssertionError, OSError, PermissionError, ValueError):
                         pass
                 # A readable multiprocessing sentinel is the operating-system
-                # proof that the process has physically exited.  is_alive()
-                # may still expose a stale parent-side reap/cache view under
-                # runner load and must not override that stronger proof.
+                # proof that the process has physically exited.  Reap it before
+                # dropping the owned handle: on a busy runner a nonblocking join
+                # can run just before the final exit status becomes observable.
                 return True
             return not _process_is_alive(process)
         except (AttributeError, OSError, PermissionError, ValueError):

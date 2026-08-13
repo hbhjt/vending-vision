@@ -181,6 +181,11 @@ def _corrupt_ready_render_target(connection):
         time.sleep(1)
 
 
+def _unrelated_child_target(ready, release):
+    ready.set()
+    release.wait()
+
+
 def _crash_first_render_target(connection, counter):
     connection.send(("ready", {"pid": os.getpid()}))
     try:
@@ -338,24 +343,126 @@ def test_render_spawn_failure_unlinks_slot_and_closes_process_handle():
         broker._start_sync()
 
 
-def test_live_render_prewarm_corrupt_ready_stops_child_and_fails_closed():
-    broker = FastRenderBroker(
-        context=multiprocessing.get_context("spawn"),
-        target=_corrupt_ready_render_target,
+def test_readable_process_sentinel_waits_for_parent_reap(monkeypatch):
+    no_timeout = object()
+
+    class SentinelBeforeReapProcess:
+        sentinel = object()
+
+        def __init__(self):
+            self.alive = True
+            self.join_timeout = None
+
+        def join(self, timeout=no_timeout):
+            self.join_timeout = timeout
+            if timeout is no_timeout:
+                self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+    process = SentinelBeforeReapProcess()
+    monkeypatch.setattr(
+        attempt_worker_module,
+        "wait_for_sentinels",
+        lambda sentinels, *, timeout: sentinels,
     )
 
-    with pytest.raises(AttemptWorkerError, match="readiness"):
-        broker._start_sync()
+    assert attempt_worker_module._wait_process_dead(process, 0.1) is True
+    assert process.join_timeout is no_timeout
+    assert process.alive is False
 
-    assert broker.ready is False
-    assert broker.pid is None
-    assert broker.active_request_count == 0
-    assert broker._slot is None
-    assert broker._fatal_error is not None
-    assert "readiness" in broker._fatal_error
-    assert {child.pid for child in multiprocessing.active_children()} == set()
-    with pytest.raises(AttemptWorkerError, match="unavailable"):
-        broker._start_sync()
+
+def test_live_render_prewarm_corrupt_ready_stops_child_and_fails_closed():
+    real_context = multiprocessing.get_context("spawn")
+
+    class OwnedProcessProbe:
+        def __init__(self, process, *, requested_target, worker_target, slot_name):
+            self._process = process
+            self.requested_target = requested_target
+            self.worker_target = worker_target
+            self.slot_name = slot_name
+            self.pid_when_closed = None
+            self.exitcode_when_closed = None
+            self.alive_when_closed = None
+            self.closed = False
+
+        def __getattr__(self, name):
+            return getattr(self._process, name)
+
+        def close(self):
+            self.pid_when_closed = self._process.pid
+            self.exitcode_when_closed = self._process.exitcode
+            self.alive_when_closed = self._process.is_alive()
+            self._process.close()
+            self.closed = True
+
+    class RecordingContext:
+        def __init__(self, delegate):
+            self._delegate = delegate
+            self.created = []
+
+        def __getattr__(self, name):
+            return getattr(self._delegate, name)
+
+        def Process(self, **kwargs):
+            process = self._delegate.Process(**kwargs)
+            process_args = kwargs["args"]
+            probe = OwnedProcessProbe(
+                process,
+                requested_target=kwargs["target"],
+                worker_target=process_args[0],
+                slot_name=process_args[1]["name"],
+            )
+            self.created.append(probe)
+            return probe
+
+    unrelated_ready = real_context.Event()
+    unrelated_release = real_context.Event()
+    unrelated = real_context.Process(
+        target=_unrelated_child_target,
+        args=(unrelated_ready, unrelated_release),
+    )
+    unrelated.start()
+    assert unrelated_ready.wait(timeout=2.0)
+    context = RecordingContext(real_context)
+    broker = FastRenderBroker(context=context, target=_corrupt_ready_render_target)
+
+    try:
+        with pytest.raises(AttemptWorkerError, match="readiness"):
+            broker._start_sync()
+
+        assert broker.ready is False
+        assert broker.pid is None
+        assert broker.active_request_count == 0
+        assert broker._slot is None
+        assert broker._fatal_error is not None
+        assert "readiness" in broker._fatal_error
+        assert len(context.created) == 1
+        owned = context.created[0]
+        assert owned.requested_target is attempt_worker_module.run_shared_ipc_child
+        assert owned.worker_target is _corrupt_ready_render_target
+        assert owned.slot_name.startswith("vem_render_ctl_")
+        assert owned.closed is True, (
+            owned.pid_when_closed,
+            owned.exitcode_when_closed,
+            owned.alive_when_closed,
+        )
+        assert owned.alive_when_closed is False
+        assert owned.exitcode_when_closed is not None
+        active_pids = {child.pid for child in multiprocessing.active_children()}
+        assert owned.pid_when_closed not in active_pids
+        assert unrelated.pid in active_pids
+        assert unrelated.is_alive()
+        with pytest.raises(AttemptWorkerError, match="unavailable"):
+            broker._start_sync()
+    finally:
+        unrelated_release.set()
+        unrelated.join(timeout=2.0)
+        if unrelated.is_alive():
+            unrelated.kill()
+            unrelated.join(timeout=2.0)
+        unrelated.close()
 
 
 @pytest.mark.parametrize("compression", ["compressible", "difficult"])
@@ -1080,7 +1187,7 @@ def test_render_shutdown_accepts_process_sentinel_before_is_alive_reap_catches_u
 
     assert process.killed is True
     assert process.terminate_calls == 0
-    assert process.join_calls == [0]
+    assert process.join_calls == [None]
     assert process.closed is True
     assert broker.pid is None
 
