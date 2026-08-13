@@ -10,6 +10,7 @@ import pytest
 
 from scripts.workflow_yaml import load_workflow_yaml
 from scripts.check_trusted_candidate_workflows import (
+    TrustPolicyError,
     _logical_shell_commands,
     _shell_statements,
     _shell_tokens,
@@ -144,6 +145,23 @@ def _hide_fence_in_here_string(source: str, opener: str) -> str:
     return mutated
 
 
+def _hide_fence_in_block_comment(source: str, opener: str, closer: str) -> str:
+    fence = (
+        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }'
+    )
+    mutated = source.replace(
+        fence,
+        f"          {opener}\n"
+        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }\n'
+        f"          {closer}",
+        1,
+    )
+    assert mutated != source
+    return mutated
+
+
 def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload():
     source = TRUSTED_BUILDER.read_text("utf-8")
     attest = source.index("actions/attest-build-provenance@v4")
@@ -200,6 +218,41 @@ def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload
         quoted_literal, "Record trusted builder evidence"
     )
     assert _has_post_attestation_subject_fence(quoted_literal_evidence)
+
+    block_comment = _hide_fence_in_block_comment(source, "<#", "#>")
+    _, block_comment_evidence = _workflow_step_run(
+        block_comment, "Record trusted builder evidence"
+    )
+    assert not _has_post_attestation_subject_fence(block_comment_evidence)
+
+    inline_block_comment = source.replace(
+        '          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash\n'
+        '          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }',
+        '          <# $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash #>\n'
+        '          <# if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" } #>',
+        1,
+    )
+    _, inline_block_evidence = _workflow_step_run(
+        inline_block_comment, "Record trusted builder evidence"
+    )
+    assert not _has_post_attestation_subject_fence(inline_block_evidence)
+
+    unterminated_block = _hide_fence_in_block_comment(source, "<#", "")
+    _, unterminated_evidence = _workflow_step_run(
+        unterminated_block, "Record trusted builder evidence"
+    )
+    with pytest.raises(TrustPolicyError, match="unterminated_block_comment"):
+        _has_post_attestation_subject_fence(unterminated_evidence)
+
+    quoted_block_literal = source.replace(
+        '          $bundleFile = "github-build-provenance.sigstore.json"',
+        '          $literal = "<#"\n          $bundleFile = "github-build-provenance.sigstore.json"',
+        1,
+    )
+    _, quoted_block_evidence = _workflow_step_run(
+        quoted_block_literal, "Record trusted builder evidence"
+    )
+    assert _has_post_attestation_subject_fence(quoted_block_evidence)
 
 
 def test_active_verified_archive_downloads_have_an_explicit_bounded_total_timeout():

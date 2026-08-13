@@ -155,18 +155,75 @@ def _pwsh_here_string_opener(line: str) -> str | None:
     return None
 
 
+def _pwsh_without_block_comments(line: str, in_block_comment: bool) -> tuple[str, bool]:
+    """Remove real PowerShell block comments while preserving executable source."""
+    output: list[str] = []
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(line):
+        character = line[index]
+        following = line[index + 1] if index + 1 < len(line) else None
+        if in_block_comment:
+            if character == "#" and following == ">":
+                in_block_comment = False
+                index += 2
+                continue
+            index += 1
+            continue
+        if quote:
+            output.append(character)
+            if character == quote:
+                quote = ""
+            index += 1
+            continue
+        if escaped:
+            output.append(character)
+            escaped = False
+            index += 1
+            continue
+        if _is_shell_escape(character, following, "pwsh"):
+            output.append(character)
+            escaped = True
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            output.append(character)
+            if not quote:
+                quote = character
+            elif quote == character:
+                quote = ""
+            index += 1
+            continue
+        if character == "<" and following == "#":
+            in_block_comment = True
+            index += 2
+            continue
+        if character == "#" and (index == 0 or line[index - 1].isspace()):
+            break
+        output.append(character)
+        index += 1
+    return "".join(output).rstrip(), in_block_comment
+
+
 def _logical_shell_commands(run: str, dialect: str) -> tuple[str, ...]:
     """Return executable shell statements, excluding comment-only source lines."""
     commands: list[str] = []
     pending = ""
     here_string_quote = ""
+    block_comment = False
     for raw in run.splitlines():
         stripped = raw.strip()
         if here_string_quote:
             if stripped == f"{here_string_quote}@":
                 here_string_quote = ""
             continue
-        line = _strip_shell_comment(stripped, dialect)
+        if dialect == "pwsh":
+            line, block_comment = _pwsh_without_block_comments(
+                stripped, block_comment
+            )
+        else:
+            line = _strip_shell_comment(stripped, dialect)
         if not line:
             continue
         if dialect == "pwsh":
@@ -180,6 +237,8 @@ def _logical_shell_commands(run: str, dialect: str) -> tuple[str, ...]:
             pending = ""
     if here_string_quote:
         raise TrustPolicyError("archive_downloader_unterminated_here_string")
+    if block_comment:
+        raise TrustPolicyError("archive_downloader_unterminated_block_comment")
     if pending:
         commands.append(pending.strip())
     return tuple(commands)
