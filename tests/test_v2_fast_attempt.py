@@ -1,5 +1,7 @@
 import hashlib
 import asyncio
+import ast
+import importlib
 import json
 import multiprocessing
 import os
@@ -16,12 +18,32 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from tests import fast_worker_fixture
+
 import app as vision_app
 from vision import camera_manager
 from vision.config import settings
 from vision.directshow_broker import DirectShowCameraBroker
 from vision.attempt_worker import FastRenderBroker
 from vision.acquisition_observer import AcquisitionObservation
+
+
+def test_fast_worker_fixture_is_spawn_safe():
+    """Broker child targets must not import the application test module on spawn."""
+    module = importlib.import_module("tests.fast_worker_fixture")
+    tree = ast.parse(Path(module.__file__).read_text("utf-8"))
+    top_level_imports = {
+        alias.name.split(".")[0]
+        for statement in tree.body
+        if isinstance(statement, (ast.Import, ast.ImportFrom))
+        for alias in statement.names
+    }
+    assert top_level_imports <= {"base64", "os", "threading", "time"}
+    assert {
+        "block_first_render",
+        "block_then_barrier_restart_render",
+        "block_then_ready_barrier_directshow",
+    } <= set(vars(module))
 
 
 def _active_child_pids_except_acquisition_observer():
@@ -88,63 +110,6 @@ def _fast_block_first_broker_target(connection, config):
         connection.close()
 
 
-def _fast_block_then_ready_barrier_broker_target(connection, config):
-    starts = config["starts"]
-    blocked_read_entered = config["blockedReadEntered"]
-    restart_ready_entered = config["restartReadyEntered"]
-    restart_ready_release = config["restartReadyRelease"]
-    with starts.get_lock():
-        starts.value += 1
-        start_number = starts.value
-    if start_number == 2:
-        # This is a synchronization boundary, not a wall-clock delay.  It
-        # lets the parent prove whether cleanup waits for replacement readiness
-        # without charging arbitrary hosted spawn time to a 1s frame budget.
-        restart_ready_entered.value = 1
-        # Do not wait on a multiprocessing.Condition here.  The production
-        # timeout can kill this child while it is parked at the boundary;
-        # notifying a condition whose waiter died can itself deadlock cleanup.
-        while not restart_ready_release.value:
-            time.sleep(0.01)
-    try:
-        connection.send(("ready", {"pid": os.getpid()}))
-        while True:
-            command, _payload = connection.recv()
-            if command == "shutdown":
-                connection.send(("ok", None))
-                return
-            if command == "read":
-                if start_number == 1:
-                    blocked_read_entered.value = 1
-                    while True:
-                        threading.Event().wait(1.0)
-                connection.send(("ok", {
-                    "pid": os.getpid(),
-                    "image": np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8),
-                }))
-    finally:
-        connection.close()
-
-
-def _fast_block_first_render_target(connection, counter):
-    connection.send(("ready", {"pid": os.getpid()}))
-    try:
-        while True:
-            command, _payload = connection.recv()
-            if command == "shutdown":
-                connection.send(("ok", None))
-                return
-            with counter.get_lock():
-                counter.value += 1
-                request_number = counter.value
-            if request_number == 1:
-                while True:
-                    threading.Event().wait(1.0)
-            connection.send(("ok", _png_bytes()))
-    finally:
-        connection.close()
-
-
 def _fast_pose_error_then_success_target(connection, counter):
     """A test-only worker fixture for public typed-attempt outcome coverage."""
     connection.send(("ready", {"pid": os.getpid(), "poseReady": True}))
@@ -183,41 +148,6 @@ def _fast_block_then_fail_restart_target(connection, starts, requests):
                 requests.value += 1
             while True:
                 threading.Event().wait(1.0)
-    finally:
-        connection.close()
-
-
-def _fast_block_then_barrier_restart_target(
-    connection,
-    starts,
-    requests,
-    restart_entered,
-    restart_release,
-    restart_fails,
-):
-    with starts.get_lock():
-        starts.value += 1
-        start_number = starts.value
-    if start_number > 1:
-        restart_entered.set()
-        restart_release.wait()
-        if restart_fails:
-            connection.close()
-            return
-    connection.send(("ready", {"pid": os.getpid()}))
-    try:
-        while True:
-            command, _payload = connection.recv()
-            if command == "shutdown":
-                connection.send(("ok", None))
-                return
-            with requests.get_lock():
-                requests.value += 1
-                request_number = requests.value
-            if request_number == 1:
-                while True:
-                    threading.Event().wait(1.0)
-            connection.send(("ok", _png_bytes()))
     finally:
         connection.close()
 
@@ -984,7 +914,7 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
     counter = context.Value("i", 0)
     broker = FastRenderBroker(
         context=context,
-        target=_fast_block_first_render_target,
+        target=fast_worker_fixture.block_first_render,
         target_args=(counter,),
     )
     monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
@@ -1155,7 +1085,7 @@ def test_v2_duplicate_waits_for_atomic_failed_replacement_admission(
     restart_release = context.Event()
     broker = FastRenderBroker(
         context=context,
-        target=_fast_block_then_barrier_restart_target,
+        target=fast_worker_fixture.block_then_barrier_restart_render,
         target_args=(
             starts,
             requests,
@@ -1270,7 +1200,7 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
     restart_release = context.Event()
     broker = FastRenderBroker(
         context=context,
-        target=_fast_block_then_barrier_restart_target,
+        target=fast_worker_fixture.block_then_barrier_restart_render,
         target_args=(
             starts,
             requests,
@@ -1393,7 +1323,7 @@ def test_v2_disconnect_restarts_render_and_new_connection_completes(
     counter = context.Value("i", 0)
     broker = FastRenderBroker(
         context=context,
-        target=_fast_block_first_render_target,
+        target=fast_worker_fixture.block_first_render,
         target_args=(counter,),
     )
     monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
@@ -1565,7 +1495,7 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
     counter = context.Value("i", 0)
     broker = FastRenderBroker(
         context=context,
-        target=_fast_block_first_render_target,
+        target=fast_worker_fixture.block_first_render,
         target_args=(counter,),
     )
     monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
@@ -1998,7 +1928,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
             "restartReadyRelease": restart_ready_release,
         },
         context=context,
-        target=_fast_block_then_ready_barrier_broker_target,
+        target=fast_worker_fixture.block_then_ready_barrier_directshow,
     )
 
     class Candidate:
