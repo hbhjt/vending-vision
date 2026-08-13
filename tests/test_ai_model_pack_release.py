@@ -223,6 +223,7 @@ def test_precutover_verifier_imports_with_the_pinned_stdlib_python():
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shebang worker fixture")
 def test_precutover_worker_probe_uses_production_tree_supervisor(tmp_path):
     worker = tmp_path / "worker"
     worker.write_text(

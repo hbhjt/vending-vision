@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import time
 import zipfile
 
@@ -18,6 +19,7 @@ from vision.precutover_companion import (
     _fd_sha256,
     _IntegrityFence,
     _WindowsFileApi,
+    _worker_probe_command,
 )
 from vision.precutover_companion import verify_frozen_worker_archive, verify_precutover
 from vision.precutover_companion import main as companion_main
@@ -206,6 +208,16 @@ def test_source_mode_verifies_real_candidate_model_archive_and_both_worker_probe
     assert list(tmp_path.glob(".precutover-*")) == []
 
 
+def test_source_test_worker_uses_the_interpreter_even_on_windows():
+    worker = Path("C:/private/vending-vision-ai-worker.exe")
+
+    assert _worker_probe_command(worker, require_frozen_worker=False) == [
+        sys.executable,
+        str(worker),
+    ]
+    assert _worker_probe_command(worker, require_frozen_worker=True) == [str(worker)]
+
+
 def test_exact_json_emitter_is_not_accepted_as_a_frozen_windows_worker(tmp_path):
     emitter = tmp_path / "vending-vision-ai-worker.exe"
     emitter.write_text(
@@ -318,6 +330,7 @@ def test_candidate_input_directory_rejects_an_extra_fifth_member_before_extracti
     assert not output.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group descendant assertion")
 def test_worker_timeout_kills_its_descendant_and_leaves_no_partial_proof(tmp_path):
     pid_file = tmp_path / "descendant.pid"
     script = (
@@ -342,6 +355,7 @@ def test_worker_timeout_kills_its_descendant_and_leaves_no_partial_proof(tmp_pat
     assert list(tmp_path.glob(".precutover-*")) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX in-place worker mutation assertion")
 def test_private_worker_rewrite_between_probes_cannot_publish_a_proof(tmp_path):
     script = (
         "#!/usr/bin/env python3\n"
@@ -389,6 +403,7 @@ def test_private_worker_rewrite_between_probes_cannot_publish_a_proof(tmp_path):
 @pytest.mark.parametrize(
     "phase", ["before-runtime-probe", "between-probes", "before-receipt"]
 )
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mutation-observation matrix")
 def test_every_critical_input_is_fenced_through_both_probes_and_receipt_publish(
     tmp_path, target, mutation, phase
 ):
@@ -532,7 +547,7 @@ def test_held_descriptor_hash_has_a_windows_compatible_fallback(tmp_path, monkey
     path.write_bytes(b"held resource")
     descriptor = os.open(path, os.O_RDONLY)
     try:
-        monkeypatch.delattr(os, "pread")
+        monkeypatch.delattr(os, "pread", raising=False)
         assert _fd_sha256(descriptor) == sha256(path)
     finally:
         os.close(descriptor)
@@ -576,6 +591,7 @@ def test_preexisting_proof_is_preserved_by_exclusive_publish(tmp_path):
     assert not list(tmp_path.glob(".precutover-*"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX linkat publication seam")
 def test_final_proof_link_failure_cleans_prepared_and_private_state(tmp_path, monkeypatch):
     fixture = build_fixture(tmp_path)
     output = tmp_path / "proof.json"
@@ -644,6 +660,7 @@ def test_failure_after_final_link_rolls_back_only_this_invocation(tmp_path, monk
 
 
 @pytest.mark.parametrize("mutation", ["atomic-replace", "in-place-same-bytes"])
+@pytest.mark.skipif(os.name == "nt", reason="POSIX prepared-proof mutation assertion")
 def test_prepared_proof_is_fenced_while_inputs_close_and_private_state_cleans(
     tmp_path, monkeypatch, mutation
 ):
@@ -676,6 +693,7 @@ def test_prepared_proof_is_fenced_while_inputs_close_and_private_state_cleans(
     assert not list(tmp_path.glob(".precutover-*"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX linkat publication seam")
 def test_prepared_proof_link_rejects_an_instant_source_identity_swap(tmp_path, monkeypatch):
     fixture = build_fixture(tmp_path)
     output = tmp_path / "proof.json"
@@ -698,6 +716,7 @@ def test_prepared_proof_link_rejects_an_instant_source_identity_swap(tmp_path, m
     assert not list(tmp_path.glob(".precutover-*"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX prepared-proof lease assertion")
 def test_prepared_proof_lease_close_failure_rolls_back_linked_final(tmp_path, monkeypatch):
     fixture = build_fixture(tmp_path)
     output = tmp_path / "proof.json"
@@ -759,6 +778,7 @@ def test_windows_prepared_closehandle_false_rolls_back_the_linked_final(tmp_path
     assert not temporary.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX linkat publication seam")
 def test_posix_prepared_temp_replace_after_verify_before_link_leaves_no_final(
     tmp_path, monkeypatch
 ):
@@ -787,6 +807,7 @@ def test_posix_prepared_temp_replace_after_verify_before_link_leaves_no_final(
     assert not list(tmp_path.glob(".precutover-*"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX linkat publication seam")
 def test_posix_linkat_uses_held_source_fd_parent_dirfd_and_empty_path_flag(tmp_path):
     class FakeLibc:
         def __init__(self):
@@ -818,6 +839,7 @@ def test_posix_linkat_uses_held_source_fd_parent_dirfd_and_empty_path_flag(tmp_p
         os.close(source_descriptor)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX parent-directory lease assertion")
 def test_parent_directory_close_after_effect_rolls_back_owned_final(tmp_path, monkeypatch):
     fixture = build_fixture(tmp_path)
     output = tmp_path / "proof.json"
@@ -854,6 +876,7 @@ def test_parent_directory_close_after_effect_rolls_back_owned_final(tmp_path, mo
     assert not list(tmp_path.glob(".precutover-*"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX parent-directory lease assertion")
 def test_rollback_parent_close_after_effect_keeps_owned_final_removed(tmp_path, monkeypatch):
     fixture = build_fixture(tmp_path)
     output = tmp_path / "proof.json"
@@ -887,6 +910,7 @@ def test_rollback_parent_close_after_effect_keeps_owned_final_removed(tmp_path, 
     assert not list(tmp_path.glob(".precutover-*"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX parent-directory lease assertion")
 def test_rollback_parent_reopen_identity_mismatch_never_unlinks_other_directory(
     tmp_path, monkeypatch
 ):

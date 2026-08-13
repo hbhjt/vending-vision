@@ -720,6 +720,13 @@ def verify_frozen_worker_archive(worker: Path) -> None:
         raise RuntimeError("precutover_worker_archive_modules")
 
 
+def _worker_probe_command(worker: Path, *, require_frozen_worker: bool) -> list[str]:
+    """Run test-source workers through Python; production workers stay native executables."""
+    if require_frozen_worker:
+        return [str(worker)]
+    return [sys.executable, str(worker)]
+
+
 def _unlink_owned(path: Path) -> None:
     failure = None
     for _attempt in range(2):
@@ -1261,7 +1268,9 @@ def verify_precutover(
                 "worker": worker,
                 "worker_resource": internal / "runtime-resource.dll",
             }
-            worker_command = [str(worker)] if os.name == "nt" else [sys.executable, str(worker)]
+            worker_command = _worker_probe_command(
+                worker, require_frozen_worker=require_frozen_worker
+            )
             if _test_phase_hook is not None:
                 _test_phase_hook("before-runtime-probe", observed_paths)
             verify_all()
