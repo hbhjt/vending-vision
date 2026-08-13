@@ -548,12 +548,20 @@ def test_trusted_proof_policy_counts_only_real_candidate_attestations(tmp_path, 
 @pytest.mark.parametrize(
     ("executable", "valid"),
     (
+        ("gh", True),
         ("foogh", False),
         ("mygh", False),
         ("gh.bat", False),
+        ("/usr/local/bin/gh", False),
+        ("& /usr/local/bin/gh", True),
         ("'C:\\Program Files\\GitHub CLI\\gh.exe'", False),
-        ("/usr/local/bin/gh", True),
         (r"& 'C:\\Program Files\\GitHub CLI\\gh.exe'", True),
+        ("$env:TRUSTED_GH", False),
+        ("& $env:TRUSTED_GH", False),
+        ("${env:TRUSTED_GH}", False),
+        ("& ${env:TRUSTED_GH}", False),
+        ("$(Get-Command gh)", False),
+        ("& $(Get-Command gh)", False),
     ),
 )
 def test_trusted_proof_policy_accepts_only_real_gh_executables(tmp_path, executable, valid):

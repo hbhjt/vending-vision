@@ -547,7 +547,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          & $env:TRUSTED_GH attestation verify signer-proof-input/candidate/candidate.zip --bundle signer-proof-input/candidate/github-build-provenance.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958" --source-ref $env:CALLER_REF --source-digest $env:PROOF_SOURCE_COMMIT --deny-self-hosted-runners
+          & "C:\Program Files\GitHub CLI\gh.exe" attestation verify signer-proof-input/candidate/candidate.zip --bundle signer-proof-input/candidate/github-build-provenance.sigstore.json --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "c85ac3059c31d41b405282ecfc7641d0c1b88958" --source-ref $env:CALLER_REF --source-digest $env:PROOF_SOURCE_COMMIT --deny-self-hosted-runners
           if ($LASTEXITCODE -ne 0) { throw "signer candidate attestation verification failed" }
       - name: Download fixed execution handoff
         uses: actions/download-artifact@v4

@@ -138,13 +138,16 @@ def _assert_candidate_builder_authority_sync(source: str, repository_root: Path)
                 attestation_index = tokens.index("attestation")
             except ValueError:
                 raise PolicyError("trusted_proof_candidate_builder_attestation_shape")
-            executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
-            supported_executable = executable in {"gh", "gh.exe"} or tokens[0] == "$env:TRUSTED_GH"
+            executable_token = tokens[0]
+            executable = executable_token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+            supported_executable = executable in {"gh", "gh.exe"}
             quoted_executable = token_facts[0][1]
+            bare_executable = executable_token.lower() in {"gh", "gh.exe"}
             _require(
                 attestation_index + 1 < len(tokens)
                 and tokens[attestation_index + 1] == "verify"
                 and supported_executable
+                and (bare_executable or call_operator)
                 and (not quoted_executable or call_operator),
                 "trusted_proof_candidate_builder_attestation_shape",
             )
@@ -610,7 +613,8 @@ def check(workflow_path: Path, repository_root: Path) -> None:
             if command.startswith("& "):
                 _require(
                     re.match(
-                        r"^& \$env:TRUSTED_(?:PYTHON|GH|GIT)(?:\s|$)", command
+                        r'^& (?:\$env:TRUSTED_(?:PYTHON|GH|GIT)(?:\s|$)|"C:\\Program Files\\GitHub CLI\\gh\.exe"(?:\s|$))',
+                        command,
                     )
                     is not None,
                     "trusted_proof_sign_untrusted_call_operator",
@@ -636,7 +640,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         'C:\\Program Files\\GitHub CLI\\gh.exe',
         'C:\\Program Files\\Git\\cmd\\git.exe',
         'Join-Path $env:pythonLocation "python.exe"',
-        "& $env:TRUSTED_GH attestation verify",
+        '& "C:\\Program Files\\GitHub CLI\\gh.exe" attestation verify',
         "& $env:TRUSTED_GIT --git-dir",
         "& $env:TRUSTED_PYTHON $proofTool verify-execution-handoff",
         "inspect-inputs --input-root signer-proof-input",
