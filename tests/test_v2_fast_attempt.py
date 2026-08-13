@@ -219,6 +219,31 @@ class _ReadyFastBroker:
         return None
 
 
+class _CompletedEnvelopeRenderBroker:
+    """No-spawn broker for the post-render completed-envelope failure path."""
+
+    ready = True
+    pose_ready = True
+
+    def __init__(self):
+        self.render_calls = []
+
+    async def start(self):
+        return None
+
+    def quiesce(self):
+        return None
+
+    async def shutdown(self):
+        return None
+
+    async def render(self, payload, *, deadline):
+        self.render_calls.append(
+            {"payload": payload, "deadline": deadline, "called_at": time.monotonic()}
+        )
+        return _png_bytes()
+
+
 class _SingleAlignedObserver:
     ready = True
     pose_ready = True
@@ -414,12 +439,20 @@ def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result
         lambda: {"cameraReady": True, "modelReady": True},
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    broker = _CompletedEnvelopeRenderBroker()
+    # This covers post-render completed-envelope cleanup, not the production
+    # broker's startup readiness.  Keep TestClient admission deterministic so
+    # the real recorded acquisition and staged-result path are reached.
+    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
     _configure_recorded_front(monkeypatch)
     sentinel_token = "sentinel-result-token"
     original_prepare = vision_app._prepare_fast_result
     original_envelope = vision_app._generated_v2_envelope
+    prepared_attempts = []
+    rejected_completed = []
 
     def prepare_with_sentinel(attempt_id, image):
+        prepared_attempts.append((attempt_id, image))
         stored, public = original_prepare(attempt_id, image)
         reference = vision_app._fast_result_reference(attempt_id, sentinel_token)
         stored.update(token=sentinel_token, reference=reference)
@@ -428,6 +461,7 @@ def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result
 
     def reject_completed(message_type, payload):
         if message_type == "vision.try_on.attempt.completed":
+            rejected_completed.append(payload)
             raise ValueError("forced_completed_contract_failure")
         return original_envelope(message_type, payload)
 
@@ -446,6 +480,21 @@ def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result
 
         assert failed["type"] == "vision.try_on.attempt.failed"
         assert failed["payload"] == {"attemptId": attempt_id, "reason": "fast_failed"}
+        assert len(broker.render_calls) == 1
+        render_call = broker.render_calls[0]
+        assert render_call["deadline"] > render_call["called_at"]
+        assert render_call["payload"]["garmentPng"] == _GarmentHandler.payload
+        assert render_call["payload"]["garmentDigest"] == (
+            "sha256:" + hashlib.sha256(_GarmentHandler.payload).hexdigest()
+        )
+        assert render_call["payload"]["template"] == "tshirt_short_sleeve"
+        assert isinstance(render_call["payload"]["frame"], np.ndarray)
+        assert len(prepared_attempts) == 1
+        assert prepared_attempts[0][0] == attempt_id
+        assert prepared_attempts[0][1] == _png_bytes()
+        assert len(rejected_completed) == 1
+        assert rejected_completed[0]["attemptId"] == attempt_id
+        assert isinstance(rejected_completed[0]["result"], dict)
         assert client.get(
             f"/v2/try-on/results/{attempt_id}?token={sentinel_token}"
         ).status_code == 404
@@ -454,7 +503,10 @@ def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result
             replay_socket.send_json(_hello(manifest))
             assert replay_socket.receive_json()["type"] == "vision.ready"
             replay_socket.send_json(_start(attempt_id, garment_reference))
-            assert replay_socket.receive_json()["type"] == "vision.try_on.attempt.failed"
+            replay_failed = replay_socket.receive_json()
+            assert replay_failed == failed
+
+    assert await_no_active_fast_attempt()
 
 
 def test_v2_fast_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(

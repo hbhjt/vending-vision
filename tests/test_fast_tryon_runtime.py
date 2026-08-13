@@ -38,15 +38,20 @@ class GarmentHandler(BaseHTTPRequestHandler):
 
 
 class SlowDripHandler(BaseHTTPRequestHandler):
-    entered = threading.Event()
+    streaming = threading.Event()
     closed = threading.Event()
 
     def do_GET(self):
-        self.entered.set()
         self.send_response(200)
         self.send_header("Content-Type", "image/png")
         self.end_headers()
         try:
+            # The cancellation assertion must begin only after this real HTTP
+            # response has become a slow body stream, not merely after a task
+            # has been scheduled to connect to the local server.
+            self.wfile.write(b"x")
+            self.wfile.flush()
+            self.streaming.set()
             while True:
                 self.wfile.write(b"x")
                 self.wfile.flush()
@@ -164,7 +169,7 @@ def test_fast_runtime_rejects_png_bomb_dimensions_before_decode(garment_server):
 
 def test_fast_runtime_cancels_a_slow_drip_and_closes_its_stream():
     """A replacement never leaves a blocking response reader behind."""
-    SlowDripHandler.entered.clear()
+    SlowDripHandler.streaming.clear()
     SlowDripHandler.closed.clear()
     server = ThreadingHTTPServer(("127.0.0.1", 0), SlowDripHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -185,12 +190,14 @@ def test_fast_runtime_cancels_a_slow_drip_and_closes_its_stream():
                 canceled,
             )
         )
-        assert await asyncio.to_thread(SlowDripHandler.entered.wait, 1.0)
+        # This only bounds a hung test fixture.  It does not change Fast's
+        # five-second fetch deadline or its cancellation contract.
+        assert await asyncio.to_thread(SlowDripHandler.streaming.wait, 5.0)
         canceled.set()
         with pytest.raises(GarmentFetchError, match="attempt_canceled"):
             await asyncio.wait_for(task, timeout=1.0)
         assert task.done()
-        assert await asyncio.to_thread(SlowDripHandler.closed.wait, 1.0)
+        assert await asyncio.to_thread(SlowDripHandler.closed.wait, 5.0)
 
     from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
 
