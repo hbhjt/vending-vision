@@ -115,7 +115,7 @@ jobs:
           if ($env:CORE_WHEELHOUSE_BYTES -notmatch '^[1-9][0-9]*$') { throw "core wheelhouse byte size is invalid" }
           python ../trusted-builder/scripts/set_release_version.py $version --root $PWD
           if ($LASTEXITCODE -ne 0) { throw "release version materialization failed" }
-          python ../trusted-builder/scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --expected-bytes $env:CORE_WHEELHOUSE_BYTES --destination wheelhouse
+          python ../trusted-builder/scripts/download_verified_archive.py --url $env:CORE_WHEELHOUSE_URL --sha256 $env:CORE_WHEELHOUSE_SHA256 --expected-bytes $env:CORE_WHEELHOUSE_BYTES --destination wheelhouse --total-timeout-seconds 1800
           if ($LASTEXITCODE -ne 0) { throw "core wheelhouse materialization failed" }
           "VISION_RELEASE_VERSION=$version" >> $env:GITHUB_ENV
       - name: Materialize the exact AI wheel closure

@@ -52,6 +52,16 @@ def test_trusted_builder_has_a_closed_raw_material_interface_and_owns_attestatio
     assert "attestations: write" in workflow
     assert "secrets:" not in workflow
     assert "self-hosted" not in workflow
+    wheelhouse_download = next(
+        line.strip()
+        for line in workflow.splitlines()
+        if "download_verified_archive.py" in line
+    )
+    assert "--url $env:CORE_WHEELHOUSE_URL" in wheelhouse_download
+    assert "--sha256 $env:CORE_WHEELHOUSE_SHA256" in wheelhouse_download
+    assert "--expected-bytes $env:CORE_WHEELHOUSE_BYTES" in wheelhouse_download
+    assert "--destination wheelhouse" in wheelhouse_download
+    assert "--total-timeout-seconds 1800" in wheelhouse_download
     for forbidden in ("artifact_path", "worker_path", "predicate", "custom_command", "command_input"):
         assert forbidden not in workflow
 
