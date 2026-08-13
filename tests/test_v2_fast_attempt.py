@@ -1519,6 +1519,8 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    test_broker = _ReadyFastBroker()
+    monkeypatch.setattr(vision_app, "_fast_render_broker", test_broker)
     parent_pid = os.getpid()
     read_pids = []
 
@@ -1536,7 +1538,7 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
         assert garment_png == _GarmentHandler.payload
         assert digest.startswith("sha256:")
         assert template == "tshirt_short_sleeve"
-        assert broker is vision_app._fast_render_broker
+        assert broker is test_broker
         return _png_bytes()
 
     monkeypatch.setattr(vision_app, "read_camera_with_source", read_front)
