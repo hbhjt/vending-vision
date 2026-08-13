@@ -25,6 +25,9 @@ def materialize_regional_evaluator_resources(internal: Path) -> None:
         destination = internal / source["path"]
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes((ROOT / source["path"]).read_bytes())
+    marker = internal / "vision" / "_build_version.py"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_bytes((ROOT / "vision" / "_build_version.py").read_bytes())
 
 
 def test_packaged_archive_guard_rejects_retired_modules_and_resources():
@@ -324,6 +327,58 @@ def test_packaged_verifier_rejects_missing_regional_evaluator_source(tmp_path):
     (internal / "vision" / "config.py").unlink()
 
     with pytest.raises(AssertionError, match="regional evaluator"):
+        assert_ai_worker_layout(exe, required=True)
+
+
+def test_packaged_verifier_rejects_missing_release_version_runtime_marker(tmp_path):
+    from scripts.verify_packaged_exe import assert_ai_worker_layout
+
+    suffix = ".exe" if sys.platform == "win32" else ""
+    exe = tmp_path / "vending-vision" / f"vending-vision{suffix}"
+    worker = tmp_path / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}"
+    internal = worker.parent / "_internal"
+    exe.parent.mkdir()
+    internal.mkdir(parents=True)
+    exe.write_bytes(b"main")
+    worker.write_bytes(b"worker")
+    for name in (
+        "official-ai-model-pack-descriptor.json",
+        "ai-runtime-descriptor.json",
+        "requirements-ai.lock.json",
+        "official-ai-source-descriptor.json",
+    ):
+        (internal / name).write_text("{}", "utf-8")
+    materialize_regional_evaluator_resources(internal)
+    (internal / "vision" / "_build_version.py").unlink()
+
+    with pytest.raises(AssertionError, match="release version runtime marker"):
+        assert_ai_worker_layout(exe, required=True)
+
+
+def test_packaged_verifier_rejects_noncanonical_release_version_runtime_marker(tmp_path):
+    from scripts.verify_packaged_exe import assert_ai_worker_layout
+
+    suffix = ".exe" if sys.platform == "win32" else ""
+    exe = tmp_path / "vending-vision" / f"vending-vision{suffix}"
+    worker = tmp_path / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}"
+    internal = worker.parent / "_internal"
+    exe.parent.mkdir()
+    internal.mkdir(parents=True)
+    exe.write_bytes(b"main")
+    worker.write_bytes(b"worker")
+    for name in (
+        "official-ai-model-pack-descriptor.json",
+        "ai-runtime-descriptor.json",
+        "requirements-ai.lock.json",
+        "official-ai-source-descriptor.json",
+    ):
+        (internal / name).write_text("{}", "utf-8")
+    materialize_regional_evaluator_resources(internal)
+    (internal / "vision" / "_build_version.py").write_text(
+        'APP_VERSION = "untrusted"\n', "utf-8"
+    )
+
+    with pytest.raises(AssertionError, match="invalid release version runtime marker"):
         assert_ai_worker_layout(exe, required=True)
 
 

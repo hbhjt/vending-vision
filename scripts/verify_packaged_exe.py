@@ -38,6 +38,9 @@ PROFILE_FIELDS = {
     "upperColor",
     "confidence",
 }
+BUILD_VERSION_MARKER_RE = re.compile(
+    r'^APP_VERSION = "(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?"\n$'
+)
 
 
 def create_managed_maintenance_fixture(temp_dir, *, port):
@@ -438,6 +441,17 @@ def _candidate_ai_worker_paths(exe_path):
     ]
 
 
+def assert_release_version_runtime_marker(internal):
+    """Require the sole release-materialized runtime datum outside evaluator provenance."""
+    marker = internal / "vision" / "_build_version.py"
+    try:
+        raw = marker.read_text("utf-8")
+    except OSError as exc:
+        raise AssertionError("missing release version runtime marker") from exc
+    if BUILD_VERSION_MARKER_RE.fullmatch(raw) is None:
+        raise AssertionError("invalid release version runtime marker")
+
+
 def assert_ai_worker_layout(exe_path, *, required):
     candidates = _candidate_ai_worker_paths(exe_path)
     worker = next((path for path in candidates if path.is_file()), None)
@@ -456,6 +470,7 @@ def assert_ai_worker_layout(exe_path, *, required):
     missing = [str(path) for path in required_resources if not path.is_file()]
     if missing:
         raise AssertionError(f"missing packaged AI worker resources: {missing}")
+    assert_release_version_runtime_marker(internal)
     if not verify_regional_evaluator_provenance_at_root(internal):
         raise AssertionError("packaged regional evaluator resources are invalid")
     digest = __import__("hashlib").sha256(worker.read_bytes()).hexdigest()
