@@ -27,7 +27,11 @@ _DIGEST = re.compile(r"^[a-f0-9]{64}$")
 
 
 class RegionalEvaluatorError(RuntimeError):
-    pass
+    """Typed evaluator failure that is safe to expose at the worker boundary."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 def _captured_source(raw: str | None) -> dict[str, object]:

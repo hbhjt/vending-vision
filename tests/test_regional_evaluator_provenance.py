@@ -12,9 +12,17 @@ from vision.regional_evaluator_provenance import (
     verify_regional_evaluator_provenance,
     verify_regional_evaluator_provenance_at_root,
 )
+from vision.regional_evaluator import RegionalEvaluatorError
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_regional_evaluator_error_exposes_its_stable_worker_code():
+    error = RegionalEvaluatorError("official_catvton_invalid_garment")
+
+    assert error.code == "official_catvton_invalid_garment"
+    assert str(error) == error.code
 
 
 def test_regional_evaluator_descriptor_is_canonical_exact_and_verifiable():
