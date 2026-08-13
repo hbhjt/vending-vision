@@ -377,7 +377,14 @@ class _OutputValidationAiChild:
         else:
             raise AssertionError(mode)
         if regional_evidence_output is not None and output_png.is_file() and not output_png.is_symlink() and mode != "extra-file":
-            _write_test_regional_sidecar(regional_evidence_output, person_png, garment_png, output_png, captured_source)
+            _write_test_regional_sidecar(
+                regional_evidence_output,
+                person_png,
+                garment_png,
+                output_png,
+                captured_source,
+                decoded_size=(8193, 1) if mode == "oversize-dimensions" else None,
+            )
 
     async def close(self):
         self.closed = True
@@ -440,9 +447,14 @@ def _recorded_front_source():
     }
 
 
-def _write_test_regional_sidecar(path, person, garment, output, captured_source):
-    with Image.open(output) as image:
-        width, height = image.size
+def _write_test_regional_sidecar(
+    path, person, garment, output, captured_source, *, decoded_size=None
+):
+    if decoded_size is None:
+        with Image.open(output) as image:
+            width, height = image.size
+    else:
+        width, height = decoded_size
     value = {
         "attempt": {
             "acquisitionSource": "direct_recorded_frame",
@@ -1118,6 +1130,15 @@ def test_v2_ai_invalid_private_staging_outputs_fail_without_result_or_orphan(
     monkeypatch.setenv("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", str(acceptance_root))
     if mode == "oversize-bytes":
         monkeypatch.setattr(vision_app, "_FAST_RESULT_MAX_BYTES", 8)
+    prepare_ai_result = vision_app._prepare_ai_result
+    validator_received_output = False
+
+    def record_ai_result_validation(*args, **kwargs):
+        nonlocal validator_received_output
+        validator_received_output = True
+        return prepare_ai_result(*args, **kwargs)
+
+    monkeypatch.setattr(vision_app, "_prepare_ai_result", record_ai_result_validation)
     _start_output_validation_ai(monkeypatch, mode)
     server, thread, reference = _serve_garment()
     child = None
@@ -1131,6 +1152,8 @@ def test_v2_ai_invalid_private_staging_outputs_fail_without_result_or_orphan(
                 _trace, terminal = _receive_until_terminal(socket)
             child = _OutputValidationAiChild.instances[0]
             _assert_failed_cleanup_and_no_result(client, attempt_id, child, terminal)
+            if mode == "oversize-dimensions":
+                assert validator_received_output
             assert list(acceptance_root.iterdir()) == []
 
             with client.websocket_connect("/ws") as replay:
