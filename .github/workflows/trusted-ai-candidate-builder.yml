@@ -183,6 +183,8 @@ jobs:
           $evidenceFile = "trusted-builder-evidence.json"
           $bundle = Join-Path $PWD "trusted-output/$bundleFile"
           if ($env:ATTESTATION_BUNDLE_PATH -notmatch '\S' -or $env:SUBJECT_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:MANIFEST_SHA256 -notmatch '^[a-f0-9]{64}$') { throw "attestation evidence inputs are invalid" }
+          $subjectDigest = (Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256).Hash
+          if (-not [string]::Equals($subjectDigest, $env:SUBJECT_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) { throw "attested candidate subject digest changed" }
           Copy-Item -LiteralPath $env:ATTESTATION_BUNDLE_PATH -Destination $bundle
           $bundleSha = (Get-FileHash -LiteralPath $bundle -Algorithm SHA256).Hash.ToLowerInvariant()
           $evidence = [ordered]@{

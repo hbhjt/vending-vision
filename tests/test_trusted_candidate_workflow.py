@@ -8,6 +8,8 @@ import sys
 
 import pytest
 
+from scripts.workflow_yaml import load_workflow_yaml
+
 
 ROOT = Path(__file__).parents[1]
 TRUSTED_BUILDER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder.yml"
@@ -77,6 +79,62 @@ def test_trusted_builder_has_a_closed_raw_material_interface_and_owns_attestatio
     assert "$env:TRUSTED_CANDIDATE_ARTIFACT" in verifier
     assert "subject-path: ${{ env.TRUSTED_CANDIDATE_ARTIFACT }}" in attestation
     assert "..\\trusted-output" not in attestation
+
+
+def _workflow_step_run(source: str, name: str) -> tuple[int, str]:
+    workflow = load_workflow_yaml(source)
+    steps = workflow["jobs"]["build"]["steps"]
+    matches = [
+        (index, step["run"])
+        for index, step in enumerate(steps)
+        if isinstance(step, dict) and step.get("name") == name
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _has_post_attestation_subject_fence(run: str) -> bool:
+    digest = re.compile(
+        r"(?m)^\$subjectDigest = \(Get-FileHash -LiteralPath "
+        r"\$env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256\)\.Hash$"
+    )
+    comparison = re.compile(
+        r"(?m)^if \(-not \[string\]::Equals\(\$subjectDigest, "
+        r"\$env:SUBJECT_SHA256, \[System\.StringComparison\]::OrdinalIgnoreCase\)\) "
+        r"\{ throw \"attested candidate subject digest changed\" \}$"
+    )
+    return digest.search(run) is not None and comparison.search(run) is not None
+
+
+def test_builder_fences_the_attested_canonical_subject_before_evidence_or_upload():
+    source = TRUSTED_BUILDER.read_text("utf-8")
+    attest = source.index("actions/attest-build-provenance@v4")
+    evidence_index, evidence = _workflow_step_run(source, "Record trusted builder evidence")
+    upload = source.index("actions/upload-artifact@v4")
+
+    assert attest < source.index("- name: Record trusted builder evidence") < upload
+    assert evidence_index < next(
+        index
+        for index, step in enumerate(load_workflow_yaml(source)["jobs"]["build"]["steps"])
+        if isinstance(step, dict) and step.get("name") == "Upload only trusted builder outputs"
+    )
+    assert _has_post_attestation_subject_fence(evidence)
+
+    commented = source.replace(
+        "Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256",
+        "# Get-FileHash -LiteralPath $env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256",
+        1,
+    )
+    _, commented_evidence = _workflow_step_run(commented, "Record trusted builder evidence")
+    assert not _has_post_attestation_subject_fence(commented_evidence)
+
+    wrong_path = source.replace(
+        "$env:TRUSTED_CANDIDATE_ARTIFACT -Algorithm SHA256",
+        '"trusted-output/*.zip" -Algorithm SHA256',
+        1,
+    )
+    _, wrong_path_evidence = _workflow_step_run(wrong_path, "Record trusted builder evidence")
+    assert not _has_post_attestation_subject_fence(wrong_path_evidence)
 
 
 def test_active_verified_archive_downloads_have_an_explicit_bounded_total_timeout():
