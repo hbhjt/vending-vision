@@ -27,6 +27,10 @@ on:
         description: GitHub attestation bundle digest reported by the trusted builder
         required: true
         type: string
+      signer_identity:
+        description: Public protected supplier signing-key identity
+        required: true
+        type: string
     outputs:
       signed_evidence_artifact_name:
         description: Artifact containing supplier-signed installed evidence
@@ -65,6 +69,7 @@ jobs:
           SUBJECT_SHA256: ${{ inputs.subject_sha256 }}
           MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
           ATTESTATION_BUNDLE_SHA256: ${{ inputs.attestation_bundle_sha256 }}
+          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ inputs.signer_identity }}
           CALLER_SHA: ${{ github.sha }}
           CALLER_REF: ${{ github.ref }}
           TRUSTED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
@@ -81,6 +86,7 @@ jobs:
           foreach ($digest in @($env:SUBJECT_SHA256, $env:MANIFEST_SHA256, $env:ATTESTATION_BUNDLE_SHA256)) {
             if ($digest -notmatch '^[a-f0-9]{64}$') { throw "builder metadata digest is invalid" }
           }
+          if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "supplier signer identity is invalid" }
           $version = $env:SOURCE_REF -replace '^refs/tags/v',''
           $artifactFile = "vending-vision-$version-windows-x86_64.zip"
           $unsignedArtifact = "vending-vision-verified-evidence-$env:SOURCE_COMMIT"
@@ -95,6 +101,7 @@ jobs:
           "SUBJECT_SHA256=$env:SUBJECT_SHA256" >> $env:GITHUB_ENV
           "MANIFEST_SHA256=$env:MANIFEST_SHA256" >> $env:GITHUB_ENV
           "ATTESTATION_BUNDLE_SHA256=$env:ATTESTATION_BUNDLE_SHA256" >> $env:GITHUB_ENV
+          "VISION_SUPPLIER_SIGNER_IDENTITY=$env:VISION_SUPPLIER_SIGNER_IDENTITY" >> $env:GITHUB_ENV
       - name: Verify immutable trusted script hashes
         shell: pwsh
         run: |
@@ -138,8 +145,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "source commit is not approved by protected main and its exact tag" }
       - name: Generate unsigned evidence from trusted code and approved source data
         shell: pwsh
-        env:
-          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}
         run: |
           if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "supplier signer identity is invalid" }
           $version = $env:SOURCE_REF -replace '^refs/tags/v',''
@@ -185,6 +190,7 @@ jobs:
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
           SOURCE_REF: ${{ inputs.source_ref }}
+          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ inputs.signer_identity }}
           CALLER_SHA: ${{ github.sha }}
           CALLER_REF: ${{ github.ref }}
           TRUSTED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
@@ -195,6 +201,7 @@ jobs:
           if ($env:TRUSTED_WORKFLOW_SHA -notmatch '^[a-f0-9]{40}$') { throw "trusted signer SHA is unavailable" }
           if ($env:SOURCE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:SOURCE_COMMIT -cne $env:CALLER_SHA) { throw "fresh signer source commit claim is invalid" }
           if ($env:SOURCE_REF -notmatch '^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+$' -or $env:SOURCE_REF -cne $env:CALLER_REF) { throw "fresh signer source ref claim is invalid" }
+          if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "supplier signer identity is invalid" }
           $python = (Get-Command python.exe -ErrorAction Stop).Source
           if (-not [IO.Path]::IsPathFullyQualified($python)) { throw "trusted system Python path is not absolute" }
           $openssl = "C:\Program Files\Git\mingw64\bin\openssl.exe"
@@ -203,6 +210,7 @@ jobs:
           "TRUSTED_OPENSSL=$openssl" >> $env:GITHUB_ENV
           "SOURCE_COMMIT=$env:SOURCE_COMMIT" >> $env:GITHUB_ENV
           "SOURCE_REF=$env:SOURCE_REF" >> $env:GITHUB_ENV
+          "VISION_SUPPLIER_SIGNER_IDENTITY=$env:VISION_SUPPLIER_SIGNER_IDENTITY" >> $env:GITHUB_ENV
           "signed_evidence_artifact_name=vending-vision-signed-evidence-$env:SOURCE_COMMIT" >> $env:GITHUB_OUTPUT
       - name: Reverify immutable trusted script hashes
         shell: pwsh
@@ -231,7 +239,6 @@ jobs:
         shell: pwsh
         env:
           VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}
-          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:VISION_SUPPLIER_PRIVATE_KEY_PEM)) { throw "supplier private key is required" }
           if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "supplier signer identity is invalid" }
