@@ -25,7 +25,7 @@ from vision.source_provenance import verify_official_source_provenance
 
 _REGIONAL_EVIDENCE_POLICY = {
     "schemaVersion": "vem-ai-regional-evidence-policy/v1",
-    "sha256": "1dfc50804123f31382e9e2e27ed8e35fed8f6c68cce7df0dee4975f43726f405",
+    "sha256": "141dc7bd9d8b03dc54dd5ec343e5090b9c673366d37c6250cf6135f717161654",
 }
 
 def _deny_downloads() -> None:
