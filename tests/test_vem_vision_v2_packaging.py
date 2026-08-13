@@ -667,6 +667,281 @@ def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_pub
     ).hexdigest()
 
 
+@pytest.mark.parametrize("missing", [None, "server-valid.json"])
+def test_main_artifact_runtime_allows_only_the_exact_v2_contract_fixtures(tmp_path, missing):
+    """The frozen V2 bundle needs its four contract fixtures, not test video data."""
+    root = tmp_path / "package-root"
+    scripts = root / "scripts"
+    runtime = root / "dist" / "vending-vision"
+    recorded = root / "fixtures" / "recorded-video"
+    scripts.mkdir(parents=True)
+    runtime.mkdir(parents=True)
+    recorded.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts" / "package_main_artifacts.ps1", scripts)
+    (runtime / "vending-vision.exe").write_bytes(b"MZ")
+    (recorded / "expected-results.json").write_text("{}", "utf-8")
+    (recorded / "top.mp4").write_bytes(b"top")
+    (recorded / "front.mp4").write_bytes(b"front")
+    for name in (
+        "client-invalid.json",
+        "client-valid.json",
+        "server-invalid.json",
+        "server-valid.json",
+    ):
+        path = runtime / "_internal" / "contracts" / "vem_vision_v2" / "fixtures" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[]", "utf-8")
+    if missing is not None:
+        (
+            runtime
+            / "_internal"
+            / "contracts"
+            / "vem_vision_v2"
+            / "fixtures"
+            / missing
+        ).unlink()
+
+    output = root / "output"
+    completed = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(scripts / "package_main_artifacts.ps1"),
+            "-Commit",
+            "a" * 40,
+            "-OutputDirectory",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    combined = f"{completed.stdout}{completed.stderr}"
+    if missing is not None:
+        assert completed.returncode != 0
+        assert "Runtime archive is missing V2 contract fixtures" in combined
+        return
+    assert completed.returncode == 0, combined
+    with zipfile.ZipFile(output / "vending-vision-windows-x86_64.zip") as archive:
+        entries = {entry.replace("\\", "/") for entry in archive.namelist()}
+    assert {
+        "_internal/contracts/vem_vision_v2/fixtures/client-invalid.json",
+        "_internal/contracts/vem_vision_v2/fixtures/client-valid.json",
+        "_internal/contracts/vem_vision_v2/fixtures/server-invalid.json",
+        "_internal/contracts/vem_vision_v2/fixtures/server-valid.json",
+    } <= entries
+
+
+def test_main_artifact_runtime_rejects_noncontract_fixture_paths(tmp_path):
+    root = tmp_path / "package-root"
+    scripts = root / "scripts"
+    runtime = root / "dist" / "vending-vision"
+    recorded = root / "fixtures" / "recorded-video"
+    scripts.mkdir(parents=True)
+    runtime.mkdir(parents=True)
+    recorded.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts" / "package_main_artifacts.ps1", scripts)
+    (runtime / "vending-vision.exe").write_bytes(b"MZ")
+    (runtime / "_internal" / "fixtures" / "unexpected.json").parent.mkdir(parents=True)
+    (runtime / "_internal" / "fixtures" / "unexpected.json").write_text("{}", "utf-8")
+    for name in (
+        "client-invalid.json",
+        "client-valid.json",
+        "server-invalid.json",
+        "server-valid.json",
+    ):
+        path = runtime / "_internal" / "contracts" / "vem_vision_v2" / "fixtures" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[]", "utf-8")
+    (recorded / "expected-results.json").write_text("{}", "utf-8")
+    (recorded / "top.mp4").write_bytes(b"top")
+    (recorded / "front.mp4").write_bytes(b"front")
+
+    completed = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(scripts / "package_main_artifacts.ps1"),
+            "-Commit",
+            "a" * 40,
+            "-OutputDirectory",
+            str(root / "output"),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert completed.returncode != 0
+    assert "Runtime archive includes recorded-video fixtures" in (
+        completed.stdout + completed.stderr
+    )
+
+
+def _write_runtime_contract_fixtures(runtime, contract_root):
+    for name in (
+        "client-invalid.json",
+        "client-valid.json",
+        "server-invalid.json",
+        "server-valid.json",
+    ):
+        path = runtime / "_internal" / contract_root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[]", "utf-8")
+
+
+def _run_main_artifact_package(root):
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(root / "scripts" / "package_main_artifacts.ps1"),
+            "-Commit",
+            "a" * 40,
+            "-OutputDirectory",
+            str(root / "output"),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def _main_artifact_harness_root(tmp_path):
+    root = tmp_path / "package-root"
+    (root / "scripts").mkdir(parents=True)
+    (root / "dist" / "vending-vision").mkdir(parents=True)
+    recorded = root / "fixtures" / "recorded-video"
+    recorded.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts" / "package_main_artifacts.ps1", root / "scripts")
+    (root / "dist" / "vending-vision" / "vending-vision.exe").write_bytes(b"MZ")
+    (recorded / "expected-results.json").write_text("{}", "utf-8")
+    (recorded / "top.mp4").write_bytes(b"top")
+    (recorded / "front.mp4").write_bytes(b"front")
+    return root
+
+
+def _run_main_artifact_archive_guard(root, runtime_entries):
+    """Exercise the PowerShell ZIP guard with legacy entry separators directly."""
+    script_path = root / "scripts" / "package_main_artifacts.ps1"
+    script = script_path.read_text("utf-8")
+    script = script.replace(
+        "Remove-Item -LiteralPath $RuntimeArchive, $FixtureArchive -Force -ErrorAction SilentlyContinue",
+        "$null = 1",
+    ).replace(
+        "Compress-Archive -Path (Join-Path $RuntimeStage \"*\") -DestinationPath $RuntimeArchive -CompressionLevel Optimal",
+        "$null = 1",
+    ).replace(
+        "Compress-Archive -Path (Join-Path $FixtureStage \"*\") -DestinationPath $FixtureArchive -CompressionLevel Optimal",
+        "$null = 1",
+    )
+    script_path.write_text(script, "utf-8")
+    output = root / "output"
+    output.mkdir()
+    manifest = json.dumps(
+        {
+            "schemaVersion": "vending-vision-main-artifacts/v1",
+            "commit": "a" * 40,
+            "runtimeArchive": "vending-vision-windows-x86_64.zip",
+            "fixtureArchive": "vending-vision-test-fixtures.zip",
+        }
+    ).encode()
+    with zipfile.ZipFile(output / "vending-vision-windows-x86_64.zip", "w") as archive:
+        for entry in runtime_entries:
+            archive.writestr(entry, manifest if entry == "vision-artifact.json" else b"x")
+    with zipfile.ZipFile(output / "vending-vision-test-fixtures.zip", "w") as archive:
+        for entry in (
+            "recorded-video/expected-results.json",
+            "recorded-video/top.mp4",
+            "recorded-video/front.mp4",
+        ):
+            archive.writestr(entry, b"x")
+        archive.writestr("vision-artifact.json", manifest)
+    return _run_main_artifact_package(root)
+
+
+def _runtime_contract_archive_entries(separator="/"):
+    prefix = separator.join(
+        ("_internal", "contracts", "vem_vision_v2", "fixtures")
+    )
+    return [
+        "vending-vision.exe",
+        "vision-artifact.json",
+        *(f"{prefix}{separator}{name}" for name in (
+            "client-invalid.json",
+            "client-valid.json",
+            "server-invalid.json",
+            "server-valid.json",
+        )),
+    ]
+
+
+def test_main_artifact_runtime_normalizes_legacy_backslash_contract_entries(tmp_path):
+    root = _main_artifact_harness_root(tmp_path)
+
+    completed = _run_main_artifact_archive_guard(
+        root, _runtime_contract_archive_entries("\\")
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("path", "error"),
+    [
+        ("fixtures/unexpected.json", "Runtime archive includes recorded-video fixtures"),
+        ("recorded-video/top.mp4", "Runtime archive includes recorded-video fixtures"),
+        ("unexpected.mp4", "Runtime archive includes recorded-video fixtures"),
+        ("top.mp4", "Runtime archive includes recorded-video fixtures"),
+        ("front.mp4", "Runtime archive includes recorded-video fixtures"),
+        ("expected-results.json", "Runtime archive includes recorded-video fixtures"),
+    ],
+)
+def test_main_artifact_runtime_rejects_forward_fixture_and_video_entries(tmp_path, path, error):
+    root = _main_artifact_harness_root(tmp_path)
+    runtime = root / "dist" / "vending-vision"
+    _write_runtime_contract_fixtures(runtime, "contracts/vem_vision_v2/fixtures")
+    extra = runtime / "_internal" / path
+    extra.parent.mkdir(parents=True, exist_ok=True)
+    extra.write_bytes(b"unexpected")
+
+    completed = _run_main_artifact_package(root)
+
+    assert completed.returncode != 0
+    assert error in completed.stdout + completed.stderr
+
+
+def test_main_artifact_runtime_rejects_backslash_fixture_and_casefold_collisions(tmp_path):
+    root = _main_artifact_harness_root(tmp_path)
+
+    entries = _runtime_contract_archive_entries()
+    entries.append("_internal\\contracts\\vem_vision_v2\\Fixtures\\client-valid.json")
+    entries.append("_internal\\fixtures\\unexpected.json")
+    completed = _run_main_artifact_archive_guard(root, entries)
+
+    assert completed.returncode != 0
+    assert "Runtime archive has case-folding collision" in completed.stdout + completed.stderr
+
+
+def test_main_artifact_runtime_rejects_slash_backslash_normalized_collisions(tmp_path):
+    root = _main_artifact_harness_root(tmp_path)
+
+    completed = _run_main_artifact_archive_guard(
+        root,
+        _runtime_contract_archive_entries()
+        + _runtime_contract_archive_entries("\\")[2:],
+    )
+
+    assert completed.returncode != 0
+    assert "Runtime archive has duplicate normalized entry" in completed.stdout + completed.stderr
+
+
 def test_worker_probe_executes_production_observation_and_render_ipc():
     probe = subprocess.run(
         [sys.executable, str(ROOT / "run_vision_server.py"), "--verify-v2-try-on-workers"],

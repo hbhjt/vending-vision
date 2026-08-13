@@ -87,11 +87,43 @@ if ($fixtureEntries -notcontains "recorded-video/expected-results.json" -or
     $fixtureEntries -notcontains "vision-artifact.json") {
     throw "Fixture archive layout is incomplete"
 }
-$runtimeFixtureEntries = @($runtimeEntries | Where-Object {
-    $_ -match '(^|/)fixtures(/|$)' -or $_ -match '(^|/)recorded-video(/|$)' -or $_ -match '\.mp4$'
+$allowedRuntimeContractFixtureNames = @(
+    "_internal/contracts/vem_vision_v2/fixtures/client-invalid.json",
+    "_internal/contracts/vem_vision_v2/fixtures/client-valid.json",
+    "_internal/contracts/vem_vision_v2/fixtures/server-invalid.json",
+    "_internal/contracts/vem_vision_v2/fixtures/server-valid.json"
+)
+$allowedRuntimeContractFixtures = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach ($fixture in $allowedRuntimeContractFixtureNames) {
+    [void]$allowedRuntimeContractFixtures.Add($fixture)
+}
+$normalizedRuntimeEntries = [Collections.Generic.List[string]]::new()
+$seenNormalizedRuntimeEntries = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$seenCaseFoldedRuntimeEntries = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($runtimeEntry in $runtimeEntries) {
+    $normalizedRuntimeEntry = $runtimeEntry.Replace([char]92, [char]47)
+    if (-not $seenNormalizedRuntimeEntries.Add($normalizedRuntimeEntry)) {
+        throw "Runtime archive has duplicate normalized entry: $normalizedRuntimeEntry"
+    }
+    if (-not $seenCaseFoldedRuntimeEntries.Add($normalizedRuntimeEntry)) {
+        throw "Runtime archive has case-folding collision: $normalizedRuntimeEntry"
+    }
+    $normalizedRuntimeEntries.Add($normalizedRuntimeEntry)
+}
+$missingRuntimeContractFixtures = @($allowedRuntimeContractFixtureNames | Where-Object {
+    -not $seenNormalizedRuntimeEntries.Contains($_)
 })
-if ($runtimeFixtureEntries.Count -gt 0) {
-    throw "Runtime archive includes recorded-video fixtures: $($runtimeFixtureEntries -join ', ')"
+if ($missingRuntimeContractFixtures.Count -gt 0) {
+    throw "Runtime archive is missing V2 contract fixtures: $($missingRuntimeContractFixtures -join ', ')"
+}
+$runtimeFixtureEntries = @($normalizedRuntimeEntries | Where-Object {
+    $_ -match '(^|/)fixtures(/|$)' -or $_ -match '(^|/)recorded-video(/|$)' -or $_ -match '(^|/)(top|front)\.mp4$' -or $_ -match '(^|/)expected-results\.json$' -or $_ -match '\.mp4$'
+})
+$unexpectedRuntimeFixtureEntries = @($runtimeFixtureEntries | Where-Object {
+    -not $allowedRuntimeContractFixtures.Contains($_)
+})
+if ($unexpectedRuntimeFixtureEntries.Count -gt 0) {
+    throw "Runtime archive includes recorded-video fixtures: $($unexpectedRuntimeFixtureEntries -join ', ')"
 }
 
 foreach ($archive in @($RuntimeArchive, $FixtureArchive)) {
