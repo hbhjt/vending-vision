@@ -143,6 +143,8 @@ jobs:
           $manifest = Join-Path $PWD "../trusted-output/candidate-manifest.json"
           $result = (& $CorePython ../trusted-builder/scripts/candidate_artifact_manifest.py --dist-root dist --artifact $artifact --manifest-output $manifest --source-commit $env:SOURCE_COMMIT) | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw "candidate archive generation failed" }
+          if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) { throw "candidate archive is unavailable" }
+          $artifact = (Resolve-Path -LiteralPath $artifact).Path
           if ($result.subjectSha256 -notmatch '^[a-f0-9]{64}$') { throw "candidate subject digest missing" }
           if ($result.embeddedManifestSha256 -notmatch '^[a-f0-9]{64}$') { throw "candidate manifest digest missing" }
           "artifact_name=vending-vision-trusted-$env:SOURCE_COMMIT" >> $env:GITHUB_OUTPUT

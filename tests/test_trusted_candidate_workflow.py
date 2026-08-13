@@ -69,6 +69,14 @@ def test_trusted_builder_has_a_closed_raw_material_interface_and_owns_attestatio
     attest = workflow.index("actions/attest-build-provenance@v4")
     upload = workflow.index("actions/upload-artifact@v4")
     assert verify < attest < upload
+    bundle = workflow[workflow.index("- name: Create the canonical candidate ZIP") : verify]
+    verifier = workflow[verify:attest]
+    attestation = workflow[attest:upload]
+    assert "$artifact = (Resolve-Path -LiteralPath $artifact).Path" in bundle
+    assert "TRUSTED_CANDIDATE_ARTIFACT=$artifact" in bundle
+    assert "$env:TRUSTED_CANDIDATE_ARTIFACT" in verifier
+    assert "subject-path: ${{ env.TRUSTED_CANDIDATE_ARTIFACT }}" in attestation
+    assert "..\\trusted-output" not in attestation
 
 
 def test_active_verified_archive_downloads_have_an_explicit_bounded_total_timeout():
