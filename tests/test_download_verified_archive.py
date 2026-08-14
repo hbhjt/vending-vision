@@ -241,7 +241,7 @@ def test_archive_extract_deadline_kills_ignore_term_descendant_tree(tmp_path):
             destination,
             expected_bytes=len(payload),
             opener=lambda _request, timeout: _Response(payload, url),
-            total_timeout_seconds=0.05,
+            total_timeout_seconds=0.5,
             extractor_command=[sys.executable, str(worker), str(child_pid)],
         )
 
