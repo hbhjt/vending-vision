@@ -853,6 +853,27 @@ def test_bounded_file_downloader_accepts_rc22_github_release_redirect(
     assert destination.read_bytes() == payload
 
 
+def test_bounded_file_downloader_rejects_http_final_redirect_without_destination(
+    tmp_path,
+):
+    initial_url = "https://example.invalid/candidate.zip"
+    payload = b"verified but downgraded bytes"
+    destination = tmp_path / "candidate.zip"
+
+    with pytest.raises(DownloadError, match="download_identity"):
+        download_verified_file(
+            initial_url,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            destination,
+            opener=lambda _request, timeout: Response(
+                payload, "http://evil.invalid/candidate.zip"
+            ),
+        )
+
+    assert not destination.exists()
+
+
 @pytest.mark.parametrize("mutation", ["http", "digest"])
 def test_bounded_file_downloader_rejects_invalid_initial_identity_or_digest(
     tmp_path, mutation
