@@ -787,6 +787,7 @@ def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_pub
         "vending-vision-ai-worker.exe",
         "official-ai-source-descriptor.json",
         "regional-evaluator-descriptor.json",
+        "ai_attempt_worker.py",
         "catvton_pose_masks.py",
         "regional_evaluator.py",
         "regional_evaluator_provenance.py",

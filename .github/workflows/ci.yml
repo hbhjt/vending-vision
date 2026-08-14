@@ -101,7 +101,7 @@ jobs:
           foreach ($name in @("official-ai-source-descriptor.json", "regional-evaluator-descriptor.json")) {
             Copy-Item -LiteralPath (Join-Path $worker "_internal/$name") -Destination (Join-Path $patch "_internal/$name")
           }
-          foreach ($name in @("catvton_pose_masks.py", "regional_evaluator.py", "regional_evaluator_provenance.py")) {
+          foreach ($name in @("ai_attempt_worker.py", "catvton_pose_masks.py", "regional_evaluator.py", "regional_evaluator_provenance.py")) {
             Copy-Item -LiteralPath (Join-Path $worker "_internal/vision/$name") -Destination (Join-Path $patch "_internal/vision/$name")
           }
       - name: 暂存同提交 Vision artifacts
