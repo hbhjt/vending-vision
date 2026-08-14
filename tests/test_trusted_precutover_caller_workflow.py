@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from scripts.admit_trusted_precutover_inputs import AdmissionError, admit_inputs
 from scripts.workflow_yaml import load_workflow_yaml
 from scripts.trusted_precutover_proof import HANDOFF_FILES
 
@@ -31,6 +33,166 @@ MODEL_PART_INPUTS = {
     for field in ("url", "sha256", "bytes")
 }
 INPUTS = CANDIDATE_INPUTS | MODEL_FINAL_INPUTS | MODEL_PART_INPUTS | {"model_pack_url"}
+PROOF_KEYS = (
+    "candidate_archive_url",
+    "candidate_archive_sha256",
+    "candidate_archive_bytes",
+    "candidate_manifest_url",
+    "candidate_manifest_sha256",
+    "candidate_manifest_bytes",
+    "candidate_attestation_url",
+    "candidate_attestation_sha256",
+    "candidate_attestation_bytes",
+    "candidate_evidence_url",
+    "candidate_evidence_sha256",
+    "candidate_evidence_bytes",
+    "model_pack_url",
+    "model_pack_sha256",
+    "model_pack_bytes",
+    "model_pack_part_01_url",
+    "model_pack_part_01_sha256",
+    "model_pack_part_01_bytes",
+    "model_pack_part_02_url",
+    "model_pack_part_02_sha256",
+    "model_pack_part_02_bytes",
+    "model_pack_part_03_url",
+    "model_pack_part_03_sha256",
+    "model_pack_part_03_bytes",
+)
+COMPANION_KEYS = (
+    "artifact_name",
+    "archive_file",
+    "archive_sha256",
+    "descriptor_file",
+    "descriptor_sha256",
+    "attestation_bundle_file",
+    "attestation_bundle_sha256",
+)
+
+
+def _dispatch_inputs_fixture(*, multipart: bool) -> dict[str, object]:
+    """Match GitHub's omitted-key JSON shape for empty optional dispatch inputs."""
+    value: dict[str, object] = {}
+    for key in PROOF_KEYS:
+        if multipart and key == "model_pack_url":
+            continue
+        if not multipart and key.startswith("model_pack_part_"):
+            continue
+        if key.endswith("_bytes"):
+            value[key] = 1
+        elif key.endswith("_sha256"):
+            value[key] = "a" * 64
+        else:
+            value[key] = f"https://example.invalid/{key}"
+    return value
+
+
+def _companion_fixture() -> dict[str, str]:
+    return {
+        key: ("b" * 64 if key.endswith("_sha256") else f"fixed-{key}")
+        for key in COMPANION_KEYS
+    }
+
+
+def _compact(value: dict[str, object]) -> str:
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _explicit_proof_inputs_expression() -> str:
+    fields = []
+    arguments = []
+    for index, key in enumerate(PROOF_KEYS):
+        fields.append(f'"{key}":{{{index}}}')
+        fallback = "0" if key.endswith("_bytes") else "''"
+        optional = key == "model_pack_url" or key.startswith("model_pack_part_")
+        source = f"inputs.{key} || {fallback}" if optional else f"inputs.{key}"
+        arguments.append(f"toJSON({source})")
+    return "${{ format('{{" + ",".join(fields) + "}}', " + ", ".join(arguments) + ") }}"
+
+
+def test_caller_normalizes_an_omitted_whole_model_url_before_exact_proof_admission():
+    dispatch_inputs = _dispatch_inputs_fixture(multipart=True)
+    raw_to_json_inputs = _compact(dispatch_inputs)
+
+    assert len(json.loads(raw_to_json_inputs)) == 23
+    with pytest.raises(AdmissionError, match="proof_inputs_key_set"):
+        admit_inputs(raw_to_json_inputs, _compact(_companion_fixture()))
+
+    workflow = load_workflow_yaml(CALLER.read_text("utf-8"))
+    assert (
+        workflow["jobs"]["trusted_proof"]["with"]["proof_inputs"]
+        == _explicit_proof_inputs_expression()
+    )
+
+    canonical = {
+        key: dispatch_inputs.get(key, 0 if key.endswith("_bytes") else "")
+        for key in PROOF_KEYS
+    }
+    proof, _ = admit_inputs(_compact(canonical), _compact(_companion_fixture()))
+    assert list(json.loads(proof)) == list(PROOF_KEYS)
+
+
+@pytest.mark.parametrize(
+    ("multipart", "omitted_count"), ((True, 23), (False, 15))
+)
+def test_caller_explicit_envelope_admits_both_exact_model_delivery_shapes(
+    multipart: bool, omitted_count: int
+):
+    dispatch_inputs = _dispatch_inputs_fixture(multipart=multipart)
+    assert len(dispatch_inputs) == omitted_count
+    canonical = {
+        key: dispatch_inputs.get(key, 0 if key.endswith("_bytes") else "")
+        for key in PROOF_KEYS
+    }
+
+    proof, _ = admit_inputs(_compact(canonical), _compact(_companion_fixture()))
+
+    admitted = json.loads(proof)
+    assert set(admitted) == set(PROOF_KEYS)
+    assert admitted["model_pack_url"] == (
+        "" if multipart else "https://example.invalid/model_pack_url"
+    )
+    assert all(
+        admitted[key] not in ("", 0)
+        for key in PROOF_KEYS
+        if multipart and key.startswith("model_pack_part_")
+    )
+    assert all(
+        admitted[key] in ("", 0)
+        for key in PROOF_KEYS
+        if not multipart and key.startswith("model_pack_part_")
+    )
+
+
+def test_caller_canonicalization_does_not_relax_proof_admission_mutations():
+    canonical = {
+        key: 0 if key.endswith("_bytes") and key.startswith("model_pack_part_") else
+        "" if (not key.endswith("_bytes") and key.startswith("model_pack_part_")) else
+        1 if key.endswith("_bytes") else
+        "a" * 64 if key.endswith("_sha256") else
+        f"https://example.invalid/{key}"
+        for key in PROOF_KEYS
+    }
+    raw = _compact(canonical)
+
+    unknown = dict(canonical)
+    unknown["unexpected"] = "value"
+    missing = dict(canonical)
+    missing.pop("candidate_archive_url")
+    placeholder = dict(canonical)
+    placeholder["candidate_archive_url"] = "https://example.invalid/${MODEL_RELEASE}"
+    mutations = {
+        "unknown": _compact(unknown),
+        "missing": _compact(missing),
+        "duplicate": raw[:-1]
+        + ',"candidate_archive_url":"https://evil.invalid/archive.zip"}',
+        "placeholder": _compact(placeholder),
+    }
+
+    for name, mutated in mutations.items():
+        assert mutated != raw, name
+        with pytest.raises(AdmissionError):
+            admit_inputs(mutated, _compact(_companion_fixture()))
 
 
 def test_manual_trusted_precutover_caller_has_only_closed_data_inputs():
@@ -89,7 +251,7 @@ def _assert_flattened_caller_contract(source: str) -> None:
         "id-token": "write",
     }
     assert set(job["with"]) == {"proof_inputs", "companion_builder_outputs"}
-    assert job["with"]["proof_inputs"] == "${{ toJSON(inputs) }}"
+    assert job["with"]["proof_inputs"] == _explicit_proof_inputs_expression()
     assert job["with"]["companion_builder_outputs"] == (
         "${{ toJSON(needs.companion_builder.outputs) }}"
     )
@@ -110,7 +272,12 @@ def test_caller_only_sha_pins_the_reusable_proof_and_forwards_all_inputs():
             "companion_builder_outputs: ${{ toJSON(needs.companion_builder.outputs) }}",
             "companion_builder_outputs: ${{ inputs.companion_builder_outputs }}",
         ),
-        ("proof_inputs: ${{ toJSON(inputs) }}", "proof_inputs: {}"),
+        (_explicit_proof_inputs_expression(), "${{ toJSON(inputs) }}"),
+        ("toJSON(inputs.model_pack_url || '')", "toJSON(inputs.model_pack_url)"),
+        (
+            "toJSON(inputs.model_pack_part_01_bytes || 0)",
+            "toJSON(inputs.model_pack_part_01_bytes)",
+        ),
         ("needs: companion_builder", "needs: missing_builder"),
         (COMPANION_BUILDER_SHA, "a" * 40),
         ("  trusted_proof:\n", "  unexpected:\n"),

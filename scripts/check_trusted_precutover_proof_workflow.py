@@ -19,6 +19,7 @@ from check_trusted_candidate_workflows import (
 
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 WORKFLOW_PATH = ".github/workflows/trusted-precutover-companion-proof.yml"
+CALLER_WORKFLOW_PATH = ".github/workflows/trusted-precutover-caller.yml"
 COMPANION_BUILDER_PATH = ".github/workflows/trusted-precutover-companion-builder.yml"
 COMPANION_BUILDER_SHA = "852ca005c5ce0fcdf7799f38d2335ae94c49be3c"
 COMPANION_BUILDER_CLOSURE = "trusted-precutover-companion-builder-closure.json"
@@ -55,6 +56,32 @@ OUTPUTS = {
     "companion_descriptor_sha256",
     "source_commit",
 }
+CALLER_PROOF_KEYS = (
+    "candidate_archive_url",
+    "candidate_archive_sha256",
+    "candidate_archive_bytes",
+    "candidate_manifest_url",
+    "candidate_manifest_sha256",
+    "candidate_manifest_bytes",
+    "candidate_attestation_url",
+    "candidate_attestation_sha256",
+    "candidate_attestation_bytes",
+    "candidate_evidence_url",
+    "candidate_evidence_sha256",
+    "candidate_evidence_bytes",
+    "model_pack_url",
+    "model_pack_sha256",
+    "model_pack_bytes",
+    "model_pack_part_01_url",
+    "model_pack_part_01_sha256",
+    "model_pack_part_01_bytes",
+    "model_pack_part_02_url",
+    "model_pack_part_02_sha256",
+    "model_pack_part_02_bytes",
+    "model_pack_part_03_url",
+    "model_pack_part_03_sha256",
+    "model_pack_part_03_bytes",
+)
 
 
 class PolicyError(RuntimeError):
@@ -64,6 +91,39 @@ class PolicyError(RuntimeError):
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise PolicyError(message)
+
+
+def _caller_proof_inputs_expression() -> str:
+    fields: list[str] = []
+    arguments: list[str] = []
+    for index, key in enumerate(CALLER_PROOF_KEYS):
+        fields.append(f'"{key}":{{{index}}}')
+        fallback = "0" if key.endswith("_bytes") else "''"
+        optional = key == "model_pack_url" or key.startswith("model_pack_part_")
+        source = f"inputs.{key} || {fallback}" if optional else f"inputs.{key}"
+        arguments.append(f"toJSON({source})")
+    return "${{ format('{{" + ",".join(fields) + "}}', " + ", ".join(arguments) + ") }}"
+
+
+def _assert_caller_explicit_proof_envelope(caller_workflow_path: Path) -> None:
+    source = caller_workflow_path.read_text("utf-8")
+    workflow = load_workflow_yaml(source)
+    dispatch = workflow.get("on", {}).get("workflow_dispatch", {})
+    dispatch_inputs = dispatch.get("inputs", {}) if isinstance(dispatch, dict) else {}
+    _require(
+        isinstance(dispatch_inputs, dict)
+        and set(dispatch_inputs) == set(CALLER_PROOF_KEYS)
+        and len(dispatch_inputs) == len(CALLER_PROOF_KEYS),
+        "trusted_proof_caller_dispatch_input_set",
+    )
+    jobs = workflow.get("jobs")
+    trusted_proof = jobs.get("trusted_proof") if isinstance(jobs, dict) else None
+    with_inputs = trusted_proof.get("with") if isinstance(trusted_proof, dict) else None
+    _require(
+        isinstance(with_inputs, dict)
+        and with_inputs.get("proof_inputs") == _caller_proof_inputs_expression(),
+        "trusted_proof_caller_explicit_envelope",
+    )
 
 
 def _job_block(source: str, name: str) -> str:
@@ -200,7 +260,9 @@ def _assert_candidate_builder_authority_sync(source: str, repository_root: Path)
     )
 
 
-def check(workflow_path: Path, repository_root: Path) -> None:
+def check(
+    workflow_path: Path, repository_root: Path, caller_workflow_path: Path
+) -> None:
     for label, commit in (
         ("companion_builder", COMPANION_BUILDER_SHA),
         ("candidate_builder", CANDIDATE_BUILDER_SHA),
@@ -211,6 +273,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
             f"trusted_proof_{label}_commit_invalid",
         )
     source = workflow_path.read_text("utf-8")
+    _assert_caller_explicit_proof_envelope(caller_workflow_path)
     _assert_candidate_builder_authority_sync(source, repository_root)
     workflow = load_workflow_yaml(source)
     on = workflow.get("on")
@@ -715,9 +778,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workflow", required=True, type=Path)
     parser.add_argument("--repository-root", required=True, type=Path)
+    parser.add_argument("--caller-workflow", type=Path)
     args = parser.parse_args()
     try:
-        check(args.workflow.resolve(), args.repository_root.resolve())
+        repository_root = args.repository_root.resolve()
+        caller_workflow = args.caller_workflow or (
+            repository_root / CALLER_WORKFLOW_PATH
+        )
+        check(args.workflow.resolve(), repository_root, caller_workflow.resolve())
     except (OSError, PolicyError, WorkflowYamlError) as exc:
         print(f"TRUSTED_PRECUTOVER_PROOF_POLICY=FAIL:{exc}")
         return 1

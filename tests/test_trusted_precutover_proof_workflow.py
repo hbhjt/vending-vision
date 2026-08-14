@@ -21,6 +21,7 @@ ROOT = Path(__file__).parents[1]
 TRUSTED_PROOF = (
     ROOT / ".github" / "workflows" / "trusted-precutover-companion-proof.yml"
 )
+CALLER = ROOT / ".github" / "workflows" / "trusted-precutover-caller.yml"
 COMPANION_BUILDER_COMMIT = "852ca005c5ce0fcdf7799f38d2335ae94c49be3c"
 BUILDER_CLOSURE = ROOT / "trusted-precutover-companion-builder-closure.json"
 BUILDER_CLOSURE_VERIFIER = ROOT / "scripts/verify_trusted_builder_closure.py"
@@ -439,7 +440,9 @@ def test_proof_and_fresh_verify_jobs_use_only_immutable_trusted_code_and_safe_en
     )
 
 
-def _check_policy(workflow: Path) -> subprocess.CompletedProcess[str]:
+def _check_policy(
+    workflow: Path, caller: Path = CALLER
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             sys.executable,
@@ -448,6 +451,8 @@ def _check_policy(workflow: Path) -> subprocess.CompletedProcess[str]:
             str(workflow),
             "--repository-root",
             str(ROOT),
+            "--caller-workflow",
+            str(caller),
         ],
         cwd=ROOT,
         capture_output=True,
@@ -459,6 +464,69 @@ def _check_policy(workflow: Path) -> subprocess.CompletedProcess[str]:
 def test_trusted_proof_workflow_passes_executable_trust_policy():
     completed = _check_policy(TRUSTED_PROOF)
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        (
+            "proof_inputs: ${{ format(",
+            "proof_inputs: ${{ toJSON(inputs) }}\n      # format(",
+        ),
+        ("toJSON(inputs.model_pack_url || '')", "toJSON(inputs.model_pack_url)"),
+        (
+            "toJSON(inputs.model_pack_part_02_bytes || 0)",
+            "toJSON(inputs.model_pack_part_02_bytes)",
+        ),
+        ('"model_pack_part_03_bytes":{23}', '"removed_part":{23}'),
+    ),
+    ids=("raw-tojson", "whole-url-default", "multipart-byte-default", "key-tamper"),
+)
+def test_trusted_proof_policy_rejects_caller_envelope_regressions(
+    tmp_path, old: str, new: str
+):
+    source = CALLER.read_text("utf-8")
+    mutated = source.replace(old, new, 1)
+    assert mutated != source
+    candidate = tmp_path / "trusted-precutover-caller.yml"
+    candidate.write_text(mutated, "utf-8")
+
+    completed = _check_policy(TRUSTED_PROOF, candidate)
+
+    assert completed.returncode != 0
+    assert "trusted_proof_caller_explicit_envelope" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        (
+            "      model_pack_part_03_bytes:\n"
+            "        description: Model-pack part 03 byte size\n"
+            "        required: false\n"
+            "        type: number\n",
+            "",
+        ),
+        (
+            "      model_pack_part_03_bytes:\n",
+            "      removed_model_pack_part_03_bytes:\n",
+        ),
+    ),
+    ids=("removed", "replaced"),
+)
+def test_trusted_proof_policy_rejects_caller_dispatch_input_set_regressions(
+    tmp_path, old: str, new: str
+):
+    source = CALLER.read_text("utf-8")
+    mutated = source.replace(old, new, 1)
+    assert mutated != source
+    candidate = tmp_path / "trusted-precutover-caller.yml"
+    candidate.write_text(mutated, "utf-8")
+
+    completed = _check_policy(TRUSTED_PROOF, candidate)
+
+    assert completed.returncode != 0
+    assert "trusted_proof_caller_dispatch_input_set" in completed.stdout
 
 
 def test_trusted_proof_policy_rejects_a_noncanonical_companion_output_envelope(
