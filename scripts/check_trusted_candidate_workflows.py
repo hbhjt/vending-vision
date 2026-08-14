@@ -919,7 +919,6 @@ def _assert_exact4_publisher(
         "sign_evidence",
         "verify_evidence",
         "VISION_SUPPLIER_",
-        "secrets.",
         "signed-evidence",
         "path: source",
         "refs/tags/",
@@ -931,6 +930,10 @@ def _assert_exact4_publisher(
         "hosted-authority",
     ):
         _require(forbidden not in publisher_source, "publisher_forbidden_capability")
+    _require(
+        re.search(r"(?i)\bsecrets\s*(?:\.|\[)", publisher_source) is None,
+        "publisher_forbidden_capability",
+    )
 
     steps = _job_steps(publish, "publisher_publish")
     _require(set(steps) == {

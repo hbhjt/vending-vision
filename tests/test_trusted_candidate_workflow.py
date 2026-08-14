@@ -96,6 +96,7 @@ def test_exact4_policy_accepts_the_publisher():
         ("signer-job", "  publish:\n", "  trusted_signer:\n    uses: owner/repo/.github/workflows/signer.yml@deadbeef\n\n  publish:\n", "publisher_jobs_exact4"),
         ("direct-sign-job", "  publish:\n", "  sign_evidence:\n    runs-on: windows-latest\n    steps: []\n\n  publish:\n", "publisher_jobs_exact4"),
         ("supplier-secret", "    environment: production\n", "    environment: production\n    env:\n      KEY: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}\n", "publisher_forbidden_capability"),
+        ("bracket-secret", "    environment: production\n", "    environment: production\n    env:\n      KEY: ${{ secrets['REINTRODUCED_SECRET'] }}\n", "publisher_forbidden_capability"),
         ("wrong-environment", "environment: production", "environment: experimental-candidate", "publisher_production_environment"),
         ("source-checkout", "path: trusted-builder", "path: source", "publisher_forbidden_capability"),
         ("sidecar", "trusted-builder-evidence.json", "supplier-signed-evidence.json", "publisher_forbidden_capability"),
