@@ -37,7 +37,7 @@ def test_regional_evaluator_descriptor_is_canonical_exact_and_verifiable():
         "algorithm": "rgb-absolute-delta-rle/v1",
         "atr": "schp-atr",
         "lip": "schp-lip",
-        "pose": "mediapipe-pose",
+        "pose": "mediapipe-pose-or-frame-proportional",
     }
     assert [source["path"] for source in descriptor["sources"]] == list(
         sorted(REGIONAL_EVALUATOR_SOURCE_PATHS)

@@ -480,7 +480,7 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
         "algorithm": "rgb-absolute-delta-rle/v1",
         "atr": "schp-atr",
         "lip": "schp-lip",
-        "pose": "mediapipe-pose",
+        "pose": "mediapipe-pose-or-frame-proportional",
         "sourceDescriptorSha256": hashlib.sha256(
             (ROOT / "regional-evaluator-descriptor.json").read_bytes()
         ).hexdigest(),

@@ -207,7 +207,7 @@ def write_regional_evidence(
             "algorithm": "rgb-absolute-delta-rle/v1",
             "atr": "schp-atr",
             "lip": "schp-lip",
-            "pose": "mediapipe-pose",
+            "pose": "mediapipe-pose-or-frame-proportional",
             "sourceDescriptorSha256": evaluator_source_descriptor_sha256,
         },
         "kind": "regional-evidence",

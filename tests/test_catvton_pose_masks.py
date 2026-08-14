@@ -64,15 +64,55 @@ def test_pose_derived_masks_follow_shoulders_hips_and_sleeve_length():
     assert not np.array_equal(high_target, low_target)
 
 
-def test_pose_unavailable_is_typed_and_has_no_fixed_band_fallback():
+def test_missing_pose_uses_nonempty_proportional_fallback_masks():
     person = np.zeros((180, 120, 3), dtype=np.uint8)
     garment = np.zeros((80, 60, 4), dtype=np.uint8)
     garment[8:74, 6:54, 3] = 255
 
-    with pytest.raises(CatVTONPoseError, match="official_catvton_pose_unavailable"):
+    target, hands, sleeves = target_hands_sleeve_masks(
+        person,
+        garment,
+        template="tshirt_short_sleeve",
+        pose_results=SimpleNamespace(pose_landmarks=None),
+    )
+
+    assert target.shape == person.shape[:2]
+    assert target.dtype == np.uint8
+    assert int(target.sum()) > 0
+    assert int(hands.sum()) == 0
+    assert int(sleeves.sum()) > 0
+
+
+def test_detector_error_uses_same_fallback_masks(monkeypatch):
+    person = np.zeros((180, 120, 3), dtype=np.uint8)
+    garment = np.zeros((80, 60, 4), dtype=np.uint8)
+    garment[8:74, 6:54, 3] = 255
+
+    def detector_failure(_person):
+        raise RuntimeError("mediapipe is unavailable")
+
+    monkeypatch.setattr("vision.catvton_pose_masks._detect_pose", detector_failure)
+
+    target, hands, sleeves = target_hands_sleeve_masks(
+        person,
+        garment,
+        template="tshirt_long_sleeve",
+        pose_results=None,
+    )
+
+    assert int(target.sum()) > 0
+    assert int(hands.sum()) == 0
+    assert int(sleeves.sum()) > 0
+
+
+def test_missing_pose_does_not_accept_an_invalid_garment():
+    person = np.zeros((180, 120, 3), dtype=np.uint8)
+    invalid_garment = np.zeros((80, 60, 3), dtype=np.uint8)
+
+    with pytest.raises(CatVTONPoseError, match="official_catvton_invalid_garment"):
         target_hands_sleeve_masks(
             person,
-            garment,
+            invalid_garment,
             template="tshirt_short_sleeve",
             pose_results=SimpleNamespace(pose_landmarks=None),
         )

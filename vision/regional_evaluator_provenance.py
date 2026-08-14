@@ -40,7 +40,7 @@ REGIONAL_EVALUATOR_SEMANTICS = {
     "algorithm": "rgb-absolute-delta-rle/v1",
     "atr": "schp-atr",
     "lip": "schp-lip",
-    "pose": "mediapipe-pose",
+    "pose": "mediapipe-pose-or-frame-proportional",
 }
 
 
