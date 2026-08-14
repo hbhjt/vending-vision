@@ -781,6 +781,17 @@ def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_pub
     assert build_run.count("scripts/verify_packaged_exe.py") == 1
     assert build_run.count("scripts/package_main_artifacts.ps1") == 1
     assert '-Commit "${{ github.sha }}"' in build_run
+    assert 'build/dist-ai/vending-vision-ai-worker' in build_run
+    assert 'build/ai-worker-vm-patch' in build_run
+    for name in (
+        "vending-vision-ai-worker.exe",
+        "official-ai-source-descriptor.json",
+        "regional-evaluator-descriptor.json",
+        "catvton_pose_masks.py",
+        "regional_evaluator.py",
+        "regional_evaluator_provenance.py",
+    ):
+        assert name in build_run
 
     staging_upload = next(
         step for step in steps if step.get("uses") == "actions/upload-artifact@v4"
@@ -789,6 +800,19 @@ def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_pub
         "name": "vending-vision-main-staging-${{ github.sha }}",
         "path": "main-artifacts/*",
         "if-no-files-found": "error",
+    }
+    worker_patch_upload = next(
+        step
+        for step in steps
+        if step.get("name") == "暂存 VM AI worker 热补丁"
+    )
+    assert worker_patch_upload["uses"] == "actions/upload-artifact@v4"
+    assert worker_patch_upload["with"] == {
+        "name": "vending-vision-ai-worker-patch-${{ github.sha }}",
+        "path": "build/ai-worker-vm-patch/**",
+        "if-no-files-found": "error",
+        "compression-level": "0",
+        "retention-days": "3",
     }
 
     publish_steps = publish_job["steps"]

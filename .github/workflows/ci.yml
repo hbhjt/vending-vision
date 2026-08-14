@@ -94,12 +94,30 @@ jobs:
           ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse") -AiWheelhouse (Join-Path $PWD "ai-wheelhouse") -AiWheelhouseDescriptor (Join-Path $PWD "requirements-ai.lock.json")
           & (Join-Path $PWD ".venv-packaging-core\Scripts\python.exe") scripts/verify_packaged_exe.py
           ./scripts/package_main_artifacts.ps1 -Commit "${{ github.sha }}" -OutputDirectory (Join-Path $PWD "main-artifacts")
+          $worker = Join-Path $PWD "build/dist-ai/vending-vision-ai-worker"
+          $patch = Join-Path $PWD "build/ai-worker-vm-patch"
+          New-Item -ItemType Directory -Force (Join-Path $patch "_internal/vision") | Out-Null
+          Copy-Item -LiteralPath (Join-Path $worker "vending-vision-ai-worker.exe") -Destination $patch
+          foreach ($name in @("official-ai-source-descriptor.json", "regional-evaluator-descriptor.json")) {
+            Copy-Item -LiteralPath (Join-Path $worker "_internal/$name") -Destination (Join-Path $patch "_internal/$name")
+          }
+          foreach ($name in @("catvton_pose_masks.py", "regional_evaluator.py", "regional_evaluator_provenance.py")) {
+            Copy-Item -LiteralPath (Join-Path $worker "_internal/vision/$name") -Destination (Join-Path $patch "_internal/vision/$name")
+          }
       - name: 暂存同提交 Vision artifacts
         uses: actions/upload-artifact@v4
         with:
           name: vending-vision-main-staging-${{ github.sha }}
           path: main-artifacts/*
           if-no-files-found: error
+      - name: 暂存 VM AI worker 热补丁
+        uses: actions/upload-artifact@v4
+        with:
+          name: vending-vision-ai-worker-patch-${{ github.sha }}
+          path: build/ai-worker-vm-patch/**
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
 
   regional-evidence-contract:
     name: VEM 区域证据合同
