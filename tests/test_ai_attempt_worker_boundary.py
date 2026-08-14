@@ -28,6 +28,7 @@ def test_vm_acceptance_can_reduce_inference_steps_without_changing_the_default(m
 def test_explicit_inference_steps_do_not_read_the_vm_acceptance_default(monkeypatch, tmp_path):
     observed_steps = []
     monkeypatch.setenv("VEM_VM_ACCEPTANCE_AI_STEPS", "invalid")
+    monkeypatch.setattr(ai_attempt_worker, "_deny_downloads", lambda: None)
     monkeypatch.setattr(ai_attempt_worker, "verify_ai_model_pack", lambda _root: None)
     monkeypatch.setattr(
         ai_attempt_worker,
