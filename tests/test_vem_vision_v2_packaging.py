@@ -694,9 +694,11 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "--source-ref" not in publisher
     assert "--source-digest" not in publisher
     assert "--deny-self-hosted-runners" in publisher
-    assert "verify_trusted_candidate_inputs.py" in publisher
-    assert "--trusted-builder-evidence" in publisher
-    assert "--attestation-bundle-sha256" in publisher
+    assert "verify_trusted_candidate_inputs.py" not in publisher
+    assert "--trusted-builder-evidence" not in publisher
+    assert "trusted builder artifact member set mismatch" in publisher
+    assert "Get-FileHash" in publisher
+    assert "ATTESTATION_BUNDLE_SHA256" in publisher
     assert "--require-ai-worker" not in publisher
     assert "environment: experimental-candidate" not in signer
     assert "--trusted-builder-evidence" in signer
