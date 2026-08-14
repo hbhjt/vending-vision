@@ -475,12 +475,22 @@ def test_trusted_proof_workflow_passes_executable_trust_policy():
         ),
         ("toJSON(inputs.model_pack_url || '')", "toJSON(inputs.model_pack_url)"),
         (
-            "toJSON(inputs.model_pack_part_02_bytes || 0)",
-            "toJSON(inputs.model_pack_part_02_bytes)",
+            "toJSON(fromJSON(inputs.model_pack_part_02_bytes || '0'))",
+            "toJSON(fromJSON(inputs.model_pack_part_02_bytes))",
+        ),
+        (
+            "toJSON(fromJSON(inputs.candidate_archive_bytes))",
+            "toJSON(inputs.candidate_archive_bytes)",
         ),
         ('"model_pack_part_03_bytes":{23}', '"removed_part":{23}'),
     ),
-    ids=("raw-tojson", "whole-url-default", "multipart-byte-default", "key-tamper"),
+    ids=(
+        "raw-tojson",
+        "whole-url-default",
+        "multipart-byte-default",
+        "required-byte-string",
+        "key-tamper",
+    ),
 )
 def test_trusted_proof_policy_rejects_caller_envelope_regressions(
     tmp_path, old: str, new: str

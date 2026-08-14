@@ -98,10 +98,13 @@ def _caller_proof_inputs_expression() -> str:
     arguments: list[str] = []
     for index, key in enumerate(CALLER_PROOF_KEYS):
         fields.append(f'"{key}":{{{index}}}')
-        fallback = "0" if key.endswith("_bytes") else "''"
         optional = key == "model_pack_url" or key.startswith("model_pack_part_")
-        source = f"inputs.{key} || {fallback}" if optional else f"inputs.{key}"
-        arguments.append(f"toJSON({source})")
+        if key.endswith("_bytes"):
+            source = f"inputs.{key} || '0'" if optional else f"inputs.{key}"
+            arguments.append(f"toJSON(fromJSON({source}))")
+        else:
+            source = f"inputs.{key} || ''" if optional else f"inputs.{key}"
+            arguments.append(f"toJSON({source})")
     return "${{ format('{{" + ",".join(fields) + "}}', " + ", ".join(arguments) + ") }}"
 
 

@@ -103,11 +103,119 @@ def _explicit_proof_inputs_expression() -> str:
     arguments = []
     for index, key in enumerate(PROOF_KEYS):
         fields.append(f'"{key}":{{{index}}}')
-        fallback = "0" if key.endswith("_bytes") else "''"
         optional = key == "model_pack_url" or key.startswith("model_pack_part_")
-        source = f"inputs.{key} || {fallback}" if optional else f"inputs.{key}"
-        arguments.append(f"toJSON({source})")
+        if key.endswith("_bytes"):
+            source = f"inputs.{key} || '0'" if optional else f"inputs.{key}"
+            arguments.append(f"toJSON(fromJSON({source}))")
+        else:
+            source = f"inputs.{key} || ''" if optional else f"inputs.{key}"
+            arguments.append(f"toJSON({source})")
     return "${{ format('{{" + ",".join(fields) + "}}', " + ", ".join(arguments) + ") }}"
+
+
+def _evaluate_caller_proof_inputs(
+    dispatch_inputs: dict[str, str], expression: str
+) -> str:
+    """Evaluate the caller's format/toJSON envelope for dispatch string values."""
+    proof: dict[str, object] = {}
+    for key in PROOF_KEYS:
+        optional = key == "model_pack_url" or key.startswith("model_pack_part_")
+        fallback = "0" if key.endswith("_bytes") else ""
+        value = dispatch_inputs[key] or (fallback if optional else dispatch_inputs[key])
+        parses_bytes = f"toJSON(fromJSON(inputs.{key}" in expression
+        proof[key] = json.loads(value) if key.endswith("_bytes") and parses_bytes else value
+    return _compact(proof)
+
+
+def _string_dispatch_inputs(*, multipart: bool) -> dict[str, str]:
+    return {
+        key: (
+            ""
+            if multipart and key == "model_pack_url"
+            else ""
+            if not multipart and key.startswith("model_pack_part_")
+            else "1"
+            if key.endswith("_bytes")
+            else "a" * 64
+            if key.endswith("_sha256")
+            else f"https://example.invalid/{key}"
+        )
+        for key in PROOF_KEYS
+    }
+
+
+@pytest.mark.parametrize("multipart", (False, True), ids=("whole", "multipart"))
+def test_caller_converts_all_dispatch_byte_strings_to_json_numbers_before_admission(
+    multipart: bool,
+):
+    dispatch_inputs = _string_dispatch_inputs(multipart=multipart)
+    expression = load_workflow_yaml(CALLER.read_text("utf-8"))["jobs"][
+        "trusted_proof"
+    ]["with"]["proof_inputs"]
+
+    proof, _ = admit_inputs(
+        _evaluate_caller_proof_inputs(dispatch_inputs, expression),
+        _compact(_companion_fixture()),
+    )
+
+    admitted = json.loads(proof)
+    assert list(admitted) == list(PROOF_KEYS)
+    assert len(admitted) == 24
+    assert all(type(admitted[key]) is int for key in PROOF_KEYS if key.endswith("_bytes"))
+
+
+@pytest.mark.parametrize(
+    ("value", "expression_failure"),
+    (
+        ("", True),
+        ("1.5", False),
+        ("true", False),
+        (str(1 << 53), False),
+        ("0", False),
+        ("not-a-number", True),
+        ("${UNTRUSTED_BYTES}", True),
+    ),
+    ids=(
+        "empty",
+        "float",
+        "bool",
+        "unsafe-integer",
+        "zero",
+        "non-json",
+        "placeholder",
+    ),
+)
+def test_caller_fails_closed_for_invalid_required_dispatch_byte_strings(
+    value: str, expression_failure: bool
+):
+    dispatch_inputs = _string_dispatch_inputs(multipart=False)
+    dispatch_inputs["candidate_archive_bytes"] = value
+    expression = load_workflow_yaml(CALLER.read_text("utf-8"))["jobs"][
+        "trusted_proof"
+    ]["with"]["proof_inputs"]
+
+    if expression_failure:
+        with pytest.raises(json.JSONDecodeError):
+            _evaluate_caller_proof_inputs(dispatch_inputs, expression)
+    else:
+        with pytest.raises(
+            AdmissionError, match="proof_inputs_type:candidate_archive_bytes"
+        ):
+            admit_inputs(
+                _evaluate_caller_proof_inputs(dispatch_inputs, expression),
+                _compact(_companion_fixture()),
+            )
+
+
+def test_caller_fails_closed_for_invalid_optional_dispatch_byte_string():
+    dispatch_inputs = _string_dispatch_inputs(multipart=True)
+    dispatch_inputs["model_pack_part_01_bytes"] = "not-a-number"
+    expression = load_workflow_yaml(CALLER.read_text("utf-8"))["jobs"][
+        "trusted_proof"
+    ]["with"]["proof_inputs"]
+
+    with pytest.raises(json.JSONDecodeError):
+        _evaluate_caller_proof_inputs(dispatch_inputs, expression)
 
 
 def test_caller_normalizes_an_omitted_whole_model_url_before_exact_proof_admission():
@@ -275,8 +383,12 @@ def test_caller_only_sha_pins_the_reusable_proof_and_forwards_all_inputs():
         (_explicit_proof_inputs_expression(), "${{ toJSON(inputs) }}"),
         ("toJSON(inputs.model_pack_url || '')", "toJSON(inputs.model_pack_url)"),
         (
-            "toJSON(inputs.model_pack_part_01_bytes || 0)",
-            "toJSON(inputs.model_pack_part_01_bytes)",
+            "toJSON(fromJSON(inputs.model_pack_part_01_bytes || '0'))",
+            "toJSON(fromJSON(inputs.model_pack_part_01_bytes))",
+        ),
+        (
+            "toJSON(fromJSON(inputs.candidate_archive_bytes))",
+            "toJSON(inputs.candidate_archive_bytes)",
         ),
         ("needs: companion_builder", "needs: missing_builder"),
         (COMPANION_BUILDER_SHA, "a" * 40),
