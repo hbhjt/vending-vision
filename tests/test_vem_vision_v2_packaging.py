@@ -682,30 +682,29 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "secrets:" not in builder
 
     assert "trusted-ai-candidate-builder.yml@691b5056e8b9bf2667bc527b2170780b05863946" in publisher
-    assert "trusted-ai-candidate-signer.yml@59b4fee088db08f3008c137409f98577de987595" in publisher
     assert "scripts/build_exe.ps1" not in publisher
     assert "actions/attest-build-provenance" not in publisher
     assert "needs: trusted_builder" in publisher
-    assert "needs: verify" in publisher
-    assert publisher.count("runs-on: windows-latest") == 3
-    assert "actions/download-artifact@v4" in publisher
+    assert publisher.count("runs-on: windows-latest") == 1
+    assert publisher.count("actions/download-artifact@v4") == 1
     assert "gh attestation verify" in publisher
     assert "--signer-repo" not in publisher
     assert "--signer-workflow \"hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml\"" in publisher
     assert "--signer-digest \"691b5056e8b9bf2667bc527b2170780b05863946\"" in publisher
-    assert "--source-ref" in publisher
-    assert "--source-digest" in publisher
+    assert "--source-ref" not in publisher
+    assert "--source-digest" not in publisher
     assert "--deny-self-hosted-runners" in publisher
-    assert "--trusted-subject-sha256" in publisher
-    assert "--expected-embedded-manifest-sha256" in publisher
-    assert "--expected-source-commit" in publisher
-    assert "--extract-root" in publisher
-    assert "--require-ai-worker" in publisher
+    assert "verify_trusted_candidate_inputs.py" in publisher
+    assert "--trusted-builder-evidence" in publisher
+    assert "--attestation-bundle-sha256" in publisher
+    assert "--require-ai-worker" not in publisher
     assert "environment: experimental-candidate" not in signer
     assert "--trusted-builder-evidence" in signer
     assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in signer
-    assert publisher.count("${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}") == 1
-    assert "--expected-candidate-manifest-sha256" not in publisher
+    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in publisher
+    assert "environment: production" in publisher
+    assert "signed-evidence" not in publisher
+    assert "release/*" not in publisher
 
 
 def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_publish():

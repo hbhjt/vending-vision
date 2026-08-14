@@ -863,17 +863,178 @@ def check_trusted_candidate_workflows(
     _assert_gh_attestation_flags_parse(repository_root)
 
 
+def _assert_exact4_publisher(
+    *, builder: Path, publisher: Path, repository_root: Path
+) -> None:
+    """Fail closed unless the publisher consumes and releases exactly builder exact4."""
+    builder_source = builder.read_text("utf-8")
+    publisher_source = publisher.read_text("utf-8")
+    _assert_files_are_immutable(
+        commit=TRUSTED_BUILDER_COMMIT,
+        paths={TRUSTED_BUILDER_PATH: builder},
+        repository_root=repository_root,
+        label="trusted_builder",
+    )
+    _require(
+        _workflow_call_inputs(builder_source) == BUILDER_INPUTS,
+        "trusted_builder_input_allowlist",
+    )
+    for required in (
+        "Run the full packaged candidate verifier before signing",
+        "--require-ai-worker",
+        "actions/attest-build-provenance@v4",
+        "Record trusted builder evidence",
+        "trusted-builder-evidence.json",
+        "id-token: write",
+        "attestations: write",
+    ):
+        _require(required in builder_source, f"trusted_builder_evidence_policy:{required}")
+    _require(
+        builder_source.index("--require-ai-worker")
+        < builder_source.index("actions/attest-build-provenance@v4")
+        < builder_source.index("Record trusted builder evidence"),
+        "trusted_builder_full_verifier_order",
+    )
+
+    publisher_jobs = _workflow_jobs(publisher_source, "publisher")
+    _require(set(publisher_jobs) == {"trusted_builder", "publish"}, "publisher_jobs_exact4")
+    trusted_builder = publisher_jobs.get("trusted_builder")
+    _require(isinstance(trusted_builder, dict), "publisher_builder_job_missing")
+    trusted_call = f"uses: {TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}@{TRUSTED_BUILDER_COMMIT}"
+    _require(publisher_source.count(trusted_call) == 1, "publisher_literal_builder_pin")
+    _require(trusted_builder.get("uses") == f"{TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}@{TRUSTED_BUILDER_COMMIT}", "publisher_builder_job_pin")
+    caller_inputs = trusted_builder.get("with")
+    _require(isinstance(caller_inputs, dict), "publisher_builder_inputs_missing")
+    _require(set(caller_inputs) == BUILDER_INPUTS, "publisher_builder_input_allowlist")
+
+    publish = publisher_jobs.get("publish")
+    _require(isinstance(publish, dict), "publisher_publish_job_missing")
+    _require(publish.get("needs") == "trusted_builder", "publisher_requires_builder")
+    _require(publish.get("environment") == "production", "publisher_production_environment")
+    _require(publisher_source.count("environment:") == 1, "publisher_environment_exactly_one")
+    _require(publish.get("permissions") == {"contents": "write", "attestations": "read"}, "publisher_permissions_exact4")
+
+    for forbidden in (
+        "trusted-ai-candidate-signer.yml",
+        "sign_evidence",
+        "verify_evidence",
+        "VISION_SUPPLIER_",
+        "secrets.",
+        "signed-evidence",
+        "path: source",
+        "refs/tags/",
+        "refs/heads/main",
+        "release/*",
+        "approve_candidate_source.py",
+        "verify_hosted_release_authority.py",
+        "trusted-policy",
+        "hosted-authority",
+    ):
+        _require(forbidden not in publisher_source, "publisher_forbidden_capability")
+
+    steps = _job_steps(publish, "publisher_publish")
+    _require(set(steps) == {
+        "Checkout immutable exact4 verifier",
+        "Download exactly the trusted builder artifact",
+        "Reverify exact4 trusted candidate inputs in production",
+        "Publish exactly the reverified builder assets",
+    }, "publisher_steps_exact4")
+    checkout = steps["Checkout immutable exact4 verifier"].get("with")
+    _require(isinstance(checkout, dict), "publisher_verifier_checkout_inputs")
+    _require(checkout == {
+        "repository": TRUSTED_REPOSITORY,
+        "ref": TRUSTED_BUILDER_COMMIT,
+        "path": "trusted-builder",
+        "persist-credentials": "false",
+    }, "publisher_verifier_checkout_pin")
+    download = steps["Download exactly the trusted builder artifact"].get("with")
+    _require(isinstance(download, dict), "publisher_download_inputs")
+    _require(download == {
+        "name": "${{ needs.trusted_builder.outputs.artifact_name }}",
+        "path": "candidate-input",
+    }, "publisher_download_builder_artifact")
+    _require(publisher_source.count("actions/download-artifact@v4") == 1, "publisher_download_count")
+
+    reverify = steps["Reverify exact4 trusted candidate inputs in production"]
+    env = _step_env(reverify, "publisher_reverify")
+    _require(env == {
+        "GH_TOKEN": "${{ github.token }}",
+        "ARTIFACT_FILE": "${{ needs.trusted_builder.outputs.artifact_file }}",
+        "SUBJECT_SHA256": "${{ needs.trusted_builder.outputs.subject_sha256 }}",
+        "MANIFEST_SHA256": "${{ needs.trusted_builder.outputs.manifest_sha256 }}",
+        "ATTESTATION_BUNDLE_SHA256": "${{ needs.trusted_builder.outputs.attestation_bundle_sha256 }}",
+        "CANDIDATE_COMMIT": "${{ github.sha }}",
+        "CANDIDATE_TAG": "${{ github.ref_name }}",
+    }, "publisher_output_binding")
+    reverify_run = reverify.get("run")
+    _require(isinstance(reverify_run, str), "publisher_reverify_run")
+    for fragment in (
+        "gh attestation verify $artifact",
+        f'--repo "{TRUSTED_REPOSITORY}"',
+        f'--signer-workflow "{TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}"',
+        f'--signer-digest "{TRUSTED_BUILDER_COMMIT}"',
+        "--deny-self-hosted-runners",
+        "trusted-builder/scripts/verify_trusted_candidate_inputs.py",
+        "--artifact $artifact",
+        "--candidate-manifest (Join-Path $inputRoot \"candidate-manifest.json\")",
+        "--github-attestation $bundle",
+        "--trusted-builder-evidence (Join-Path $inputRoot \"trusted-builder-evidence.json\")",
+        "--subject-sha256 $env:SUBJECT_SHA256",
+        "--manifest-sha256 $env:MANIFEST_SHA256",
+        "--attestation-bundle-sha256 $env:ATTESTATION_BUNDLE_SHA256",
+        "--source-commit $env:CANDIDATE_COMMIT",
+    ):
+        _require(fragment in reverify_run, "publisher_exact4_member")
+    _require("--source-ref" not in reverify_run and "--source-digest" not in reverify_run, "publisher_source_authority_removed")
+    _require(reverify_run.count("candidate-manifest.json") == 1, "publisher_exact4_member")
+    _require(reverify_run.count("github-build-provenance.sigstore.json") == 1, "publisher_exact4_member")
+    _require(reverify_run.count("trusted-builder-evidence.json") == 1, "publisher_exact4_member")
+
+    release = steps["Publish exactly the reverified builder assets"]
+    release_env = _step_env(release, "publisher_release")
+    _require(release_env == {
+        "GH_TOKEN": "${{ github.token }}",
+        "CANDIDATE_TAG": "${{ github.ref_name }}",
+        "ARTIFACT_FILE": "${{ needs.trusted_builder.outputs.artifact_file }}",
+    }, "publisher_release_output_binding")
+    release_run = release.get("run")
+    _require(isinstance(release_run, str), "publisher_release_run")
+    release_commands = [line.strip() for line in release_run.splitlines() if line.strip().startswith("gh release create ")]
+    _require(len(release_commands) == 1, "publisher_release_cli_count")
+    exact_release = (
+        "gh release create $env:CANDIDATE_TAG \"candidate-input/$env:ARTIFACT_FILE\" "
+        "\"candidate-input/candidate-manifest.json\" "
+        "\"candidate-input/github-build-provenance.sigstore.json\" "
+        "\"candidate-input/trusted-builder-evidence.json\" "
+        "--repo hbhjt/vending-vision --prerelease --verify-tag "
+    )
+    _require(release_commands[0].startswith(exact_release), "publisher_release_assets_exact4")
+    _require("*" not in release_commands[0], "publisher_release_assets_exact4")
+    _require(release_run.count("candidate-manifest.json") == 1, "publisher_release_assets_exact4")
+    _require(release_run.count("github-build-provenance.sigstore.json") == 1, "publisher_release_assets_exact4")
+    _require(release_run.count("trusted-builder-evidence.json") == 1, "publisher_release_assets_exact4")
+    _assert_no_untrusted_run_expressions(builder_source, "trusted_builder")
+    _assert_no_untrusted_run_expressions(publisher_source, "publisher")
+    _assert_gh_attestation_flags_parse(repository_root)
+
+
+def check_trusted_candidate_workflows(
+    *, builder: Path, publisher: Path, repository_root: Path
+) -> None:
+    _assert_exact4_publisher(
+        builder=builder, publisher=publisher, repository_root=repository_root
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--builder", required=True, type=Path)
-    parser.add_argument("--signer", required=True, type=Path)
     parser.add_argument("--publisher", required=True, type=Path)
     parser.add_argument("--repository-root", required=True, type=Path)
     args = parser.parse_args()
     try:
         check_trusted_candidate_workflows(
             builder=args.builder.resolve(),
-            signer=args.signer.resolve(),
             publisher=args.publisher.resolve(),
             repository_root=args.repository_root.resolve(),
         )

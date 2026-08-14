@@ -179,7 +179,7 @@ def test_authority_rejects_repository_ref_and_digest_scope_drift(
         )
 
 
-def test_publish_and_proof_use_the_hosted_environment_and_release_fence_not_rulesets():
+def test_exact4_publish_drops_hosted_authority_while_proof_keeps_its_own_fence():
     publisher = (ROOT / ".github/workflows/publish-candidate.yml").read_text("utf-8")
     proof = (
         ROOT / ".github/workflows/trusted-precutover-companion-proof.yml"
@@ -188,14 +188,18 @@ def test_publish_and_proof_use_the_hosted_environment_and_release_fence_not_rule
     assert "rulesets?targets=tag" not in publisher
     assert "rulesets?targets=tag" not in proof
     publish_job = publisher[publisher.index("  publish:\n") :]
-    assert "environment: experimental-candidate" in publish_job.split("steps:", 1)[0]
-    assert f"ref: {AUTHORITY_COMMIT}" in publish_job
-    assert "verify_hosted_release_authority.py" in publish_job
-    assert "--mode publish-admission" in publish_job
-    assert "--mode publish-complete" in publish_job
-    assert publish_job.index("--mode publish-admission") < publish_job.index(
-        "gh release create"
-    ) < publish_job.index("--mode publish-complete")
+    assert "environment: production" in publish_job.split("steps:", 1)[0]
+    for removed in (
+        f"ref: {AUTHORITY_COMMIT}",
+        "verify_hosted_release_authority.py",
+        "--mode publish-admission",
+        "--mode publish-complete",
+        "approve_candidate_source.py",
+        "refs/heads/main",
+        "refs/tags/",
+    ):
+        assert removed not in publish_job
+    assert "gh release create" in publish_job
 
     _assert_candidate_builder_authority_sync(proof, ROOT)
     parsed_proof = load_workflow_yaml(proof)
