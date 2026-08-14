@@ -12,7 +12,7 @@ from scripts.trusted_precutover_proof import HANDOFF_FILES
 
 ROOT = Path(__file__).parents[1]
 CALLER = ROOT / ".github/workflows/trusted-precutover-caller.yml"
-PROOF_SHA = "bd1ec7eb917710f0752fd615da5b639c1a4758d0"
+PROOF_SHA = "fd02d344350d856b04f0bcfa06f56630337c64fb"
 COMPANION_BUILDER_SHA = "852ca005c5ce0fcdf7799f38d2335ae94c49be3c"
 CANDIDATE_INPUTS = {
     f"{name}_{field}"
@@ -88,9 +88,8 @@ def _assert_flattened_caller_contract(source: str) -> None:
         "contents": "read",
         "id-token": "write",
     }
-    assert set(job["with"]) == INPUTS | {"companion_builder_outputs"}
-    for name in INPUTS:
-        assert job["with"][name] == f"${{{{ inputs.{name} }}}}"
+    assert set(job["with"]) == {"proof_inputs", "companion_builder_outputs"}
+    assert job["with"]["proof_inputs"] == "${{ toJSON(inputs) }}"
     assert job["with"]["companion_builder_outputs"] == (
         "${{ toJSON(needs.companion_builder.outputs) }}"
     )
@@ -111,6 +110,7 @@ def test_caller_only_sha_pins_the_reusable_proof_and_forwards_all_inputs():
             "companion_builder_outputs: ${{ toJSON(needs.companion_builder.outputs) }}",
             "companion_builder_outputs: ${{ inputs.companion_builder_outputs }}",
         ),
+        ("proof_inputs: ${{ toJSON(inputs) }}", "proof_inputs: {}"),
         ("needs: companion_builder", "needs: missing_builder"),
         (COMPANION_BUILDER_SHA, "a" * 40),
         ("  trusted_proof:\n", "  unexpected:\n"),

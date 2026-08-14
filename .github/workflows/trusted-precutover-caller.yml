@@ -123,30 +123,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-proof.yml@bd1ec7eb917710f0752fd615da5b639c1a4758d0
+    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-proof.yml@fd02d344350d856b04f0bcfa06f56630337c64fb
     with:
-      candidate_archive_url: ${{ inputs.candidate_archive_url }}
-      candidate_archive_sha256: ${{ inputs.candidate_archive_sha256 }}
-      candidate_archive_bytes: ${{ inputs.candidate_archive_bytes }}
-      candidate_manifest_url: ${{ inputs.candidate_manifest_url }}
-      candidate_manifest_sha256: ${{ inputs.candidate_manifest_sha256 }}
-      candidate_manifest_bytes: ${{ inputs.candidate_manifest_bytes }}
-      candidate_attestation_url: ${{ inputs.candidate_attestation_url }}
-      candidate_attestation_sha256: ${{ inputs.candidate_attestation_sha256 }}
-      candidate_attestation_bytes: ${{ inputs.candidate_attestation_bytes }}
-      candidate_evidence_url: ${{ inputs.candidate_evidence_url }}
-      candidate_evidence_sha256: ${{ inputs.candidate_evidence_sha256 }}
-      candidate_evidence_bytes: ${{ inputs.candidate_evidence_bytes }}
-      model_pack_url: ${{ inputs.model_pack_url }}
-      model_pack_sha256: ${{ inputs.model_pack_sha256 }}
-      model_pack_bytes: ${{ inputs.model_pack_bytes }}
-      model_pack_part_01_url: ${{ inputs.model_pack_part_01_url }}
-      model_pack_part_01_sha256: ${{ inputs.model_pack_part_01_sha256 }}
-      model_pack_part_01_bytes: ${{ inputs.model_pack_part_01_bytes }}
-      model_pack_part_02_url: ${{ inputs.model_pack_part_02_url }}
-      model_pack_part_02_sha256: ${{ inputs.model_pack_part_02_sha256 }}
-      model_pack_part_02_bytes: ${{ inputs.model_pack_part_02_bytes }}
-      model_pack_part_03_url: ${{ inputs.model_pack_part_03_url }}
-      model_pack_part_03_sha256: ${{ inputs.model_pack_part_03_sha256 }}
-      model_pack_part_03_bytes: ${{ inputs.model_pack_part_03_bytes }}
+      proof_inputs: ${{ toJSON(inputs) }}
       companion_builder_outputs: ${{ toJSON(needs.companion_builder.outputs) }}
