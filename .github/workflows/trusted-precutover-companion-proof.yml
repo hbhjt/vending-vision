@@ -99,6 +99,10 @@ on:
         description: Exact byte size for official model-pack ZIP part 03
         required: false
         type: number
+      companion_builder_outputs:
+        description: Exact JSON output envelope from the immutable companion builder
+        required: true
+        type: string
     outputs:
       artifact_name:
         description: Fresh-runner verified proof artifact name
@@ -123,19 +127,7 @@ permissions:
   contents: read
 
 jobs:
-  companion_builder:
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-builder.yml@852ca005c5ce0fcdf7799f38d2335ae94c49be3c
-    with:
-      core_wheelhouse_url: ${{ vars.CORE_WHEELHOUSE_URL }}
-      core_wheelhouse_sha256: ${{ vars.CORE_WHEELHOUSE_SHA256 }}
-      core_wheelhouse_bytes: ${{ fromJSON(vars.CORE_WHEELHOUSE_BYTES) }}
-
   execute:
-    needs: companion_builder
     runs-on: windows-latest
     environment: experimental-candidate
     timeout-minutes: 180
@@ -163,10 +155,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version-file: trusted-proof/.python-version
+      - name: Parse exact caller-built companion output envelope
+        shell: pwsh
+        env:
+          COMPANION_BUILDER_OUTPUTS: ${{ inputs.companion_builder_outputs }}
+        run: |
+          try { $outputs = $env:COMPANION_BUILDER_OUTPUTS | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "companion builder output envelope is invalid JSON" }
+          $required = @("artifact_name", "archive_file", "archive_sha256", "descriptor_file", "descriptor_sha256", "attestation_bundle_file", "attestation_bundle_sha256")
+          if ((Compare-Object @($outputs.Keys | Sort-Object) @($required | Sort-Object)).Count -ne 0) { throw "companion builder output envelope key set is invalid" }
+          foreach ($key in $required) { if ([string]::IsNullOrWhiteSpace([string]$outputs[$key])) { throw "companion builder output envelope contains an empty value" } }
+          "COMPANION_ARTIFACT_NAME=$($outputs["artifact_name"])" >> $env:GITHUB_ENV
+          "COMPANION_ARCHIVE_FILE=$($outputs["archive_file"])" >> $env:GITHUB_ENV
+          "COMPANION_ARCHIVE_SHA256=$($outputs["archive_sha256"])" >> $env:GITHUB_ENV
+          "COMPANION_DESCRIPTOR_FILE=$($outputs["descriptor_file"])" >> $env:GITHUB_ENV
+          "COMPANION_DESCRIPTOR_SHA256=$($outputs["descriptor_sha256"])" >> $env:GITHUB_ENV
+          "COMPANION_ATTESTATION_FILE=$($outputs["attestation_bundle_file"])" >> $env:GITHUB_ENV
+          "COMPANION_ATTESTATION_SHA256=$($outputs["attestation_bundle_sha256"])" >> $env:GITHUB_ENV
       - name: Download independently built frozen companion
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.companion_builder.outputs.artifact_name }}
+          name: ${{ env.COMPANION_ARTIFACT_NAME }}
           path: companion-input
       - name: Verify companion artifact identity and GitHub provenance
         shell: pwsh
@@ -177,12 +185,6 @@ jobs:
           TRUSTED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
           TRUSTED_WORKFLOW_PATH: ${{ job.workflow_file_path }}
           TRUSTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
-          COMPANION_ARCHIVE_FILE: ${{ needs.companion_builder.outputs.archive_file }}
-          COMPANION_ARCHIVE_SHA256: ${{ needs.companion_builder.outputs.archive_sha256 }}
-          COMPANION_DESCRIPTOR_FILE: ${{ needs.companion_builder.outputs.descriptor_file }}
-          COMPANION_DESCRIPTOR_SHA256: ${{ needs.companion_builder.outputs.descriptor_sha256 }}
-          COMPANION_ATTESTATION_FILE: ${{ needs.companion_builder.outputs.attestation_bundle_file }}
-          COMPANION_ATTESTATION_SHA256: ${{ needs.companion_builder.outputs.attestation_bundle_sha256 }}
         run: |
           if ($env:TRUSTED_WORKFLOW_REPOSITORY -cne "hbhjt/vending-vision" -or $env:TRUSTED_WORKFLOW_PATH -cne ".github/workflows/trusted-precutover-companion-proof.yml" -or $env:TRUSTED_WORKFLOW_SHA -notmatch '^[a-f0-9]{40}$') { throw "unexpected trusted proof workflow identity" }
           if ($env:CALLER_SHA -notmatch '^[a-f0-9]{40}$' -or $env:CALLER_REF -notmatch '^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+$') { throw "proof caller source identity is invalid" }
@@ -357,9 +359,7 @@ jobs:
           retention-days: 1
 
   sign:
-    needs:
-      - companion_builder
-      - execute
+    needs: execute
     runs-on: windows-latest
     environment: experimental-candidate
     timeout-minutes: 180
@@ -390,6 +390,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version-file: trusted-proof/.python-version
+      - name: Parse exact caller-built companion output envelope
+        shell: pwsh
+        env:
+          COMPANION_BUILDER_OUTPUTS: ${{ inputs.companion_builder_outputs }}
+        run: |
+          try { $outputs = $env:COMPANION_BUILDER_OUTPUTS | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "companion builder output envelope is invalid JSON" }
+          $required = @("artifact_name", "archive_file", "archive_sha256", "descriptor_file", "descriptor_sha256", "attestation_bundle_file", "attestation_bundle_sha256")
+          if ((Compare-Object @($outputs.Keys | Sort-Object) @($required | Sort-Object)).Count -ne 0) { throw "companion builder output envelope key set is invalid" }
+          foreach ($key in $required) { if ([string]::IsNullOrWhiteSpace([string]$outputs[$key])) { throw "companion builder output envelope contains an empty value" } }
+          "COMPANION_ARTIFACT_NAME=$($outputs["artifact_name"])" >> $env:GITHUB_ENV
+          "COMPANION_ARCHIVE_FILE=$($outputs["archive_file"])" >> $env:GITHUB_ENV
+          "COMPANION_ARCHIVE_SHA256=$($outputs["archive_sha256"])" >> $env:GITHUB_ENV
+          "COMPANION_DESCRIPTOR_FILE=$($outputs["descriptor_file"])" >> $env:GITHUB_ENV
+          "COMPANION_DESCRIPTOR_SHA256=$($outputs["descriptor_sha256"])" >> $env:GITHUB_ENV
+          "COMPANION_ATTESTATION_FILE=$($outputs["attestation_bundle_file"])" >> $env:GITHUB_ENV
+          "COMPANION_ATTESTATION_SHA256=$($outputs["attestation_bundle_sha256"])" >> $env:GITHUB_ENV
       - name: Establish absolute trusted signer tools
         shell: pwsh
         env:
@@ -414,18 +430,12 @@ jobs:
       - name: Download independently built companion for fresh identity proof
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.companion_builder.outputs.artifact_name }}
+          name: ${{ env.COMPANION_ARTIFACT_NAME }}
           path: signer-companion-input
       - name: Reverify companion bytes and provenance without executing it
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          COMPANION_ARCHIVE_FILE: ${{ needs.companion_builder.outputs.archive_file }}
-          COMPANION_ARCHIVE_SHA256: ${{ needs.companion_builder.outputs.archive_sha256 }}
-          COMPANION_DESCRIPTOR_FILE: ${{ needs.companion_builder.outputs.descriptor_file }}
-          COMPANION_DESCRIPTOR_SHA256: ${{ needs.companion_builder.outputs.descriptor_sha256 }}
-          COMPANION_ATTESTATION_FILE: ${{ needs.companion_builder.outputs.attestation_bundle_file }}
-          COMPANION_ATTESTATION_SHA256: ${{ needs.companion_builder.outputs.attestation_bundle_sha256 }}
         run: |
           if ($env:COMPANION_ARCHIVE_FILE -cne "vending-vision-precutover-verifier.zip" -or $env:COMPANION_DESCRIPTOR_FILE -cne "precutover-companion-descriptor.json" -or $env:COMPANION_ATTESTATION_FILE -cne "precutover-companion-provenance.sigstore.json") { throw "signer companion filenames are invalid" }
           if ($env:COMPANION_ARCHIVE_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:COMPANION_DESCRIPTOR_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:COMPANION_ATTESTATION_SHA256 -notmatch '^[a-f0-9]{64}$') { throw "signer companion identities are invalid" }
@@ -597,9 +607,7 @@ jobs:
           retention-days: 1
 
   verify:
-    needs:
-      - companion_builder
-      - sign
+    needs: sign
     runs-on: windows-latest
     timeout-minutes: 30
     permissions:
@@ -623,6 +631,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version-file: trusted-proof/.python-version
+      - name: Parse exact caller-built companion output envelope
+        shell: pwsh
+        env:
+          COMPANION_BUILDER_OUTPUTS: ${{ inputs.companion_builder_outputs }}
+        run: |
+          try { $outputs = $env:COMPANION_BUILDER_OUTPUTS | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "companion builder output envelope is invalid JSON" }
+          $required = @("artifact_name", "archive_file", "archive_sha256", "descriptor_file", "descriptor_sha256", "attestation_bundle_file", "attestation_bundle_sha256")
+          if ((Compare-Object @($outputs.Keys | Sort-Object) @($required | Sort-Object)).Count -ne 0) { throw "companion builder output envelope key set is invalid" }
+          foreach ($key in $required) { if ([string]::IsNullOrWhiteSpace([string]$outputs[$key])) { throw "companion builder output envelope contains an empty value" } }
+          "EXPECTED_COMPANION_ARCHIVE_SHA256=$($outputs["archive_sha256"])" >> $env:GITHUB_ENV
+          "EXPECTED_COMPANION_DESCRIPTOR_SHA256=$($outputs["descriptor_sha256"])" >> $env:GITHUB_ENV
       - name: Download fixed proof handoff
         uses: actions/download-artifact@v4
         with:
@@ -641,8 +660,6 @@ jobs:
           EXPECTED_PROOF_SHA256: ${{ needs.sign.outputs.proof_sha256 }}
           EXPECTED_ATTESTATION_SHA256: ${{ needs.sign.outputs.attestation_bundle_sha256 }}
           EXPECTED_SOURCE_COMMIT: ${{ needs.sign.outputs.source_commit }}
-          EXPECTED_COMPANION_ARCHIVE_SHA256: ${{ needs.companion_builder.outputs.archive_sha256 }}
-          EXPECTED_COMPANION_DESCRIPTOR_SHA256: ${{ needs.companion_builder.outputs.descriptor_sha256 }}
         run: |
           if ($env:TRUSTED_WORKFLOW_REPOSITORY -cne "hbhjt/vending-vision" -or $env:TRUSTED_WORKFLOW_PATH -cne ".github/workflows/trusted-precutover-companion-proof.yml" -or $env:TRUSTED_WORKFLOW_SHA -notmatch '^[a-f0-9]{40}$') { throw "unexpected fresh proof verifier identity" }
           if ($env:CALLER_SHA -cne $env:EXPECTED_SOURCE_COMMIT -or $env:CALLER_REF -notmatch '^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+$') { throw "fresh proof source identity mismatch" }

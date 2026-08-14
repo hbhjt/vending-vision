@@ -44,6 +44,8 @@ MODEL_PART_INPUTS = {
     for field in ("url", "sha256", "bytes")
 }
 INPUTS |= MODEL_PART_INPUTS
+COMPANION_OUTPUT_ENVELOPE = "companion_builder_outputs"
+INPUTS.add(COMPANION_OUTPUT_ENVELOPE)
 REQUIRED_INPUTS = INPUTS - {"model_pack_url", *MODEL_PART_INPUTS}
 OUTPUTS = {
     "artifact_name",
@@ -234,7 +236,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     jobs = workflow.get("jobs")
     _require(
         isinstance(jobs, dict)
-        and set(jobs) == {"companion_builder", "execute", "sign", "verify"},
+        and set(jobs) == {"execute", "sign", "verify"},
         "trusted_proof_job_set",
     )
     for run in workflow_run_scalars(source):
@@ -249,6 +251,18 @@ def check(workflow_path: Path, repository_root: Path) -> None:
             for line in input_lines
         ),
         "trusted_proof_input_not_step_env",
+    )
+    companion_keys = (
+        '"artifact_name", "archive_file", "archive_sha256", "descriptor_file", '
+        '"descriptor_sha256", "attestation_bundle_file", "attestation_bundle_sha256"'
+    )
+    _require(
+        source.count("COMPANION_BUILDER_OUTPUTS: ${{ inputs.companion_builder_outputs }}")
+        == 3
+        and source.count("ConvertFrom-Json -AsHashtable -ErrorAction Stop") == 3
+        and source.count(companion_keys) == 3
+        and source.count("companion builder output envelope key set is invalid") == 3,
+        "trusted_proof_companion_output_envelope",
     )
     for forbidden in (
         "secrets:",
@@ -265,17 +279,10 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     ):
         _require(forbidden not in source, f"trusted_proof_forbidden:{forbidden}")
 
-    builder = jobs["companion_builder"]
     expected_use = (
         f"{TRUSTED_REPOSITORY}/{COMPANION_BUILDER_PATH}@{COMPANION_BUILDER_SHA}"
     )
-    _require(isinstance(builder, dict) and builder.get("uses") == expected_use, "trusted_proof_builder_pin")
-    _require(
-        isinstance(builder.get("with"), dict)
-        and set(builder["with"])
-        == {"core_wheelhouse_url", "core_wheelhouse_sha256", "core_wheelhouse_bytes"},
-        "trusted_proof_builder_inputs",
-    )
+    _require(expected_use not in source, "trusted_proof_nested_builder_forbidden")
     ancestor = subprocess.run(
         ["git", "merge-base", "--is-ancestor", COMPANION_BUILDER_SHA, "HEAD"],
         cwd=repository_root,
@@ -369,6 +376,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     _require(isinstance(signing_job, dict), "trusted_proof_sign_shape")
     execution_permissions = execution_job.get("permissions")
     signing_permissions = signing_job.get("permissions")
+    _require("needs" not in execution_job, "trusted_proof_execute_needs")
     _require(
         isinstance(execution_permissions, dict)
         and "id-token" not in execution_permissions
@@ -381,14 +389,11 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         and signing_permissions.get("attestations") == "write",
         "trusted_proof_sign_privilege",
     )
-    _require(
-        signing_job.get("needs") == ["companion_builder", "execute"],
-        "trusted_proof_sign_needs_execute",
-    )
+    _require(signing_job.get("needs") == "execute", "trusted_proof_sign_needs_execute")
     verify_job = jobs["verify"]
     _require(
         isinstance(verify_job, dict)
-        and verify_job.get("needs") == ["companion_builder", "sign"],
+        and verify_job.get("needs") == "sign",
         "trusted_proof_verify_needs_sign",
     )
     for name, expected_timeout in {"execute": 180, "sign": 180, "verify": 30}.items():
@@ -466,7 +471,7 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         )
     ]
     _require(
-        write_capable == ["companion_builder", "sign"],
+        write_capable == ["sign"],
         "trusted_proof_privileged_job_set",
     )
 
