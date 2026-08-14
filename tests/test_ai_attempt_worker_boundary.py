@@ -15,6 +15,43 @@ from vision import ai_attempt_worker
 ROOT = Path(__file__).parents[1]
 
 
+def test_vm_acceptance_can_reduce_inference_steps_without_changing_the_default(monkeypatch):
+    monkeypatch.delenv("VEM_VM_ACCEPTANCE_AI_STEPS", raising=False)
+    assert ai_attempt_worker.default_inference_steps() == 12
+    monkeypatch.setenv("VEM_VM_ACCEPTANCE_AI_STEPS", "1")
+    assert ai_attempt_worker.default_inference_steps() == 1
+    monkeypatch.setenv("VEM_VM_ACCEPTANCE_AI_STEPS", "0")
+    with pytest.raises(RuntimeError, match="vm_acceptance_ai_steps_invalid"):
+        ai_attempt_worker.default_inference_steps()
+
+
+def test_explicit_inference_steps_do_not_read_the_vm_acceptance_default(monkeypatch, tmp_path):
+    observed_steps = []
+    monkeypatch.setenv("VEM_VM_ACCEPTANCE_AI_STEPS", "invalid")
+    monkeypatch.setattr(ai_attempt_worker, "verify_ai_model_pack", lambda _root: None)
+    monkeypatch.setattr(
+        ai_attempt_worker,
+        "run_regional_evaluator_attempt",
+        lambda args, _root, *, policy: observed_steps.append(args.steps) or {},
+    )
+
+    assert ai_attempt_worker.main(
+        [
+            "--model-pack",
+            str(tmp_path),
+            "--person",
+            "person.png",
+            "--garment",
+            "garment.png",
+            "--output",
+            "output.png",
+            "--steps",
+            "7",
+        ]
+    ) == 0
+    assert observed_steps == [7]
+
+
 def write_worker_pack(root: Path) -> None:
     files = {
         "CatVTON/SCHP/exp-schp-201908301523-atr.pth": b"atr",

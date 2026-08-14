@@ -43,6 +43,19 @@ class CatVTONWorkerError(RuntimeError):
         self.code = code
 
 
+def default_inference_steps() -> int:
+    raw = os.environ.get("VEM_VM_ACCEPTANCE_AI_STEPS")
+    if raw is None:
+        return 12
+    try:
+        steps = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("vm_acceptance_ai_steps_invalid") from exc
+    if steps < 1 or steps > 12:
+        raise RuntimeError("vm_acceptance_ai_steps_invalid")
+    return steps
+
+
 def _pack_path(root: Path, relative: str) -> Path:
     path = (root / relative).resolve(strict=False)
     if not path.is_file() or root.resolve() not in path.parents:
@@ -113,9 +126,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--captured-source")
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=768)
-    parser.add_argument("--steps", type=int, default=12)
+    parser.add_argument("--steps", type=int)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
+    if args.steps is None:
+        args.steps = default_inference_steps()
     _deny_downloads()
     if args.probe_runtime:
         try:
