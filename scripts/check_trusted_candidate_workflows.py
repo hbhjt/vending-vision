@@ -827,10 +827,32 @@ def check_trusted_candidate_workflows(
         "--mode publish-complete",
         "environment: experimental-candidate",
         "gh release create $env:RELEASE_TAG",
+        "--repo hbhjt/vending-vision",
         "--target $env:RELEASE_TARGET",
         "--verify-tag",
     ):
         _require(fragment in publish, f"publisher_release_authority:{fragment}")
+    publish_steps = _job_steps(
+        _workflow_jobs(publisher_source, "publisher").get("publish"),
+        "publisher_publish",
+    )
+    publish_step = publish_steps.get("Publish immutable prerelease only after trusted signing")
+    _require(isinstance(publish_step, dict), "publisher_release_step_missing")
+    release_run = publish_step.get("run")
+    _require(isinstance(release_run, str), "publisher_release_step_run_missing")
+    release_commands = [
+        line.strip()
+        for line in release_run.splitlines()
+        if line.strip().startswith("gh release create ")
+    ]
+    _require(len(release_commands) == 1, "publisher_release_cli_count")
+    _require(
+        release_commands[0].startswith(
+            "gh release create $env:RELEASE_TAG release/* --repo hbhjt/vending-vision "
+            "--target $env:RELEASE_TARGET --prerelease --verify-tag "
+        ),
+        "publisher_release_cli_exact_repository_context",
+    )
     _require(publish.count("actions/checkout@v4") == 2, "publisher_trusted_policy_checkout")
     for forbidden in (
         "generate_candidate_evidence.py", "sign_candidate_evidence.py",

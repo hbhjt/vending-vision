@@ -308,7 +308,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           Copy-Item -Path (Join-Path $PWD "signed-evidence/*") -Destination release/
-          gh release create $env:RELEASE_TAG release/* --target $env:RELEASE_TARGET --prerelease --verify-tag --title "Vending Vision $env:RELEASE_TAG" --notes "Built by immutable trusted builder 691b5056e8b9bf2667bc527b2170780b05863946; independently verified, source-approved and supplier-signed with immutable trusted signer scripts 59b4fee088db08f3008c137409f98577de987595."
+          gh release create $env:RELEASE_TAG release/* --repo hbhjt/vending-vision --target $env:RELEASE_TARGET --prerelease --verify-tag --title "Vending Vision $env:RELEASE_TAG" --notes "Built by immutable trusted builder 691b5056e8b9bf2667bc527b2170780b05863946; independently verified, source-approved and supplier-signed with immutable trusted signer scripts 59b4fee088db08f3008c137409f98577de987595."
           if ($LASTEXITCODE -ne 0) { throw "immutable candidate release failed" }
           gh api "/repos/hbhjt/vending-vision/releases/tags/$env:RELEASE_TAG" --jq '{tagName:.tag_name,targetCommitish:.target_commitish,isDraft:.draft,isPrerelease:.prerelease}' | Set-Content -LiteralPath release-complete.json -Encoding utf8NoBOM
           if ($LASTEXITCODE -ne 0) { throw "published release identity query failed" }

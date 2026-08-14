@@ -650,6 +650,80 @@ def _check_policy(
     )
 
 
+def test_release_create_is_explicitly_bound_when_publisher_root_has_no_git(tmp_path):
+    publish = load_workflow_yaml(PUBLISHER.read_text("utf-8"))["jobs"]["publish"]
+    step = next(
+        step
+        for step in publish["steps"]
+        if step.get("name")
+        == "Publish immutable prerelease only after trusted signing"
+    )
+    release = tmp_path / "release"
+    release.mkdir()
+    (release / "candidate.zip").write_bytes(b"candidate")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1 $2 $3\" == 'release create v0.2.1-rc.99' ]] && [[ \" $* \" != *' --repo hbhjt/vending-vision '* ]]; then\n"
+        "  git rev-parse --show-toplevel >&2\n"
+        "  exit 128\n"
+        "fi\n"
+        "printf '%s\\n' \"$*\" > \"$FAKE_GH_ARGS\"\n",
+        "utf-8",
+    )
+    fake_gh.chmod(0o755)
+    script = step["run"].split("\n", 2)[1]
+    completed = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+            "RELEASE_TAG": "v0.2.1-rc.99",
+            "RELEASE_TARGET": "a" * 40,
+            "FAKE_GH_ARGS": str(tmp_path / "gh-args"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    arguments = (tmp_path / "gh-args").read_text("utf-8")
+    assert (
+        "release create v0.2.1-rc.99 release/candidate.zip "
+        "--repo hbhjt/vending-vision"
+    ) in arguments
+    assert "--target " + "a" * 40 in arguments
+    assert "--prerelease --verify-tag" in arguments
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        "",
+        "--repo example/other ",
+    ),
+)
+def test_trust_policy_rejects_release_create_without_exact_repository_context(
+    tmp_path, replacement
+):
+    candidate = tmp_path / "publisher.yml"
+    candidate.write_text(
+        PUBLISHER.read_text("utf-8").replace(
+            "--repo hbhjt/vending-vision ", replacement, 1
+        ),
+        "utf-8",
+    )
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode != 0
+    assert "publisher_release_" in completed.stdout
+
+
 def test_publish_caller_pins_builder_a_and_directly_signs_only_verified_evidence():
     completed = _check_policy(PUBLISHER)
     assert completed.returncode == 0, completed.stdout + completed.stderr
