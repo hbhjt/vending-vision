@@ -21,6 +21,7 @@ ROOT = Path(__file__).parents[1]
 TRUSTED_PROOF = (
     ROOT / ".github" / "workflows" / "trusted-precutover-companion-proof.yml"
 )
+TRUSTED_CALLER = ROOT / ".github" / "workflows" / "trusted-precutover-caller.yml"
 COMPANION_BUILDER_COMMIT = "852ca005c5ce0fcdf7799f38d2335ae94c49be3c"
 BUILDER_CLOSURE = ROOT / "trusted-precutover-companion-builder-closure.json"
 BUILDER_CLOSURE_VERIFIER = ROOT / "scripts/verify_trusted_builder_closure.py"
@@ -42,6 +43,7 @@ MODEL_PART_INPUTS = {
     for field in ("url", "sha256", "bytes")
 }
 INPUTS |= MODEL_PART_INPUTS
+COMPANION_OUTPUT_ENVELOPE = "companion_builder_outputs"
 
 
 def test_trusted_windows_companion_proof_workflow_exists():
@@ -202,13 +204,15 @@ def test_builder_closure_rejects_import_and_spec_mutation_bypasses(
         verify_closure(root, manifest_path)
 
 
-def test_trusted_proof_has_closed_https_inputs_and_pins_companion_builder():
+def test_trusted_proof_has_closed_inputs_and_requires_the_builder_output_envelope():
     source = TRUSTED_PROOF.read_text("utf-8")
     match = re.search(
         r"(?ms)^  workflow_call:\n    inputs:\n(?P<body>.*?)(?=^    outputs:)", source
     )
     assert match is not None
-    assert set(re.findall(r"(?m)^      ([a-z][a-z0-9_]*):$", match.group("body"))) == INPUTS
+    assert set(re.findall(r"(?m)^      ([a-z][a-z0-9_]*):$", match.group("body"))) == (
+        INPUTS | {COMPANION_OUTPUT_ENVELOPE}
+    )
     workflow = load_workflow_yaml(source)
     inputs = workflow["on"]["workflow_call"]["inputs"]
     assert inputs["model_pack_url"]["required"] == "false"
@@ -216,14 +220,36 @@ def test_trusted_proof_has_closed_https_inputs_and_pins_companion_builder():
     assert inputs["model_pack_bytes"]["required"] == "true"
     for name in MODEL_PART_INPUTS:
         assert inputs[name]["required"] == "false"
-    assert (
-        "uses: hbhjt/vending-vision/.github/workflows/"
-        f"trusted-precutover-companion-builder.yml@{COMPANION_BUILDER_COMMIT}"
-    ) in source
+    assert inputs[COMPANION_OUTPUT_ENVELOPE]["required"] == "true"
+    assert inputs[COMPANION_OUTPUT_ENVELOPE]["type"] == "string"
+    assert "trusted-precutover-companion-builder.yml@" not in source
     assert "runs-on: windows-latest" in source
     assert "secrets:" not in source
     for forbidden in ("path_input", "command", "predicate", "worker_path", "artifact_path"):
         assert forbidden not in source
+
+
+def test_caller_builds_the_companion_before_the_flattened_proof_boundary():
+    caller = load_workflow_yaml(TRUSTED_CALLER.read_text("utf-8"))
+    proof = load_workflow_yaml(TRUSTED_PROOF.read_text("utf-8"))
+
+    assert set(proof["jobs"]) == {"execute", "sign", "verify"}
+    proof_inputs = proof["on"]["workflow_call"]["inputs"]
+    assert set(proof_inputs) == INPUTS | {COMPANION_OUTPUT_ENVELOPE}
+    assert "trusted-precutover-companion-builder.yml@" not in TRUSTED_PROOF.read_text(
+        "utf-8"
+    )
+
+    builder = caller["jobs"]["companion_builder"]
+    assert builder["uses"].endswith(
+        f"trusted-precutover-companion-builder.yml@{COMPANION_BUILDER_COMMIT}"
+    )
+    proof_call = caller["jobs"]["trusted_proof"]
+    assert proof_call["needs"] == "companion_builder"
+    assert set(proof_call["with"]) == INPUTS | {COMPANION_OUTPUT_ENVELOPE}
+    assert proof_call["with"][COMPANION_OUTPUT_ENVELOPE] == (
+        "${{ toJSON(needs.companion_builder.outputs) }}"
+    )
 
 
 def test_candidate_execution_job_has_no_oidc_or_attestation_write_capability():
@@ -247,7 +273,7 @@ def test_candidate_execution_job_has_no_oidc_or_attestation_write_capability():
     assert permissions.get("attestations") != "write"
 
     signing = jobs["sign"]
-    assert signing["needs"] == ["companion_builder", "execute"]
+    assert signing["needs"] == "execute"
     assert signing["permissions"]["id-token"] == "write"
     assert signing["permissions"]["attestations"] == "write"
 
@@ -369,7 +395,7 @@ def test_proof_and_fresh_verify_jobs_use_only_immutable_trusted_code_and_safe_en
     workflow = load_workflow_yaml(source)
     jobs = workflow["jobs"]
 
-    assert set(jobs) == {"companion_builder", "execute", "sign", "verify"}
+    assert set(jobs) == {"execute", "sign", "verify"}
     assert jobs["execute"]["runs-on"] == "windows-latest"
     assert jobs["sign"]["runs-on"] == "windows-latest"
     assert jobs["verify"]["runs-on"] == "windows-latest"
@@ -422,6 +448,23 @@ def _check_policy(workflow: Path) -> subprocess.CompletedProcess[str]:
 def test_trusted_proof_workflow_passes_executable_trust_policy():
     completed = _check_policy(TRUSTED_PROOF)
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_trusted_proof_policy_rejects_a_noncanonical_companion_output_envelope(
+    tmp_path,
+):
+    candidate = tmp_path / "noncanonical-companion-envelope.yml"
+    candidate.write_text(
+        TRUSTED_PROOF.read_text("utf-8").replace(
+            '"attestation_bundle_sha256"', '"unexpected_output"', 1
+        ),
+        "utf-8",
+    )
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode != 0
+    assert "trusted_proof_companion_output_envelope" in completed.stdout
 
 
 @pytest.mark.parametrize(
@@ -711,8 +754,13 @@ def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
     tmp_path,
 ):
     trusted = TRUSTED_PROOF.read_text("utf-8")
+
+    def mutate(old: str, new: str) -> str:
+        source = trusted.replace(old, new, 1)
+        assert source != trusted, old
+        return source
+
     execute_permission = """  execute:
-    needs: companion_builder
     runs-on: windows-latest
     environment: experimental-candidate
     timeout-minutes: 180
@@ -724,6 +772,7 @@ def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
         "      attestations: read\n",
         "      attestations: read\n      id-token: write\n",
     )
+    assert execute_with_oidc != execute_permission
     sign_execution_marker = (
         "      - name: Untrusted candidate execution mutation\n"
         "        shell: pwsh\n"
@@ -739,29 +788,35 @@ def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
         "          & $env:TRUSTED_PYTHON $candidateScript\n"
         "      - name: Download fixed execution handoff\n"
     )
-    raw_handoff = trusted.replace(
+    raw_handoff = mutate(
         "& $env:TRUSTED_PYTHON $proofTool verify-execution-handoff --directory execution-handoff --identity signer-proof-input-identity.json",
         "Get-Content -LiteralPath execution-handoff/precutover-ai-proof.json | Out-Null",
-        1,
     )
     sign_start = trusted.index("  sign:\n")
     verify_start = trusted.index("  verify:\n")
-    merged = trusted[:sign_start] + trusted[verify_start:].replace(
-        "      - companion_builder\n      - sign\n",
-        "      - companion_builder\n      - execute\n",
+    verify_tail = trusted[verify_start:]
+    merged_tail = verify_tail.replace(
+        "  verify:\n    needs: sign\n",
+        "  verify:\n    needs: execute\n",
         1,
     )
+    assert merged_tail != verify_tail
+    merged = trusted[:sign_start] + merged_tail
+    assert merged != trusted
     mutations = {
-        "candidate-execution-job-gains-oidc": trusted.replace(
-            execute_permission, execute_with_oidc, 1
+        "candidate-execution-job-gains-oidc": mutate(
+            execute_permission, execute_with_oidc
         ),
-        "signing-job-executes-candidate": trusted.replace(
-            "      - name: Download fixed execution handoff\n", sign_execution_marker, 1
+        "candidate-execution-job-restores-nested-builder": mutate(
+            "  execute:\n    runs-on: windows-latest\n",
+            "  execute:\n    needs: companion_builder\n    runs-on: windows-latest\n",
         ),
-        "signing-job-executes-arbitrary-python": trusted.replace(
+        "signing-job-executes-candidate": mutate(
+            "      - name: Download fixed execution handoff\n", sign_execution_marker
+        ),
+        "signing-job-executes-arbitrary-python": mutate(
             "      - name: Download fixed execution handoff\n",
             arbitrary_python_marker,
-            1,
         ),
         "signing-job-trusts-raw-handoff": raw_handoff,
         "execution-and-signing-jobs-merged": merged,

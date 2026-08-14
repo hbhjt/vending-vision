@@ -106,8 +106,24 @@ permissions:
   attestations: write
 
 jobs:
+  companion_builder:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-builder.yml@852ca005c5ce0fcdf7799f38d2335ae94c49be3c
+    with:
+      core_wheelhouse_url: ${{ vars.CORE_WHEELHOUSE_URL }}
+      core_wheelhouse_sha256: ${{ vars.CORE_WHEELHOUSE_SHA256 }}
+      core_wheelhouse_bytes: ${{ fromJSON(vars.CORE_WHEELHOUSE_BYTES) }}
+
   trusted_proof:
-    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-proof.yml@d9905980e666463e4f3072072b551773decd3cdd
+    needs: companion_builder
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: hbhjt/vending-vision/.github/workflows/trusted-precutover-companion-proof.yml@bd1ec7eb917710f0752fd615da5b639c1a4758d0
     with:
       candidate_archive_url: ${{ inputs.candidate_archive_url }}
       candidate_archive_sha256: ${{ inputs.candidate_archive_sha256 }}
@@ -133,3 +149,4 @@ jobs:
       model_pack_part_03_url: ${{ inputs.model_pack_part_03_url }}
       model_pack_part_03_sha256: ${{ inputs.model_pack_part_03_sha256 }}
       model_pack_part_03_bytes: ${{ inputs.model_pack_part_03_bytes }}
+      companion_builder_outputs: ${{ toJSON(needs.companion_builder.outputs) }}
