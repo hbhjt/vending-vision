@@ -170,7 +170,7 @@ def proof_for(identity: dict) -> dict:
         "companion": {
             "archiveSha256": "c" * 64,
             "descriptorSha256": "d" * 64,
-            "sourceCommit": "852ca005c5ce0fcdf7799f38d2335ae94c49be3c",
+            "sourceCommit": "274a411472bbded27da55a0b33d8f5627c6ef0f7",
         },
         "schemaVersion": "vending-vision-precutover-proof/v2",
     }
@@ -317,7 +317,7 @@ def test_execute_binds_verified_companion_and_builder_evidence_into_signed_proof
         identity,
         companion_archive_sha256="c" * 64,
         companion_descriptor_sha256="d" * 64,
-        companion_source_commit="852ca005c5ce0fcdf7799f38d2335ae94c49be3c",
+        companion_source_commit="274a411472bbded27da55a0b33d8f5627c6ef0f7",
         output=proof_path,
     )
 

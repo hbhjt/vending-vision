@@ -21,7 +21,7 @@ TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 WORKFLOW_PATH = ".github/workflows/trusted-precutover-companion-proof.yml"
 CALLER_WORKFLOW_PATH = ".github/workflows/trusted-precutover-caller.yml"
 COMPANION_BUILDER_PATH = ".github/workflows/trusted-precutover-companion-builder.yml"
-COMPANION_BUILDER_SHA = "852ca005c5ce0fcdf7799f38d2335ae94c49be3c"
+COMPANION_BUILDER_SHA = "274a411472bbded27da55a0b33d8f5627c6ef0f7"
 COMPANION_BUILDER_CLOSURE = "trusted-precutover-companion-builder-closure.json"
 COMPANION_BUILDER_CLOSURE_VERIFIER = "scripts/verify_trusted_builder_closure.py"
 CANDIDATE_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
@@ -643,7 +643,7 @@ def check(
         "scripts/download_verified_file.py",
         "inspect-inputs --input-root proof-input",
         "bind-execution-proof --source companion-report.json",
-        "--companion-source-commit \"852ca005c5ce0fcdf7799f38d2335ae94c49be3c\"",
+        f'--companion-source-commit "{COMPANION_BUILDER_SHA}"',
         "verify-proof --proof precutover-ai-proof.json",
         "+refs/heads/main:refs/remotes/origin/main",
         "--protected-main refs/remotes/origin/main",
