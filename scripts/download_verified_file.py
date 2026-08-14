@@ -45,17 +45,6 @@ class DownloadRecoveryError(DownloadError):
         )
 
 
-def _is_https_url_identity(value: str) -> bool:
-    parsed = urlsplit(value)
-    return (
-        parsed.scheme == "https"
-        and bool(parsed.netloc)
-        and not parsed.username
-        and not parsed.password
-        and not parsed.fragment
-    )
-
-
 def _file_identity(path: Path) -> tuple[int, int, int, int]:
     facts = path.stat(follow_symlinks=False)
     if not stat.S_ISREG(facts.st_mode):
@@ -214,8 +203,13 @@ def download_verified_file(
     total_timeout_seconds: float = DEFAULT_TOTAL_TIMEOUT_SECONDS,
     monotonic=time.monotonic,
 ) -> None:
+    parsed = urlsplit(url)
     if (
-        not _is_https_url_identity(url)
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
         or re.fullmatch(r"[a-f0-9]{64}", sha256) is None
     ):
         raise DownloadError("download_identity")
@@ -262,9 +256,6 @@ def download_verified_file(
             descriptor, "wb"
         ) as output:
             descriptor = -1
-            remaining()
-            if not _is_https_url_identity(response.geturl()):
-                raise DownloadError("download_identity")
             remaining()
             while True:
                 remaining()

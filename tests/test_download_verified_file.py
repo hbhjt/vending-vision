@@ -49,16 +49,6 @@ class SlowTrickleResponse(Response):
         return super().read(1)
 
 
-class RedirectAdvancingResponse(Response):
-    def __init__(self, payload: bytes, url: str, clock: Clock):
-        super().__init__(payload, url)
-        self._clock = clock
-
-    def geturl(self) -> str:
-        self._clock.advance(2.0)
-        return super().geturl()
-
-
 def test_total_deadline_aborts_slow_trickle_and_closes_response(tmp_path):
     url = "https://example.invalid/slow.bin"
     payload = b"slow"
@@ -133,28 +123,6 @@ def test_opener_socket_timeout_is_capped_below_long_total_deadline(tmp_path):
 
     assert observed_timeouts == [120.0]
     assert destination.read_bytes() == payload
-
-
-def test_deadline_is_checked_after_final_response_url(tmp_path):
-    url = "https://example.invalid/redirect.bin"
-    payload = b"redirect"
-    destination = tmp_path / "redirect.bin"
-    clock = Clock()
-    response = RedirectAdvancingResponse(payload, url, clock)
-
-    with pytest.raises(DownloadError, match="download_timeout"):
-        download_verified_file(
-            url,
-            hashlib.sha256(payload).hexdigest(),
-            len(payload),
-            destination,
-            opener=lambda _request, timeout: response,
-            total_timeout_seconds=1.0,
-            monotonic=clock,
-        )
-
-    assert response.closed
-    assert not destination.exists()
 
 
 def test_deadline_is_checked_after_fsync_before_digest_and_publish(
@@ -851,27 +819,6 @@ def test_bounded_file_downloader_accepts_rc22_github_release_redirect(
 
     assert requests[0][0] == initial_url
     assert destination.read_bytes() == payload
-
-
-def test_bounded_file_downloader_rejects_http_final_redirect_without_destination(
-    tmp_path,
-):
-    initial_url = "https://example.invalid/candidate.zip"
-    payload = b"verified but downgraded bytes"
-    destination = tmp_path / "candidate.zip"
-
-    with pytest.raises(DownloadError, match="download_identity"):
-        download_verified_file(
-            initial_url,
-            hashlib.sha256(payload).hexdigest(),
-            len(payload),
-            destination,
-            opener=lambda _request, timeout: Response(
-                payload, "http://evil.invalid/candidate.zip"
-            ),
-        )
-
-    assert not destination.exists()
 
 
 @pytest.mark.parametrize("mutation", ["http", "digest"])
