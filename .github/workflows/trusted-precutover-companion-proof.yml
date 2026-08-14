@@ -3,102 +3,10 @@ name: Trusted Windows pre-cutover companion proof
 on:
   workflow_call:
     inputs:
-      candidate_archive_url:
-        description: Immutable HTTPS URL for the attested Windows candidate ZIP
+      proof_inputs:
+        description: Exact JSON envelope containing the 24 proof data identities
         required: true
         type: string
-      candidate_archive_sha256:
-        description: Exact candidate ZIP SHA-256
-        required: true
-        type: string
-      candidate_archive_bytes:
-        description: Exact candidate ZIP byte size
-        required: true
-        type: number
-      candidate_manifest_url:
-        description: Immutable HTTPS URL for the canonical candidate manifest
-        required: true
-        type: string
-      candidate_manifest_sha256:
-        description: Exact candidate manifest SHA-256
-        required: true
-        type: string
-      candidate_manifest_bytes:
-        description: Exact candidate manifest byte size
-        required: true
-        type: number
-      candidate_attestation_url:
-        description: Immutable HTTPS URL for the candidate GitHub attestation bundle
-        required: true
-        type: string
-      candidate_attestation_sha256:
-        description: Exact candidate attestation bundle SHA-256
-        required: true
-        type: string
-      candidate_attestation_bytes:
-        description: Exact candidate attestation bundle byte size
-        required: true
-        type: number
-      candidate_evidence_url:
-        description: Immutable HTTPS URL for canonical trusted-builder evidence
-        required: true
-        type: string
-      candidate_evidence_sha256:
-        description: Exact trusted-builder evidence SHA-256
-        required: true
-        type: string
-      candidate_evidence_bytes:
-        description: Exact trusted-builder evidence byte size
-        required: true
-        type: number
-      model_pack_url:
-        description: Immutable HTTPS URL for the official model-pack ZIP
-        required: false
-        type: string
-      model_pack_sha256:
-        description: Exact official model-pack ZIP SHA-256
-        required: true
-        type: string
-      model_pack_bytes:
-        description: Exact official model-pack ZIP byte size
-        required: true
-        type: number
-      model_pack_part_01_url:
-        description: Immutable HTTPS URL for official model-pack ZIP part 01
-        required: false
-        type: string
-      model_pack_part_01_sha256:
-        description: Exact SHA-256 for official model-pack ZIP part 01
-        required: false
-        type: string
-      model_pack_part_01_bytes:
-        description: Exact byte size for official model-pack ZIP part 01
-        required: false
-        type: number
-      model_pack_part_02_url:
-        description: Immutable HTTPS URL for official model-pack ZIP part 02
-        required: false
-        type: string
-      model_pack_part_02_sha256:
-        description: Exact SHA-256 for official model-pack ZIP part 02
-        required: false
-        type: string
-      model_pack_part_02_bytes:
-        description: Exact byte size for official model-pack ZIP part 02
-        required: false
-        type: number
-      model_pack_part_03_url:
-        description: Immutable HTTPS URL for official model-pack ZIP part 03
-        required: false
-        type: string
-      model_pack_part_03_sha256:
-        description: Exact SHA-256 for official model-pack ZIP part 03
-        required: false
-        type: string
-      model_pack_part_03_bytes:
-        description: Exact byte size for official model-pack ZIP part 03
-        required: false
-        type: number
       companion_builder_outputs:
         description: Exact JSON output envelope from the immutable companion builder
         required: true
@@ -127,7 +35,32 @@ permissions:
   contents: read
 
 jobs:
+  admit_inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      proof_inputs: ${{ steps.admit.outputs.proof_inputs }}
+      companion_builder_outputs: ${{ steps.admit.outputs.companion_builder_outputs }}
+    steps:
+      - name: Checkout immutable trusted input admission
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: trusted-proof
+          persist-credentials: false
+      - name: Admit only exact canonical proof envelopes
+        id: admit
+        env:
+          RAW_PROOF_INPUTS: ${{ inputs.proof_inputs }}
+          RAW_COMPANION_BUILDER_OUTPUTS: ${{ inputs.companion_builder_outputs }}
+        run: |
+          python -I trusted-proof/scripts/admit_trusted_precutover_inputs.py --proof-inputs-env RAW_PROOF_INPUTS --companion-builder-outputs-env RAW_COMPANION_BUILDER_OUTPUTS --github-output "$GITHUB_OUTPUT"
+
   execute:
+    needs: admit_inputs
     runs-on: windows-latest
     environment: experimental-candidate
     timeout-minutes: 180
@@ -158,7 +91,7 @@ jobs:
       - name: Parse exact caller-built companion output envelope
         shell: pwsh
         env:
-          COMPANION_BUILDER_OUTPUTS: ${{ inputs.companion_builder_outputs }}
+          COMPANION_BUILDER_OUTPUTS: ${{ needs.admit_inputs.outputs.companion_builder_outputs }}
         run: |
           try { $outputs = $env:COMPANION_BUILDER_OUTPUTS | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "companion builder output envelope is invalid JSON" }
           $required = @("artifact_name", "archive_file", "archive_sha256", "descriptor_file", "descriptor_sha256", "attestation_bundle_file", "attestation_bundle_sha256")
@@ -216,30 +149,30 @@ jobs:
       - name: Bounded-download exact candidate and official model inputs
         shell: pwsh
         env:
-          CANDIDATE_ARCHIVE_URL: ${{ inputs.candidate_archive_url }}
-          CANDIDATE_ARCHIVE_SHA256: ${{ inputs.candidate_archive_sha256 }}
-          CANDIDATE_ARCHIVE_BYTES: ${{ inputs.candidate_archive_bytes }}
-          CANDIDATE_MANIFEST_URL: ${{ inputs.candidate_manifest_url }}
-          CANDIDATE_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
-          CANDIDATE_MANIFEST_BYTES: ${{ inputs.candidate_manifest_bytes }}
-          CANDIDATE_ATTESTATION_URL: ${{ inputs.candidate_attestation_url }}
-          CANDIDATE_ATTESTATION_SHA256: ${{ inputs.candidate_attestation_sha256 }}
-          CANDIDATE_ATTESTATION_BYTES: ${{ inputs.candidate_attestation_bytes }}
-          CANDIDATE_EVIDENCE_URL: ${{ inputs.candidate_evidence_url }}
-          CANDIDATE_EVIDENCE_SHA256: ${{ inputs.candidate_evidence_sha256 }}
-          CANDIDATE_EVIDENCE_BYTES: ${{ inputs.candidate_evidence_bytes }}
-          MODEL_PACK_URL: ${{ inputs.model_pack_url }}
-          MODEL_PACK_SHA256: ${{ inputs.model_pack_sha256 }}
-          MODEL_PACK_BYTES: ${{ inputs.model_pack_bytes }}
-          MODEL_PACK_PART_01_URL: ${{ inputs.model_pack_part_01_url }}
-          MODEL_PACK_PART_01_SHA256: ${{ inputs.model_pack_part_01_sha256 }}
-          MODEL_PACK_PART_01_BYTES: ${{ inputs.model_pack_part_01_bytes }}
-          MODEL_PACK_PART_02_URL: ${{ inputs.model_pack_part_02_url }}
-          MODEL_PACK_PART_02_SHA256: ${{ inputs.model_pack_part_02_sha256 }}
-          MODEL_PACK_PART_02_BYTES: ${{ inputs.model_pack_part_02_bytes }}
-          MODEL_PACK_PART_03_URL: ${{ inputs.model_pack_part_03_url }}
-          MODEL_PACK_PART_03_SHA256: ${{ inputs.model_pack_part_03_sha256 }}
-          MODEL_PACK_PART_03_BYTES: ${{ inputs.model_pack_part_03_bytes }}
+          CANDIDATE_ARCHIVE_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_archive_url }}
+          CANDIDATE_ARCHIVE_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_archive_sha256 }}
+          CANDIDATE_ARCHIVE_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_archive_bytes }}
+          CANDIDATE_MANIFEST_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_manifest_url }}
+          CANDIDATE_MANIFEST_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_manifest_sha256 }}
+          CANDIDATE_MANIFEST_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_manifest_bytes }}
+          CANDIDATE_ATTESTATION_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_attestation_url }}
+          CANDIDATE_ATTESTATION_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_attestation_sha256 }}
+          CANDIDATE_ATTESTATION_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_attestation_bytes }}
+          CANDIDATE_EVIDENCE_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_evidence_url }}
+          CANDIDATE_EVIDENCE_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_evidence_sha256 }}
+          CANDIDATE_EVIDENCE_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_evidence_bytes }}
+          MODEL_PACK_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_url }}
+          MODEL_PACK_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_sha256 }}
+          MODEL_PACK_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_bytes }}
+          MODEL_PACK_PART_01_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_01_url }}
+          MODEL_PACK_PART_01_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_01_sha256 }}
+          MODEL_PACK_PART_01_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_01_bytes }}
+          MODEL_PACK_PART_02_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_02_url }}
+          MODEL_PACK_PART_02_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_02_sha256 }}
+          MODEL_PACK_PART_02_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_02_bytes }}
+          MODEL_PACK_PART_03_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_03_url }}
+          MODEL_PACK_PART_03_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_03_sha256 }}
+          MODEL_PACK_PART_03_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_03_bytes }}
         run: |
           New-Item -ItemType Directory -Path proof-input/candidate -Force | Out-Null
           New-Item -ItemType Directory -Path proof-input/model -Force | Out-Null
@@ -359,7 +292,7 @@ jobs:
           retention-days: 1
 
   sign:
-    needs: execute
+    needs: [admit_inputs, execute]
     runs-on: windows-latest
     environment: experimental-candidate
     timeout-minutes: 180
@@ -393,7 +326,7 @@ jobs:
       - name: Parse exact caller-built companion output envelope
         shell: pwsh
         env:
-          COMPANION_BUILDER_OUTPUTS: ${{ inputs.companion_builder_outputs }}
+          COMPANION_BUILDER_OUTPUTS: ${{ needs.admit_inputs.outputs.companion_builder_outputs }}
         run: |
           try { $outputs = $env:COMPANION_BUILDER_OUTPUTS | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "companion builder output envelope is invalid JSON" }
           $required = @("artifact_name", "archive_file", "archive_sha256", "descriptor_file", "descriptor_sha256", "attestation_bundle_file", "attestation_bundle_sha256")
@@ -460,30 +393,30 @@ jobs:
       - name: Fresh bounded-download candidate and model data for signing
         shell: pwsh
         env:
-          CANDIDATE_ARCHIVE_URL: ${{ inputs.candidate_archive_url }}
-          CANDIDATE_ARCHIVE_SHA256: ${{ inputs.candidate_archive_sha256 }}
-          CANDIDATE_ARCHIVE_BYTES: ${{ inputs.candidate_archive_bytes }}
-          CANDIDATE_MANIFEST_URL: ${{ inputs.candidate_manifest_url }}
-          CANDIDATE_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
-          CANDIDATE_MANIFEST_BYTES: ${{ inputs.candidate_manifest_bytes }}
-          CANDIDATE_ATTESTATION_URL: ${{ inputs.candidate_attestation_url }}
-          CANDIDATE_ATTESTATION_SHA256: ${{ inputs.candidate_attestation_sha256 }}
-          CANDIDATE_ATTESTATION_BYTES: ${{ inputs.candidate_attestation_bytes }}
-          CANDIDATE_EVIDENCE_URL: ${{ inputs.candidate_evidence_url }}
-          CANDIDATE_EVIDENCE_SHA256: ${{ inputs.candidate_evidence_sha256 }}
-          CANDIDATE_EVIDENCE_BYTES: ${{ inputs.candidate_evidence_bytes }}
-          MODEL_PACK_URL: ${{ inputs.model_pack_url }}
-          MODEL_PACK_SHA256: ${{ inputs.model_pack_sha256 }}
-          MODEL_PACK_BYTES: ${{ inputs.model_pack_bytes }}
-          MODEL_PACK_PART_01_URL: ${{ inputs.model_pack_part_01_url }}
-          MODEL_PACK_PART_01_SHA256: ${{ inputs.model_pack_part_01_sha256 }}
-          MODEL_PACK_PART_01_BYTES: ${{ inputs.model_pack_part_01_bytes }}
-          MODEL_PACK_PART_02_URL: ${{ inputs.model_pack_part_02_url }}
-          MODEL_PACK_PART_02_SHA256: ${{ inputs.model_pack_part_02_sha256 }}
-          MODEL_PACK_PART_02_BYTES: ${{ inputs.model_pack_part_02_bytes }}
-          MODEL_PACK_PART_03_URL: ${{ inputs.model_pack_part_03_url }}
-          MODEL_PACK_PART_03_SHA256: ${{ inputs.model_pack_part_03_sha256 }}
-          MODEL_PACK_PART_03_BYTES: ${{ inputs.model_pack_part_03_bytes }}
+          CANDIDATE_ARCHIVE_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_archive_url }}
+          CANDIDATE_ARCHIVE_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_archive_sha256 }}
+          CANDIDATE_ARCHIVE_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_archive_bytes }}
+          CANDIDATE_MANIFEST_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_manifest_url }}
+          CANDIDATE_MANIFEST_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_manifest_sha256 }}
+          CANDIDATE_MANIFEST_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_manifest_bytes }}
+          CANDIDATE_ATTESTATION_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_attestation_url }}
+          CANDIDATE_ATTESTATION_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_attestation_sha256 }}
+          CANDIDATE_ATTESTATION_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_attestation_bytes }}
+          CANDIDATE_EVIDENCE_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_evidence_url }}
+          CANDIDATE_EVIDENCE_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_evidence_sha256 }}
+          CANDIDATE_EVIDENCE_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).candidate_evidence_bytes }}
+          MODEL_PACK_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_url }}
+          MODEL_PACK_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_sha256 }}
+          MODEL_PACK_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_bytes }}
+          MODEL_PACK_PART_01_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_01_url }}
+          MODEL_PACK_PART_01_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_01_sha256 }}
+          MODEL_PACK_PART_01_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_01_bytes }}
+          MODEL_PACK_PART_02_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_02_url }}
+          MODEL_PACK_PART_02_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_02_sha256 }}
+          MODEL_PACK_PART_02_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_02_bytes }}
+          MODEL_PACK_PART_03_URL: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_03_url }}
+          MODEL_PACK_PART_03_SHA256: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_03_sha256 }}
+          MODEL_PACK_PART_03_BYTES: ${{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_03_bytes }}
         run: |
           New-Item -ItemType Directory -Path signer-proof-input/candidate -Force | Out-Null
           New-Item -ItemType Directory -Path signer-proof-input/model -Force | Out-Null
@@ -607,7 +540,7 @@ jobs:
           retention-days: 1
 
   verify:
-    needs: sign
+    needs: [admit_inputs, sign]
     runs-on: windows-latest
     timeout-minutes: 30
     permissions:
@@ -634,7 +567,7 @@ jobs:
       - name: Parse exact caller-built companion output envelope
         shell: pwsh
         env:
-          COMPANION_BUILDER_OUTPUTS: ${{ inputs.companion_builder_outputs }}
+          COMPANION_BUILDER_OUTPUTS: ${{ needs.admit_inputs.outputs.companion_builder_outputs }}
         run: |
           try { $outputs = $env:COMPANION_BUILDER_OUTPUTS | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "companion builder output envelope is invalid JSON" }
           $required = @("artifact_name", "archive_file", "archive_sha256", "descriptor_file", "descriptor_sha256", "attestation_bundle_file", "attestation_bundle_sha256")

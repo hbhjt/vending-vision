@@ -27,7 +27,7 @@ CANDIDATE_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
 CANDIDATE_BUILDER_SHA = "691b5056e8b9bf2667bc527b2170780b05863946"
 CANONICAL_GH_PATH = r"c:\program files\github cli\gh.exe"
 HOSTED_AUTHORITY_SHA = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
-INPUTS = {
+PROOF_DATA_INPUTS = {
     f"{name}_{field}"
     for name in (
         "candidate_archive",
@@ -43,10 +43,10 @@ MODEL_PART_INPUTS = {
     for index in range(1, 4)
     for field in ("url", "sha256", "bytes")
 }
-INPUTS |= MODEL_PART_INPUTS
+PROOF_DATA_INPUTS |= MODEL_PART_INPUTS
+PROOF_INPUT_ENVELOPE = "proof_inputs"
 COMPANION_OUTPUT_ENVELOPE = "companion_builder_outputs"
-INPUTS.add(COMPANION_OUTPUT_ENVELOPE)
-REQUIRED_INPUTS = INPUTS - {"model_pack_url", *MODEL_PART_INPUTS}
+INPUTS = {PROOF_INPUT_ENVELOPE, COMPANION_OUTPUT_ENVELOPE}
 OUTPUTS = {
     "artifact_name",
     "proof_sha256",
@@ -223,9 +223,8 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         _require(
             isinstance(descriptor, dict)
             and set(descriptor) == {"description", "required", "type"}
-            and descriptor["required"]
-            == ("true" if name in REQUIRED_INPUTS else "false")
-            and descriptor["type"] == ("number" if name.endswith("_bytes") else "string"),
+            and descriptor["required"] == "true"
+            and descriptor["type"] == "string",
             f"trusted_proof_input_contract:{name}",
         )
     outputs = call.get("outputs")
@@ -236,29 +235,30 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     jobs = workflow.get("jobs")
     _require(
         isinstance(jobs, dict)
-        and set(jobs) == {"execute", "sign", "verify"},
+        and set(jobs) == {"admit_inputs", "execute", "sign", "verify"},
         "trusted_proof_job_set",
     )
     for run in workflow_run_scalars(source):
         _require("${{" not in run, "trusted_proof_workflow_expression_in_run")
     input_lines = [line.strip() for line in source.splitlines() if "${{ inputs." in line]
-    _require(bool(input_lines), "trusted_proof_input_env_missing")
     _require(
-        all(
-            re.fullmatch(
-                r"[A-Z][A-Z0-9_]*: \$\{\{ inputs\.[a-z][a-z0-9_]* \}\}", line
-            )
-            for line in input_lines
+        sorted(input_lines)
+        == sorted(
+            [
+                "RAW_PROOF_INPUTS: ${{ inputs.proof_inputs }}",
+                "RAW_COMPANION_BUILDER_OUTPUTS: ${{ inputs.companion_builder_outputs }}",
+            ]
         ),
-        "trusted_proof_input_not_step_env",
+        "trusted_proof_raw_input_boundary",
     )
     companion_keys = (
         '"artifact_name", "archive_file", "archive_sha256", "descriptor_file", '
         '"descriptor_sha256", "attestation_bundle_file", "attestation_bundle_sha256"'
     )
     _require(
-        source.count("COMPANION_BUILDER_OUTPUTS: ${{ inputs.companion_builder_outputs }}")
-        == 3
+        source.count("RAW_COMPANION_BUILDER_OUTPUTS: ${{ inputs.companion_builder_outputs }}")
+        == 1
+        and source.count("COMPANION_BUILDER_OUTPUTS: ${{ needs.admit_inputs.outputs.companion_builder_outputs }}") == 3
         and source.count("ConvertFrom-Json -AsHashtable -ErrorAction Stop") == 3
         and source.count(companion_keys) == 3
         and source.count("companion builder output envelope key set is invalid") == 3,
@@ -338,16 +338,26 @@ def check(workflow_path: Path, repository_root: Path) -> None:
             f"trusted_proof_builder_closure_digest:{item['path']}",
         )
 
+    admit = _job_block(source, "admit_inputs")
     execute = _job_block(source, "execute")
     sign = _job_block(source, "sign")
     verify = _job_block(source, "verify")
+    _require(admit.count("runs-on: ubuntu-latest") == 1, "trusted_proof_admit_runner")
     _require(
         execute.count("runs-on: windows-latest") == 1,
         "trusted_proof_execute_runner",
     )
     _require(sign.count("runs-on: windows-latest") == 1, "trusted_proof_sign_runner")
     _require(verify.count("runs-on: windows-latest") == 1, "trusted_proof_verify_runner")
-    _require(source.count("actions/checkout@v4") == 5, "trusted_proof_checkout_count")
+    _require(source.count("actions/checkout@v4") == 6, "trusted_proof_checkout_count")
+    for fragment in (
+        "repository: ${{ job.workflow_repository }}",
+        "ref: ${{ job.workflow_sha }}",
+        "path: trusted-proof",
+        "persist-credentials: false",
+        "scripts/admit_trusted_precutover_inputs.py",
+    ):
+        _require(fragment in admit, f"trusted_proof_admit:{fragment}")
     for block, label in (
         (execute, "execute"),
         (sign, "sign"),
@@ -376,7 +386,15 @@ def check(workflow_path: Path, repository_root: Path) -> None:
     _require(isinstance(signing_job, dict), "trusted_proof_sign_shape")
     execution_permissions = execution_job.get("permissions")
     signing_permissions = signing_job.get("permissions")
-    _require("needs" not in execution_job, "trusted_proof_execute_needs")
+    admission_job = jobs["admit_inputs"]
+    _require(
+        isinstance(admission_job, dict)
+        and admission_job.get("permissions") == {"contents": "read"}
+        and admission_job.get("timeout-minutes") == "5"
+        and set(admission_job.get("outputs", {})) == INPUTS,
+        "trusted_proof_admit_minimal",
+    )
+    _require(execution_job.get("needs") == "admit_inputs", "trusted_proof_execute_needs")
     _require(
         isinstance(execution_permissions, dict)
         and "id-token" not in execution_permissions
@@ -389,14 +407,17 @@ def check(workflow_path: Path, repository_root: Path) -> None:
         and signing_permissions.get("attestations") == "write",
         "trusted_proof_sign_privilege",
     )
-    _require(signing_job.get("needs") == "execute", "trusted_proof_sign_needs_execute")
+    _require(
+        signing_job.get("needs") == "[admit_inputs, execute]",
+        "trusted_proof_sign_needs_execute",
+    )
     verify_job = jobs["verify"]
     _require(
         isinstance(verify_job, dict)
-        and verify_job.get("needs") == "sign",
+        and verify_job.get("needs") == "[admit_inputs, sign]",
         "trusted_proof_verify_needs_sign",
     )
-    for name, expected_timeout in {"execute": 180, "sign": 180, "verify": 30}.items():
+    for name, expected_timeout in {"admit_inputs": 5, "execute": 180, "sign": 180, "verify": 30}.items():
         _require(
             jobs[name].get("timeout-minutes") == str(expected_timeout)
             and _job_block(source, name).count(
@@ -446,10 +467,10 @@ def check(workflow_path: Path, repository_root: Path) -> None:
             env = f"MODEL_PACK_PART_{index:02d}"
             part = f"official-model-pack.part{index:02d}"
             _require(
-                f"{env}_URL: ${{{{ inputs.model_pack_part_{index:02d}_url }}}}" in block
-                and f"{env}_SHA256: ${{{{ inputs.model_pack_part_{index:02d}_sha256 }}}}"
+                f"{env}_URL: ${{{{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_{index:02d}_url }}}}" in block
+                and f"{env}_SHA256: ${{{{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_{index:02d}_sha256 }}}}"
                 in block
-                and f"{env}_BYTES: ${{{{ inputs.model_pack_part_{index:02d}_bytes }}}}"
+                and f"{env}_BYTES: ${{{{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_{index:02d}_bytes }}}}"
                 in block
                 and f"@($env:{env}_URL, $env:{env}_SHA256, $env:{env}_BYTES, \"{root}/model-parts/{part}\")"
                 in block

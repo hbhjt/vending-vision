@@ -21,7 +21,6 @@ ROOT = Path(__file__).parents[1]
 TRUSTED_PROOF = (
     ROOT / ".github" / "workflows" / "trusted-precutover-companion-proof.yml"
 )
-TRUSTED_CALLER = ROOT / ".github" / "workflows" / "trusted-precutover-caller.yml"
 COMPANION_BUILDER_COMMIT = "852ca005c5ce0fcdf7799f38d2335ae94c49be3c"
 BUILDER_CLOSURE = ROOT / "trusted-precutover-companion-builder-closure.json"
 BUILDER_CLOSURE_VERIFIER = ROOT / "scripts/verify_trusted_builder_closure.py"
@@ -44,6 +43,7 @@ MODEL_PART_INPUTS = {
 }
 INPUTS |= MODEL_PART_INPUTS
 COMPANION_OUTPUT_ENVELOPE = "companion_builder_outputs"
+PROOF_INPUT_ENVELOPE = "proof_inputs"
 
 
 def test_trusted_windows_companion_proof_workflow_exists():
@@ -211,17 +211,15 @@ def test_trusted_proof_has_closed_inputs_and_requires_the_builder_output_envelop
     )
     assert match is not None
     assert set(re.findall(r"(?m)^      ([a-z][a-z0-9_]*):$", match.group("body"))) == (
-        INPUTS | {COMPANION_OUTPUT_ENVELOPE}
+        {PROOF_INPUT_ENVELOPE, COMPANION_OUTPUT_ENVELOPE}
     )
     workflow = load_workflow_yaml(source)
     inputs = workflow["on"]["workflow_call"]["inputs"]
-    assert inputs["model_pack_url"]["required"] == "false"
-    assert inputs["model_pack_sha256"]["required"] == "true"
-    assert inputs["model_pack_bytes"]["required"] == "true"
-    for name in MODEL_PART_INPUTS:
-        assert inputs[name]["required"] == "false"
-    assert inputs[COMPANION_OUTPUT_ENVELOPE]["required"] == "true"
-    assert inputs[COMPANION_OUTPUT_ENVELOPE]["type"] == "string"
+    assert set(inputs) == {PROOF_INPUT_ENVELOPE, COMPANION_OUTPUT_ENVELOPE}
+    assert all(
+        descriptor["required"] == "true" and descriptor["type"] == "string"
+        for descriptor in inputs.values()
+    )
     assert "trusted-precutover-companion-builder.yml@" not in source
     assert "runs-on: windows-latest" in source
     assert "secrets:" not in source
@@ -229,27 +227,39 @@ def test_trusted_proof_has_closed_inputs_and_requires_the_builder_output_envelop
         assert forbidden not in source
 
 
-def test_caller_builds_the_companion_before_the_flattened_proof_boundary():
-    caller = load_workflow_yaml(TRUSTED_CALLER.read_text("utf-8"))
+def test_proof_boundary_accepts_only_the_two_admitted_envelopes():
     proof = load_workflow_yaml(TRUSTED_PROOF.read_text("utf-8"))
 
-    assert set(proof["jobs"]) == {"execute", "sign", "verify"}
+    assert set(proof["jobs"]) == {"admit_inputs", "execute", "sign", "verify"}
     proof_inputs = proof["on"]["workflow_call"]["inputs"]
-    assert set(proof_inputs) == INPUTS | {COMPANION_OUTPUT_ENVELOPE}
+    assert set(proof_inputs) == {PROOF_INPUT_ENVELOPE, COMPANION_OUTPUT_ENVELOPE}
     assert "trusted-precutover-companion-builder.yml@" not in TRUSTED_PROOF.read_text(
         "utf-8"
     )
 
-    builder = caller["jobs"]["companion_builder"]
-    assert builder["uses"].endswith(
-        f"trusted-precutover-companion-builder.yml@{COMPANION_BUILDER_COMMIT}"
-    )
-    proof_call = caller["jobs"]["trusted_proof"]
-    assert proof_call["needs"] == "companion_builder"
-    assert set(proof_call["with"]) == INPUTS | {COMPANION_OUTPUT_ENVELOPE}
-    assert proof_call["with"][COMPANION_OUTPUT_ENVELOPE] == (
-        "${{ toJSON(needs.companion_builder.outputs) }}"
-    )
+def test_proof_admission_is_the_only_raw_input_consumer_and_gates_every_job():
+    source = TRUSTED_PROOF.read_text("utf-8")
+    workflow = load_workflow_yaml(source)
+    admission = workflow["jobs"]["admit_inputs"]
+    assert admission["runs-on"] == "ubuntu-latest"
+    assert admission["timeout-minutes"] == "5"
+    assert admission["permissions"] == {"contents": "read"}
+    assert set(admission["outputs"]) == {
+        PROOF_INPUT_ENVELOPE,
+        COMPANION_OUTPUT_ENVELOPE,
+    }
+    for raw in (
+        "${{ inputs.proof_inputs }}",
+        "${{ inputs.companion_builder_outputs }}",
+    ):
+        assert source.count(raw) == 1
+        assert raw in str(admission)
+    assert workflow["jobs"]["execute"]["needs"] == "admit_inputs"
+    assert workflow["jobs"]["sign"]["needs"] == "[admit_inputs, execute]"
+    assert workflow["jobs"]["verify"]["needs"] == "[admit_inputs, sign]"
+    downstream = source[source.index("  execute:\n") :]
+    assert "${{ inputs." not in downstream
+    assert downstream.count("fromJSON(needs.admit_inputs.outputs.proof_inputs)") == 48
 
 
 def test_candidate_execution_job_has_no_oidc_or_attestation_write_capability():
@@ -273,7 +283,7 @@ def test_candidate_execution_job_has_no_oidc_or_attestation_write_capability():
     assert permissions.get("attestations") != "write"
 
     signing = jobs["sign"]
-    assert signing["needs"] == "execute"
+    assert signing["needs"] == "[admit_inputs, execute]"
     assert signing["permissions"]["id-token"] == "write"
     assert signing["permissions"]["attestations"] == "write"
 
@@ -395,12 +405,13 @@ def test_proof_and_fresh_verify_jobs_use_only_immutable_trusted_code_and_safe_en
     workflow = load_workflow_yaml(source)
     jobs = workflow["jobs"]
 
-    assert set(jobs) == {"execute", "sign", "verify"}
+    assert set(jobs) == {"admit_inputs", "execute", "sign", "verify"}
+    assert jobs["admit_inputs"]["runs-on"] == "ubuntu-latest"
     assert jobs["execute"]["runs-on"] == "windows-latest"
     assert jobs["sign"]["runs-on"] == "windows-latest"
     assert jobs["verify"]["runs-on"] == "windows-latest"
-    assert source.count("repository: ${{ job.workflow_repository }}") == 3
-    assert source.count("ref: ${{ job.workflow_sha }}") == 3
+    assert source.count("repository: ${{ job.workflow_repository }}") == 4
+    assert source.count("ref: ${{ job.workflow_sha }}") == 4
     assert "path: source" not in source
     assert "ref: ${{ github.sha }}" not in source
     assert "actions/checkout@v4" in source
@@ -691,7 +702,7 @@ def test_trusted_proof_policy_rejects_mutable_authority_and_execution_bypasses(t
         ),
         "raw-input-expression": trusted.replace(
             "run: |\n          if ($env:TRUSTED_WORKFLOW_REPOSITORY",
-            'run: |\n          Write-Output "${{ inputs.candidate_archive_url }}"\n'
+            'run: |\n          Write-Output "${{ inputs.proof_inputs }}"\n'
             "          if ($env:TRUSTED_WORKFLOW_REPOSITORY",
             1,
         ),
@@ -761,6 +772,7 @@ def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
         return source
 
     execute_permission = """  execute:
+    needs: admit_inputs
     runs-on: windows-latest
     environment: experimental-candidate
     timeout-minutes: 180
@@ -796,8 +808,8 @@ def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
     verify_start = trusted.index("  verify:\n")
     verify_tail = trusted[verify_start:]
     merged_tail = verify_tail.replace(
-        "  verify:\n    needs: sign\n",
-        "  verify:\n    needs: execute\n",
+        "  verify:\n    needs: [admit_inputs, sign]\n",
+        "  verify:\n    needs: [admit_inputs, execute]\n",
         1,
     )
     assert merged_tail != verify_tail
@@ -808,7 +820,7 @@ def test_trusted_proof_policy_rejects_privilege_and_cross_job_trust_regressions(
             execute_permission, execute_with_oidc
         ),
         "candidate-execution-job-restores-nested-builder": mutate(
-            "  execute:\n    runs-on: windows-latest\n",
+            "  execute:\n    needs: admit_inputs\n    runs-on: windows-latest\n",
             "  execute:\n    needs: companion_builder\n    runs-on: windows-latest\n",
         ),
         "signing-job-executes-candidate": mutate(
@@ -839,7 +851,7 @@ def test_trusted_proof_policy_rejects_missing_mutable_or_zero_deadlines(tmp_path
         ),
         "expression-verify-job-timeout": trusted.replace(
             "    timeout-minutes: 30\n",
-            "    timeout-minutes: ${{ inputs.model_pack_bytes }}\n",
+            "    timeout-minutes: ${{ inputs.proof_inputs }}\n",
             1,
         ),
         "missing-download-total-timeout": trusted.replace(
@@ -850,7 +862,7 @@ def test_trusted_proof_policy_rejects_missing_mutable_or_zero_deadlines(tmp_path
         ),
         "expression-download-total-timeout": trusted.replace(
             "--total-timeout-seconds 1800",
-            "--total-timeout-seconds ${{ inputs.model_pack_bytes }}",
+            "--total-timeout-seconds ${{ inputs.proof_inputs }}",
             1,
         ),
     }
