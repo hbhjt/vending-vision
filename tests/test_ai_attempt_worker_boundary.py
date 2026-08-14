@@ -53,6 +53,122 @@ def test_explicit_inference_steps_do_not_read_the_vm_acceptance_default(monkeypa
     assert observed_steps == [7]
 
 
+def test_vm_acceptance_dimensions_reach_the_regional_evaluator(monkeypatch, tmp_path):
+    observed_dimensions = []
+    monkeypatch.delenv("VEM_VM_ACCEPTANCE_AI_STEPS", raising=False)
+    monkeypatch.setenv("VEM_VM_ACCEPTANCE_AI_WIDTH", "256")
+    monkeypatch.setenv("VEM_VM_ACCEPTANCE_AI_HEIGHT", "384")
+    monkeypatch.setattr(ai_attempt_worker, "_deny_downloads", lambda: None)
+    monkeypatch.setattr(ai_attempt_worker, "verify_ai_model_pack", lambda _root: None)
+    monkeypatch.setattr(
+        ai_attempt_worker,
+        "run_regional_evaluator_attempt",
+        lambda args, _root, *, policy: observed_dimensions.append((args.width, args.height)) or {},
+    )
+
+    assert ai_attempt_worker.main(
+        [
+            "--model-pack",
+            str(tmp_path),
+            "--person",
+            "person.png",
+            "--garment",
+            "garment.png",
+            "--output",
+            "output.png",
+        ]
+    ) == 0
+    assert observed_dimensions == [(256, 384)]
+
+
+def test_explicit_dimensions_ignore_invalid_vm_acceptance_environment(monkeypatch, tmp_path):
+    observed_dimensions = []
+    monkeypatch.delenv("VEM_VM_ACCEPTANCE_AI_STEPS", raising=False)
+    monkeypatch.setenv("VEM_VM_ACCEPTANCE_AI_WIDTH", "not-an-integer")
+    monkeypatch.setenv("VEM_VM_ACCEPTANCE_AI_HEIGHT", "not-an-integer")
+    monkeypatch.setattr(ai_attempt_worker, "_deny_downloads", lambda: None)
+    monkeypatch.setattr(ai_attempt_worker, "verify_ai_model_pack", lambda _root: None)
+    monkeypatch.setattr(
+        ai_attempt_worker,
+        "run_regional_evaluator_attempt",
+        lambda args, _root, *, policy: observed_dimensions.append((args.width, args.height)) or {},
+    )
+
+    assert ai_attempt_worker.main(
+        [
+            "--model-pack",
+            str(tmp_path),
+            "--person",
+            "person.png",
+            "--garment",
+            "garment.png",
+            "--output",
+            "output.png",
+            "--width",
+            "512",
+            "--height",
+            "768",
+        ]
+    ) == 0
+    assert observed_dimensions == [(512, 768)]
+
+
+def test_default_dimensions_reach_the_regional_evaluator(monkeypatch, tmp_path):
+    observed_dimensions = []
+    monkeypatch.delenv("VEM_VM_ACCEPTANCE_AI_STEPS", raising=False)
+    monkeypatch.delenv("VEM_VM_ACCEPTANCE_AI_WIDTH", raising=False)
+    monkeypatch.delenv("VEM_VM_ACCEPTANCE_AI_HEIGHT", raising=False)
+    monkeypatch.setattr(ai_attempt_worker, "_deny_downloads", lambda: None)
+    monkeypatch.setattr(ai_attempt_worker, "verify_ai_model_pack", lambda _root: None)
+    monkeypatch.setattr(
+        ai_attempt_worker,
+        "run_regional_evaluator_attempt",
+        lambda args, _root, *, policy: observed_dimensions.append((args.width, args.height)) or {},
+    )
+
+    assert ai_attempt_worker.main(
+        [
+            "--model-pack",
+            str(tmp_path),
+            "--person",
+            "person.png",
+            "--garment",
+            "garment.png",
+            "--output",
+            "output.png",
+        ]
+    ) == 0
+    assert observed_dimensions == [(512, 768)]
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [
+        ("256", None),
+        (None, "384"),
+        ("not-an-integer", "384"),
+        ("256", "not-an-integer"),
+        ("0", "384"),
+        ("256", "0"),
+        ("520", "384"),
+        ("256", "776"),
+        ("255", "384"),
+        ("256", "383"),
+    ],
+)
+def test_invalid_vm_acceptance_dimensions_fail_closed(monkeypatch, width, height):
+    monkeypatch.delenv("VEM_VM_ACCEPTANCE_AI_STEPS", raising=False)
+    monkeypatch.delenv("VEM_VM_ACCEPTANCE_AI_WIDTH", raising=False)
+    monkeypatch.delenv("VEM_VM_ACCEPTANCE_AI_HEIGHT", raising=False)
+    if width is not None:
+        monkeypatch.setenv("VEM_VM_ACCEPTANCE_AI_WIDTH", width)
+    if height is not None:
+        monkeypatch.setenv("VEM_VM_ACCEPTANCE_AI_HEIGHT", height)
+
+    with pytest.raises(RuntimeError, match="vm_acceptance_ai_dimensions_invalid"):
+        ai_attempt_worker.main([])
+
+
 def write_worker_pack(root: Path) -> None:
     files = {
         "CatVTON/SCHP/exp-schp-201908301523-atr.pth": b"atr",

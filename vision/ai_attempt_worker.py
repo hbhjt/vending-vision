@@ -56,6 +56,30 @@ def default_inference_steps() -> int:
     return steps
 
 
+def default_inference_dimensions() -> tuple[int, int]:
+    raw_width = os.environ.get("VEM_VM_ACCEPTANCE_AI_WIDTH")
+    raw_height = os.environ.get("VEM_VM_ACCEPTANCE_AI_HEIGHT")
+    if raw_width is None and raw_height is None:
+        return 512, 768
+    if raw_width is None or raw_height is None:
+        raise RuntimeError("vm_acceptance_ai_dimensions_invalid")
+    try:
+        width = int(raw_width)
+        height = int(raw_height)
+    except ValueError as exc:
+        raise RuntimeError("vm_acceptance_ai_dimensions_invalid") from exc
+    if (
+        width < 1
+        or height < 1
+        or width > 512
+        or height > 768
+        or width % 8
+        or height % 8
+    ):
+        raise RuntimeError("vm_acceptance_ai_dimensions_invalid")
+    return width, height
+
+
 def _pack_path(root: Path, relative: str) -> Path:
     path = (root / relative).resolve(strict=False)
     if not path.is_file() or root.resolve() not in path.parents:
@@ -124,13 +148,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output")
     parser.add_argument("--regional-evidence-output")
     parser.add_argument("--captured-source")
-    parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--height", type=int, default=768)
+    parser.add_argument("--width", type=int)
+    parser.add_argument("--height", type=int)
     parser.add_argument("--steps", type=int)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
     if args.steps is None:
         args.steps = default_inference_steps()
+    if args.width is None and args.height is None:
+        args.width, args.height = default_inference_dimensions()
+    else:
+        args.width = 512 if args.width is None else args.width
+        args.height = 768 if args.height is None else args.height
     _deny_downloads()
     if args.probe_runtime:
         try:
