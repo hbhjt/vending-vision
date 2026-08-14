@@ -661,26 +661,27 @@ def test_release_create_is_explicitly_bound_when_publisher_root_has_no_git(tmp_p
     release = tmp_path / "release"
     release.mkdir()
     (release / "candidate.zip").write_bytes(b"candidate")
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_gh = fake_bin / "gh"
-    fake_gh.write_text(
-        "#!/usr/bin/env bash\n"
-        "if [[ \"$1 $2 $3\" == 'release create v0.2.1-rc.99' ]] && [[ \" $* \" != *' --repo hbhjt/vending-vision '* ]]; then\n"
-        "  git rev-parse --show-toplevel >&2\n"
-        "  exit 128\n"
-        "fi\n"
-        "printf '%s\\n' \"$*\" > \"$FAKE_GH_ARGS\"\n",
-        "utf-8",
-    )
-    fake_gh.chmod(0o755)
-    script = step["run"].split("\n", 2)[1]
+    assert not (tmp_path / ".git").exists()
+    release_command = step["run"].split("\n", 2)[1]
+    shim = f"""
+function gh {{
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]] $arguments)
+    $repo_index = [Array]::IndexOf($arguments, '--repo')
+    if ($repo_index -lt 0 -or $repo_index + 1 -ge $arguments.Count -or
+        $arguments[$repo_index + 1] -cne 'hbhjt/vending-vision') {{
+        & git rev-parse --show-toplevel
+        throw 'fake gh requires an explicit canonical repository'
+    }}
+    [IO.File]::WriteAllText($env:FAKE_GH_ARGS, ($arguments -join ' '))
+    $global:LASTEXITCODE = 0
+}}
+"""
+    script = shim + release_command
     completed = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
         cwd=tmp_path,
         env={
             **os.environ,
-            "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
             "RELEASE_TAG": "v0.2.1-rc.99",
             "RELEASE_TARGET": "a" * 40,
             "FAKE_GH_ARGS": str(tmp_path / "gh-args"),
@@ -693,11 +694,34 @@ def test_release_create_is_explicitly_bound_when_publisher_root_has_no_git(tmp_p
     assert completed.returncode == 0, completed.stdout + completed.stderr
     arguments = (tmp_path / "gh-args").read_text("utf-8")
     assert (
-        "release create v0.2.1-rc.99 release/candidate.zip "
+        "release create v0.2.1-rc.99 release/* "
         "--repo hbhjt/vending-vision"
     ) in arguments
     assert "--target " + "a" * 40 in arguments
     assert "--prerelease --verify-tag" in arguments
+
+    missing_repository = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            shim + "gh release create v0.2.1-rc.99 release/* --verify-tag",
+        ],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "FAKE_GH_ARGS": str(tmp_path / "must-not-exist"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing_repository.returncode != 0
+    assert "not a git repository" in (
+        missing_repository.stdout + missing_repository.stderr
+    )
+    assert not (tmp_path / "must-not-exist").exists()
 
 
 @pytest.mark.parametrize(
