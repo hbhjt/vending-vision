@@ -60,7 +60,8 @@ def test_publisher_is_an_exact4_only_builder_artifact_consumer():
     assert publish["needs"] == "trusted_builder"
     assert publish["environment"] == "production"
     assert source.count("actions/download-artifact@v4") == 1
-    assert "verify_trusted_candidate_inputs.py" in source
+    assert source.count("actions/checkout@v4") == 0
+    assert "verify_trusted_candidate_inputs.py" not in source
     assert "gh attestation verify" in source
     assert source.count("gh release create ") == 1
     for member in (
@@ -98,7 +99,7 @@ def test_exact4_policy_accepts_the_publisher():
         ("supplier-secret", "    environment: production\n", "    environment: production\n    env:\n      KEY: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}\n", "publisher_forbidden_capability"),
         ("bracket-secret", "    environment: production\n", "    environment: production\n    env:\n      KEY: ${{ secrets['REINTRODUCED_SECRET'] }}\n", "publisher_forbidden_capability"),
         ("wrong-environment", "environment: production", "environment: experimental-candidate", "publisher_production_environment"),
-        ("source-checkout", "path: trusted-builder", "path: source", "publisher_forbidden_capability"),
+        ("regular-file", "[System.IO.FileInfo]", "[System.IO.DirectoryInfo]", "publisher_exact4_member"),
         ("sidecar", "trusted-builder-evidence.json", "supplier-signed-evidence.json", "publisher_forbidden_capability"),
         ("missing-artifact", "candidate-manifest.json", "candidate-manifest-missing.json", "publisher_exact4_member"),
         ("wrong-digest", "SUBJECT_SHA256: ${{ needs.trusted_builder.outputs.subject_sha256 }}", "SUBJECT_SHA256: ${{ needs.trusted_builder.outputs.manifest_sha256 }}", "publisher_output_binding"),

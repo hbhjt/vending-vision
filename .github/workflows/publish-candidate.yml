@@ -29,13 +29,6 @@ jobs:
       contents: write
       attestations: read
     steps:
-      - name: Checkout immutable exact4 verifier
-        uses: actions/checkout@v4
-        with:
-          repository: hbhjt/vending-vision
-          ref: 691b5056e8b9bf2667bc527b2170780b05863946
-          path: trusted-builder
-          persist-credentials: false
       - name: Download exactly the trusted builder artifact
         uses: actions/download-artifact@v4
         with:
@@ -49,18 +42,24 @@ jobs:
           SUBJECT_SHA256: ${{ needs.trusted_builder.outputs.subject_sha256 }}
           MANIFEST_SHA256: ${{ needs.trusted_builder.outputs.manifest_sha256 }}
           ATTESTATION_BUNDLE_SHA256: ${{ needs.trusted_builder.outputs.attestation_bundle_sha256 }}
-          CANDIDATE_COMMIT: ${{ github.sha }}
-          CANDIDATE_TAG: ${{ github.ref_name }}
         run: |
           if ($env:ARTIFACT_FILE -notmatch '^vending-vision-(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+-windows-x86_64\.zip$') { throw "candidate artifact file output is invalid" }
-          if ($env:SUBJECT_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:MANIFEST_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:ATTESTATION_BUNDLE_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:CANDIDATE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:CANDIDATE_TAG -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+$') { throw "candidate identity output is invalid" }
+          if ($env:SUBJECT_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:MANIFEST_SHA256 -notmatch '^[a-f0-9]{64}$' -or $env:ATTESTATION_BUNDLE_SHA256 -notmatch '^[a-f0-9]{64}$') { throw "candidate digest output is invalid" }
           $inputRoot = (Resolve-Path -LiteralPath candidate-input).Path
           $artifact = Join-Path $inputRoot $env:ARTIFACT_FILE
           $bundle = Join-Path $inputRoot "github-build-provenance.sigstore.json"
+          $expectedNames = @($env:ARTIFACT_FILE, "candidate-manifest.json", "github-build-provenance.sigstore.json", "trusted-builder-evidence.json")
+          $members = @(Get-ChildItem -LiteralPath $inputRoot -Force)
+          if ($members.Count -ne 4 -or ((@($members.Name | Sort-Object) -join "`n") -ne (@($expectedNames | Sort-Object) -join "`n"))) { throw "trusted builder artifact member set mismatch" }
+          foreach ($member in $members) {
+            if (-not ($member -is [System.IO.FileInfo]) -or ($member.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { throw "trusted builder artifact member is not a regular file" }
+          }
+          $subjectSha = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifestSha = (Get-FileHash -LiteralPath (Join-Path $inputRoot "candidate-manifest.json") -Algorithm SHA256).Hash.ToLowerInvariant()
+          $bundleSha = (Get-FileHash -LiteralPath $bundle -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($subjectSha -ne $env:SUBJECT_SHA256 -or $manifestSha -ne $env:MANIFEST_SHA256 -or $bundleSha -ne $env:ATTESTATION_BUNDLE_SHA256) { throw "trusted builder artifact digest mismatch" }
           gh attestation verify $artifact --bundle $bundle --repo "hbhjt/vending-vision" --signer-workflow "hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml" --signer-digest "691b5056e8b9bf2667bc527b2170780b05863946" --deny-self-hosted-runners
           if ($LASTEXITCODE -ne 0) { throw "trusted builder attestation verification failed" }
-          python trusted-builder/scripts/verify_trusted_candidate_inputs.py --artifact $artifact --candidate-manifest (Join-Path $inputRoot "candidate-manifest.json") --github-attestation $bundle --trusted-builder-evidence (Join-Path $inputRoot "trusted-builder-evidence.json") --destination (Join-Path $PWD "verified-candidate") --subject-sha256 $env:SUBJECT_SHA256 --manifest-sha256 $env:MANIFEST_SHA256 --attestation-bundle-sha256 $env:ATTESTATION_BUNDLE_SHA256 --source-commit $env:CANDIDATE_COMMIT
-          if ($LASTEXITCODE -ne 0) { throw "exact4 trusted candidate input verification failed" }
       - name: Publish exactly the reverified builder assets
         shell: pwsh
         env:

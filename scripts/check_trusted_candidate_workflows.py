@@ -576,8 +576,6 @@ def _assert_gh_attestation_flags_parse(repository_root: Path) -> None:
                 "--repo", TRUSTED_REPOSITORY,
                 "--signer-workflow", f"{TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}",
                 "--signer-digest", TRUSTED_BUILDER_COMMIT,
-                "--source-ref", "refs/tags/v0.0.0-rc.0",
-                "--source-digest", "0" * 40,
                 "--deny-self-hosted-runners",
             ],
             cwd=repository_root,
@@ -937,19 +935,10 @@ def _assert_exact4_publisher(
 
     steps = _job_steps(publish, "publisher_publish")
     _require(set(steps) == {
-        "Checkout immutable exact4 verifier",
         "Download exactly the trusted builder artifact",
         "Reverify exact4 trusted candidate inputs in production",
         "Publish exactly the reverified builder assets",
     }, "publisher_steps_exact4")
-    checkout = steps["Checkout immutable exact4 verifier"].get("with")
-    _require(isinstance(checkout, dict), "publisher_verifier_checkout_inputs")
-    _require(checkout == {
-        "repository": TRUSTED_REPOSITORY,
-        "ref": TRUSTED_BUILDER_COMMIT,
-        "path": "trusted-builder",
-        "persist-credentials": "false",
-    }, "publisher_verifier_checkout_pin")
     download = steps["Download exactly the trusted builder artifact"].get("with")
     _require(isinstance(download, dict), "publisher_download_inputs")
     _require(download == {
@@ -966,8 +955,6 @@ def _assert_exact4_publisher(
         "SUBJECT_SHA256": "${{ needs.trusted_builder.outputs.subject_sha256 }}",
         "MANIFEST_SHA256": "${{ needs.trusted_builder.outputs.manifest_sha256 }}",
         "ATTESTATION_BUNDLE_SHA256": "${{ needs.trusted_builder.outputs.attestation_bundle_sha256 }}",
-        "CANDIDATE_COMMIT": "${{ github.sha }}",
-        "CANDIDATE_TAG": "${{ github.ref_name }}",
     }, "publisher_output_binding")
     reverify_run = reverify.get("run")
     _require(isinstance(reverify_run, str), "publisher_reverify_run")
@@ -977,20 +964,24 @@ def _assert_exact4_publisher(
         f'--signer-workflow "{TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}"',
         f'--signer-digest "{TRUSTED_BUILDER_COMMIT}"',
         "--deny-self-hosted-runners",
-        "trusted-builder/scripts/verify_trusted_candidate_inputs.py",
-        "--artifact $artifact",
-        "--candidate-manifest (Join-Path $inputRoot \"candidate-manifest.json\")",
-        "--github-attestation $bundle",
-        "--trusted-builder-evidence (Join-Path $inputRoot \"trusted-builder-evidence.json\")",
-        "--subject-sha256 $env:SUBJECT_SHA256",
-        "--manifest-sha256 $env:MANIFEST_SHA256",
-        "--attestation-bundle-sha256 $env:ATTESTATION_BUNDLE_SHA256",
-        "--source-commit $env:CANDIDATE_COMMIT",
+        "$expectedNames = @($env:ARTIFACT_FILE, \"candidate-manifest.json\", \"github-build-provenance.sigstore.json\", \"trusted-builder-evidence.json\")",
+        "Get-ChildItem -LiteralPath $inputRoot -Force",
+        "$members.Count -ne 4",
+        "$member -is [System.IO.FileInfo]",
+        "[System.IO.FileAttributes]::ReparsePoint",
+        "Get-FileHash -LiteralPath $artifact -Algorithm SHA256",
+        "Get-FileHash -LiteralPath (Join-Path $inputRoot \"candidate-manifest.json\") -Algorithm SHA256",
+        "Get-FileHash -LiteralPath $bundle -Algorithm SHA256",
+        "$subjectSha -ne $env:SUBJECT_SHA256",
+        "$manifestSha -ne $env:MANIFEST_SHA256",
+        "$bundleSha -ne $env:ATTESTATION_BUNDLE_SHA256",
     ):
         _require(fragment in reverify_run, "publisher_exact4_member")
+    _require("verify_trusted_candidate_inputs.py" not in publisher_source, "publisher_duplicate_python_verifier")
+    _require(publisher_source.count("actions/checkout@v4") == 0, "publisher_duplicate_verifier_checkout")
     _require("--source-ref" not in reverify_run and "--source-digest" not in reverify_run, "publisher_source_authority_removed")
-    _require(reverify_run.count("candidate-manifest.json") == 1, "publisher_exact4_member")
-    _require(reverify_run.count("github-build-provenance.sigstore.json") == 1, "publisher_exact4_member")
+    _require(reverify_run.count("candidate-manifest.json") == 2, "publisher_exact4_member")
+    _require(reverify_run.count("github-build-provenance.sigstore.json") == 2, "publisher_exact4_member")
     _require(reverify_run.count("trusted-builder-evidence.json") == 1, "publisher_exact4_member")
 
     release = steps["Publish exactly the reverified builder assets"]
