@@ -39,7 +39,11 @@ def canonical(value: object) -> str:
 
 
 def build_fixture(
-    root: Path, *, torch_version: str = "2.8.0+cpu", worker_script: str | None = None
+    root: Path,
+    *,
+    torch_version: str = "2.8.0+cpu",
+    worker_script: str | None = None,
+    model_descriptor_suffix: str = "",
 ) -> dict[str, object]:
     dist = root / "dist"
     main = dist / "vending-vision/vending-vision.exe"
@@ -129,7 +133,7 @@ def build_fixture(
     }
     model_descriptor_path = internal / "official-ai-model-pack-descriptor.json"
     model_descriptor_path.write_text(
-        canonical_ai_model_manifest_json(model_descriptor), "utf-8"
+        canonical_ai_model_manifest_json(model_descriptor) + model_descriptor_suffix, "utf-8"
     )
     candidate_root = root / "candidate-input"
     candidate_root.mkdir()
@@ -166,7 +170,9 @@ def build_fixture(
         "manifest_sha": candidate_facts["embeddedManifestSha256"],
         "model_archive": model_archive,
         "model_descriptor_sha": hashlib.sha256(
-            canonical_ai_model_manifest_json(model_descriptor).encode("utf-8")
+            (canonical_ai_model_manifest_json(model_descriptor) + model_descriptor_suffix).encode(
+                "utf-8"
+            )
         ).hexdigest(),
         "model_sha": model_sha,
         "subject_sha": candidate_facts["subjectSha256"],
@@ -206,6 +212,32 @@ def test_source_mode_verifies_real_candidate_model_archive_and_both_worker_probe
         == manifest["bindings"]["workerExecutable"]["sha256"]
     )
     assert list(tmp_path.glob(".precutover-*")) == []
+
+
+def test_source_mode_accepts_canonical_model_descriptor_with_trailing_newline(tmp_path):
+    fixture = build_fixture(tmp_path, model_descriptor_suffix="\n")
+    output = tmp_path / "proof.json"
+
+    report = verify_precutover(
+        candidate_artifact=fixture["candidate_archive"],
+        candidate_manifest=fixture["candidate_manifest"],
+        github_attestation=fixture["attestation"],
+        trusted_builder_evidence=fixture["evidence"],
+        subject_sha256=fixture["subject_sha"],
+        manifest_sha256=fixture["manifest_sha"],
+        attestation_bundle_sha256=sha256(fixture["attestation"]),
+        source_commit=SOURCE_COMMIT,
+        model_pack_archive=fixture["model_archive"],
+        model_pack_byte_size=fixture["model_archive"].stat().st_size,
+        model_pack_sha256=fixture["model_sha"],
+        model_descriptor_sha256=fixture["model_descriptor_sha"],
+        private_parent=tmp_path,
+        report_output=output,
+        timeout=5.0,
+    )
+
+    assert report["schemaVersion"] == "vending-vision-precutover-proof/v1"
+    assert output.is_file()
 
 
 def test_source_test_worker_uses_the_interpreter_even_on_windows():

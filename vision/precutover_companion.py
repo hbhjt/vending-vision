@@ -1213,8 +1213,14 @@ def verify_precutover(
             if require_frozen_worker:
                 verify_frozen_worker_archive(worker)
             model_descriptor = _load_canonical(model_descriptor_path, "model_descriptor")
-            if canonical_ai_model_manifest_json(model_descriptor) != model_descriptor_path.read_text("utf-8"):
+            canonical_model_descriptor = canonical_ai_model_manifest_json(
+                model_descriptor
+            )
+            if canonical_model_descriptor != model_descriptor_path.read_text("utf-8").rstrip(
+                "\n"
+            ):
                 raise RuntimeError("model_descriptor_noncanonical")
+            canonical_model_descriptor_bytes = canonical_model_descriptor.encode("utf-8")
             source = _load_canonical(source_path, "source_descriptor")
             _require_exact(source, {"catvtonSourceRevision", "schemaVersion", "sources"}, "source_descriptor")
             source_revision = source["catvtonSourceRevision"]
@@ -1234,8 +1240,8 @@ def verify_precutover(
             installed_expectations = [
                 _ExpectedFile(
                     (installed / "ai-model-manifest.json").resolve(),
-                    model_descriptor_path.stat().st_size,
-                    model_descriptor_sha256,
+                    len(canonical_model_descriptor_bytes),
+                    hashlib.sha256(canonical_model_descriptor_bytes).hexdigest(),
                     "installed_model:ai-model-manifest.json",
                 ),
                 *[
