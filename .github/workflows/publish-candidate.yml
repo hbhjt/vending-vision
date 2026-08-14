@@ -40,7 +40,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: hbhjt/vending-vision
-          ref: 43226e057afc5cda782a5ae837e727663a6625b1
+          ref: 59b4fee088db08f3008c137409f98577de987595
           path: trusted-verifier
           persist-credentials: false
       - name: Checkout exact release source
@@ -101,7 +101,7 @@ jobs:
     permissions:
       contents: read
       attestations: read
-    uses: hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-signer.yml@43226e057afc5cda782a5ae837e727663a6625b1
+    uses: hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-signer.yml@59b4fee088db08f3008c137409f98577de987595
     with:
       source_commit: ${{ github.sha }}
       source_ref: ${{ github.ref }}
@@ -111,8 +111,117 @@ jobs:
       attestation_bundle_sha256: ${{ needs.verify.outputs.attestation_bundle_sha256 }}
       signer_identity: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}
 
-  publish:
+  sign_evidence:
     needs: [verify, trusted_signer]
+    runs-on: windows-latest
+    environment: experimental-candidate
+    permissions:
+      contents: read
+    outputs:
+      signed_evidence_artifact_name: ${{ steps.identities.outputs.signed_evidence_artifact_name }}
+      signed_evidence_sha256: ${{ steps.seal.outputs.signed_evidence_sha256 }}
+    steps:
+      - name: Checkout immutable trusted signing implementation
+        uses: actions/checkout@v4
+        with:
+          repository: hbhjt/vending-vision
+          ref: 59b4fee088db08f3008c137409f98577de987595
+          path: trusted-signer
+          persist-credentials: false
+      - name: Validate direct signing identities without shell interpolation
+        id: identities
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+          UNSIGNED_EVIDENCE_ARTIFACT_NAME: ${{ needs.trusted_signer.outputs.unsigned_evidence_artifact_name }}
+          UNSIGNED_EVIDENCE_SHA256: ${{ needs.trusted_signer.outputs.unsigned_evidence_sha256 }}
+          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}
+        run: |
+          if ($env:SOURCE_COMMIT -notmatch '^[a-f0-9]{40}$') { throw "direct signer source commit is invalid" }
+          if ($env:SOURCE_REF -notmatch '^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+$') { throw "direct signer source ref is invalid" }
+          if ($env:UNSIGNED_EVIDENCE_ARTIFACT_NAME -cne "vending-vision-verified-evidence-$env:SOURCE_COMMIT") { throw "direct signer unsigned evidence artifact is invalid" }
+          if ($env:UNSIGNED_EVIDENCE_SHA256 -notmatch '^[a-f0-9]{64}$') { throw "direct signer unsigned evidence digest is invalid" }
+          if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "supplier signer identity is invalid" }
+          $python = (Get-Command python.exe -ErrorAction Stop).Source
+          if (-not [IO.Path]::IsPathFullyQualified($python)) { throw "trusted system Python path is not absolute" }
+          $openssl = "C:\Program Files\Git\mingw64\bin\openssl.exe"
+          if (-not (Test-Path -LiteralPath $openssl -PathType Leaf)) { throw "trusted absolute OpenSSL executable is unavailable" }
+          "TRUSTED_PYTHON=$python" >> $env:GITHUB_ENV
+          "TRUSTED_OPENSSL=$openssl" >> $env:GITHUB_ENV
+          "SOURCE_COMMIT=$env:SOURCE_COMMIT" >> $env:GITHUB_ENV
+          "UNSIGNED_EVIDENCE_SHA256=$env:UNSIGNED_EVIDENCE_SHA256" >> $env:GITHUB_ENV
+          "VISION_SUPPLIER_SIGNER_IDENTITY=$env:VISION_SUPPLIER_SIGNER_IDENTITY" >> $env:GITHUB_ENV
+          "signed_evidence_artifact_name=vending-vision-signed-evidence-$env:SOURCE_COMMIT" >> $env:GITHUB_OUTPUT
+      - name: Verify immutable trusted signing script hashes
+        shell: pwsh
+        run: |
+          $root = (Resolve-Path -LiteralPath trusted-signer).Path
+          $verifier = (Resolve-Path -LiteralPath trusted-signer/scripts/verify_trusted_script_set.py).Path
+          $descriptor = (Resolve-Path -LiteralPath trusted-signer/trusted-signer-scripts.json).Path
+          & $env:TRUSTED_PYTHON $verifier --root $root --descriptor $descriptor
+          if ($LASTEXITCODE -ne 0) { throw "trusted signing script hash verification failed" }
+      - name: Download fixed verified evidence artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.trusted_signer.outputs.unsigned_evidence_artifact_name }}
+          path: unsigned-evidence
+      - name: Verify cross-job evidence digest before direct signing
+        shell: pwsh
+        run: |
+          $script = (Resolve-Path -LiteralPath trusted-signer/scripts/evidence_artifact.py).Path
+          & $env:TRUSTED_PYTHON $script verify --directory unsigned-evidence --kind unsigned --expected-digest $env:UNSIGNED_EVIDENCE_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "cross-job unsigned evidence verification failed" }
+          Copy-Item -LiteralPath unsigned-evidence -Destination signed-evidence -Recurse
+      - name: Sign only verified evidence with the protected supplier key
+        shell: pwsh
+        env:
+          VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:VISION_SUPPLIER_PRIVATE_KEY_PEM)) { throw "supplier private key is required" }
+          $key = Join-Path $env:RUNNER_TEMP "supplier-ed25519.pem"
+          $script = (Resolve-Path -LiteralPath trusted-signer/scripts/sign_candidate_evidence.py).Path
+          $primaryFailure = $null
+          $cleanupFailure = $null
+          try {
+            [IO.File]::WriteAllText($key, $env:VISION_SUPPLIER_PRIVATE_KEY_PEM)
+            & $env:TRUSTED_PYTHON $script --candidate-dir signed-evidence --private-key $key --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY --openssl $env:TRUSTED_OPENSSL
+            if ($LASTEXITCODE -ne 0) { throw "installed evidence signing failed" }
+          } catch {
+            $primaryFailure = $_
+          } finally {
+            try {
+              Remove-Item -LiteralPath $key -Force -ErrorAction Stop
+              if (Test-Path -LiteralPath $key -PathType Leaf) { throw "supplier private key cleanup did not remove the key" }
+            } catch {
+              $cleanupFailure = $_
+            }
+          }
+          if ($null -ne $primaryFailure) {
+            if ($null -ne $cleanupFailure) { Write-Warning "supplier key cleanup failed after signing failure: $($cleanupFailure.Exception.Message)" }
+            throw $primaryFailure
+          }
+          if ($null -ne $cleanupFailure) {
+            throw $cleanupFailure
+          }
+      - name: Seal canonical direct signed evidence
+        id: seal
+        shell: pwsh
+        run: |
+          $script = (Resolve-Path -LiteralPath trusted-signer/scripts/evidence_artifact.py).Path
+          $sealed = (& $env:TRUSTED_PYTHON $script seal --directory signed-evidence --kind signed) | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $sealed.sha256 -notmatch '^[a-f0-9]{64}$') { throw "direct signed evidence sealing failed" }
+          "signed_evidence_sha256=$($sealed.sha256)" >> $env:GITHUB_OUTPUT
+      - name: Upload only direct supplier-signed evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.identities.outputs.signed_evidence_artifact_name }}
+          path: signed-evidence/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [verify, sign_evidence]
     runs-on: windows-latest
     environment: experimental-candidate
     permissions:
@@ -122,7 +231,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: hbhjt/vending-vision
-          ref: 43226e057afc5cda782a5ae837e727663a6625b1
+          ref: 59b4fee088db08f3008c137409f98577de987595
           path: trusted-policy
           persist-credentials: false
       - name: Checkout immutable hosted release authority
@@ -140,7 +249,7 @@ jobs:
       - name: Download supplier-signed evidence
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.trusted_signer.outputs.signed_evidence_artifact_name }}
+          name: ${{ needs.sign_evidence.outputs.signed_evidence_artifact_name }}
           path: signed-evidence
       - name: Revalidate exact tag authority and sealed release evidence
         shell: pwsh
@@ -149,7 +258,7 @@ jobs:
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_REF: ${{ github.ref }}
           SUBJECT_SHA256: ${{ needs.verify.outputs.subject_sha256 }}
-          SIGNED_EVIDENCE_SHA256: ${{ needs.trusted_signer.outputs.signed_evidence_sha256 }}
+          SIGNED_EVIDENCE_SHA256: ${{ needs.sign_evidence.outputs.signed_evidence_sha256 }}
         run: |
           if ($env:SOURCE_COMMIT -notmatch '^[a-f0-9]{40}$') { throw "publish source commit is invalid" }
           if ($env:SOURCE_REF -notmatch '^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+$') { throw "publish source ref is invalid" }
@@ -199,7 +308,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           Copy-Item -Path (Join-Path $PWD "signed-evidence/*") -Destination release/
-          gh release create $env:RELEASE_TAG release/* --target $env:RELEASE_TARGET --prerelease --verify-tag --title "Vending Vision $env:RELEASE_TAG" --notes "Built by immutable trusted builder 691b5056e8b9bf2667bc527b2170780b05863946; independently verified, source-approved and supplier-signed by immutable trusted signer 43226e057afc5cda782a5ae837e727663a6625b1."
+          gh release create $env:RELEASE_TAG release/* --target $env:RELEASE_TARGET --prerelease --verify-tag --title "Vending Vision $env:RELEASE_TAG" --notes "Built by immutable trusted builder 691b5056e8b9bf2667bc527b2170780b05863946; independently verified, source-approved and supplier-signed with immutable trusted signer scripts 59b4fee088db08f3008c137409f98577de987595."
           if ($LASTEXITCODE -ne 0) { throw "immutable candidate release failed" }
           gh api "/repos/hbhjt/vending-vision/releases/tags/$env:RELEASE_TAG" --jq '{tagName:.tag_name,targetCommitish:.target_commitish,isDraft:.draft,isPrerelease:.prerelease}' | Set-Content -LiteralPath release-complete.json -Encoding utf8NoBOM
           if ($LASTEXITCODE -ne 0) { throw "published release identity query failed" }

@@ -15,7 +15,7 @@ else:
 TRUSTED_REPOSITORY = "hbhjt/vending-vision"
 TRUSTED_BUILDER_COMMIT = "691b5056e8b9bf2667bc527b2170780b05863946"
 TRUSTED_BUILDER_PATH = ".github/workflows/trusted-ai-candidate-builder.yml"
-TRUSTED_SIGNER_COMMIT = "43226e057afc5cda782a5ae837e727663a6625b1"
+TRUSTED_SIGNER_COMMIT = "59b4fee088db08f3008c137409f98577de987595"
 TRUSTED_SIGNER_PATH = ".github/workflows/trusted-ai-candidate-signer.yml"
 HOSTED_AUTHORITY_COMMIT = "41afbd9bd07b67df9f93de1dea1a9f9b0cea0228"
 HOSTED_AUTHORITY_PATH = "scripts/verify_hosted_release_authority.py"
@@ -104,33 +104,18 @@ def _step_env(step: object, label: str) -> dict[str, object]:
 def _assert_signer_identity_channel(signer_source: str, publisher_source: str) -> None:
     signer_jobs = _workflow_jobs(signer_source, "trusted_signer")
     verify = signer_jobs.get("verify_evidence")
-    sign = signer_jobs.get("sign_evidence")
     _require(isinstance(verify, dict), "trusted_signer_verify_job_missing")
-    _require(isinstance(sign, dict), "trusted_signer_sign_job_missing")
+    _require(set(signer_jobs) == {"verify_evidence"}, "trusted_signer_verify_only")
     _require("environment" not in verify, "trusted_signer_verify_environment")
-    _require(sign.get("environment") == "experimental-candidate", "trusted_signer_sign_environment")
     verify_steps = _job_steps(verify, "trusted_signer_verify")
-    sign_steps = _job_steps(sign, "trusted_signer_sign")
-    for label, steps, step_name in (
-        ("trusted_signer_verify", verify_steps, "Validate identities without shell interpolation"),
-        ("trusted_signer_sign", sign_steps, "Revalidate signer identity on the fresh runner"),
-    ):
-        env = _step_env(steps.get(step_name), label)
-        _require(
-            env.get("VISION_SUPPLIER_SIGNER_IDENTITY") == "${{ inputs.signer_identity }}",
-            f"{label}_signer_identity_input",
-        )
+    env = _step_env(verify_steps.get("Validate identities without shell interpolation"), "trusted_signer_verify")
     _require(
-        "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in str(verify),
+        env.get("VISION_SUPPLIER_SIGNER_IDENTITY") == "${{ inputs.signer_identity }}",
+        "trusted_signer_verify_signer_identity_input",
+    )
+    _require(
+        "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in signer_source,
         "trusted_signer_verify_secret",
-    )
-    key_env = _step_env(
-        sign_steps.get("Sign only verified evidence with the protected supplier key"),
-        "trusted_signer_key",
-    )
-    _require(
-        key_env == {"VISION_SUPPLIER_PRIVATE_KEY_PEM": "${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}"},
-        "trusted_signer_key_scope",
     )
 
     publisher_jobs = _workflow_jobs(publisher_source, "publisher")
@@ -141,6 +126,43 @@ def _assert_signer_identity_channel(signer_source: str, publisher_source: str) -
     _require(
         signer_with.get("signer_identity") == "${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}",
         "publisher_signer_identity_repository_var",
+    )
+    direct_sign = publisher_jobs.get("sign_evidence")
+    _require(isinstance(direct_sign, dict), "publisher_direct_sign_job_missing")
+    _require(direct_sign.get("environment") == "experimental-candidate", "publisher_direct_sign_environment")
+    _require(direct_sign.get("permissions") == {"contents": "read"}, "publisher_direct_sign_permissions")
+    _require("secrets" not in direct_sign, "publisher_direct_sign_job_secrets")
+    direct_steps = _job_steps(direct_sign, "publisher_direct_sign")
+    identities = _step_env(direct_steps.get("Validate direct signing identities without shell interpolation"), "publisher_direct_sign_identity")
+    _require(
+        identities.get("VISION_SUPPLIER_SIGNER_IDENTITY") == "${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}",
+        "publisher_direct_signer_identity_repository_var",
+    )
+    key_step = _step_env(direct_steps.get("Sign only verified evidence with the protected supplier key"), "publisher_direct_sign_key")
+    _require(
+        key_step == {"VISION_SUPPLIER_PRIVATE_KEY_PEM": "${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}"},
+        "publisher_direct_sign_key_scope",
+    )
+    for step_name, step in direct_steps.items():
+        env = step.get("env")
+        if env is None:
+            continue
+        _require(isinstance(env, dict), "publisher_direct_sign_step_env_invalid")
+        if step_name == "Sign only verified evidence with the protected supplier key":
+            continue
+        for value in env.values():
+            rendered = str(value)
+            _require(
+                not re.search(r"(?i)\bsecrets\s*(?:\.|\[)|PRIVATE_KEY", rendered),
+                "publisher_direct_sign_secret_outside_sign_step",
+            )
+    _require(
+        publisher_source.count("${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}") == 1,
+        "publisher_direct_sign_key_unique",
+    )
+    _require(
+        "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in publisher_source.replace(_job_block(publisher_source, "sign_evidence"), ""),
+        "publisher_direct_sign_key_outside_boundary",
     )
 
 
@@ -641,7 +663,6 @@ def check_trusted_candidate_workflows(
     ):
         _require(forbidden not in signer_source, f"trusted_signer_forbidden_input:{forbidden}")
     verify_evidence = _job_block(signer_source, "verify_evidence")
-    sign_evidence = _job_block(signer_source, "sign_evidence")
     for fragment in (
         "runs-on: windows-latest",
         "repository: ${{ job.workflow_repository }}",
@@ -667,32 +688,12 @@ def check_trusted_candidate_workflows(
     _require("environment:" not in verify_evidence, "trusted_signer_verify_environment")
     _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in verify_evidence, "trusted_signer_verify_secret")
     _require("--signer-repo" not in verify_evidence, "trusted_signer_mutually_exclusive_repo_flags")
-
-    for fragment in (
-        "needs: verify_evidence",
-        "runs-on: windows-latest",
-        "environment: experimental-candidate",
-        "repository: ${{ job.workflow_repository }}",
-        "ref: ${{ job.workflow_sha }}",
-        "path: trusted-signer",
-        "trusted-signer/scripts/verify_trusted_script_set.py",
-        "trusted-signer/scripts/evidence_artifact.py",
-        "--expected-digest $env:UNSIGNED_EVIDENCE_SHA256",
-        "trusted-signer/scripts/sign_candidate_evidence.py",
-        "--openssl $env:TRUSTED_OPENSSL",
-        "VISION_SUPPLIER_PRIVATE_KEY_PEM",
-    ):
-        _require(fragment in sign_evidence, f"trusted_signer_sign_policy:{fragment}")
-    _require(signer_source.count("actions/checkout@v4") == 2, "trusted_signer_checkout_count")
+    _require("sign_evidence:" not in signer_source, "trusted_signer_sign_job_present")
+    _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in signer_source, "trusted_signer_key_present")
+    _require("sign_candidate_evidence.py" not in signer_source, "trusted_signer_sign_script_present")
+    _require(signer_source.count("actions/checkout@v4") == 1, "trusted_signer_checkout_count")
     for forbidden in ("path: source", "actions/setup-python", "source/scripts", ".spec"):
         _require(forbidden not in signer_source, f"trusted_signer_candidate_execution:{forbidden}")
-    for forbidden in ("candidate-input", "verified-candidate", "source-approval", ".venv"):
-        _require(forbidden not in sign_evidence, f"trusted_signer_cross_job_leak:{forbidden}")
-    secret_step = re.search(r"(?ms)^      - name: Sign only verified evidence.*?(?=^      - name:)", sign_evidence)
-    _require(secret_step is not None, "trusted_signer_secret_step_missing")
-    assert secret_step is not None
-    _require("trusted-signer/scripts/sign_candidate_evidence.py" in secret_step.group(0), "trusted_signer_secret_script")
-    _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in sign_evidence[: secret_step.start()], "trusted_signer_secret_exposed_early")
 
     trusted_call = (
         f"uses: {TRUSTED_REPOSITORY}/{TRUSTED_BUILDER_PATH}@{TRUSTED_BUILDER_COMMIT}"
@@ -747,8 +748,65 @@ def check_trusted_candidate_workflows(
     signer_caller_inputs = set(re.findall(r"(?m)^      ([a-z][a-z0-9_]*):", signer_with.group("body")))
     _require(signer_caller_inputs == SIGNER_INPUTS, "publisher_signer_input_allowlist")
 
+    direct_sign = _job_block(publisher_source, "sign_evidence")
+    _require("needs: [verify, trusted_signer]" in direct_sign, "publisher_direct_sign_requires_verified_evidence")
+    _require("runs-on: windows-latest" in direct_sign, "publisher_direct_sign_runner")
+    _require("environment: experimental-candidate" in direct_sign, "publisher_direct_sign_environment")
+    for fragment in (
+        f"ref: {TRUSTED_SIGNER_COMMIT}",
+        "path: trusted-signer",
+        "trusted-signer/scripts/verify_trusted_script_set.py",
+        "trusted-signer/scripts/evidence_artifact.py",
+        "trusted-signer/scripts/sign_candidate_evidence.py",
+        "--kind unsigned --expected-digest $env:UNSIGNED_EVIDENCE_SHA256",
+        "--private-key $key --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY --openssl $env:TRUSTED_OPENSSL",
+        "VISION_SUPPLIER_PRIVATE_KEY_PEM",
+        "kind signed",
+        "Upload only direct supplier-signed evidence",
+    ):
+        _require(fragment in direct_sign, f"publisher_direct_sign_policy:{fragment}")
+    key_step = re.search(r"(?ms)^      - name: Sign only verified evidence.*?(?=^      - name:)", direct_sign)
+    _require(key_step is not None, "publisher_direct_sign_key_step_missing")
+    assert key_step is not None
+    _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in direct_sign[: key_step.start()], "publisher_direct_sign_key_exposed_early")
+    for fragment in (
+        "$primaryFailure = $null",
+        "$cleanupFailure = $null",
+        "} finally {",
+        "Remove-Item -LiteralPath $key -Force -ErrorAction Stop",
+        "Test-Path -LiteralPath $key -PathType Leaf",
+        "throw $primaryFailure",
+        "throw $cleanupFailure",
+        "Write-Warning \"supplier key cleanup failed after signing failure:",
+    ):
+        _require(fragment in key_step.group(0), f"publisher_direct_sign_cleanup:{fragment}")
+    _require("SilentlyContinue" not in key_step.group(0), "publisher_direct_sign_cleanup_silent")
+    _require("Write-Error" not in key_step.group(0), "publisher_direct_sign_cleanup_overrides_primary")
+    _require(
+        key_step.group(0).index("throw $primaryFailure") < key_step.group(0).index("throw $cleanupFailure"),
+        "publisher_direct_sign_cleanup_primary_precedes_secondary",
+    )
+
+    direct_steps = _job_steps(_workflow_jobs(publisher_source, "publisher").get("sign_evidence"), "publisher_direct_sign")
+    identities = _step_env(direct_steps.get("Validate direct signing identities without shell interpolation"), "publisher_direct_sign_identity")
+    _require(
+        identities.get("UNSIGNED_EVIDENCE_ARTIFACT_NAME") == "${{ needs.trusted_signer.outputs.unsigned_evidence_artifact_name }}",
+        "publisher_direct_sign_unsigned_artifact_binding",
+    )
+    _require(
+        identities.get("UNSIGNED_EVIDENCE_SHA256") == "${{ needs.trusted_signer.outputs.unsigned_evidence_sha256 }}",
+        "publisher_direct_sign_unsigned_digest_binding",
+    )
+    checkout = direct_steps.get("Checkout immutable trusted signing implementation")
+    _require(isinstance(checkout, dict), "publisher_direct_sign_checkout_missing")
+    checkout_with = checkout.get("with")
+    _require(isinstance(checkout_with, dict), "publisher_direct_sign_checkout_inputs")
+    _require(checkout_with.get("repository") == TRUSTED_REPOSITORY, "publisher_direct_sign_checkout_repository")
+    _require(checkout_with.get("ref") == TRUSTED_SIGNER_COMMIT, "publisher_direct_sign_checkout_ref")
+    _require(checkout_with.get("path") == "trusted-signer", "publisher_direct_sign_checkout_path")
+
     publish = _job_block(publisher_source, "publish")
-    _require("needs: [verify, trusted_signer]" in publish, "publisher_requires_trusted_signer")
+    _require("needs: [verify, sign_evidence]" in publish, "publisher_requires_direct_sign")
     _require(publish.count("actions/download-artifact@v4") == 2, "publisher_downloads_candidate_and_evidence")
     for fragment in (
         f"ref: {TRUSTED_SIGNER_COMMIT}",
@@ -775,13 +833,11 @@ def check_trusted_candidate_workflows(
         _require(fragment in publish, f"publisher_release_authority:{fragment}")
     _require(publish.count("actions/checkout@v4") == 2, "publisher_trusted_policy_checkout")
     for forbidden in (
-        "VISION_SUPPLIER_PRIVATE_KEY_PEM",
         "generate_candidate_evidence.py", "sign_candidate_evidence.py",
     ):
         _require(forbidden not in publish, f"publisher_forbidden_capability:{forbidden}")
     _require("rulesets?targets=tag" not in publish, "publisher_unavailable_rulesets_api")
     _require(publish.count("environment: experimental-candidate") == 1, "publisher_environment_authority")
-    _require("VISION_SUPPLIER_PRIVATE_KEY_PEM" not in publisher_source, "publisher_supplier_key_present")
     _assert_gh_attestation_flags_parse(repository_root)
 
 

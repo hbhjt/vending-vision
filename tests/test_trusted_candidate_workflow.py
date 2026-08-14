@@ -22,7 +22,7 @@ TRUSTED_BUILDER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder
 PUBLISHER = ROOT / ".github" / "workflows" / "publish-candidate.yml"
 TRUSTED_BUILDER_COMMIT = "691b5056e8b9bf2667bc527b2170780b05863946"
 TRUSTED_SIGNER = ROOT / ".github" / "workflows" / "trusted-ai-candidate-signer.yml"
-TRUSTED_SIGNER_COMMIT = "43226e057afc5cda782a5ae837e727663a6625b1"
+TRUSTED_SIGNER_COMMIT = "59b4fee088db08f3008c137409f98577de987595"
 TRUST_POLICY = ROOT / "scripts" / "check_trusted_candidate_workflows.py"
 
 
@@ -650,7 +650,7 @@ def _check_policy(
     )
 
 
-def test_publish_caller_pins_builder_a_and_signer_s_without_holding_supplier_secrets():
+def test_publish_caller_pins_builder_a_and_directly_signs_only_verified_evidence():
     completed = _check_policy(PUBLISHER)
     assert completed.returncode == 0, completed.stdout + completed.stderr
     workflow = PUBLISHER.read_text("utf-8")
@@ -674,13 +674,23 @@ def test_publish_caller_pins_builder_a_and_signer_s_without_holding_supplier_sec
     assert "--deny-self-hosted-runners" in workflow
     assert "actions/attest-build-provenance" not in workflow
     assert "scripts/build_exe.ps1" not in workflow
-    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in workflow
-    assert "generate_candidate_evidence.py" not in workflow
-    assert "sign_candidate_evidence.py" not in workflow
+    assert workflow.count("${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}") == 1
+    signer_call = workflow[workflow.index("  trusted_signer:\n"):workflow.index("  sign_evidence:\n")]
+    direct_sign = workflow[workflow.index("  sign_evidence:\n"):workflow.index("  publish:\n")]
+    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in signer_call
+    assert "environment: experimental-candidate" in direct_sign
+    assert "needs: [verify, trusted_signer]" in direct_sign
+    assert "${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}" in direct_sign
+    assert "scripts/verify_trusted_script_set.py" in direct_sign
+    assert "scripts/evidence_artifact.py" in direct_sign
+    assert "scripts/sign_candidate_evidence.py" in direct_sign
+    assert "--kind unsigned --expected-digest $env:UNSIGNED_EVIDENCE_SHA256" in direct_sign
+    assert "--private-key $key --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY" in direct_sign
     publish = workflow[workflow.index("  publish:\n"):]
-    assert "trusted_signer" in publish.split("steps:", 1)[0]
+    assert "needs: [verify, sign_evidence]" in publish
     assert f"ref: {TRUSTED_SIGNER_COMMIT}" in publish
     assert publish.count("actions/download-artifact@v4") == 2
+    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in publish
     assert "--target $env:RELEASE_TARGET" in publish
     assert "verify_hosted_release_authority.py" in publish
     assert "--mode publish-admission" in publish
@@ -758,6 +768,152 @@ def test_trust_policy_rejects_mutable_caller_and_missing_or_wrong_signer_digest(
         candidate.write_text(source, "utf-8")
         completed = _check_policy(candidate)
         assert completed.returncode != 0, name
+
+
+@pytest.mark.parametrize(
+    ("name", "old", "new"),
+    (
+        (
+            "missing-direct-environment",
+            "    environment: experimental-candidate\n    permissions:\n      contents: read\n    outputs:\n      signed_evidence_artifact_name:",
+            "    permissions:\n      contents: read\n    outputs:\n      signed_evidence_artifact_name:",
+        ),
+        (
+            "identity-drift",
+            "VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}",
+            "VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.WRONG_SIGNER_IDENTITY }}",
+        ),
+        (
+            "extra-secret-in-verifier",
+            "          SOURCE_REF: ${{ github.ref }}\n",
+            "          SOURCE_REF: ${{ github.ref }}\n          VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}\n",
+        ),
+        (
+            "secret-exposed-before-sign-step",
+            "          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}\n        run: |",
+            "          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.VISION_SUPPLIER_SIGNER_IDENTITY }}\n          VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}\n        run: |",
+        ),
+        (
+            "second-secret-expression",
+            "          VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}\n",
+            "          VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}\n          DUPLICATE_KEY: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}\n",
+        ),
+        (
+            "wrong-unsigned-artifact-binding",
+            "UNSIGNED_EVIDENCE_ARTIFACT_NAME: ${{ needs.trusted_signer.outputs.unsigned_evidence_artifact_name }}",
+            "UNSIGNED_EVIDENCE_ARTIFACT_NAME: ${{ needs.verify.outputs.artifact_name }}",
+        ),
+        (
+            "wrong-unsigned-digest-binding",
+            "UNSIGNED_EVIDENCE_SHA256: ${{ needs.trusted_signer.outputs.unsigned_evidence_sha256 }}",
+            "UNSIGNED_EVIDENCE_SHA256: ${{ needs.verify.outputs.subject_sha256 }}",
+        ),
+        (
+            "immutable-signer-ref-drift",
+            f"ref: {TRUSTED_SIGNER_COMMIT}",
+            "ref: 0000000000000000000000000000000000000000",
+        ),
+        (
+            "direct-sign-extra-permission",
+            "    permissions:\n      contents: read\n    outputs:\n      signed_evidence_artifact_name:",
+            "    permissions:\n      contents: read\n      id-token: write\n    outputs:\n      signed_evidence_artifact_name:",
+        ),
+        (
+            "direct-sign-secrets-inherit",
+            "    permissions:\n      contents: read\n    outputs:\n      signed_evidence_artifact_name:",
+            "    permissions:\n      contents: read\n    secrets: inherit\n    outputs:\n      signed_evidence_artifact_name:",
+        ),
+        (
+            "bracket-secret-in-seal-step",
+            "        id: seal\n        shell: pwsh",
+            "        id: seal\n        env:\n          LATE_KEY: ${{ secrets['VISION_SUPPLIER_PRIVATE_KEY_PEM'] }}\n        shell: pwsh",
+        ),
+    ),
+)
+def test_trust_policy_rejects_direct_signing_boundary_mutations(tmp_path, name, old, new):
+    source = PUBLISHER.read_text("utf-8")
+    if name == "extra-secret-in-verifier":
+        start = source.index("  verify:\n")
+        end = source.index("  trusted_signer:\n")
+        candidate_source = source[:start] + source[start:end].replace(old, new, 1) + source[end:]
+    else:
+        start = source.index("  sign_evidence:\n")
+        end = source.index("  publish:\n")
+        candidate_source = source[:start] + source[start:end].replace(old, new, 1) + source[end:]
+    candidate = tmp_path / f"{name}.yml"
+    candidate.write_text(candidate_source, "utf-8")
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode != 0, name
+
+
+@pytest.mark.parametrize(
+    ("name", "old", "new"),
+    (
+        ("missing-finally", "          } finally {\n", "          } catch {\n"),
+        ("silent-cleanup", "Remove-Item -LiteralPath $key -Force -ErrorAction Stop", "Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue"),
+        ("wrong-key-cleanup-path", "Remove-Item -LiteralPath $key", "Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'wrong.pem')"),
+    ),
+)
+def test_trust_policy_rejects_direct_signing_key_cleanup_mutations(tmp_path, name, old, new):
+    source = PUBLISHER.read_text("utf-8")
+    start = source.index("  sign_evidence:\n")
+    end = source.index("  publish:\n")
+    direct = source[start:end]
+    candidate_direct = direct.replace(old, new, 1)
+    candidate = tmp_path / f"{name}.yml"
+    candidate.write_text(source[:start] + candidate_direct + source[end:], "utf-8")
+
+    completed = _check_policy(candidate)
+
+    assert completed.returncode != 0, name
+
+
+@pytest.mark.parametrize(
+    ("primary", "cleanup", "expected"),
+    (
+        (True, False, ("PRIMARY",)),
+        (False, True, ("SECONDARY",)),
+        (True, True, ("PRIMARY", "WARNING: supplier key cleanup failed after signing failure: SECONDARY")),
+    ),
+)
+def test_direct_sign_cleanup_preserves_primary_failure_in_real_pwsh(primary, cleanup, expected):
+    script = f"""
+$WarningPreference = 'Continue'
+$primaryFailure = $null
+$cleanupFailure = $null
+try {{
+  if (${str(primary).lower()}) {{ throw 'PRIMARY' }}
+}} catch {{
+  $primaryFailure = $_
+}} finally {{
+  try {{
+    if (${str(cleanup).lower()}) {{ throw 'SECONDARY' }}
+  }} catch {{
+    $cleanupFailure = $_
+  }}
+}}
+if ($null -ne $primaryFailure) {{
+  if ($null -ne $cleanupFailure) {{ Write-Warning "supplier key cleanup failed after signing failure: $($cleanupFailure.Exception.Message)" }}
+  throw $primaryFailure
+}}
+if ($null -ne $cleanupFailure) {{ throw $cleanupFailure }}
+"""
+    completed = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    output = completed.stdout + completed.stderr
+    for item in expected:
+        assert item in output
+    if primary and cleanup:
+        assert output.index("WARNING: supplier key cleanup failed after signing failure: SECONDARY") < output.rindex("PRIMARY")
+        assert "ErrorRecord" not in output
 
 
 def test_trust_policy_rejects_any_signer_byte_change_and_does_not_require_mutually_exclusive_flags(tmp_path):

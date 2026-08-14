@@ -682,12 +682,12 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "secrets:" not in builder
 
     assert "trusted-ai-candidate-builder.yml@691b5056e8b9bf2667bc527b2170780b05863946" in publisher
-    assert "trusted-ai-candidate-signer.yml@43226e057afc5cda782a5ae837e727663a6625b1" in publisher
+    assert "trusted-ai-candidate-signer.yml@59b4fee088db08f3008c137409f98577de987595" in publisher
     assert "scripts/build_exe.ps1" not in publisher
     assert "actions/attest-build-provenance" not in publisher
     assert "needs: trusted_builder" in publisher
     assert "needs: verify" in publisher
-    assert publisher.count("runs-on: windows-latest") == 2
+    assert publisher.count("runs-on: windows-latest") == 3
     assert "actions/download-artifact@v4" in publisher
     assert "gh attestation verify" in publisher
     assert "--signer-repo" not in publisher
@@ -701,10 +701,10 @@ def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
     assert "--expected-source-commit" in publisher
     assert "--extract-root" in publisher
     assert "--require-ai-worker" in publisher
-    assert "environment: experimental-candidate" in signer
+    assert "environment: experimental-candidate" not in signer
     assert "--trusted-builder-evidence" in signer
-    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" in signer
-    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in publisher
+    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in signer
+    assert publisher.count("${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}") == 1
     assert "--expected-candidate-manifest-sha256" not in publisher
 
 
