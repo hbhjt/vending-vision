@@ -189,11 +189,11 @@ jobs:
           if ($env:MODEL_PACK_URL -match '\S' -and $partValueCount -eq 0) {
             $downloads += ,@($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "proof-input/model/official-model-pack.zip")
           } elseif ($env:MODEL_PACK_URL -notmatch '\S' -and $partValueCount -eq 9) {
-            New-Item -ItemType Directory -Path proof-input/model-parts -Force | Out-Null
+            New-Item -ItemType Directory -Path model-parts-input -Force | Out-Null
             $downloads += @(
-              @($env:MODEL_PACK_PART_01_URL, $env:MODEL_PACK_PART_01_SHA256, $env:MODEL_PACK_PART_01_BYTES, "proof-input/model-parts/official-model-pack.part01"),
-              @($env:MODEL_PACK_PART_02_URL, $env:MODEL_PACK_PART_02_SHA256, $env:MODEL_PACK_PART_02_BYTES, "proof-input/model-parts/official-model-pack.part02"),
-              @($env:MODEL_PACK_PART_03_URL, $env:MODEL_PACK_PART_03_SHA256, $env:MODEL_PACK_PART_03_BYTES, "proof-input/model-parts/official-model-pack.part03")
+              @($env:MODEL_PACK_PART_01_URL, $env:MODEL_PACK_PART_01_SHA256, $env:MODEL_PACK_PART_01_BYTES, "model-parts-input/official-model-pack.part01"),
+              @($env:MODEL_PACK_PART_02_URL, $env:MODEL_PACK_PART_02_SHA256, $env:MODEL_PACK_PART_02_BYTES, "model-parts-input/official-model-pack.part02"),
+              @($env:MODEL_PACK_PART_03_URL, $env:MODEL_PACK_PART_03_SHA256, $env:MODEL_PACK_PART_03_BYTES, "model-parts-input/official-model-pack.part03")
             )
             $useMultipartModelPack = $true
           } else {
@@ -205,7 +205,7 @@ jobs:
           }
           if ($useMultipartModelPack) {
             $proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path
-            & $env:TRUSTED_PYTHON $proofTool assemble-model-pack --parts-root proof-input/model-parts --part-name official-model-pack.part01 --part-sha256 $env:MODEL_PACK_PART_01_SHA256 --part-bytes $env:MODEL_PACK_PART_01_BYTES --part-name official-model-pack.part02 --part-sha256 $env:MODEL_PACK_PART_02_SHA256 --part-bytes $env:MODEL_PACK_PART_02_BYTES --part-name official-model-pack.part03 --part-sha256 $env:MODEL_PACK_PART_03_SHA256 --part-bytes $env:MODEL_PACK_PART_03_BYTES --expected-sha256 $env:MODEL_PACK_SHA256 --expected-bytes $env:MODEL_PACK_BYTES --destination proof-input/model/official-model-pack.zip
+            & $env:TRUSTED_PYTHON $proofTool assemble-model-pack --parts-root model-parts-input --part-name official-model-pack.part01 --part-sha256 $env:MODEL_PACK_PART_01_SHA256 --part-bytes $env:MODEL_PACK_PART_01_BYTES --part-name official-model-pack.part02 --part-sha256 $env:MODEL_PACK_PART_02_SHA256 --part-bytes $env:MODEL_PACK_PART_02_BYTES --part-name official-model-pack.part03 --part-sha256 $env:MODEL_PACK_PART_03_SHA256 --part-bytes $env:MODEL_PACK_PART_03_BYTES --expected-sha256 $env:MODEL_PACK_SHA256 --expected-bytes $env:MODEL_PACK_BYTES --destination proof-input/model/official-model-pack.zip
             if ($LASTEXITCODE -ne 0) { throw "trusted proof model-pack reconstruction failed" }
           }
       - name: Derive exact candidate identities without executing candidate code
@@ -433,11 +433,11 @@ jobs:
           if ($env:MODEL_PACK_URL -match '\S' -and $partValueCount -eq 0) {
             $downloads += ,@($env:MODEL_PACK_URL, $env:MODEL_PACK_SHA256, $env:MODEL_PACK_BYTES, "signer-proof-input/model/official-model-pack.zip")
           } elseif ($env:MODEL_PACK_URL -notmatch '\S' -and $partValueCount -eq 9) {
-            New-Item -ItemType Directory -Path signer-proof-input/model-parts -Force | Out-Null
+            New-Item -ItemType Directory -Path signer-model-parts-input -Force | Out-Null
             $downloads += @(
-              @($env:MODEL_PACK_PART_01_URL, $env:MODEL_PACK_PART_01_SHA256, $env:MODEL_PACK_PART_01_BYTES, "signer-proof-input/model-parts/official-model-pack.part01"),
-              @($env:MODEL_PACK_PART_02_URL, $env:MODEL_PACK_PART_02_SHA256, $env:MODEL_PACK_PART_02_BYTES, "signer-proof-input/model-parts/official-model-pack.part02"),
-              @($env:MODEL_PACK_PART_03_URL, $env:MODEL_PACK_PART_03_SHA256, $env:MODEL_PACK_PART_03_BYTES, "signer-proof-input/model-parts/official-model-pack.part03")
+              @($env:MODEL_PACK_PART_01_URL, $env:MODEL_PACK_PART_01_SHA256, $env:MODEL_PACK_PART_01_BYTES, "signer-model-parts-input/official-model-pack.part01"),
+              @($env:MODEL_PACK_PART_02_URL, $env:MODEL_PACK_PART_02_SHA256, $env:MODEL_PACK_PART_02_BYTES, "signer-model-parts-input/official-model-pack.part02"),
+              @($env:MODEL_PACK_PART_03_URL, $env:MODEL_PACK_PART_03_SHA256, $env:MODEL_PACK_PART_03_BYTES, "signer-model-parts-input/official-model-pack.part03")
             )
             $useMultipartModelPack = $true
           } else {
@@ -449,7 +449,7 @@ jobs:
           }
           if ($useMultipartModelPack) {
             $proofTool = (Resolve-Path -LiteralPath trusted-proof/scripts/trusted_precutover_proof.py).Path
-            & $env:TRUSTED_PYTHON $proofTool assemble-model-pack --parts-root signer-proof-input/model-parts --part-name official-model-pack.part01 --part-sha256 $env:MODEL_PACK_PART_01_SHA256 --part-bytes $env:MODEL_PACK_PART_01_BYTES --part-name official-model-pack.part02 --part-sha256 $env:MODEL_PACK_PART_02_SHA256 --part-bytes $env:MODEL_PACK_PART_02_BYTES --part-name official-model-pack.part03 --part-sha256 $env:MODEL_PACK_PART_03_SHA256 --part-bytes $env:MODEL_PACK_PART_03_BYTES --expected-sha256 $env:MODEL_PACK_SHA256 --expected-bytes $env:MODEL_PACK_BYTES --destination signer-proof-input/model/official-model-pack.zip
+            & $env:TRUSTED_PYTHON $proofTool assemble-model-pack --parts-root signer-model-parts-input --part-name official-model-pack.part01 --part-sha256 $env:MODEL_PACK_PART_01_SHA256 --part-bytes $env:MODEL_PACK_PART_01_BYTES --part-name official-model-pack.part02 --part-sha256 $env:MODEL_PACK_PART_02_SHA256 --part-bytes $env:MODEL_PACK_PART_02_BYTES --part-name official-model-pack.part03 --part-sha256 $env:MODEL_PACK_PART_03_SHA256 --part-bytes $env:MODEL_PACK_PART_03_BYTES --expected-sha256 $env:MODEL_PACK_SHA256 --expected-bytes $env:MODEL_PACK_BYTES --destination signer-proof-input/model/official-model-pack.zip
             if ($LASTEXITCODE -ne 0) { throw "signer proof model-pack reconstruction failed" }
           }
       - name: Fresh inspect candidate and model identities without execution

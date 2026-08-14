@@ -506,9 +506,9 @@ def check(
         ),
         "trusted_proof_download_total_timeout",
     )
-    for block, root, label in (
-        (execute, "proof-input", "execute"),
-        (sign, "signer-proof-input", "sign"),
+    for block, root, parts_root, label in (
+        (execute, "proof-input", "model-parts-input", "execute"),
+        (sign, "signer-proof-input", "signer-model-parts-input", "sign"),
     ):
         _require(
             "$env:MODEL_PACK_URL -match '\\S' -and $partValueCount -eq 0" in block
@@ -524,8 +524,14 @@ def check(
             f"trusted_proof_single_model_tuple:{label}",
         )
         _require(
+            f"New-Item -ItemType Directory -Path {parts_root} -Force | Out-Null"
+            in block
+            and f"{root}/model-parts" not in block,
+            f"trusted_proof_model_parts_sibling:{label}",
+        )
+        _require(
             block.count("assemble-model-pack --parts-root") == 1
-            and f"--parts-root {root}/model-parts" in block
+            and f"--parts-root {parts_root}" in block
             and f"--destination {root}/model/official-model-pack.zip" in block,
             f"trusted_proof_model_assembly:{label}",
         )
@@ -538,7 +544,7 @@ def check(
                 in block
                 and f"{env}_BYTES: ${{{{ fromJSON(needs.admit_inputs.outputs.proof_inputs).model_pack_part_{index:02d}_bytes }}}}"
                 in block
-                and f"@($env:{env}_URL, $env:{env}_SHA256, $env:{env}_BYTES, \"{root}/model-parts/{part}\")"
+                and f"@($env:{env}_URL, $env:{env}_SHA256, $env:{env}_BYTES, \"{parts_root}/{part}\")"
                 in block
                 and (
                     f"--part-name {part} --part-sha256 $env:{env}_SHA256 "

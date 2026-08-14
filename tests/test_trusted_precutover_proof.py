@@ -245,6 +245,47 @@ def test_inspector_derives_identity_and_accepts_only_bound_canonical_frozen_proo
     verify_proof(proof_path, identity)
 
 
+def test_multipart_staging_sibling_reconstructs_an_inspectable_exact_input_layout(tmp_path):
+    proof_input = tmp_path / "proof-input"
+    expected, _ = build_inputs(proof_input)
+    archive = b"official model archive fixture"
+    destination = proof_input / "model" / "official-model-pack.zip"
+    destination.unlink()
+    parts_root = tmp_path / "model-parts-input"
+    parts_root.mkdir()
+    parts = (b"official ", b"model ", b"archive fixture")
+    part_identities = tuple(
+        ModelPackPart(
+            name=f"official-model-pack.part{index:02d}",
+            sha256=_sha(raw),
+            byte_size=len(raw),
+        )
+        for index, raw in enumerate(parts, start=1)
+    )
+    for part, raw in zip(part_identities, parts, strict=True):
+        (parts_root / part.name).write_bytes(raw)
+
+    assemble_model_pack(
+        parts_root,
+        destination,
+        parts=part_identities,
+        expected_sha256=_sha(archive),
+        expected_bytes=len(archive),
+    )
+
+    assert {path.name for path in proof_input.iterdir()} == {"candidate", "model"}
+    assert inspect_inputs(proof_input) == expected
+
+
+def test_inspector_rejects_multipart_staging_inside_exact_input_layout(tmp_path):
+    proof_input = tmp_path / "proof-input"
+    build_inputs(proof_input)
+    (proof_input / "model-parts").mkdir()
+
+    with pytest.raises(ProofError, match="proof_inputs_layout"):
+        inspect_inputs(proof_input)
+
+
 def test_inspector_rejects_candidate_evidence_from_a_different_builder(tmp_path):
     build_inputs(tmp_path / "inputs")
     evidence_path = tmp_path / "inputs" / "candidate" / "trusted-builder-evidence.json"

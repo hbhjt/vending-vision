@@ -307,15 +307,18 @@ def test_proof_jobs_and_downloads_have_fixed_total_deadlines():
     assert all("--total-timeout-seconds 1800" in line for line in download_commands)
 
 
-def test_proof_reconstructs_only_the_exact_three_model_parts_in_both_fresh_jobs():
+def test_proof_reconstructs_only_the_exact_three_model_parts_outside_fresh_inputs():
     source = TRUSTED_PROOF.read_text("utf-8")
     execute = source[source.index("  execute:\n") : source.index("  sign:\n")]
     sign = source[source.index("  sign:\n") : source.index("  verify:\n")]
-    for job, root in ((execute, "proof-input"), (sign, "signer-proof-input")):
+    for job, root, parts_root in (
+        (execute, "proof-input", "model-parts-input"),
+        (sign, "signer-proof-input", "signer-model-parts-input"),
+    ):
         assert "$env:MODEL_PACK_URL -match '\\S' -and $partValueCount -eq 0" in job
         assert "$env:MODEL_PACK_URL -notmatch '\\S' -and $partValueCount -eq 9" in job
         assert "model pack input must be one complete archive URL or exactly the three ordered part identities" in job
-        assert f"--parts-root {root}/model-parts" in job
+        assert f"--parts-root {parts_root}" in job
         assert f"--destination {root}/model/official-model-pack.zip" in job
         for index in range(1, 4):
             part = f"official-model-pack.part{index:02d}"
@@ -323,7 +326,7 @@ def test_proof_reconstructs_only_the_exact_three_model_parts_in_both_fresh_jobs(
             assert f"$env:{env}_URL" in job
             assert f"$env:{env}_SHA256" in job
             assert f"$env:{env}_BYTES" in job
-            assert f"{root}/model-parts/{part}" in job
+            assert f"{parts_root}/{part}" in job
             assert (
                 f"--part-name {part} --part-sha256 $env:{env}_SHA256 "
                 f"--part-bytes $env:{env}_BYTES"
@@ -464,6 +467,19 @@ def _check_policy(
 def test_trusted_proof_workflow_passes_executable_trust_policy():
     completed = _check_policy(TRUSTED_PROOF)
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_trusted_proof_policy_rejects_multipart_parts_inside_inspected_input(tmp_path):
+    source = TRUSTED_PROOF.read_text("utf-8")
+    mutated = source.replace("model-parts-input", "proof-input/model-parts")
+    assert mutated != source
+    workflow = tmp_path / "trusted-precutover-companion-proof.yml"
+    workflow.write_text(mutated, "utf-8")
+
+    completed = _check_policy(workflow)
+
+    assert completed.returncode != 0
+    assert "trusted_proof_model_parts_sibling:execute" in completed.stdout
 
 
 @pytest.mark.parametrize(
