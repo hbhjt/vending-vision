@@ -257,10 +257,8 @@ def download_verified_file(
         ) as output:
             descriptor = -1
             remaining()
-            response_url = response.geturl()
+            response.geturl()
             remaining()
-            if response_url != url:
-                raise DownloadError("download_redirect_identity")
             while True:
                 remaining()
                 chunk = response.read(min(CHUNK_BYTES, expected_bytes - downloaded + 1))

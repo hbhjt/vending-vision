@@ -135,7 +135,7 @@ def test_opener_socket_timeout_is_capped_below_long_total_deadline(tmp_path):
     assert destination.read_bytes() == payload
 
 
-def test_deadline_is_checked_after_final_redirect_identity(tmp_path):
+def test_deadline_is_checked_after_final_response_url(tmp_path):
     url = "https://example.invalid/redirect.bin"
     payload = b"redirect"
     destination = tmp_path / "redirect.bin"
@@ -820,14 +820,46 @@ def test_bounded_file_downloader_aborts_expected_plus_one_without_destination(tm
     assert not destination.exists()
 
 
-@pytest.mark.parametrize("mutation", ["http", "redirect", "digest"])
-def test_bounded_file_downloader_rejects_mutable_or_wrong_identity(tmp_path, mutation):
+def test_bounded_file_downloader_accepts_rc22_github_release_redirect(
+    tmp_path,
+):
+    initial_url = (
+        "https://github.com/hbhjt/vending-vision/releases/download/"
+        "v0.2.1-rc.22/vending-vision-0.2.1-rc.22-windows-x86_64.zip"
+    )
+    signed_final_url = (
+        "https://release-assets.githubusercontent.com/"
+        "github-production-release-asset/1262176963/"
+        "c17a54f0-6655-4832-a74e-427a3a6d0ded?"
+        "sp=r&sv=2018-11-09&sig=signature"
+    )
+    payload = b"exact RC22 candidate bytes"
+    destination = tmp_path / "candidate.zip"
+    requests = []
+
+    def opener(request, timeout):
+        requests.append((request.full_url, timeout))
+        return Response(payload, signed_final_url)
+
+    download_verified_file(
+        initial_url,
+        hashlib.sha256(payload).hexdigest(),
+        len(payload),
+        destination,
+        opener=opener,
+    )
+
+    assert requests[0][0] == initial_url
+    assert destination.read_bytes() == payload
+
+
+@pytest.mark.parametrize("mutation", ["http", "digest"])
+def test_bounded_file_downloader_rejects_invalid_initial_identity_or_digest(
+    tmp_path, mutation
+):
     expected_url = "https://example.invalid/proof.json"
     payload = b"proof"
     url = expected_url if mutation != "http" else "http://example.invalid/proof.json"
-    response_url = (
-        "https://cdn.example.invalid/proof.json" if mutation == "redirect" else url
-    )
     digest = hashlib.sha256(payload).hexdigest() if mutation != "digest" else "0" * 64
     destination = tmp_path / "proof.json"
 
@@ -837,7 +869,7 @@ def test_bounded_file_downloader_rejects_mutable_or_wrong_identity(tmp_path, mut
             digest,
             len(payload),
             destination,
-            opener=lambda _request, timeout: Response(payload, response_url),
+            opener=lambda _request, timeout: Response(payload, url),
         )
 
     assert not destination.exists()
