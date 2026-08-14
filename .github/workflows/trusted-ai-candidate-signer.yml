@@ -32,12 +32,12 @@ on:
         required: true
         type: string
     outputs:
-      signed_evidence_artifact_name:
-        description: Artifact containing supplier-signed installed evidence
-        value: ${{ jobs.sign_evidence.outputs.signed_evidence_artifact_name }}
-      signed_evidence_sha256:
-        description: Canonical signed evidence manifest digest
-        value: ${{ jobs.sign_evidence.outputs.signed_evidence_sha256 }}
+      unsigned_evidence_artifact_name:
+        description: Artifact containing verified unsigned installed evidence
+        value: ${{ jobs.verify_evidence.outputs.unsigned_evidence_artifact_name }}
+      unsigned_evidence_sha256:
+        description: Canonical verified unsigned evidence manifest digest
+        value: ${{ jobs.verify_evidence.outputs.unsigned_evidence_sha256 }}
 
 permissions:
   contents: read
@@ -166,103 +166,3 @@ jobs:
           path: unsigned-evidence/*
           if-no-files-found: error
           retention-days: 1
-
-  sign_evidence:
-    needs: verify_evidence
-    runs-on: windows-latest
-    environment: experimental-candidate
-    permissions:
-      contents: read
-    outputs:
-      signed_evidence_artifact_name: ${{ steps.identities.outputs.signed_evidence_artifact_name }}
-      signed_evidence_sha256: ${{ steps.seal.outputs.signed_evidence_sha256 }}
-    steps:
-      - name: Checkout immutable trusted signer implementation
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: trusted-signer
-          persist-credentials: false
-      - name: Revalidate signer identity on the fresh runner
-        id: identities
-        shell: pwsh
-        env:
-          SOURCE_COMMIT: ${{ inputs.source_commit }}
-          SOURCE_REF: ${{ inputs.source_ref }}
-          VISION_SUPPLIER_SIGNER_IDENTITY: ${{ inputs.signer_identity }}
-          CALLER_SHA: ${{ github.sha }}
-          CALLER_REF: ${{ github.ref }}
-          TRUSTED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
-          TRUSTED_WORKFLOW_PATH: ${{ job.workflow_file_path }}
-          TRUSTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
-        run: |
-          if ($env:TRUSTED_WORKFLOW_REPOSITORY -cne "hbhjt/vending-vision" -or $env:TRUSTED_WORKFLOW_PATH -cne ".github/workflows/trusted-ai-candidate-signer.yml") { throw "unexpected trusted signer identity" }
-          if ($env:TRUSTED_WORKFLOW_SHA -notmatch '^[a-f0-9]{40}$') { throw "trusted signer SHA is unavailable" }
-          if ($env:SOURCE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:SOURCE_COMMIT -cne $env:CALLER_SHA) { throw "fresh signer source commit claim is invalid" }
-          if ($env:SOURCE_REF -notmatch '^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[0-9A-Za-z.-]+$' -or $env:SOURCE_REF -cne $env:CALLER_REF) { throw "fresh signer source ref claim is invalid" }
-          if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "supplier signer identity is invalid" }
-          $python = (Get-Command python.exe -ErrorAction Stop).Source
-          if (-not [IO.Path]::IsPathFullyQualified($python)) { throw "trusted system Python path is not absolute" }
-          $openssl = "C:\Program Files\Git\mingw64\bin\openssl.exe"
-          if (-not (Test-Path -LiteralPath $openssl -PathType Leaf)) { throw "trusted absolute OpenSSL executable is unavailable" }
-          "TRUSTED_PYTHON=$python" >> $env:GITHUB_ENV
-          "TRUSTED_OPENSSL=$openssl" >> $env:GITHUB_ENV
-          "SOURCE_COMMIT=$env:SOURCE_COMMIT" >> $env:GITHUB_ENV
-          "SOURCE_REF=$env:SOURCE_REF" >> $env:GITHUB_ENV
-          "VISION_SUPPLIER_SIGNER_IDENTITY=$env:VISION_SUPPLIER_SIGNER_IDENTITY" >> $env:GITHUB_ENV
-          "signed_evidence_artifact_name=vending-vision-signed-evidence-$env:SOURCE_COMMIT" >> $env:GITHUB_OUTPUT
-      - name: Reverify immutable trusted script hashes
-        shell: pwsh
-        run: |
-          $root = (Resolve-Path -LiteralPath trusted-signer).Path
-          $verifier = (Resolve-Path -LiteralPath trusted-signer/scripts/verify_trusted_script_set.py).Path
-          $descriptor = (Resolve-Path -LiteralPath trusted-signer/trusted-signer-scripts.json).Path
-          & $env:TRUSTED_PYTHON $verifier --root $root --descriptor $descriptor
-          if ($LASTEXITCODE -ne 0) { throw "fresh signer script hash verification failed" }
-      - name: Download fixed verified evidence artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.verify_evidence.outputs.unsigned_evidence_artifact_name }}
-          path: unsigned-evidence
-      - name: Verify cross-job evidence digest without candidate workspace
-        shell: pwsh
-        env:
-          UNSIGNED_EVIDENCE_SHA256: ${{ needs.verify_evidence.outputs.unsigned_evidence_sha256 }}
-        run: |
-          if ($env:UNSIGNED_EVIDENCE_SHA256 -notmatch '^[a-f0-9]{64}$') { throw "unsigned evidence digest output is invalid" }
-          $script = (Resolve-Path -LiteralPath trusted-signer/scripts/evidence_artifact.py).Path
-          & $env:TRUSTED_PYTHON $script verify --directory unsigned-evidence --kind unsigned --expected-digest $env:UNSIGNED_EVIDENCE_SHA256
-          if ($LASTEXITCODE -ne 0) { throw "cross-job unsigned evidence verification failed" }
-          Copy-Item -LiteralPath unsigned-evidence -Destination signed-evidence -Recurse
-      - name: Sign only verified evidence with the protected supplier key
-        shell: pwsh
-        env:
-          VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:VISION_SUPPLIER_PRIVATE_KEY_PEM)) { throw "supplier private key is required" }
-          if ($env:VISION_SUPPLIER_SIGNER_IDENTITY -notmatch '^spki-sha256:[a-f0-9]{64}$') { throw "supplier signer identity is invalid" }
-          $key = Join-Path $env:RUNNER_TEMP "supplier-ed25519.pem"
-          $script = (Resolve-Path -LiteralPath trusted-signer/scripts/sign_candidate_evidence.py).Path
-          try {
-            [IO.File]::WriteAllText($key, $env:VISION_SUPPLIER_PRIVATE_KEY_PEM)
-            & $env:TRUSTED_PYTHON $script --candidate-dir signed-evidence --private-key $key --signer-identity $env:VISION_SUPPLIER_SIGNER_IDENTITY --openssl $env:TRUSTED_OPENSSL
-            if ($LASTEXITCODE -ne 0) { throw "installed evidence signing failed" }
-          } finally {
-            Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue
-          }
-      - name: Seal canonical signed evidence
-        id: seal
-        shell: pwsh
-        run: |
-          $script = (Resolve-Path -LiteralPath trusted-signer/scripts/evidence_artifact.py).Path
-          $sealed = (& $env:TRUSTED_PYTHON $script seal --directory signed-evidence --kind signed) | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or $sealed.sha256 -notmatch '^[a-f0-9]{64}$') { throw "signed evidence sealing failed" }
-          "signed_evidence_sha256=$($sealed.sha256)" >> $env:GITHUB_OUTPUT
-      - name: Upload only supplier-signed evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.identities.outputs.signed_evidence_artifact_name }}
-          path: signed-evidence/*
-          if-no-files-found: error
-          retention-days: 14

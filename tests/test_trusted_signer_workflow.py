@@ -26,11 +26,9 @@ TRUSTED_BUILDER_COMMIT = "691b5056e8b9bf2667bc527b2170780b05863946"
 def _assert_signer_environment_authority(source: str) -> None:
     jobs = load_workflow_yaml(source)["jobs"]
     verify = jobs["verify_evidence"]
-    sign = jobs["sign_evidence"]
+    assert set(jobs) == {"verify_evidence"}
     assert "environment" not in verify
-    assert sign["environment"] == "experimental-candidate"
     verify_steps = {step["name"]: step for step in verify["steps"]}
-    sign_steps = {step["name"]: step for step in sign["steps"]}
     assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in str(verify)
     assert verify_steps["Validate identities without shell interpolation"]["env"][
         "VISION_SUPPLIER_SIGNER_IDENTITY"
@@ -38,15 +36,6 @@ def _assert_signer_environment_authority(source: str) -> None:
     assert '"VISION_SUPPLIER_SIGNER_IDENTITY=$env:VISION_SUPPLIER_SIGNER_IDENTITY" >> $env:GITHUB_ENV' in verify_steps[
         "Validate identities without shell interpolation"
     ]["run"]
-    assert sign_steps["Revalidate signer identity on the fresh runner"]["env"][
-        "VISION_SUPPLIER_SIGNER_IDENTITY"
-    ] == "${{ inputs.signer_identity }}"
-    assert '"VISION_SUPPLIER_SIGNER_IDENTITY=$env:VISION_SUPPLIER_SIGNER_IDENTITY" >> $env:GITHUB_ENV' in sign_steps[
-        "Revalidate signer identity on the fresh runner"
-    ]["run"]
-    assert sign_steps["Sign only verified evidence with the protected supplier key"]["env"] == {
-        "VISION_SUPPLIER_PRIVATE_KEY_PEM": "${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}"
-    }
 
 
 def _workflow_call_inputs(source: str) -> set[str]:
@@ -57,7 +46,7 @@ def _workflow_call_inputs(source: str) -> set[str]:
     return set(re.findall(r"(?m)^      ([a-z][a-z0-9_]*):$", match.group("body")))
 
 
-def test_trusted_signer_has_only_data_inputs_and_isolates_the_supplier_key():
+def test_trusted_signer_has_only_data_inputs_and_never_receives_the_supplier_key():
     workflow = SIGNER.read_text("utf-8")
 
     assert _workflow_call_inputs(workflow) == {
@@ -71,14 +60,10 @@ def test_trusted_signer_has_only_data_inputs_and_isolates_the_supplier_key():
     }
     parsed = load_workflow_yaml(workflow)
     verify = parsed["jobs"]["verify_evidence"]
-    sign = parsed["jobs"]["sign_evidence"]
-    sign_source = workflow[workflow.index("  sign_evidence:\n"):]
-    assert workflow.count("runs-on: windows-latest") == 2
+    assert set(parsed["jobs"]) == {"verify_evidence"}
+    assert workflow.count("runs-on: windows-latest") == 1
     assert "environment" not in verify
-    assert sign["environment"] == "experimental-candidate"
-    assert sign["needs"] == "verify_evidence"
     verify_steps = {step["name"]: step for step in verify["steps"]}
-    sign_steps = {step["name"]: step for step in sign["steps"]}
     _assert_signer_environment_authority(workflow)
     assert "repository: ${{ job.workflow_repository }}" in workflow
     assert "ref: ${{ job.workflow_sha }}" in workflow
@@ -89,18 +74,13 @@ def test_trusted_signer_has_only_data_inputs_and_isolates_the_supplier_key():
     assert "--deny-self-hosted-runners" in workflow
     assert f'--signer-digest "{TRUSTED_BUILDER_COMMIT}"' in workflow
     assert "actions/checkout@v4" in workflow
-    assert workflow.count("actions/checkout@v4") == 2
+    assert workflow.count("actions/checkout@v4") == 1
     assert "path: source" not in workflow
     assert "actions/setup-python" not in workflow
     assert "scripts/evidence_artifact.py" in workflow
-    assert "--expected-digest $env:UNSIGNED_EVIDENCE_SHA256" in sign_source
-    assert "scripts/verify_trusted_script_set.py" in sign_source
-    assert "candidate-input" not in sign_source
-    assert "verified-candidate" not in sign_source
-    assert "source-approval" not in sign_source
-    assert ".venv" not in sign_source
-    assert "& $env:TRUSTED_PYTHON" in sign_source
-    assert "--openssl $env:TRUSTED_OPENSSL" in sign_source
+    assert "sign_evidence:" not in workflow
+    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in workflow
+    assert "sign_candidate_evidence.py" not in workflow
     input_lines = [line.strip() for line in workflow.splitlines() if "${{ inputs." in line]
     assert input_lines
     assert all(
@@ -134,18 +114,13 @@ def test_trusted_signer_has_only_data_inputs_and_isolates_the_supplier_key():
 @pytest.mark.parametrize(
     "old,new,count",
     [
-        ("    environment: experimental-candidate\n    permissions:", "    permissions:", 1),
-        ("    environment: experimental-candidate\n    permissions:", "    environment: staging\n    permissions:", 1),
         (
             "VISION_SUPPLIER_SIGNER_IDENTITY: ${{ inputs.signer_identity }}",
             "VISION_SUPPLIER_SIGNER_IDENTITY: ${{ vars.WRONG_IDENTITY }}",
             1,
         ),
-        (
-            "VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ secrets.VISION_SUPPLIER_PRIVATE_KEY_PEM }}",
-            "VISION_SUPPLIER_PRIVATE_KEY_PEM: ${{ vars.VISION_SUPPLIER_PRIVATE_KEY_PEM }}",
-            1,
-        ),
+        ("  verify_evidence:\n", "  verify_evidence:\n    environment: experimental-candidate\n", 1),
+        ("  verify_evidence:\n", "  sign_evidence:\n", 1),
     ],
 )
 def test_trusted_signer_environment_authority_rejects_missing_or_mis_scoped_inputs(
