@@ -99,7 +99,12 @@ class FastTryOnRuntime:
             raise GarmentFetchError("loopback")
         if cancel_event is not None and cancel_event.is_set():
             raise GarmentFetchError("attempt_canceled")
-        timeout = httpx.Timeout(connect=1.0, read=0.25, write=1.0, pool=1.0)
+        # The daemon's local media read can briefly block behind a catalog
+        # adoption or media-cache transaction. A sub-second read deadline
+        # therefore turned an occasional busy daemon into a spurious
+        # garment_rejected terminal; the attempt-scoped 15s generation budget
+        # remains the authoritative outer deadline.
+        timeout = httpx.Timeout(connect=2.0, read=2.0, write=1.0, pool=1.0)
         try:
             async with asyncio.timeout(5.0):
                 # trust_env is intentionally disabled: a local daemon read
