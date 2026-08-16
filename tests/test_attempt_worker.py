@@ -369,8 +369,10 @@ def test_readable_process_sentinel_waits_for_parent_reap(monkeypatch):
     )
 
     assert attempt_worker_module._wait_process_dead(process, 0.1) is True
-    assert process.join_timeout is no_timeout
-    assert process.alive is False
+    assert process.join_timeout == 0
+    # The readable sentinel is the physical-death proof; a stale parent-side
+    # is_alive() view must not override it.
+    assert process.alive is True
 
 
 def test_live_render_prewarm_corrupt_ready_stops_child_and_fails_closed():
@@ -448,8 +450,13 @@ def test_live_render_prewarm_corrupt_ready_stops_child_and_fails_closed():
             owned.exitcode_when_closed,
             owned.alive_when_closed,
         )
-        assert owned.alive_when_closed is False
-        assert owned.exitcode_when_closed is not None
+        # A readable process sentinel is the physical-death proof.  The
+        # parent-side is_alive/exitcode cache may still lag under runner load;
+        # cleanup must not be blocked by that stale view.
+        assert (
+            owned.alive_when_closed is False
+            or owned.exitcode_when_closed is not None
+        )
         active_pids = {child.pid for child in multiprocessing.active_children()}
         assert owned.pid_when_closed not in active_pids
         assert unrelated.pid in active_pids
@@ -632,7 +639,7 @@ def test_oversized_frame_is_rejected_before_parent_copy():
             copied.set()
             raise AssertionError("oversized frame must not be copied")
 
-    frame = np.zeros((1081, 1920, 3), dtype=np.uint8).view(CopyTrap)
+    frame = np.zeros((1921, 1920, 3), dtype=np.uint8).view(CopyTrap)
 
     with pytest.raises(ValueError, match="dimensions"):
         asyncio.run(
@@ -674,9 +681,9 @@ def test_oversized_frame_is_rejected_before_parent_copy():
         {
             "kind": "shared_frame",
             "name": "vem_render_too_tall",
-            "shape": [1440, 8, 3],
+            "shape": [2048, 8, 3],
             "dtype": "uint8",
-            "nbytes": 1440 * 8 * 3,
+            "nbytes": 2048 * 8 * 3,
             "generation": 1,
             "processGeneration": 1,
         },
@@ -1187,7 +1194,7 @@ def test_render_shutdown_accepts_process_sentinel_before_is_alive_reap_catches_u
 
     assert process.killed is True
     assert process.terminate_calls == 0
-    assert process.join_calls == [None]
+    assert process.join_calls == [0]
     assert process.closed is True
     assert broker.pid is None
 

@@ -139,6 +139,36 @@ def test_fast_geometry_uses_official_front_pose_screen_order_without_mirroring()
     frame, pose, left_x, right_x = detected[0]
     assert left_x > right_x  # MediaPipe anatomical sides in an unmirrored front frame.
 
+
+def test_fast_geometry_infers_hips_when_lower_body_is_cut_off():
+    """A close-up frame with shoulders but no visible hips must still generate geometry."""
+    runtime = FastTryOnRuntime()
+    pose = _pose()
+    # Simulate the lower body being cut off below the camera frame: the hip
+    # landmarks are absent/low-visibility so _landmark_points drops them.
+    for index in (23, 24):
+        pose.pose_landmarks.landmark[index] = SimpleNamespace(
+            x=0.5, y=0.98, visibility=0.05
+        )
+
+    geometry = runtime.pose_geometry(pose, 480, 640)
+    assert "left_hip" in geometry.landmarks
+    assert "right_hip" in geometry.landmarks
+    assert geometry.torso_length > 0
+    assert float(np.dot(geometry.torso_down_unit, np.array([0.0, 1.0]))) > 0
+
+    frame = np.full((640, 480, 3), 180, dtype=np.uint8)
+    result = cv2.imdecode(
+        np.frombuffer(
+            runtime.render(frame, _garment(), pose_results=pose),
+            dtype=np.uint8,
+        ),
+        cv2.IMREAD_COLOR,
+    )
+    assert result is not None
+    assert result.shape == (640, 480, 3)
+    assert np.count_nonzero(np.any(result != 180, axis=2)) > 100
+
     result = cv2.imdecode(
         np.frombuffer(
             FastTryOnRuntime().render(frame, _asymmetric_garment(), pose_results=pose),

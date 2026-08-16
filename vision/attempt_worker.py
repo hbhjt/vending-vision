@@ -34,11 +34,11 @@ class AttemptWorkerError(RuntimeError):
 
 _MAX_GARMENT_BYTES = 8 * 1024 * 1024
 _MAX_FRAME_WIDTH = 1920
-_MAX_FRAME_HEIGHT = 1080
+_MAX_FRAME_HEIGHT = 1920
 _MAX_FRAME_RAW_BYTES = _MAX_FRAME_WIDTH * _MAX_FRAME_HEIGHT * 3
 _CONSERVATIVE_PREPARE_BYTES_PER_SECOND = 64 * 1024 * 1024
 _CONSERVATIVE_PREPARE_FIXED_SECONDS = 0.020
-_START_TIMEOUT_SECONDS = 5.0
+_START_TIMEOUT_SECONDS = 25.0
 _STOP_CONFIRM_TIMEOUT_SECONDS = 1.0
 _GRACEFUL_STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
 
@@ -118,13 +118,23 @@ def _wait_process_dead(process: Any, timeout: float) -> bool:
                 join = getattr(process, "join", None)
                 if join is not None:
                     try:
-                        join()
+                        join(timeout=0)
                     except (AssertionError, OSError, PermissionError, ValueError):
                         pass
                 # A readable multiprocessing sentinel is the operating-system
-                # proof that the process has physically exited.  Reap it before
-                # dropping the owned handle: on a busy runner a nonblocking join
-                # can run just before the final exit status becomes observable.
+                # proof that the process has physically exited.  is_alive()
+                # may still expose a stale parent-side reap/cache view under
+                # runner load and must not override that stronger proof.
+                # Briefly wait for the parent-side reap so owned handles can
+                # close cleanly; the sentinel proof still wins if it lags.
+                reap_deadline = time.monotonic() + min(max(timeout, 0.0), 0.25)
+                while time.monotonic() < reap_deadline:
+                    try:
+                        if not process.is_alive():
+                            break
+                    except (AttributeError, OSError, PermissionError, ValueError):
+                        break
+                    time.sleep(0.001)
                 return True
             return not _process_is_alive(process)
         except (AttributeError, OSError, PermissionError, ValueError):

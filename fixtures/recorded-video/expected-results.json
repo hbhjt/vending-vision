@@ -19,6 +19,22 @@
       "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
       "generator": "generate-man-front.py"
     },
+    "frontVertical": {
+      "file": "front-vertical.mp4",
+      "sha256": "80f29c1cf42f16a3bc5aa8bc6df45db581d56e741cc5eac0edf3377d1768d7ff",
+      "loop": true,
+      "source": "sources/person-man-front.png",
+      "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
+      "generator": "generate-front-vertical.py"
+    },
+    "frontVerticalUnstable": {
+      "file": "front-vertical-unstable.mp4",
+      "sha256": "c2a1961dc040eb7c1b238e62a64d789471cedd9f5fde7af3adf22f528537aba3",
+      "loop": true,
+      "source": "sources/person-man-front.png",
+      "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
+      "generator": "generate-front-vertical-unstable.py"
+    },
     "manUnalignedFront": {
       "file": "man-unaligned-front.mp4",
       "sha256": "aa0be84735b96bee0a80436e01fe1ed62390c04a81e7c2920823b8414f9b1db6",
@@ -44,6 +60,20 @@
       "departureWithinPolls": 23
     },
     "front": {
+      "profile": {
+        "minimumFields": ["personPresent", "confidence", "bodyType", "upperColor"],
+        "minimumConfidence": 0.25
+      },
+      "tryOn": {"jpeg": true}
+    },
+    "frontVertical": {
+      "profile": {
+        "minimumFields": ["personPresent", "confidence", "bodyType", "upperColor"],
+        "minimumConfidence": 0.25
+      },
+      "tryOn": {"jpeg": true}
+    },
+    "frontVerticalUnstable": {
       "profile": {
         "minimumFields": ["personPresent", "confidence", "bodyType", "upperColor"],
         "minimumConfidence": 0.25

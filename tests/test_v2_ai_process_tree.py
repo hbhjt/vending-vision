@@ -1044,9 +1044,10 @@ def test_public_ai_disconnect_joins_real_tree_and_replays_only_disconnect_termin
         thread.join()
 
 
-def test_public_recorded_departure_cancels_real_ai_tree_and_keeps_core_live(
+def test_public_recorded_departure_does_not_cancel_real_ai_tree_and_keeps_core_live(
     tmp_path, monkeypatch
 ):
+    """A production presence departure must not cancel the AI attempt; explicit user cancel still kills the real tree."""
     pack = tmp_path / "test-owned-pack"
     pack.mkdir()
     pid_file = tmp_path / "departure-tree.json"
@@ -1074,14 +1075,7 @@ def test_public_recorded_departure_cancels_real_ai_tree_and_keeps_core_live(
                 tree = _wait_pid_tree(pid_file)
                 assert all(_pid_alive(pid) for pid in tree.values())
 
-                canceled = next(
-                    (
-                        message
-                        for message in trace
-                        if message["type"] == "vision.try_on.attempt.canceled"
-                    ),
-                    None,
-                )
+                canceled = None
                 departure = next(
                     (
                         message
@@ -1093,13 +1087,7 @@ def test_public_recorded_departure_cancels_real_ai_tree_and_keeps_core_live(
                 profile_seen = any(
                     message["type"] == "vision.profile_result" for message in trace
                 )
-                post_cancel_presence = False
-                while (
-                    canceled is None
-                    or departure is None
-                    or not profile_seen
-                    or not post_cancel_presence
-                ):
+                while departure is None or not profile_seen:
                     message = socket.receive_json()
                     trace.append(message)
                     if message["type"] == "vision.try_on.attempt.canceled":
@@ -1108,11 +1096,26 @@ def test_public_recorded_departure_cancels_real_ai_tree_and_keeps_core_live(
                         departure = message
                     elif message["type"] == "vision.profile_result":
                         profile_seen = True
-                    elif (
-                        canceled is not None
-                        and message["type"] == "vision.presence_status"
-                    ):
-                        post_cancel_presence = True
+
+                # The departure edge must not have canceled the attempt and the
+                # real AI process tree must still be alive and owned.
+                assert canceled is None
+                assert all(_pid_alive(pid) for pid in tree.values())
+
+                # Explicit user cancel is the bounded terminal that still kills
+                # the whole owned process tree and clears the staged output.
+                socket.send_json(
+                    _envelope(
+                        "vision.try_on.attempt.cancel",
+                        {"attemptId": attempt_id, "reason": "user"},
+                    )
+                )
+                while True:
+                    message = socket.receive_json()
+                    trace.append(message)
+                    if message["type"] == "vision.try_on.attempt.canceled":
+                        canceled = message
+                        break
 
                 _assert_tree_dead(tree)
                 _assert_staging_clear(attempt_id)
@@ -1130,10 +1133,7 @@ def test_public_recorded_departure_cancels_real_ai_tree_and_keeps_core_live(
             core = client.get("/")
 
         assert canceled is not None
-        assert canceled["payload"] == {
-            "attemptId": attempt_id,
-            "reason": "departure",
-        }
+        assert canceled["payload"] == {"attemptId": attempt_id, "reason": "user"}
         terminals = [
             message
             for message in trace
@@ -1155,7 +1155,9 @@ def test_public_recorded_departure_cancels_real_ai_tree_and_keeps_core_live(
         assert source_frame["synthetic"] is False
         assert source_frame["relabeled"] is False
         assert profile_seen is True
-        assert post_cancel_presence is True
+        assert any(
+            message["type"] == "vision.presence_status" for message in trace
+        )
         assert pong["type"] == "vision.pong"
         assert missing.status_code == 404
         assert core.status_code == 200

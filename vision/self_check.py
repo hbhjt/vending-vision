@@ -63,7 +63,10 @@ def check_camera():
             }
 
     try:
-        contract = get_camera_maintenance().cached_contract()
+        maintenance = get_camera_maintenance()
+        contract = maintenance.cached_contract()
+        if contract.get("generation") == "unobserved":
+            contract = maintenance.contract()
         roles = contract.get("roles", {})
         ok = all(roles.get(role, {}).get("ready") is True for role in ("top", "front"))
         return {

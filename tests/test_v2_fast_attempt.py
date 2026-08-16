@@ -532,19 +532,19 @@ def test_v2_fast_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(
             assert socket.receive_json()["type"] == "vision.try_on.attempt.completed"
 
 
-def test_v2_top_departure_cancels_active_generated_attempt_without_late_completion(
+def test_v2_top_departure_does_not_cancel_active_generated_attempt_without_late_completion(
     monkeypatch, garment_reference
 ):
-    """A production presence departure cancels the active attempt through the public WS."""
+    """A production presence departure must not cancel the active attempt through the public WS."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", True)
     monkeypatch.setattr(vision_app.settings, "MOCK_SCENARIO", "departure-test")
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 5)
     _configure_recorded_front(monkeypatch)
-    _GarmentHandler.release.clear()
     depart = threading.Event()
     departed_once = threading.Event()
+    departure_seen = threading.Event()
 
     def collect_departure(_status, _ambient, include_departure):
         if depart.is_set() and include_departure and not departed_once.is_set():
@@ -560,6 +560,15 @@ def test_v2_top_departure_cancels_active_generated_attempt_without_late_completi
         return None
 
     monkeypatch.setattr(vision_app, "collect_profile_update", collect_departure)
+    async def render_until_departure(*_args, **_kwargs):
+        # Hold generation until the recorded departure edge has been observed:
+        # a top-camera departure must not cancel the active front-camera attempt.
+        assert await asyncio.to_thread(departure_seen.wait, 5), (
+            "recorded departure edge did not arrive while the attempt was generating"
+        )
+        return _png_bytes()
+
+    monkeypatch.setattr(vision_app, "render_attempt_frame", render_until_departure)
     attempt_id = str(uuid4())
     messages = []
 
@@ -574,38 +583,42 @@ def test_v2_top_departure_cancels_active_generated_attempt_without_late_completi
             socket.send_json(_start(attempt_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
             _await_generating(socket)
-            assert _GarmentHandler.entered.wait(timeout=2)
 
             depart.set()
-            while len(messages) < 2:
+            while len(messages) < 20:
                 messages.append(socket.receive_json())
-                if any(
-                    message["type"] == "vision.try_on.attempt.canceled"
-                    for message in messages
-                ) and any(
-                    message["type"] == "vision.person_departed"
-                    for message in messages
-                ):
+                if any(message["type"] == "vision.person_departed" for message in messages):
+                    departure_seen.set()
                     break
 
-            _GarmentHandler.release.set()
+            while True:
+                message = socket.receive_json()
+                messages.append(message)
+                if message["type"] in {
+                    "vision.try_on.attempt.completed",
+                    "vision.try_on.attempt.failed",
+                    "vision.try_on.attempt.canceled",
+                } and message["payload"].get("attemptId") == attempt_id:
+                    break
 
         assert await_no_active_fast_attempt()
         assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
+    completed = [
+        message for message in messages
+        if message["type"] == "vision.try_on.attempt.completed"
+    ]
     canceled = [
         message for message in messages
         if message["type"] == "vision.try_on.attempt.canceled"
     ]
-    assert canceled == [
-        {
-            **canceled[0],
-            "payload": {"attemptId": attempt_id, "reason": "departure"},
-        }
-    ]
-    assert [message["type"] for message in messages].count(
-        "vision.try_on.attempt.completed"
-    ) == 0
+    assert len(completed) == 1
+    assert completed[0]["payload"]["attemptId"] == attempt_id
+    assert canceled == []
+    assert any(
+        message["type"] == "vision.person_departed"
+        for message in messages
+    )
     assert departed_once.is_set()
 
 

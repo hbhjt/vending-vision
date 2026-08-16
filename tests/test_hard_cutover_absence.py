@@ -103,7 +103,7 @@ STANDALONE_PROVENANCE_ALLOWANCES = {
         "occurrences": {"standalone-repository-url": 1},
     },
     (ROOT / "fixtures/recorded-video/README.md").resolve(): {
-        "sha256": "414c953a0f797284201636a04f0f726ab0ad5cabebcedde0874c593d28990a6d",
+        "sha256": "5297c02093e360696832533993fcaa5f8c3a7c5f32d6e0104e63afff58c0dfa5",
         "occurrences": {"standalone-repository-url": 1},
     },
 }

@@ -89,7 +89,7 @@ def test_recorded_video_fixture_manifest_binds_top_and_front_recordings():
 
     assert manifest["schemaVersion"] == "vending-vision-recorded-video-fixture/v1"
     assert set(manifest["recordings"]) == {
-        "top", "front", "manFront", "manUnalignedFront", "emptyFront"
+        "top", "front", "manFront", "frontVertical", "frontVerticalUnstable", "manUnalignedFront", "emptyFront"
     }
     for role, recording in manifest["recordings"].items():
         video = FIXTURE_ROOT / recording["file"]
@@ -101,6 +101,41 @@ def test_recorded_video_fixture_manifest_binds_top_and_front_recordings():
         "vision.person_departed",
     ]
     assert manifest["expected"]["front"]["profile"]["minimumFields"]
+
+
+def test_recorded_video_front_vertical_fixture_is_traceable_and_vertical():
+    """The vertical close-up fixture is reproducible and 720x1280 with a single aligned person."""
+    recording = fixture_manifest()["recordings"]["frontVertical"]
+    video = FIXTURE_ROOT / recording["file"]
+    generator = FIXTURE_ROOT / recording["generator"]
+    assert video.is_file()
+    assert generator.is_file()
+    assert recording["sourceSha256"] == hashlib.sha256(
+        (FIXTURE_ROOT / recording["source"]).read_bytes()
+    ).hexdigest()
+    assert recording["sha256"] == hashlib.sha256(video.read_bytes()).hexdigest()
+    capture = cv2.VideoCapture(str(video))
+    ok, frame = capture.read()
+    capture.release()
+    assert ok and frame.shape == (1280, 720, 3)
+    assert fixture_manifest()["expected"]["frontVertical"]["profile"]["minimumFields"]
+
+
+def test_recorded_video_front_vertical_unstable_fixture_is_traceable():
+    """The unstable vertical fixture never reaches a stable aligned run."""
+    recording = fixture_manifest()["recordings"]["frontVerticalUnstable"]
+    video = FIXTURE_ROOT / recording["file"]
+    generator = FIXTURE_ROOT / recording["generator"]
+    assert video.is_file()
+    assert generator.is_file()
+    assert recording["sourceSha256"] == hashlib.sha256(
+        (FIXTURE_ROOT / recording["source"]).read_bytes()
+    ).hexdigest()
+    assert recording["sha256"] == hashlib.sha256(video.read_bytes()).hexdigest()
+    capture = cv2.VideoCapture(str(video))
+    ok, frame = capture.read()
+    capture.release()
+    assert ok and frame.shape == (1280, 720, 3)
 
 
 def test_recorded_video_man_front_fixture_is_traceable_and_decodes():

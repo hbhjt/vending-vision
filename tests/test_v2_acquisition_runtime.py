@@ -269,8 +269,8 @@ def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkey
         vision_app._acquisition_observer = None
 
 
-def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_events(monkeypatch):
-    """Production top presence cancels a public WS attempt; the stream keeps reporting Vision facts."""
+def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile_events(monkeypatch):
+    """Production top presence departure must not cancel a public WS attempt; the stream keeps reporting Vision facts."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     recorded_manifest = json.loads(
         (Path(__file__).parents[1] / "fixtures/recorded-video/expected-results.json").read_text(
@@ -331,25 +331,26 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     attempt_id = str(uuid4())
-    canceled = []
+    completed = []
     departures = []
     seen_types = []
-    post_cancel_presence = False
+    post_departure_presence = False
     generating_seen = False
     front_idle_after_generating = False
     profile_after_generating = False
     ambient_payloads = []
+    departure_seen = threading.Event()
 
     def missing_facts():
         missing = []
-        if not canceled:
-            missing.append("departure cancellation")
         if not departures:
             missing.append("person departure")
-        if not post_cancel_presence:
-            missing.append("post-cancel presence")
         if not generating_seen:
             missing.append("generating")
+        if not completed:
+            missing.append("completion after departure")
+        if not post_departure_presence:
+            missing.append("post-departure presence")
         if not front_idle_after_generating:
             missing.append("front camera release before generation")
         if not profile_after_generating:
@@ -370,12 +371,17 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
         if update["message_type"] == "vision.profile_result":
             profile_result_broadcasted.set()
 
-    async def unfinished_render(*_args, **_kwargs):
+    async def render_until_departure(*_args, **_kwargs):
         generating_started.set()
-        await asyncio.sleep(30)
+        # Hold generation until the recorded departure edge has been observed
+        # and broadcast: a top-camera departure must not cancel the active
+        # front-camera attempt.
+        assert await asyncio.to_thread(
+            _wait_for_recorded_fixture_event, departure_seen, timeout=8
+        ), "recorded departure edge did not arrive while the attempt was generating"
         return _png_bytes()
 
-    monkeypatch.setattr(vision_app, "render_attempt_frame", unfinished_render)
+    monkeypatch.setattr(vision_app, "render_attempt_frame", render_until_departure)
     monkeypatch.setattr(vision_app, "broadcast_profile_update", broadcast_after_generating)
     try:
         with TestClient(vision_app.app) as client:
@@ -407,12 +413,13 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                         )
                     if generating_seen and message["type"] == "vision.profile_result":
                         profile_after_generating = True
-                    if message["type"] == "vision.try_on.attempt.canceled":
-                        canceled.append(message)
+                    if message["type"] == "vision.try_on.attempt.completed":
+                        completed.append(message)
                     if message["type"] == "vision.person_departed":
                         departures.append(message)
-                    if canceled and message["type"] == "vision.presence_status":
-                        post_cancel_presence = True
+                        departure_seen.set()
+                    if completed and message["type"] == "vision.presence_status":
+                        post_departure_presence = True
                     if message["type"] in {
                         "vision.presence_status",
                         "vision.person_departed",
@@ -425,13 +432,20 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                     f"missing facts before deadline: {missing_facts()}; "
                     f"seen types: {seen_types}"
                 )
-                assert [message["payload"] for message in canceled] == [
-                    {"attemptId": attempt_id, "reason": "departure"}
-                ]
+                assert len(completed) == 1
+                assert completed[0]["payload"]["attemptId"] == attempt_id
+                assert isinstance(completed[0]["payload"].get("result"), dict)
+                assert isinstance(
+                    completed[0]["payload"]["result"].get("reference"), str
+                )
+                assert isinstance(completed[0]["payload"]["result"].get("digest"), str)
+                assert "vision.try_on.attempt.canceled" not in seen_types
+                assert "vision.try_on.attempt.failed" not in seen_types
                 assert generating_seen
                 assert front_idle_after_generating
                 assert profile_after_generating
                 assert len(departures) == 1
+                assert departure_seen.is_set()
                 assert "vision.presence_status" in seen_types
                 assert "vision.profile_result" in seen_types
                 assert ambient_payloads
@@ -445,7 +459,7 @@ def test_public_recorded_top_departure_cancels_attempt_without_stopping_profile_
                     message_type in seen_types
                     for message_type in ["vision.presence_status", "vision.profile_result"]
                 )
-                assert post_cancel_presence
+                assert post_departure_presence
                 assert monitor.front_sampling_observed
                 assert monitor.profile_result_broadcast_observed
                 assert monitor.poll_count >= expected_polls + 1
@@ -561,7 +575,6 @@ def test_v2_manual_capture_bypasses_stability_but_not_single_person_alignment(mo
     [
         ("empty-front.mp4", "none", "no_person"),
         ("front.mp4", "multiple", "multiple_people"),
-        ("man-unaligned-front.mp4", "single", "align"),
     ],
 )
 def test_v2_recorded_production_observation_truthfully_blocks_capture(
@@ -593,6 +606,42 @@ def test_v2_recorded_production_observation_truthfully_blocks_capture(
                 socket.send_json(_envelope("vision.try_on.attempt.cancel", {"attemptId": attempt_id, "reason": "user"}))
                 canceled = socket.receive_json()
                 assert canceled["type"] == "vision.try_on.attempt.canceled"
+                assert vision_app.get_front_camera_owner()["owner"] == "idle"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_v2_recorded_close_up_single_person_manual_capture_proceeds_when_aligned(
+    monkeypatch,
+):
+    """A close-up single person (lower body cropped) is aligned and manual intent captures immediately."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_STABLE_FRAMES", 100)
+    _configure_recorded_front(monkeypatch, "man-unaligned-front.mp4")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _GarmentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    attempt_id = str(uuid4())
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on_fast"]}))
+                assert socket.receive_json()["type"] == "vision.ready"
+                garment = _GarmentHandler.payload
+                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
+                assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+                acquiring = socket.receive_json()
+                assert acquiring["type"] == "vision.try_on.attempt.acquiring"
+                assert acquiring["payload"]["occupancy"] == "single"
+                assert acquiring["payload"]["guidance"] == "hold_still"
+                assert acquiring["payload"]["manualCaptureAllowed"] is True
+                socket.send_json(_envelope("vision.try_on.attempt.capture", {"attemptId": attempt_id}))
+                generating = socket.receive_json()
+                assert generating["type"] == "vision.try_on.attempt.generating"
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
     finally:
         server.shutdown()

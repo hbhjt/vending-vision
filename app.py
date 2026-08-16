@@ -459,7 +459,6 @@ def _acquisition_observer_ready() -> bool:
     observer = _acquisition_observer
     return bool(
         observer is not None
-        and getattr(observer, "ready", False)
         and getattr(observer, "fatal_error", None) is None
     )
 
@@ -780,9 +779,13 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
         or not status.get("fastPoseReady", True)
         or not status.get("acquisitionObserverReady", True)
     ):
-        # The frozen V2 diagnostic vocabulary has one local Vision capability
-        # unavailable value.  Do not extend that cross-repository contract in
-        # this worker-only slice.
+        logger.warning(
+            f"V2 ready degraded: fastRenderReady={status.get('fastRenderReady')}, "
+            f"fastPoseReady={status.get('fastPoseReady')}, "
+            f"acquisitionObserverReady={status.get('acquisitionObserverReady')}, "
+            f"brokerFatal={getattr(_fast_render_broker, 'fatal_error', None)}, "
+            f"observerFatal={getattr(_acquisition_observer, 'fatal_error', None)}"
+        )
         diagnostic = "camera_unavailable"
         schema_version = identity.schema_version
         bundle_version = identity.bundle_version
@@ -1539,8 +1542,10 @@ async def presence_broadcast_loop():
                     "person_departed" in capabilities,
                 )
                 if mock_update is not None:
-                    if mock_update.get("message_type") == "vision.person_departed":
-                        await _cancel_active_attempt("departure")
+                    # Do not auto-cancel an active front-camera try-on attempt on
+                    # an overhead presence departure (same rule as the real
+                    # presence path): the top camera can lose its overhead
+                    # bounding box when the customer leans into the touchscreen.
                     await broadcast_profile_update(mock_update)
                 await asyncio.sleep(settings.PROFILE_PUSH_INTERVAL_MS / 1000.0)
                 continue
@@ -1566,8 +1571,12 @@ async def presence_broadcast_loop():
                     "presence_worker_update_total",
                     message_type=result.update["message_type"],
                 )
+                # Do not auto-cancel an active front-camera try-on attempt on an
+                # overhead presence departure: the top camera can lose its
+                # overhead bounding box when the customer leans into the
+                # touchscreen, which must not interrupt the front-camera flow.
                 if result.update["message_type"] == "vision.person_departed":
-                    await _cancel_active_attempt("departure")
+                    pass
                 await broadcast_profile_update(result.update)
 
             if (
@@ -1776,7 +1785,9 @@ async def run_v2_ai_attempt(
                     )
                     last_guidance = acquiring["payload"]["guidance"]
                 manual = await _fast_attempt_registry.take_manual_capture_request(receipt)
-                if occupancy == "single" and aligned and (stable or manual):
+                if (occupancy == "single" and aligned and stable) or (
+                    manual and occupancy == "single" and aligned
+                ):
                     captured_frame, captured_source = frame.copy(), source
                     break
                 await asyncio.sleep(_ACQUISITION_POLL_SECONDS)
@@ -2071,7 +2082,9 @@ async def run_v2_fast_attempt(
                 )
                 last_guidance = acquiring["payload"]["guidance"]
             manual = await _fast_attempt_registry.take_manual_capture_request(receipt)
-            if occupancy == "single" and aligned and (stable or manual):
+            if (occupancy == "single" and aligned and stable) or (
+                manual and occupancy == "single" and aligned
+            ):
                 # The source frame remains Vision memory, never the MJPEG representation.
                 captured_frame, source_frame = frame.copy(), source
                 break

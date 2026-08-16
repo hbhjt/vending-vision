@@ -15,7 +15,7 @@ from multiprocessing.connection import Connection
 
 MAX_GARMENT_BYTES = 8 * 1024 * 1024
 MAX_FRAME_WIDTH = 1920
-MAX_FRAME_HEIGHT = 1080
+MAX_FRAME_HEIGHT = 1920
 MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
 MAX_RESULT_BYTES = 16 * 1024 * 1024
 _RENDER_SHARED_NAME = re.compile(r"^vem_render_[0-9a-f]{32}$")

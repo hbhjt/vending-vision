@@ -277,7 +277,7 @@ class FastTryOnRuntime:
             y = float(getattr(landmark, "y", float("nan")))
             if not math.isfinite(x) or not math.isfinite(y):
                 continue
-            if not math.isfinite(visibility) or visibility < 0.55:
+            if not math.isfinite(visibility) or visibility < 0.25:
                 continue
             # MediaPipe can report a point a little outside the image, but a
             # grossly invalid normalized geometry must never place a garment.
@@ -288,13 +288,7 @@ class FastTryOnRuntime:
 
     def pose_geometry(self, pose_results, width: int, height: int) -> PoseGeometry:
         points = self._landmark_points(pose_results, width, height)
-        required = (
-            "left_shoulder",
-            "right_shoulder",
-            "left_hip",
-            "right_hip",
-        )
-        if any(name not in points for name in required):
+        if "left_shoulder" not in points or "right_shoulder" not in points:
             raise PoseUnavailableError("pose_unavailable")
         # MediaPipe's LEFT/RIGHT landmarks are anatomical sides.  A person
         # facing an unmirrored camera therefore commonly has LEFT at a larger
@@ -313,6 +307,28 @@ class FastTryOnRuntime:
         shoulder_axis = screen_right_shoulder - screen_left_shoulder
         shoulder_span = float(np.linalg.norm(shoulder_axis))
         shoulder_center = (screen_left_shoulder + screen_right_shoulder) * 0.5
+
+        # Infer hips when the lower body is cut off at the bottom of a close-up
+        # frame: derive a downward torso direction from the shoulder axis and
+        # place inferred hips one shoulder span below each shoulder.
+        estimated_down = np.array(
+            [
+                -shoulder_axis[1] / max(shoulder_span, 1e-6),
+                shoulder_axis[0] / max(shoulder_span, 1e-6),
+            ],
+            dtype=np.float32,
+        )
+        if estimated_down[1] < 0:
+            estimated_down = -estimated_down
+        if "left_hip" not in points:
+            points["left_hip"] = anatomical_left_shoulder + estimated_down * (
+                shoulder_span * 1.25
+            )
+        if "right_hip" not in points:
+            points["right_hip"] = anatomical_right_shoulder + estimated_down * (
+                shoulder_span * 1.25
+            )
+
         hip_center = (points["left_hip"] + points["right_hip"]) * 0.5
         torso_axis = hip_center - shoulder_center
         torso_length = float(np.linalg.norm(torso_axis))

@@ -27,7 +27,7 @@ from vision.shared_ipc_slot import SharedIpcError, SharedIpcSlot, run_shared_ipc
 
 
 MAX_FRAME_WIDTH = 1920
-MAX_FRAME_HEIGHT = 1080
+MAX_FRAME_HEIGHT = 1920
 MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
 STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
 _ACQ_SHARED_NAME = re.compile(r"^vem_acq_[0-9a-f]{32}$")
@@ -209,22 +209,19 @@ def _pose_is_aligned(estimator, frame: Any) -> bool:
         return False
     try:
         left_shoulder, right_shoulder = landmarks[11], landmarks[12]
-        left_hip, right_hip = landmarks[23], landmarks[24]
     except (IndexError, TypeError):
         return False
-    points = (left_shoulder, right_shoulder, left_hip, right_hip)
-    if any(float(point.visibility) < 0.55 for point in points):
+    if float(getattr(left_shoulder, "visibility", 1.0)) < 0.30 or float(
+        getattr(right_shoulder, "visibility", 1.0)
+    ) < 0.30:
         return False
     shoulder_x = (float(left_shoulder.x) + float(right_shoulder.x)) / 2
     shoulder_y = (float(left_shoulder.y) + float(right_shoulder.y)) / 2
-    hip_x = (float(left_hip.x) + float(right_hip.x)) / 2
-    hip_y = (float(left_hip.y) + float(right_hip.y)) / 2
     shoulder_span = abs(float(left_shoulder.x) - float(right_shoulder.x))
-    torso_height = hip_y - shoulder_y
     return (
-        0.30 <= shoulder_x <= 0.70 and 0.30 <= hip_x <= 0.70
-        and 0.10 <= shoulder_y <= 0.68 and 0.35 <= hip_y <= 0.95
-        and 0.14 <= shoulder_span <= 0.75 and 0.18 <= torso_height <= 0.62
+        0.15 <= shoulder_x <= 0.85
+        and 0.05 <= shoulder_y <= 0.85
+        and 0.08 <= shoulder_span <= 0.90
     )
 
 
@@ -233,23 +230,12 @@ def _observe_frame(detector, estimator, frame: Any) -> AcquisitionObservation:
     if not ok:
         raise RuntimeError("acquisition_preview_encode_failed")
     status = detector.status()
-    if not status.get("ready"):
-        return AcquisitionObservation(encoded.tobytes(), "none", False)
-    detections = detector.detect(frame)
-    if len(detections) == 0:
-        return AcquisitionObservation(encoded.tobytes(), "none", False)
+    detections = detector.detect(frame) if status.get("ready") else []
     if len(detections) > 1:
         return AcquisitionObservation(encoded.tobytes(), "multiple", False)
-    x, y, width, height = detections[0]["box"]
-    frame_height, frame_width = frame.shape[:2]
-    center_x = (x + width / 2) / max(frame_width, 1)
-    center_y = (y + height / 2) / max(frame_height, 1)
-    area = (width * height) / max(frame_width * frame_height, 1)
-    aligned = (
-        0.25 <= center_x <= 0.75 and 0.10 <= center_y <= 0.82
-        and area >= 0.08 and _pose_is_aligned(estimator, frame)
-    )
-    return AcquisitionObservation(encoded.tobytes(), "single", aligned)
+    aligned = _pose_is_aligned(estimator, frame)
+    occupancy = "single" if (len(detections) == 1 or aligned) else "none"
+    return AcquisitionObservation(encoded.tobytes(), occupancy, aligned)
 
 
 def acquisition_observer_entry(connection: Connection) -> None:
@@ -387,8 +373,14 @@ class AcquisitionObservationWorker:
 
     async def start(self) -> None:
         async with self._start_lock:
-            if self.ready:
-                return
+            with self._state_lock:
+                if (
+                    self._ready
+                    and self._process is not None
+                    and self._process.is_alive()
+                    and self._slot is not None
+                ):
+                    return
             cancelled = False
             start_task = asyncio.create_task(
                 asyncio.to_thread(self._start),
@@ -413,7 +405,7 @@ class AcquisitionObservationWorker:
                         continue
                 cleanup.result()
                 raise asyncio.CancelledError
-            deadline = time.monotonic() + 15.0
+            deadline = time.monotonic() + 30.0
             while time.monotonic() < deadline:
                 with self._state_lock:
                     process, generation, slot = self._process, self._generation, self._slot
@@ -766,10 +758,11 @@ class AcquisitionObservationWorker:
     def ready(self) -> bool:
         with self._state_lock:
             return bool(
-                self._ready
-                and self._fatal_error is None
-                and self._process is not None
-                and self.pid is not None
+                self._fatal_error is None
+                and (
+                    self._process is None
+                    or self._process.is_alive()
+                )
             )
 
     @property

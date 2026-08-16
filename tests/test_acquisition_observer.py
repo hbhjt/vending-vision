@@ -2,6 +2,7 @@ import asyncio
 import json
 import multiprocessing
 import os
+import signal
 import threading
 import time
 
@@ -655,7 +656,11 @@ def test_async_acquisition_start_ticks_and_cancel_stops_new_child_before_ready()
     assert ticks >= 5
     assert process.kill_attempted is True
     assert process.is_alive() is False
-    assert worker.ready is False
+    # A canceled start leaves no live child but also no fatal error: the
+    # observer must remain healable so the next attempt can re-spawn it.
+    assert worker.pid is None
+    assert worker.fatal_error is None
+    assert worker.ready is True
 
 
 @pytest.mark.parametrize(
@@ -683,9 +688,9 @@ def test_async_acquisition_start_ticks_and_cancel_stops_new_child_before_ready()
         {
             "kind": "shared_frame",
             "name": "vem_acq_too_tall",
-            "shape": [1440, 8, 3],
+            "shape": [2048, 8, 3],
             "dtype": "uint8",
-            "nbytes": 1440 * 8 * 3,
+            "nbytes": 2048 * 8 * 3,
             "generation": 1,
             "processGeneration": 1,
         },
@@ -732,3 +737,60 @@ def test_acquisition_rejects_strict_frame_metadata_before_arbitrary_shm_attach(
     with pytest.raises(ValueError):
         _read_shared_frame(metadata, generation=1, process_generation=1)
     assert not attached.is_set()
+
+
+def test_acquisition_observer_accepts_vertical_720x1280_frame():
+    """A physical vertical 720x1280 camera frame must pass the acquisition cap."""
+    from vision.acquisition_observer import (
+        MAX_FRAME_HEIGHT,
+        _coerce_frame_for_shared_memory,
+    )
+
+    assert MAX_FRAME_HEIGHT == 1920
+    frame = np.zeros((1280, 720, 3), dtype=np.uint8)
+    coerced = _coerce_frame_for_shared_memory(frame)
+    assert coerced.shape == (1280, 720, 3)
+    assert coerced.flags.c_contiguous
+
+    with pytest.raises(ValueError, match="exceeds cap"):
+        _coerce_frame_for_shared_memory(np.zeros((1921, 720, 3), dtype=np.uint8))
+
+
+def test_acquisition_observer_respawns_after_child_death_and_recovers_ready():
+    """A killed observer child must be replaced by the next start() instead of a permanent degrade."""
+    async def scenario():
+        context = multiprocessing.get_context("spawn")
+        starts = context.Value("i", 0)
+        worker = AcquisitionObservationWorker(
+            context=context,
+            target=_counting_observer_target,
+            target_args=(starts,),
+        )
+        first = await worker.observe(np.zeros((8, 8, 3), dtype=np.uint8))
+        assert first == AcquisitionObservation(b"jpeg", "single", True)
+        assert starts.value == 1
+        first_pid = worker.pid
+        assert first_pid is not None
+
+        # Simulate a hard child crash: the observer must not degrade forever.
+        os.kill(first_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while worker.pid is not None and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert worker.pid is None
+        assert worker.fatal_error is None
+        assert worker.ready is True  # process is gone but no fatal error: healable
+
+        # The next observation must respawn a fresh child and complete.
+        second = await asyncio.wait_for(
+            worker.observe(np.ones((8, 8, 3), dtype=np.uint8), timeout=35.0),
+            timeout=40.0,
+        )
+        assert second == AcquisitionObservation(b"jpeg", "single", True)
+        assert starts.value == 2
+        assert worker.pid is not None
+        assert worker.pid != first_pid
+        await worker.shutdown()
+        assert worker.assert_dead
+
+    asyncio.run(scenario())

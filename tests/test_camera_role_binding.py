@@ -94,7 +94,7 @@ def make_service(*, discovery=None, store=None, access=None, clock=time.time):
     )
 
 
-def test_startup_camera_check_uses_cached_contract_without_discovering_devices(monkeypatch):
+def test_startup_camera_check_refreshes_unobserved_generation_and_reports_roles(monkeypatch):
     from vision import self_check
 
     discovery = MutableDiscovery()
@@ -111,12 +111,12 @@ def test_startup_camera_check_uses_cached_contract_without_discovering_devices(m
 
     result = self_check.check_camera()
 
-    assert discovery.calls == 0
-    assert result["ok"] is False
+    assert discovery.calls == 1
+    assert result["ok"] is True
     assert result["detail"]["contractVersion"] == CAMERA_MAINTENANCE_CONTRACT_VERSION
-    assert result["detail"]["generation"] == "unobserved"
-    assert result["detail"]["roles"]["top"]["ready"] is False
-    assert result["detail"]["roles"]["front"]["ready"] is False
+    assert result["detail"]["generation"] != "unobserved"
+    assert result["detail"]["roles"]["top"]["ready"] is True
+    assert result["detail"]["roles"]["front"]["ready"] is True
 
 
 def test_windows_discovery_never_zips_independent_pnp_and_opencv_orderings(monkeypatch):
