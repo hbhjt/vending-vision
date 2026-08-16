@@ -118,6 +118,23 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 3
+      - name: 生成同提交候选交付包（供 VM 验收）
+        shell: pwsh
+        run: |
+          $candidateDir = Join-Path $PWD "candidate-artifacts"
+          New-Item -ItemType Directory -Force -Path $candidateDir | Out-Null
+          & (Join-Path $PWD ".venv-packaging-core\Scripts\python.exe") scripts/candidate_artifact_manifest.py `
+            --dist-root (Join-Path $PWD "dist") `
+            --artifact (Join-Path $candidateDir "vending-vision-${{ github.sha }}.zip") `
+            --manifest-output (Join-Path $candidateDir "candidate-manifest.json") `
+            --source-commit "${{ github.sha }}"
+          if ($LASTEXITCODE -ne 0) { throw "candidate delivery generation failed" }
+      - name: 暂存同提交候选交付包
+        uses: actions/upload-artifact@v4
+        with:
+          name: vending-vision-candidate-${{ github.sha }}
+          path: candidate-artifacts/*
+          if-no-files-found: error
 
   regional-evidence-contract:
     name: VEM 区域证据合同
