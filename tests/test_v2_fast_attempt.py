@@ -934,6 +934,7 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     _configure_recorded_front(monkeypatch)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
     broker = FastRenderBroker(
@@ -1004,6 +1005,7 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     _configure_recorded_front(monkeypatch)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
     context = multiprocessing.get_context("spawn")
     starts = context.Value("i", 0)
     requests = context.Value("i", 0)
@@ -1272,10 +1274,13 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
             assert requests.value == 1
 
             def receive_owner():
-                for _ in range(6):
-                    owner_messages.append(owner.receive_json())
+                while True:
+                    message = owner.receive_json()
+                    owner_messages.append(message)
                     if len(owner_messages) == 1:
                         replaced_seen.set()
+                    if message["type"] == "vision.try_on.attempt.completed":
+                        break
                 owner_done.set()
 
             owner_reader = threading.Thread(target=receive_owner, daemon=True)
@@ -1286,9 +1291,12 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
             duplicate.send_json(_start(replacement_id, garment_reference))
 
             def receive_duplicate():
-                for _ in range(5):
-                    duplicate_messages.append(duplicate.receive_json())
+                while True:
+                    message = duplicate.receive_json()
+                    duplicate_messages.append(message)
                     duplicate_message_seen.set()
+                    if message["type"] == "vision.try_on.attempt.completed":
+                        break
                 duplicate_done.set()
 
             duplicate_reader = threading.Thread(
@@ -1438,7 +1446,7 @@ def test_v2_start_rechecks_acquisition_observer_after_ready_before_accepting_att
 
 
 def test_v2_acquisition_observer_uses_remaining_attempt_deadline(monkeypatch, garment_reference):
-    """Observation must share the attempt deadline instead of adding its own 15s window."""
+    """Observation must share the acquisition deadline instead of adding its own fixed window."""
     manifest = json.loads(
         (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
             "utf-8"
@@ -1446,7 +1454,7 @@ def test_v2_acquisition_observer_uses_remaining_attempt_deadline(monkeypatch, ga
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
-    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(vision_app, "_ACQUISITION_POLL_SECONDS", 0.005)
     observer = _DeadlineRecordingObserver()
     vision_app._acquisition_observer = observer
@@ -1608,6 +1616,7 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
 
     monkeypatch.setattr(vision_app, "read_camera_with_source", read_front)
     monkeypatch.setattr(vision_app, "render_attempt_frame", render)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
     attempt_id = str(uuid4())
 
     with TestClient(vision_app.app) as client:
@@ -1620,7 +1629,7 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
             completed = socket.receive_json()
 
     assert completed["type"] == "vision.try_on.attempt.completed"
-    assert read_pids == [(parent_pid, "front", 1)] * vision_app._ACQUISITION_STABLE_FRAMES
+    assert read_pids == [(parent_pid, "front", 1)] * 1
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
@@ -1669,7 +1678,7 @@ def test_v2_capture_preview_close_failure_releases_lease_and_commits_one_failed_
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
     monkeypatch.setattr(vision_app, "_acquisition_observer", _SingleAlignedObserver())
-    monkeypatch.setattr(vision_app, "_ACQUISITION_STABLE_FRAMES", 1)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
     monkeypatch.setattr(
         vision_app,
         "get_runtime_status",

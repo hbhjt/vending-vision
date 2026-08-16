@@ -284,7 +284,7 @@ def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 250)
     monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 10)
     monkeypatch.setattr(vision_app, "_ACQUISITION_POLL_SECONDS", 0.01)
-    monkeypatch.setattr(vision_app, "_ACQUISITION_STABLE_FRAMES", 1)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
     monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
     monkeypatch.setattr(
         vision_app,
@@ -544,7 +544,7 @@ def test_v2_manual_capture_bypasses_stability_but_not_single_person_alignment(mo
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
-    monkeypatch.setattr(vision_app, "_ACQUISITION_STABLE_FRAMES", 100)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 1000.0)
     _configure_recorded_front(monkeypatch, "man-front.mp4")
     server = ThreadingHTTPServer(("127.0.0.1", 0), _GarmentHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -559,7 +559,7 @@ def test_v2_manual_capture_bypasses_stability_but_not_single_person_alignment(mo
                 socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
                 assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
                 acquiring = socket.receive_json()
-                assert acquiring["payload"]["guidance"] == "hold_still"
+                assert acquiring["payload"]["guidance"] == "counting_down"
                 socket.send_json(_envelope("vision.try_on.attempt.capture", {"attemptId": attempt_id}))
                 generating = socket.receive_json()
                 assert generating["type"] == "vision.try_on.attempt.generating"
@@ -620,7 +620,7 @@ def test_v2_recorded_close_up_single_person_manual_capture_proceeds_when_aligned
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
-    monkeypatch.setattr(vision_app, "_ACQUISITION_STABLE_FRAMES", 100)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 1000.0)
     _configure_recorded_front(monkeypatch, "man-unaligned-front.mp4")
     server = ThreadingHTTPServer(("127.0.0.1", 0), _GarmentHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -637,7 +637,7 @@ def test_v2_recorded_close_up_single_person_manual_capture_proceeds_when_aligned
                 acquiring = socket.receive_json()
                 assert acquiring["type"] == "vision.try_on.attempt.acquiring"
                 assert acquiring["payload"]["occupancy"] == "single"
-                assert acquiring["payload"]["guidance"] == "hold_still"
+                assert acquiring["payload"]["guidance"] == "counting_down"
                 assert acquiring["payload"]["manualCaptureAllowed"] is True
                 socket.send_json(_envelope("vision.try_on.attempt.capture", {"attemptId": attempt_id}))
                 generating = socket.receive_json()
@@ -677,7 +677,7 @@ def test_v2_recorded_single_person_auto_capture_uses_production_yolo_and_pose(mo
                 acquiring = socket.receive_json()
                 assert acquiring["type"] == "vision.try_on.attempt.acquiring"
                 assert acquiring["payload"]["occupancy"] == "single"
-                assert acquiring["payload"]["guidance"] in {"hold_still", "ready"}
+                assert acquiring["payload"]["guidance"] == "counting_down"
                 while True:
                     message = socket.receive_json()
                     if message["type"] == "vision.try_on.attempt.generating":

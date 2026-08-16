@@ -7,6 +7,7 @@ runtime.  PyInstaller and Windows ``spawn`` can import it as a plain module.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 from multiprocessing import shared_memory
@@ -61,6 +62,7 @@ def _render(
         "garmentPng",
         "garmentDigest",
         "template",
+        "garmentScale",
     }:
         raise ValueError("invalid render payload")
     frame_shared = payload["frameShared"]
@@ -111,6 +113,16 @@ def _render(
         raise ValueError("raw frame shared memory name is invalid")
     if not isinstance(garment_png, bytes) or len(garment_png) > MAX_GARMENT_BYTES:
         raise GarmentFetchError("byte_size")
+    garment_scale = payload["garmentScale"]
+    if (
+        not isinstance(garment_scale, (int, float))
+        or isinstance(garment_scale, bool)
+        or not math.isfinite(float(garment_scale))
+    ):
+        raise ValueError("garment scale is invalid")
+    garment_scale = float(garment_scale)
+    if garment_scale < 0.8 or garment_scale > 1.6:
+        raise ValueError("garment scale exceeds bounds")
     digest = "sha256:" + hashlib.sha256(garment_png).hexdigest()
     if digest != payload["garmentDigest"]:
         raise GarmentFetchError("digest")
@@ -129,7 +141,7 @@ def _render(
         from vision.fast_tryon import PoseUnavailableError
 
         raise PoseUnavailableError("pose_unavailable")
-    result = runtime.render(frame, source)
+    result = runtime.render(frame, source, garment_scale=garment_scale)
     if len(result) > MAX_RESULT_BYTES:
         raise RuntimeError("fast result exceeds render cap")
     return result

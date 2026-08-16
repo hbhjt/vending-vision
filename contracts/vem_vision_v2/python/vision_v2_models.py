@@ -41,6 +41,8 @@ def _schema_type(schema: dict[str, Any], name: str) -> Any:
         return StrictStr
     if kind == "integer":
         return StrictInt
+    if kind == "number":
+        return float
     if kind == "boolean":
         return StrictBool
     if kind == "array":
@@ -74,6 +76,12 @@ def _normalize_json_integers(value: Any, schema: dict[str, Any]) -> Any:
         if isinstance(value, float) and math.isfinite(value) and value.is_integer():
             return int(value)
         raise ValueError("JSON integer fields require a finite integer")
+    if schema.get("type") == "number":
+        if isinstance(value, bool):
+            raise ValueError("JSON number fields reject booleans")
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            return float(value)
+        raise ValueError("JSON number fields require a finite number")
     if schema.get("type") == "array" and isinstance(value, list):
         return [_normalize_json_integers(item, schema["items"]) for item in value]
     if schema.get("type") == "object" and isinstance(value, dict):

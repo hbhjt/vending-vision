@@ -859,6 +859,38 @@ class FastAttemptRegistry:
             entry = self._results._get_unlocked(attempt_id, token)
             return entry.stored() if entry is not None else None
 
+    async def replace_completed_result(
+        self, attempt_id: str, stored_result: dict
+    ) -> dict | None:
+        """Atomically swap the result bytes of a completed terminal attempt.
+
+        Only a completed terminal may be replaced, and the replacement keeps
+        the same attempt identifier while issuing a fresh token and reference
+        for the new bytes. Displaced sibling results are retired together so
+        a late replay never serves a stale grant.
+        """
+        async with self._gate:
+            self._prune_unlocked()
+            terminal = self._terminals.get(attempt_id)
+            if (
+                terminal is None
+                or terminal.message.get("type") != "vision.try_on.attempt.completed"
+            ):
+                return None
+            try:
+                admission = self._results._admit_unlocked(attempt_id, stored_result)
+            except ResultAdmissionError:
+                return None
+            public = admission.entry.public()
+            terminal.message["payload"]["result"] = public
+            terminal.result = public
+            terminal.expires_at = time.monotonic() + self._terminal_ttl_seconds
+            for evicted_id in admission.evicted_attempt_ids:
+                if evicted_id != attempt_id:
+                    self._terminals.pop(evicted_id, None)
+            self._terminals.move_to_end(attempt_id)
+            return public
+
     async def commit_terminal_transition(
         self,
         receipt: AttemptReceipt,

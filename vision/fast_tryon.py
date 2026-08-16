@@ -408,9 +408,14 @@ class FastTryOnRuntime:
         garment: PreparedGarment | ValidatedGarmentSource,
         *,
         pose_results=None,
+        garment_scale: float = 1.0,
     ) -> bytes:
         if isinstance(garment, ValidatedGarmentSource):
             garment = self.prepare_garment(garment)
+        garment_scale = float(garment_scale)
+        if not math.isfinite(garment_scale):
+            raise PoseUnavailableError("pose_unavailable")
+        garment_scale = min(1.6, max(0.8, garment_scale))
         height, width = frame.shape[:2]
         if frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8:
             raise PoseUnavailableError("pose_unavailable")
@@ -432,6 +437,13 @@ class FastTryOnRuntime:
             [top_center - half_width, top_center + half_width, bottom_center + half_width, bottom_center - half_width],
             dtype=np.float32,
         )
+        if garment_scale != 1.0:
+            # A customer adjustment scales the whole placed shirt uniformly
+            # around its fixed geometric center; pose and center never move.
+            destination_center = destination.mean(axis=0)
+            destination = (
+                destination_center + (destination - destination_center) * garment_scale
+            )
         source_corners = np.asarray([[0, 0], [source_width - 1, 0], [source_width - 1, source_height - 1], [0, source_height - 1]], dtype=np.float32)
         transform = cv2.getPerspectiveTransform(source_corners, destination)
         overlay = cv2.warpPerspective(source, transform, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)

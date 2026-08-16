@@ -423,7 +423,7 @@ def _configure_stage1_runtime(monkeypatch, pack: Path, *, ai_ready: bool = True)
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     monkeypatch.setattr(vision_app, "_acquisition_observer", _SingleAlignedObserver())
-    monkeypatch.setattr(vision_app, "_ACQUISITION_STABLE_FRAMES", 1)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
     monkeypatch.setattr(
         vision_app,
         "read_camera_with_source",

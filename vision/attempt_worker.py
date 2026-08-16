@@ -8,6 +8,7 @@ never synchronously create a process on the event-loop thread.
 from __future__ import annotations
 
 import asyncio
+import math
 import multiprocessing
 import threading
 import time
@@ -783,6 +784,7 @@ class FastRenderBroker:
         wire_payload = {
             key: value for key, value in payload.items() if key != "frame"
         }
+        wire_payload.setdefault("garmentScale", 1.0)
         try:
             wire_payload["frameShared"], shm = _write_shared_render_frame(
                 frame,
@@ -1050,11 +1052,15 @@ async def render_attempt_frame(
     template: str,
     timeout: float,
     broker: FastRenderBroker,
+    garment_scale: float = 1.0,
 ) -> bytes:
     """Apply one absolute deadline before any bounded frame copy or IPC."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     source_bytes = _validate_render_inputs(frame, garment_png, template)
+    garment_scale = float(garment_scale)
+    if not math.isfinite(garment_scale) or not 0.8 <= garment_scale <= 1.6:
+        raise AttemptWorkerError("garment scale is invalid")
     conservative_seconds = (
         _CONSERVATIVE_PREPARE_FIXED_SECONDS
         + source_bytes / _CONSERVATIVE_PREPARE_BYTES_PER_SECOND
@@ -1076,6 +1082,7 @@ async def render_attempt_frame(
             "garmentPng": garment_png,
             "garmentDigest": digest,
             "template": template,
+            "garmentScale": garment_scale,
         },
         deadline=time.monotonic() + remaining,
     )

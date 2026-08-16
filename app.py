@@ -17,6 +17,7 @@ import copy
 import hashlib
 import json
 import ipaddress
+import math
 import os
 import re
 import secrets
@@ -68,7 +69,8 @@ from vision.self_check import check_camera, run_self_check
 from vision.session_state import get_vision_session_status
 from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError, PoseUnavailableError
 from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
-from vision.attempt_worker import FastRenderBroker, render_attempt_frame
+from vision.fast_adjustment_store import FastAdjustmentStore
+from vision.attempt_worker import AttemptWorkerError, FastRenderBroker, render_attempt_frame
 from vision.acquisition_preview import AcquisitionPreviewStore
 from vision.acquisition_observer import AcquisitionObservationWorker
 from vision.v2_contract_bundle import (
@@ -107,13 +109,15 @@ _fast_attempt_registry = FastAttemptRegistry(
     result_max_bytes=_FAST_RESULT_MAX_TOTAL_BYTES,
     result_single_max_bytes=_FAST_RESULT_MAX_BYTES,
 )
+_fast_adjustment_store = FastAdjustmentStore(ttl_seconds=_FAST_RESULT_TTL_SECONDS)
 _fast_attempt_task_slots = asyncio.Semaphore(_FAST_ATTEMPT_MAX_TASKS)
 _fast_render_broker = FastRenderBroker()
 _acquisition_previews = AcquisitionPreviewStore()
 _acquisition_observer: AcquisitionObservationWorker | None = None
 _ai_attempt_process_factory = AiAttemptProcess
 _ai_attempt_execution_lock = asyncio.Lock()
-_ACQUISITION_STABLE_FRAMES = 3
+_ACQUISITION_TIMEOUT_SECONDS = 20.0
+_ACQUISITION_HOLD_SECONDS = 3.0
 _ACQUISITION_POLL_SECONDS = 0.05
 
 # 启动时的自检结果缓存
@@ -463,24 +467,41 @@ def _acquisition_observer_ready() -> bool:
     )
 
 
-def _acquiring_message(attempt_id: str, token: str, occupancy: str, aligned: bool, stable: bool) -> dict:
+def _acquisition_hold_remaining_ms(started_at: float | None, now: float) -> int | None:
+    """Milliseconds left in the continuous aligned hold, or None when not holding."""
+    if started_at is None:
+        return None
+    remaining = started_at + _ACQUISITION_HOLD_SECONDS - now
+    return max(0, math.ceil(remaining * 1000))
+
+
+def _acquiring_message(
+    attempt_id: str,
+    token: str,
+    occupancy: str,
+    aligned: bool,
+    hold_remaining_ms: int | None,
+) -> dict:
     if occupancy == "none":
         guidance, manual = "no_person", False
     elif occupancy == "multiple":
         guidance, manual = "multiple_people", False
     elif not aligned:
         guidance, manual = "align", False
-    elif stable:
-        guidance, manual = "ready", False
     else:
-        guidance, manual = "hold_still", True
-    return _generated_v2_envelope("vision.try_on.attempt.acquiring", {
+        guidance, manual = "counting_down", True
+    payload = {
         "attemptId": attempt_id,
         "preview": {"reference": _acquisition_preview_reference(token), "streamType": "mjpeg"},
         "occupancy": occupancy,
         "guidance": guidance,
         "manualCaptureAllowed": manual,
-    })
+    }
+    if guidance == "counting_down":
+        # The strict contract bounds the published hold window; a longer
+        # acquisition budget must still advertise a valid remaining time.
+        payload["holdRemainingMs"] = min(int(hold_remaining_ms or 0), 10_000)
+    return _generated_v2_envelope("vision.try_on.attempt.acquiring", payload)
 
 
 def _prepare_fast_result(attempt_id: str, image: bytes) -> tuple[dict, dict]:
@@ -1576,7 +1597,9 @@ async def presence_broadcast_loop():
                 # overhead bounding box when the customer leans into the
                 # touchscreen, which must not interrupt the front-camera flow.
                 if result.update["message_type"] == "vision.person_departed":
-                    pass
+                    # The departed customer's retained re-render source must
+                    # never survive into another customer's interaction.
+                    _fast_adjustment_store.discard_all()
                 await broadcast_profile_update(result.update)
 
             if (
@@ -1747,7 +1770,9 @@ async def run_v2_ai_attempt(
         try:
             for replay_message in admission.replay:
                 await _send_json_bounded(websocket, send_lock, replay_message)
-            await _acquire_front_io_until(asyncio.get_running_loop().time() + _FAST_ATTEMPT_TIMEOUT_SECONDS)
+            await _acquire_front_io_until(
+                asyncio.get_running_loop().time() + _ACQUISITION_TIMEOUT_SECONDS
+            )
             try:
                 owner = acquire_front_camera(
                     "try_on_attempt", reason=f"try_on_acquisition:{attempt_id}", lease_token=lease_token
@@ -1758,11 +1783,11 @@ async def run_v2_ai_attempt(
                 raise GarmentFetchError(owner.get("error") or "front_camera_busy")
             lease_acquired = True
 
-            stable_frames = 0
+            hold_started_at = None
             last_guidance = None
             captured_frame = None
             captured_source = None
-            deadline = asyncio.get_running_loop().time() + _FAST_ATTEMPT_TIMEOUT_SECONDS
+            deadline = asyncio.get_running_loop().time() + _ACQUISITION_TIMEOUT_SECONDS
             preview_token = None
             while asyncio.get_running_loop().time() < deadline:
                 remaining = max(0.001, deadline - asyncio.get_running_loop().time())
@@ -1776,18 +1801,28 @@ async def run_v2_ai_attempt(
                 else:
                     await _acquisition_previews.update(attempt_id, preview_token, jpeg)
                 occupancy, aligned = observation.occupancy, observation.aligned
-                stable_frames = stable_frames + 1 if occupancy == "single" and aligned else 0
-                stable = stable_frames >= _ACQUISITION_STABLE_FRAMES
-                acquiring = _acquiring_message(attempt_id, preview_token, occupancy, aligned, stable)
+                now = asyncio.get_running_loop().time()
+                if occupancy == "single" and aligned:
+                    if hold_started_at is None:
+                        hold_started_at = now
+                else:
+                    hold_started_at = None
+                hold_remaining_ms = _acquisition_hold_remaining_ms(hold_started_at, now)
+                stable = hold_remaining_ms == 0
+                acquiring = _acquiring_message(
+                    attempt_id,
+                    preview_token,
+                    occupancy,
+                    aligned,
+                    hold_remaining_ms,
+                )
                 if acquiring["payload"]["guidance"] != last_guidance:
                     await _publish_fast_transition(
                         await _fast_attempt_registry.publish_nonterminal(receipt, acquiring)
                     )
                     last_guidance = acquiring["payload"]["guidance"]
                 manual = await _fast_attempt_registry.take_manual_capture_request(receipt)
-                if (occupancy == "single" and aligned and stable) or (
-                    manual and occupancy == "single" and aligned
-                ):
+                if stable or (manual and occupancy == "single" and aligned):
                     captured_frame, captured_source = frame.copy(), source
                     break
                 await asyncio.sleep(_ACQUISITION_POLL_SECONDS)
@@ -2044,7 +2079,9 @@ async def run_v2_fast_attempt(
     try:
         for replay_message in admission.replay:
             await _send_json_bounded(websocket, send_lock, replay_message)
-        await _acquire_front_io_until(asyncio.get_running_loop().time() + _FAST_ATTEMPT_TIMEOUT_SECONDS)
+        await _acquire_front_io_until(
+            asyncio.get_running_loop().time() + _ACQUISITION_TIMEOUT_SECONDS
+        )
         try:
             owner = acquire_front_camera(
                 "try_on_attempt", reason=f"try_on_acquisition:{attempt_id}", lease_token=lease_token
@@ -2055,11 +2092,11 @@ async def run_v2_fast_attempt(
             raise GarmentFetchError(owner.get("error") or "front_camera_busy")
         lease_acquired = True
 
-        stable_frames = 0
+        hold_started_at = None
         last_guidance = None
         captured_frame = None
         source_frame = None
-        deadline = asyncio.get_running_loop().time() + _FAST_ATTEMPT_TIMEOUT_SECONDS
+        deadline = asyncio.get_running_loop().time() + _ACQUISITION_TIMEOUT_SECONDS
         preview_token = None
         while asyncio.get_running_loop().time() < deadline:
             remaining = max(0.001, deadline - asyncio.get_running_loop().time())
@@ -2073,18 +2110,28 @@ async def run_v2_fast_attempt(
             else:
                 await _acquisition_previews.update(attempt_id, preview_token, jpeg)
             occupancy, aligned = observation.occupancy, observation.aligned
-            stable_frames = stable_frames + 1 if occupancy == "single" and aligned else 0
-            stable = stable_frames >= _ACQUISITION_STABLE_FRAMES
-            acquiring = _acquiring_message(attempt_id, preview_token, occupancy, aligned, stable)
+            now = asyncio.get_running_loop().time()
+            if occupancy == "single" and aligned:
+                if hold_started_at is None:
+                    hold_started_at = now
+            else:
+                hold_started_at = None
+            hold_remaining_ms = _acquisition_hold_remaining_ms(hold_started_at, now)
+            stable = hold_remaining_ms == 0
+            acquiring = _acquiring_message(
+                attempt_id,
+                preview_token,
+                occupancy,
+                aligned,
+                hold_remaining_ms,
+            )
             if acquiring["payload"]["guidance"] != last_guidance:
                 await _publish_fast_transition(
                     await _fast_attempt_registry.publish_nonterminal(receipt, acquiring)
                 )
                 last_guidance = acquiring["payload"]["guidance"]
             manual = await _fast_attempt_registry.take_manual_capture_request(receipt)
-            if (occupancy == "single" and aligned and stable) or (
-                manual and occupancy == "single" and aligned
-            ):
+            if stable or (manual and occupancy == "single" and aligned):
                 # The source frame remains Vision memory, never the MJPEG representation.
                 captured_frame, source_frame = frame.copy(), source
                 break
@@ -2122,6 +2169,16 @@ async def run_v2_fast_attempt(
             timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
         )
         stored_result, result = _prepare_fast_result(attempt_id, result_image)
+        # A completed Fast result may be re-scaled around its locked center.
+        # Retain exactly the re-render inputs while the result itself lives;
+        # the snapshot is Vision-owned, bounded, and never sent to Machine.
+        _fast_adjustment_store.admit(
+            attempt_id,
+            captured_frame,
+            garment_source.png_bytes,
+            garment_source.digest,
+            garment_source.template,
+        )
         logger.info(
             "Fast attempt completed attemptId=%s frameSource=%s",
             attempt_id,
@@ -2179,6 +2236,64 @@ async def run_v2_fast_attempt(
     )
     if transition is not None:
         await _publish_fast_transition(transition)
+
+
+async def run_v2_fast_adjustment(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    message: dict,
+) -> None:
+    """Re-render one completed Fast result at a customer-chosen garment scale."""
+    payload = message["payload"]
+    attempt_id = payload["attemptId"]
+    scale = payload["garmentScale"]
+    snapshot = _fast_adjustment_store.get(attempt_id)
+    if snapshot is None:
+        async with send_lock:
+            await send_error(
+                websocket,
+                code="adjustment_unavailable",
+                message="the Fast adjustment source is no longer retained",
+                retryable=False,
+                message_id=message.get("messageId"),
+            )
+        return
+    try:
+        result_image = await render_attempt_frame(
+            snapshot.frame,
+            snapshot.garment_png,
+            digest=snapshot.garment_digest,
+            template=snapshot.template,
+            timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
+            broker=_fast_render_broker,
+            garment_scale=scale,
+        )
+        stored_result, _public_result = _prepare_fast_result(attempt_id, result_image)
+        replaced = await _fast_attempt_registry.replace_completed_result(
+            attempt_id, stored_result
+        )
+        if replaced is None:
+            raise RuntimeError("fast_adjustment_target_unavailable")
+        adjusted = _generated_v2_envelope(
+            "vision.try_on.result.adjusted",
+            {"attemptId": attempt_id, "result": replaced},
+        )
+        async with send_lock:
+            await websocket.send_json(adjusted)
+    except (PoseUnavailableError, AttemptWorkerError, RuntimeError, TimeoutError):
+        logger.exception(
+            "Fast adjustment failed attemptId=%s scale=%s",
+            attempt_id,
+            scale,
+        )
+        async with send_lock:
+            await send_error(
+                websocket,
+                code="internal_error",
+                message="the Fast result could not be adjusted",
+                retryable=False,
+                message_id=message.get("messageId"),
+            )
 
 
 async def reject_v2_fast_attempt_for_backpressure(
@@ -2373,6 +2488,7 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 "vision.try_on.attempt.start",
                 "vision.try_on.attempt.capture",
                 "vision.try_on.attempt.cancel",
+                "vision.try_on.attempt.adjust",
             }:
                 try:
                     # Every V2 frame arriving at Vision crosses only the
@@ -2395,6 +2511,7 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 "vision.try_on.attempt.start",
                 "vision.try_on.attempt.capture",
                 "vision.try_on.attempt.cancel",
+                "vision.try_on.attempt.adjust",
             }
             is_v2_fast_attempt = (
                 message_type == "vision.try_on.attempt.start"
@@ -2455,7 +2572,13 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 await _fast_attempt_registry.request_manual_capture(payload["attemptId"])
                 continue
 
+            if message_type == "vision.try_on.attempt.adjust":
+                await run_v2_fast_adjustment(websocket, send_lock, message)
+                continue
+
             if message_type == "vision.try_on.attempt.cancel":
+                if payload.get("reason") == "route_leave":
+                    _fast_adjustment_store.discard(payload["attemptId"])
                 terminal = _generated_v2_envelope(
                     "vision.try_on.attempt.canceled",
                     {"attemptId": payload["attemptId"], "reason": payload["reason"]},
