@@ -691,3 +691,48 @@ def test_v2_recorded_single_person_auto_capture_uses_production_yolo_and_pose(mo
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_v2_unstable_alignment_resets_countdown_and_manual_capture_still_completes(
+    monkeypatch,
+):
+    """An intermittent misalignment never completes the hold; manual intent still captures."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    _configure_recorded_front(monkeypatch, "front-vertical-unstable.mp4")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _GarmentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    attempt_id = str(uuid4())
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on_fast"]}))
+                assert socket.receive_json()["type"] == "vision.ready"
+                garment = _GarmentHandler.payload
+                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
+                assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+                observed_guidances = []
+                deadline = time.monotonic() + 3.5
+                while time.monotonic() < deadline:
+                    message = socket.receive_json()
+                    if message["type"] != "vision.try_on.attempt.acquiring":
+                        raise AssertionError(f"auto capture fired before manual intent: {message['type']}")
+                    observed_guidances.append(message["payload"]["guidance"])
+                assert "align" in observed_guidances
+                assert "counting_down" in observed_guidances
+                socket.send_json(_envelope("vision.try_on.attempt.capture", {"attemptId": attempt_id}))
+                generating = None
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline:
+                    message = socket.receive_json()
+                    if message["type"] == "vision.try_on.attempt.generating":
+                        generating = message
+                        break
+                    assert message["type"] == "vision.try_on.attempt.acquiring"
+                assert generating is not None
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
