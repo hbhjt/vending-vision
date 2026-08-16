@@ -50,16 +50,25 @@ class UpperColorEstimator:
         left_hip = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP]
         right_hip = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP]
 
-        needed = [left_shoulder, right_shoulder, left_hip, right_hip]
-
-        if any(lm.visibility < 0.4 for lm in needed):
+        if (
+            left_shoulder.visibility < 0.4
+            or right_shoulder.visibility < 0.4
+        ):
             return "unknown"
 
         # 计算上衣区域边界
-        x_min = int(min(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w)
-        x_max = int(max(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w)
-        y_min = int(min(left_shoulder.y, right_shoulder.y) * h)
-        y_max = int(max(left_hip.y, right_hip.y) * h)
+        if left_hip.visibility >= 0.4 and right_hip.visibility >= 0.4:
+            x_min = int(min(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w)
+            x_max = int(max(left_shoulder.x, right_shoulder.x, left_hip.x, right_hip.x) * w)
+            y_min = int(min(left_shoulder.y, right_shoulder.y) * h)
+            y_max = int(max(left_hip.y, right_hip.y) * h)
+        else:
+            # 近距离竖屏特写时下身（髋关节）落在画幅之外：退化为
+            # 双肩到画面底部的可见躯干区域，仍能采样上衣主色。
+            x_min = int(min(left_shoulder.x, right_shoulder.x) * w)
+            x_max = int(max(left_shoulder.x, right_shoulder.x) * w)
+            y_min = int(min(left_shoulder.y, right_shoulder.y) * h)
+            y_max = h
 
         # 稍微扩大区域，避免只截到身体中心太窄
         pad_x = int((x_max - x_min) * 0.25)
