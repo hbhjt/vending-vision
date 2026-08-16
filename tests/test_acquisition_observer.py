@@ -756,6 +756,7 @@ def test_acquisition_observer_accepts_vertical_720x1280_frame():
         _coerce_frame_for_shared_memory(np.zeros((1921, 720, 3), dtype=np.uint8))
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX SIGKILL process-crash tracer")
 def test_acquisition_observer_respawns_after_child_death_and_recovers_ready():
     """A killed observer child must be replaced by the next start() instead of a permanent degrade."""
     async def scenario():

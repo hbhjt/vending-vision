@@ -369,7 +369,7 @@ def test_readable_process_sentinel_waits_for_parent_reap(monkeypatch):
     )
 
     assert attempt_worker_module._wait_process_dead(process, 0.1) is True
-    assert process.join_timeout == 0
+    assert process.join_timeout == 0.25
     # The readable sentinel is the physical-death proof; a stale parent-side
     # is_alive() view must not override it.
     assert process.alive is True
@@ -1194,7 +1194,7 @@ def test_render_shutdown_accepts_process_sentinel_before_is_alive_reap_catches_u
 
     assert process.killed is True
     assert process.terminate_calls == 0
-    assert process.join_calls == [0]
+    assert process.join_calls == [0.25]
     assert process.closed is True
     assert broker.pid is None
 

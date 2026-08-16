@@ -51,7 +51,7 @@ def _wait_process_dead(process: Any, timeout: float) -> bool:
                 join = getattr(process, "join", None)
                 if join is not None:
                     try:
-                        join(timeout=0)
+                        join(timeout=0.25)
                     except (AssertionError, OSError, PermissionError, ValueError):
                         pass
                 try:

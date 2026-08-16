@@ -118,23 +118,13 @@ def _wait_process_dead(process: Any, timeout: float) -> bool:
                 join = getattr(process, "join", None)
                 if join is not None:
                     try:
-                        join(timeout=0)
+                        join(timeout=0.25)
                     except (AssertionError, OSError, PermissionError, ValueError):
                         pass
                 # A readable multiprocessing sentinel is the operating-system
                 # proof that the process has physically exited.  is_alive()
                 # may still expose a stale parent-side reap/cache view under
                 # runner load and must not override that stronger proof.
-                # Briefly wait for the parent-side reap so owned handles can
-                # close cleanly; the sentinel proof still wins if it lags.
-                reap_deadline = time.monotonic() + min(max(timeout, 0.0), 0.25)
-                while time.monotonic() < reap_deadline:
-                    try:
-                        if not process.is_alive():
-                            break
-                    except (AttributeError, OSError, PermissionError, ValueError):
-                        break
-                    time.sleep(0.001)
                 return True
             return not _process_is_alive(process)
         except (AttributeError, OSError, PermissionError, ValueError):
