@@ -1821,8 +1821,10 @@ async def run_v2_ai_attempt(
                         await _fast_attempt_registry.publish_nonterminal(receipt, acquiring)
                     )
                     last_guidance = acquiring["payload"]["guidance"]
-                manual = await _fast_attempt_registry.take_manual_capture_request(receipt)
+                manual = await _fast_attempt_registry.manual_capture_requested(receipt)
                 if stable or (manual and occupancy == "single" and aligned):
+                    if not stable:
+                        await _fast_attempt_registry.consume_manual_capture_request(receipt)
                     captured_frame, captured_source = frame.copy(), source
                     break
                 await asyncio.sleep(_ACQUISITION_POLL_SECONDS)
@@ -2130,8 +2132,10 @@ async def run_v2_fast_attempt(
                     await _fast_attempt_registry.publish_nonterminal(receipt, acquiring)
                 )
                 last_guidance = acquiring["payload"]["guidance"]
-            manual = await _fast_attempt_registry.take_manual_capture_request(receipt)
+            manual = await _fast_attempt_registry.manual_capture_requested(receipt)
             if stable or (manual and occupancy == "single" and aligned):
+                if not stable:
+                    await _fast_attempt_registry.consume_manual_capture_request(receipt)
                 # The source frame remains Vision memory, never the MJPEG representation.
                 captured_frame, source_frame = frame.copy(), source
                 break

@@ -650,15 +650,26 @@ class FastAttemptRegistry:
             active.manual_capture_requested.set()
             return True
 
-    async def take_manual_capture_request(self, receipt: AttemptReceipt) -> bool:
+    async def manual_capture_requested(self, receipt: AttemptReceipt) -> bool:
+        """Peek the recorded intent without consuming it.
+
+        A manual request must survive misaligned frames until one eligible
+        observation actually captures. Consuming on every poll would silently
+        drop the customer's click whenever it raced an unaligned frame.
+        """
         async with self._gate:
             active = self._active
             if active is None or active.receipt != receipt or active.cancel_event.is_set():
                 return False
-            if not active.manual_capture_requested.is_set():
-                return False
+            return active.manual_capture_requested.is_set()
+
+    async def consume_manual_capture_request(self, receipt: AttemptReceipt) -> None:
+        """Clear the recorded intent only once it produced a capture."""
+        async with self._gate:
+            active = self._active
+            if active is None or active.receipt != receipt:
+                return
             active.manual_capture_requested.clear()
-            return True
 
     async def cancel_current(
         self, *, attempt_id: str | None, terminal: dict
