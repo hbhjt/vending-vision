@@ -7,6 +7,7 @@ on:
 
 jobs:
   test:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +32,7 @@ jobs:
 
   windows-test:
     name: Windows 完整测试
+    timeout-minutes: 30
     runs-on: windows-latest
     defaults:
       run:
@@ -61,6 +63,7 @@ jobs:
 
   windows-package:
     name: Windows 交付包构建
+    timeout-minutes: 45
     runs-on: windows-latest
     defaults:
       run:
@@ -138,6 +141,7 @@ jobs:
 
   regional-evidence-contract:
     name: VEM 区域证据合同
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -178,6 +182,7 @@ jobs:
   publish-main-artifacts:
     name: 发布同提交 Vision artifacts
     if: github.ref == 'refs/heads/main'
+    timeout-minutes: 15
     needs:
       - test
       - windows-test
