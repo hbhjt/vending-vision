@@ -77,6 +77,11 @@ jobs:
         with:
           python-version-file: ".python-version"
           cache: pip
+      - name: 恢复 AI wheelhouse 缓存
+        uses: actions/cache@v4
+        with:
+          path: ai-wheelhouse
+          key: ${{ runner.os }}-vending-vision-ai-wheelhouse-${{ hashFiles('requirements-ai.lock.json') }}-${{ hashFiles('ai-runtime-descriptor.json') }}-${{ hashFiles('.python-version') }}
       - name: 下载完整锁定 wheel 闭包
         run: >-
           python -m pip download --only-binary=:all: --require-hashes
@@ -85,12 +90,26 @@ jobs:
         run: |
           python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
           python scripts/dependency_lock.py --wheelhouse wheelhouse --python python --target-sys-platform win32
-      - name: 物化精确 AI wheel 闭包
-        run: >-
-          python scripts/materialize_ai_wheelhouse.py
-          --descriptor requirements-ai.lock.json
-          --runtime-descriptor ai-runtime-descriptor.json
-          --destination ai-wheelhouse
+      - name: 物化或校验精确 AI wheel 闭包
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath ai-wheelhouse) {
+            New-Item -ItemType Directory -Force -Path build | Out-Null
+            python scripts/materialize_ai_wheelhouse.py `
+              --descriptor requirements-ai.lock.json `
+              --runtime-descriptor ai-runtime-descriptor.json `
+              --wheelhouse ai-wheelhouse `
+              --requirements-output build/requirements-ai-release.txt
+            if ($LASTEXITCODE -ne 0) {
+              Remove-Item -LiteralPath ai-wheelhouse -Recurse -Force
+            }
+          }
+          if (-not (Test-Path -LiteralPath ai-wheelhouse)) {
+            python scripts/materialize_ai_wheelhouse.py `
+              --descriptor requirements-ai.lock.json `
+              --runtime-descriptor ai-runtime-descriptor.json `
+              --destination ai-wheelhouse
+          }
       - name: 构建并验证 Windows runtime 与录播交付包
         shell: pwsh
         run: |
