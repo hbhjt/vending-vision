@@ -679,7 +679,7 @@ def test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png(tm
             )
     assert sidecar["policy"] == {
         "schemaVersion": "vem-ai-regional-evidence-policy/v1",
-        "sha256": "7e1f34b2a96abecd245de6ba44c7b4b0fecd2ebeb459e10fa0cc6402955abe1d",
+        "sha256": "efb65cf2cf2d06f7c8fd81bf0962ca1dcb994dfda5dd31bf1f7f48a6393dbe6e",
     }
     assert sidecar["verdict"] in {"passed", "regional_check_failed"}
 
@@ -762,7 +762,7 @@ def test_ci_declares_pinned_vem_regional_evidence_contract_job():
 
     assert "regional-evidence-contract:" in workflow
     assert "repository: YKDZ/vem" in workflow
-    assert "ref: 2dad5d56e752b2a0d19167bc0a6e32871ef3587e" in workflow
+    assert "ref: e5230a8a206343bb6f80f2e30e3d2f8b8807f2e4" in workflow
     assert "VEM_REGIONAL_EVIDENCE_MODULE:" in workflow
     assert "scripts/testbed/ai-regional-evidence-policy.json" in workflow
     assert workflow.count("fetch-depth: 0") == 5

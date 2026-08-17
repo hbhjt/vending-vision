@@ -152,7 +152,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: YKDZ/vem
-          ref: 2dad5d56e752b2a0d19167bc0a6e32871ef3587e
+          ref: e5230a8a206343bb6f80f2e30e3d2f8b8807f2e4
           path: vem-contract
           sparse-checkout: |
             scripts/testbed/ai-regional-evidence.mjs
