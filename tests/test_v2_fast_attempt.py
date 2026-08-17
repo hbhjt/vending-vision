@@ -672,6 +672,7 @@ def test_v2_fast_pose_failures_are_stable_terminals_without_worker_recovery(
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     _configure_recorded_front(monkeypatch)
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
     broker = FastRenderBroker(

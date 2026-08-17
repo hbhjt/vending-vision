@@ -743,7 +743,7 @@ def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_pub
     materialize_index, materialize_step = next(
         (index, step)
         for index, step in enumerate(named_steps)
-        if step["name"] == "物化精确 AI wheel 闭包"
+        if step["name"] == "物化或校验精确 AI wheel 闭包"
     )
     build_index, build_step = next(
         (index, step)
@@ -757,12 +757,6 @@ def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_pub
         (ROOT / "ai-runtime-descriptor.json").read_text("utf-8")
     )
 
-    materialize = (
-        "python scripts/materialize_ai_wheelhouse.py "
-        "--descriptor requirements-ai.lock.json "
-        "--runtime-descriptor ai-runtime-descriptor.json "
-        "--destination ai-wheelhouse"
-    )
     build = (
         "./scripts/build_exe.ps1 "
         "-Wheelhouse (Join-Path $PWD \"wheelhouse\") "
@@ -770,7 +764,13 @@ def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_pub
         "-AiWheelhouseDescriptor (Join-Path $PWD \"requirements-ai.lock.json\")"
     )
 
-    assert materialize in materialize_run
+    assert re.search(
+        r"python scripts/materialize_ai_wheelhouse\.py\s+"
+        r"--descriptor requirements-ai\.lock\.json\s+"
+        r"--runtime-descriptor ai-runtime-descriptor\.json\s+"
+        r"--destination ai-wheelhouse",
+        materialize_run,
+    )
     assert build in build_run
     assert (
         '& (Join-Path $PWD ".venv-packaging-core\\Scripts\\python.exe") '
