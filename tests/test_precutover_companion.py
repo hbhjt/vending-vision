@@ -132,8 +132,13 @@ def build_fixture(
         ],
     }
     model_descriptor_path = internal / "official-ai-model-pack-descriptor.json"
-    model_descriptor_path.write_text(
-        canonical_ai_model_manifest_json(model_descriptor) + model_descriptor_suffix, "utf-8"
+    # write_bytes keeps the LF-only canonical bytes identical on Windows,
+    # where write_text would translate the trailing newline to CRLF and break
+    # the precomputed model_descriptor_sha.
+    model_descriptor_path.write_bytes(
+        (canonical_ai_model_manifest_json(model_descriptor) + model_descriptor_suffix).encode(
+            "utf-8"
+        )
     )
     candidate_root = root / "candidate-input"
     candidate_root.mkdir()
