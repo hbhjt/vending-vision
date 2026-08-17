@@ -1719,7 +1719,19 @@ async def run_v2_ai_attempt(
         nonlocal admitted_model_pack
         current_root = os.environ.get("VEM_AI_MODEL_PACK")
         snapshot = official_ai_readiness_snapshot(current_root)
-        if not snapshot.ready or not _acquisition_observer_ready() or not current_root:
+        observer_ready = _acquisition_observer_ready()
+        if (
+            not snapshot.ready
+            or not observer_ready
+            or not current_root
+        ):
+            logger.warning(
+                "AI attempt admission not ready: root=%s ready=%s diag=%s observer=%s",
+                current_root,
+                snapshot.ready,
+                snapshot.diagnostic,
+                observer_ready,
+            )
             admitted_model_pack = None
             return None
         admitted_model_pack = Path(current_root)
@@ -1751,6 +1763,9 @@ async def run_v2_ai_attempt(
             for replay_message in admission.replay:
                 await _send_json_bounded(websocket, send_lock, replay_message)
             return
+        logger.info(
+            "AI attempt admitted attemptId=%s", admission.receipt.attempt_id
+        )
 
         receipt = admission.receipt
         assert receipt is not None
