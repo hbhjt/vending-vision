@@ -119,7 +119,9 @@ _acquisition_observer: AcquisitionObservationWorker | None = None
 _ai_attempt_process_factory = AiAttemptProcess
 _ai_attempt_execution_lock = asyncio.Lock()
 _ACQUISITION_TIMEOUT_SECONDS = 20.0
-_ACQUISITION_HOLD_SECONDS = 3.0
+# 8s 连续稳定才自动拍照，给用户留出看清画面和调整姿态的时间；
+# 手动拍照仍可在对齐窗口内立即触发，不受该倒计时限制。
+_ACQUISITION_HOLD_SECONDS = 8.0
 _ACQUISITION_POLL_SECONDS = 0.05
 
 # 启动时的自检结果缓存
