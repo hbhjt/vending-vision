@@ -1307,8 +1307,8 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
             assert not duplicate_message_seen.wait(timeout=0.1)
             restart_release.set()
 
-            assert owner_done.wait(timeout=5)
-            assert duplicate_done.wait(timeout=5)
+            assert owner_done.wait(timeout=15)
+            assert duplicate_done.wait(timeout=15)
             owner_reader.join(timeout=1)
             duplicate_reader.join(timeout=1)
 

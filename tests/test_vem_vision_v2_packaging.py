@@ -765,9 +765,9 @@ def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_pub
     )
 
     assert re.search(
-        r"python scripts/materialize_ai_wheelhouse\.py\s+"
-        r"--descriptor requirements-ai\.lock\.json\s+"
-        r"--runtime-descriptor ai-runtime-descriptor\.json\s+"
+        r"python scripts/materialize_ai_wheelhouse\.py[\s`]+"
+        r"--descriptor requirements-ai\.lock\.json[\s`]+"
+        r"--runtime-descriptor ai-runtime-descriptor\.json[\s`]+"
         r"--destination ai-wheelhouse",
         materialize_run,
     )
