@@ -203,10 +203,11 @@ def test_recorded_video_source_exhaustion_and_loop_semantics_are_explicit():
     frame_total = int(cv2.VideoCapture(str(FIXTURE_ROOT / "front.mp4")).get(cv2.CAP_PROP_FRAME_COUNT))
     for _ in range(frame_total):
         non_looping.read()
-    with pytest.raises(RuntimeError, match="exhausted"):
-        non_looping.read()
+    frozen = non_looping.read()
     assert non_looping.status()["exhausted"] is True
-    assert non_looping.status()["ready"] is False
+    assert non_looping.status()["ready"] is True
+    assert non_looping.status()["ok"] is True
+    assert np.array_equal(frozen, non_looping.read())
 
     looping = RecordedVideoFrameSource(
         role="front", config={"source": "recorded_video", "video_path": str(FIXTURE_ROOT / "front.mp4"), "loop": True}

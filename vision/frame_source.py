@@ -32,8 +32,9 @@ class FrameSource(Protocol):
 class RecordedVideoFrameSource:
     """Decode one deterministic recording without changing pipeline behavior.
 
-    ``loop=True`` rewinds only after EOF. ``loop=False`` remains exhausted
-    until the caller explicitly resets the source.
+    ``loop=True`` rewinds only after EOF. ``loop=False`` freezes on the last
+    decoded frame after EOF so a one-shot recording does not take the camera
+    offline; the source stays exhausted until the caller explicitly resets it.
     """
 
     def __init__(self, role: str, config: dict):
@@ -49,6 +50,7 @@ class RecordedVideoFrameSource:
         self._last_frame_index = None
         self._decoded_frame_count = None
         self._last_source_frame = None
+        self._last_frame = None
         self._fixture_sha256 = None
         self._config_sha256 = None
 
@@ -101,7 +103,11 @@ class RecordedVideoFrameSource:
         if self.capture is not None and self.capture.isOpened():
             return
         if self.exhausted and not self.loop:
-            raise RuntimeError(self.last_error or f"recorded video exhausted: {self.path}")
+            if self._last_frame is None:
+                raise RuntimeError(
+                    self.last_error or f"recorded video exhausted: {self.path}"
+                )
+            return
         if not self.path.is_file():
             self._raise_error(f"recorded video does not exist: {self.path}")
 
@@ -145,12 +151,19 @@ class RecordedVideoFrameSource:
         return bool(self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0))
 
     def _read_once(self):
+        if self.exhausted and not self.loop and self._last_frame is not None:
+            return self._last_frame
         self._ensure_open()
         ok, frame = self.capture.read()
         if ok:
+            self._last_frame = frame
             self._last_frame_index = int(self.capture.get(cv2.CAP_PROP_POS_FRAMES) - 1)
             return frame
         if not self.loop:
+            if self._last_frame is not None:
+                self.exhausted = True
+                self.last_error = None
+                return self._last_frame
             self._raise_error(f"recorded video exhausted: {self.path}", exhausted=True)
         if not self._rewind():
             self._raise_error(f"recorded video cannot rewind after exhaustion: {self.path}")
@@ -213,7 +226,6 @@ class RecordedVideoFrameSource:
             self.capture is not None
             and self.capture.isOpened()
             and self.last_error is None
-            and not self.exhausted
         )
         return {
             "ok": ready,
