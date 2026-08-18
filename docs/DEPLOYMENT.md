@@ -3,9 +3,9 @@
 ## 职责边界
 
 本仓库负责生成不可变的 Windows 视觉候选发布物，包括运行时、模型、依赖、
-现场配置 schema、bundle、SBOM、provenance、产物证明和供应方签名。本仓库
-不在售货机上复制源码、联网下载依赖、注册 Windows 任务、批准候选版本或
-重新打包已经发布的 bundle。
+现场配置 schema、bundle 和同 commit 的 SHA-256 交付清单。本仓库不在售货机
+上复制源码、联网下载依赖、注册 Windows 任务、批准候选版本或重新打包
+已经发布的 bundle。
 
 VEM 负责候选版本 conformance、approval、Factory Manifest、解压到
 `C:\VEM\vision\releases\<version>-<digest-prefix>`、当前版本选择、
@@ -14,17 +14,15 @@ VEM 负责候选版本 conformance、approval、Factory Manifest、解压到
 ## 候选版本发布
 
 1. 将候选修改合并到 `main`。
-2. 在已合并提交上创建受保护的预发布 SemVer tag，例如 `v0.3.0-rc.1`。
-3. `.github/workflows/publish-candidate.yml` 解析 Git LFS 模型、校验模型清单、
-   运行测试、构建 onedir EXE、执行机器协议打包冒烟测试，并发布 GitHub prerelease。
-4. prerelease 同时包含原始 zip、descriptor、SPDX SBOM、SLSA provenance、
-   artifact attestation 和 Ed25519 detached signature。
-5. 操作员使用 tag 和预期 bundle digest 手动启动 VEM conformance；本仓库
-   永远不生成 VEM approval。
-
-工作流需要 `VISION_SUPPLIER_PRIVATE_KEY_PEM` 和
-`VISION_SUPPLIER_SIGNER_IDENTITY` 两个仓库 secret。后者为 Ed25519 公钥
-SPKI DER 的小写 SHA-256，并带 `spki-sha256:` 前缀。
+2. `.github/workflows/ci.yml` 在测试、Windows 测试与区域证据合同通过后，
+   构建 onedir EXE、执行机器协议打包冒烟测试，并上传同 commit 的
+   `vending-vision-main-<commit>` 与 `vending-vision-candidate-<commit>`
+   Actions artifacts。
+3. `vending-vision-main-artifacts.json` 以 SHA-256 锁定 runtime 与录播
+   fixture；candidate 包内嵌 `candidate-manifest.json` 并声明 source commit
+   与逐文件 SHA-256。
+4. VEM 按 commit 下载成对 artifacts，校验清单与摘要后原样安装；本仓库
+   永远不生成 VEM approval，也不依赖任何签名 secret。
 
 ## VEM 托管现场配置
 

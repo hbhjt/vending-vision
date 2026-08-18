@@ -115,56 +115,6 @@ def test_ai_runtime_packaging_includes_worker_code_but_excludes_official_weights
     assert "model.safetensors" not in worker_spec
 
 
-def test_windows_pre_cutover_companion_is_a_separate_self_contained_build_artifact():
-    from scripts.workflow_yaml import load_workflow_yaml, workflow_run_scalars
-
-    spec_path = ROOT / "vending_vision_precutover_verifier.spec"
-    entrypoint = ROOT / "run_precutover_verifier.py"
-    build = (ROOT / "scripts" / "build_exe.ps1").read_text("utf-8")
-    builder = (
-        ROOT / ".github/workflows/trusted-precutover-companion-builder.yml"
-    ).read_text("utf-8")
-
-    assert spec_path.is_file(), "missing independent pre-cutover verifier spec"
-    assert entrypoint.is_file(), "missing frozen pre-cutover verifier entrypoint"
-    spec = spec_path.read_text("utf-8")
-    assert 'name="vending-vision-precutover-verifier"' in spec
-    assert 'str(ROOT / "run_precutover_verifier.py")' in spec
-    assert "collect_submodules(\"torch\")" not in spec
-    assert "vending_vision_precutover_verifier.spec" in build
-    assert '(Join-Path $ToolRoot "vending_vision_precutover_verifier.spec")' in build
-    assert "git -C $ToolRoot rev-parse HEAD" in build
-    assert "vending-vision-precutover-verifier" in build
-    assert "precutover-companion-descriptor.json" in build
-    assert "Invoke-Checked $CompanionExe --help" in build
-    assert '"scripts\\precutover_companion_descriptor.py") verify' in build
-    assert "vending-vision-precutover-verifier" in builder
-    assert "    timeout-minutes: 180\n" in builder
-    assert "precutover-companion-provenance.sigstore.json" in builder
-    assert "archive_sha256" in builder
-    assert "descriptor_sha256" in builder
-    assert "attestation_bundle_sha256" in builder
-    assert "actions/attest-build-provenance@v4" in builder
-    assert "repository: ${{ job.workflow_repository }}" in builder
-    assert "ref: ${{ job.workflow_sha }}" in builder
-    assert "path: source" not in builder
-    assert "candidate-manifest" not in builder
-    assert "vending-vision-ai-worker" not in builder
-    assert "--require-hashes" in builder
-    assert "--total-timeout-seconds 1800" in builder
-    workflow = load_workflow_yaml(builder)
-    assert set(workflow["on"]["workflow_call"]["inputs"]) == {
-        "core_wheelhouse_url",
-        "core_wheelhouse_sha256",
-        "core_wheelhouse_bytes",
-    }
-    assert all("${{" not in command for command in workflow_run_scalars(builder))
-    assert "$CorePython -m PyInstaller" in build
-    assert "Copy-Item -LiteralPath $CompanionRoot" not in build
-    companion_cli = (ROOT / "vision/precutover_companion.py").read_text("utf-8")
-    assert 'parser.add_argument("--python"' not in companion_cli
-
-
 def test_frozen_specs_materialize_source_descriptor_python_files_for_probe_hashing():
     descriptor = json.loads((ROOT / "official-ai-source-descriptor.json").read_text("utf-8"))
     source_paths = {entry["path"] for entry in descriptor["sources"] if entry["path"].endswith(".py")}
@@ -250,14 +200,6 @@ def test_packaged_verifier_executes_the_frozen_bundle_positive_negative_probe():
     assert '"--probe-runtime"' in launcher
     assert "missing-pack" not in launcher
     assert '"AI runtime worker contract probe passed"' in verifier
-    assert "--require-ai-worker" in verifier
-    assert "--trusted-subject-sha256" in verifier
-    assert "--expected-embedded-manifest-sha256" in verifier
-    assert "--expected-source-commit" in verifier
-    assert "--extract-root" in verifier
-    assert "verify_candidate_archive" in verifier
-    assert "--candidate-manifest" not in verifier
-    assert "--expected-candidate-manifest-sha256" not in verifier
     assert "PACKAGED_EXE_VERIFICATION=CORE_ONLY" in verifier
     assert "PACKAGED_EXE_VERIFICATION=PASS" in verifier
     assert "assert_ai_worker_layout" in verifier
@@ -469,123 +411,6 @@ def test_packaged_verifier_rejects_noncanonical_release_version_runtime_marker(
         assert_ai_worker_layout(exe, required=True)
 
 
-def test_candidate_archive_rejects_self_manifested_exact_json_fake_without_external_trust(tmp_path):
-    from scripts.candidate_artifact_manifest import verify_candidate_archive, write_candidate_archive
-
-    dist = tmp_path / "dist"
-    main = dist / "vending-vision" / "vending-vision.exe"
-    worker = dist / "vending-vision-ai-worker" / "vending-vision-ai-worker.exe"
-    internal = worker.parent / "_internal"
-    main.parent.mkdir(parents=True)
-    internal.mkdir(parents=True)
-    main.write_bytes(b"main")
-    worker.write_bytes(b"real-worker")
-    for name in (
-        "ai-runtime-descriptor.json", "requirements-ai.lock.json",
-        "official-ai-source-descriptor.json", "official-ai-model-pack-descriptor.json",
-    ):
-        (internal / name).write_bytes(name.encode("ascii"))
-    artifact = tmp_path / "candidate.zip"
-    manifest_path = tmp_path / "candidate.manifest.json"
-    trusted = write_candidate_archive(dist, artifact, manifest_path, source_commit="a" * 40)
-    repeated_artifact = tmp_path / "candidate-repeat.zip"
-    repeated_manifest = tmp_path / "candidate-repeat.manifest.json"
-    repeated = write_candidate_archive(
-        dist, repeated_artifact, repeated_manifest, source_commit="a" * 40
-    )
-    assert repeated == trusted
-    assert repeated_artifact.read_bytes() == artifact.read_bytes()
-
-    verified = verify_candidate_archive(
-        artifact,
-        tmp_path / "verified-real",
-        expected_subject_sha256=trusted["subjectSha256"],
-        expected_manifest_sha256=trusted["embeddedManifestSha256"],
-        expected_source_commit="a" * 40,
-    )
-    assert verified["workerExecutable"].read_bytes() == b"real-worker"
-
-    worker.write_text('{"probe":"official-catvton-worker-runtime","torch":"2.8.0+cpu"}\n', "utf-8")
-    fake_artifact = tmp_path / "candidate-fake.zip"
-    fake_manifest = tmp_path / "candidate-fake.manifest.json"
-    fake = write_candidate_archive(dist, fake_artifact, fake_manifest, source_commit="a" * 40)
-
-    with pytest.raises(AssertionError, match="trusted subject digest mismatch"):
-        verify_candidate_archive(
-            fake_artifact,
-            tmp_path / "fake-subject",
-            expected_subject_sha256=trusted["subjectSha256"],
-            expected_manifest_sha256=trusted["embeddedManifestSha256"],
-            expected_source_commit="a" * 40,
-        )
-    with pytest.raises(AssertionError, match="embedded manifest digest mismatch"):
-        verify_candidate_archive(
-            fake_artifact,
-            tmp_path / "fake-manifest",
-            expected_subject_sha256=fake["subjectSha256"],
-            expected_manifest_sha256=trusted["embeddedManifestSha256"],
-            expected_source_commit="a" * 40,
-        )
-
-    not_zip = tmp_path / "not.zip"
-    not_zip.write_bytes(b"not-a-zip")
-    with pytest.raises(AssertionError, match="candidate artifact is not a ZIP"):
-        verify_candidate_archive(
-            not_zip,
-            tmp_path / "not-zip",
-            expected_subject_sha256=hashlib.sha256(not_zip.read_bytes()).hexdigest(),
-            expected_manifest_sha256=trusted["embeddedManifestSha256"],
-            expected_source_commit="a" * 40,
-        )
-
-    tampered = tmp_path / "candidate-payload-tampered.zip"
-    with zipfile.ZipFile(artifact) as source, zipfile.ZipFile(tampered, "w") as output:
-        for info in source.infolist():
-            payload = source.read(info)
-            if info.filename.endswith("vending-vision-ai-worker.exe"):
-                payload = b"evil-worker"
-            output.writestr(info, payload)
-    with pytest.raises(AssertionError, match="payload digest mismatch"):
-        verify_candidate_archive(
-            tampered,
-            tmp_path / "tampered-payload",
-            expected_subject_sha256=hashlib.sha256(tampered.read_bytes()).hexdigest(),
-            expected_manifest_sha256=trusted["embeddedManifestSha256"],
-            expected_source_commit="a" * 40,
-        )
-
-
-@pytest.mark.parametrize("case", ["traversal", "symlink", "special", "collision", "compressed"])
-def test_candidate_archive_safe_extract_rejects_unsafe_zip_entries(tmp_path, case):
-    from scripts.candidate_artifact_manifest import verify_candidate_archive
-
-    artifact = tmp_path / f"{case}.zip"
-    with zipfile.ZipFile(artifact, "w") as archive:
-        if case == "traversal":
-            archive.writestr("../escape.exe", b"bad")
-        elif case in {"symlink", "special"}:
-            info = zipfile.ZipInfo("unsafe")
-            info.create_system = 3
-            mode = stat.S_IFLNK if case == "symlink" else stat.S_IFIFO
-            info.external_attr = (mode | 0o777) << 16
-            archive.writestr(info, b"target")
-        elif case == "collision":
-            archive.writestr("Demo.exe", b"one")
-            archive.writestr("demo.exe", b"two")
-        else:
-            archive.writestr("compressed.bin", b"zip-bomb-shape", compress_type=zipfile.ZIP_DEFLATED)
-
-    with pytest.raises(AssertionError, match="candidate archive"):
-        verify_candidate_archive(
-            artifact,
-            tmp_path / "extracted",
-            expected_subject_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
-            expected_manifest_sha256="0" * 64,
-            expected_source_commit="a" * 40,
-        )
-    assert not (tmp_path / "extracted").exists()
-
-
 def test_packaged_verifier_rejects_worker_that_does_not_emit_runtime_probe_json(tmp_path):
     from scripts.verify_packaged_exe import assert_ai_worker_layout, verify_ai_worker_runtime_probe
 
@@ -625,133 +450,41 @@ def test_packaged_verifier_rejects_worker_that_does_not_emit_runtime_probe_json(
         raise AssertionError("worker without runtime probe JSON must fail")
 
 
-def test_build_and_publish_candidate_require_ai_wheelhouse_and_dual_specs():
-    build = (ROOT / "scripts" / "build_exe.ps1").read_text("utf-8")
-    builder = (ROOT / ".github" / "workflows" / "trusted-ai-candidate-builder.yml").read_text("utf-8")
-    signer = (ROOT / ".github" / "workflows" / "trusted-ai-candidate-signer.yml").read_text("utf-8")
-    publisher = (ROOT / ".github" / "workflows" / "publish-candidate.yml").read_text("utf-8")
-
-    assert "AiWheelhouseDescriptor" in build
-    assert '".venv-packaging-core"' in build
-    assert '".venv-packaging-ai"' in build
-    assert "bootstrap_build_envs.py" in build
-    assert "render_ai_build_requirements.py" in build
-    assert "requirements-ai-build-tools.txt" in build
-    assert "verify_ai_wheelhouse.py" in build
-    assert "requirements-ai-release.txt" in build
-    assert "--requirements-output" in build
-    assert "--python $CorePython --target-sys-platform win32" in build
-    assert "Invoke-Checked $AiPython" in build
-    assert "Invoke-Checked $CorePython" in build
-    assert "$AiPython -m pip install" in build
-    assert "--require-hashes --no-deps -r $AiBuildRequirements" in build
-    assert "run_ai_attempt_worker.py" in build
-    assert '"--probe-runtime"' in build
-    assert "vending_vision.spec" in build
-    assert "vending_vision_ai_worker.spec" in build
-    assert "vending-vision-ai-worker" in build
-    assert "--require-ai-worker" not in build
-    assert "$CoreDist" in build
-    assert "$AiDist" in build
-    assert "Copy-Item -LiteralPath (Join-Path $CoreDist \"vending-vision\")" in build
-    assert "Copy-Item -LiteralPath (Join-Path $AiDist \"vending-vision-ai-worker\")" in build
-    assert "pip download" not in build
-
-    assert "ai-wheelhouse" in builder
-    assert "materialize_ai_wheelhouse.py" in builder
-    assert "requirements-ai.lock.json" in builder
-    assert "CORE_WHEELHOUSE_URL" in builder
-    assert "CORE_WHEELHOUSE_SHA256" in builder
-    assert "CORE_WHEELHOUSE_BYTES" in builder
-    assert "--expected-bytes $env:CORE_WHEELHOUSE_BYTES" in builder
-    assert "download_verified_archive.py" in builder
-    assert "requirements-ai-release.txt" in builder
-    assert "--requirements-output build/requirements-ai-release.txt" in builder
-    assert "pip download" not in builder
-    assert builder.count("scripts/build_exe.ps1") == 1
-    assert "-SourceRoot $PWD" in builder
-    assert "candidate_artifact_manifest.py" in builder
-    assert "--manifest-output" in builder
-    assert "--source-commit" in builder
-    assert "Compress-Archive" not in builder
-    assert "actions/attest-build-provenance@v4" in builder
-    assert builder.index("--require-ai-worker") < builder.index("actions/attest-build-provenance@v4")
-    assert "subject-path:" in builder
-    assert "id-token: write" in builder
-    assert "attestations: write" in builder
-    assert "secrets:" not in builder
-
-    assert "trusted-ai-candidate-builder.yml@691b5056e8b9bf2667bc527b2170780b05863946" in publisher
-    assert "scripts/build_exe.ps1" not in publisher
-    assert "actions/attest-build-provenance" not in publisher
-    assert "needs: trusted_builder" in publisher
-    assert publisher.count("runs-on: windows-latest") == 1
-    assert publisher.count("actions/download-artifact@v4") == 1
-    assert "gh attestation verify" in publisher
-    assert "--signer-repo" not in publisher
-    assert "--signer-workflow \"hbhjt/vending-vision/.github/workflows/trusted-ai-candidate-builder.yml\"" in publisher
-    assert "--signer-digest \"691b5056e8b9bf2667bc527b2170780b05863946\"" in publisher
-    assert "--source-ref" not in publisher
-    assert "--source-digest" not in publisher
-    assert "--deny-self-hosted-runners" in publisher
-    assert "verify_trusted_candidate_inputs.py" not in publisher
-    assert "--trusted-builder-evidence" not in publisher
-    assert "trusted builder artifact member set mismatch" in publisher
-    assert "Get-FileHash" in publisher
-    assert "ATTESTATION_BUNDLE_SHA256" in publisher
-    assert "--require-ai-worker" not in publisher
-    assert "environment: experimental-candidate" not in signer
-    assert "--trusted-builder-evidence" in signer
-    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in signer
-    assert "VISION_SUPPLIER_PRIVATE_KEY_PEM" not in publisher
-    assert "environment: production" in publisher
-    assert "signed-evidence" not in publisher
-    assert "release/*" not in publisher
-
-
 def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_publish():
     """Hosted publishing must join independent Windows test and packaging gates."""
-    from scripts.workflow_yaml import load_workflow_yaml
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    test_job = ci.split("windows-test:", 1)[1].split("windows-package:", 1)[0]
+    package_job = ci.split("windows-package:", 1)[1].split("regional-evidence-contract:", 1)[0]
+    publish_job = ci.split("publish-main-artifacts:", 1)[1]
 
-    workflow = load_workflow_yaml(
-        (ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    assert re.search(
+        r"needs:\n\s+- test\n\s+- windows-test\n"
+        r"\s+- regional-evidence-contract\n\s+- windows-package",
+        publish_job,
     )
-    jobs = workflow["jobs"]
-    test_job = jobs["windows-test"]
-    package_job = jobs["windows-package"]
-    publish_job = jobs["publish-main-artifacts"]
-    assert "needs" not in test_job
-    assert "needs" not in package_job
-    assert publish_job["needs"] == [
-        "test",
-        "windows-test",
-        "regional-evidence-contract",
-        "windows-package",
-    ]
-    assert publish_job["if"] == "github.ref == 'refs/heads/main'"
+    assert re.search(r"if: github\.ref == 'refs/heads/main'", publish_job)
 
-    test_runs = "\n".join(
-        step.get("run", "") for step in test_job["steps"] if isinstance(step, dict)
+    assert "python -m pytest -q" in test_job
+    assert (
+        "python -m py_compile app.py run_vision_server.py vision/*.py scripts/*.py"
+        in test_job
     )
-    assert "python -m pytest -q" in test_runs
-    assert "python -m py_compile app.py run_vision_server.py vision/*.py scripts/*.py" in test_runs
-    assert "verify_model_manifest" in test_runs
-    assert "scripts/build_exe.ps1" not in test_runs
+    assert "verify_model_manifest" in test_job
+    assert "scripts/build_exe.ps1" not in test_job
 
-    steps = package_job["steps"]
-    named_steps = [step for step in steps if isinstance(step, dict) and "name" in step]
-    materialize_index, materialize_step = next(
-        (index, step)
-        for index, step in enumerate(named_steps)
-        if step["name"] == "物化或校验精确 AI wheel 闭包"
+    materialize_index = package_job.index("物化或校验精确 AI wheel 闭包")
+    build_index = package_job.index("构建并验证 Windows runtime 与录播交付包")
+    assert materialize_index < build_index
+    materialize_run = " ".join(
+        package_job.split("物化或校验精确 AI wheel 闭包", 1)[1]
+        .split("name: 构建并验证", 1)[0]
+        .split()
     )
-    build_index, build_step = next(
-        (index, step)
-        for index, step in enumerate(named_steps)
-        if step["name"] == "构建并验证 Windows runtime 与录播交付包"
+    build_run = " ".join(
+        package_job.split("构建并验证 Windows runtime 与录播交付包", 1)[1]
+        .split("name: 暂存同提交 Vision artifacts", 1)[0]
+        .split()
     )
-    materialize_run = " ".join(materialize_step["run"].split())
-    build_run = " ".join(build_step["run"].split())
     lock = ROOT / "requirements-ai.lock.json"
     runtime_descriptor = json.loads(
         (ROOT / "ai-runtime-descriptor.json").read_text("utf-8")
@@ -794,44 +527,29 @@ def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_pub
     ):
         assert name in build_run
 
-    staging_upload = next(
-        step for step in steps if step.get("uses") == "actions/upload-artifact@v4"
+    assert re.search(
+        r"name: vending-vision-main-staging-\$\{\{ github\.sha \}\}\n"
+        r"\s+path: main-artifacts/\*\n\s+if-no-files-found: error",
+        package_job,
     )
-    assert staging_upload["with"] == {
-        "name": "vending-vision-main-staging-${{ github.sha }}",
-        "path": "main-artifacts/*",
-        "if-no-files-found": "error",
-    }
-    worker_patch_upload = next(
-        step
-        for step in steps
-        if step.get("name") == "暂存 VM AI worker 热补丁"
+    assert re.search(
+        r"name: vending-vision-ai-worker-patch-\$\{\{ github\.sha \}\}\n"
+        r"\s+path: build/ai-worker-vm-patch/\*\*\n\s+if-no-files-found: error\n"
+        r"\s+compression-level: 0\n\s+retention-days: 3",
+        package_job,
     )
-    assert worker_patch_upload["uses"] == "actions/upload-artifact@v4"
-    assert worker_patch_upload["with"] == {
-        "name": "vending-vision-ai-worker-patch-${{ github.sha }}",
-        "path": "build/ai-worker-vm-patch/**",
-        "if-no-files-found": "error",
-        "compression-level": "0",
-        "retention-days": "3",
-    }
-
-    publish_steps = publish_job["steps"]
-    staging_download = next(
-        step for step in publish_steps if step.get("uses") == "actions/download-artifact@v4"
+    assert re.search(
+        r"uses: actions/download-artifact@v4\n\s+with:\n"
+        r"\s+name: vending-vision-main-staging-\$\{\{ github\.sha \}\}\n"
+        r"\s+path: main-artifacts",
+        publish_job,
     )
-    final_upload = next(
-        step for step in publish_steps if step.get("uses") == "actions/upload-artifact@v4"
+    assert re.search(
+        r"uses: actions/upload-artifact@v4\n\s+with:\n"
+        r"\s+name: vending-vision-main-\$\{\{ github\.sha \}\}\n"
+        r"\s+path: main-artifacts/\*\n\s+if-no-files-found: error",
+        publish_job,
     )
-    assert staging_download["with"] == {
-        "name": "vending-vision-main-staging-${{ github.sha }}",
-        "path": "main-artifacts",
-    }
-    assert final_upload["with"] == {
-        "name": "vending-vision-main-${{ github.sha }}",
-        "path": "main-artifacts/*",
-        "if-no-files-found": "error",
-    }
     assert runtime_descriptor["requirementsAiLockSha256"] == hashlib.sha256(
         lock.read_bytes()
     ).hexdigest()

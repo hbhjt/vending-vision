@@ -19,8 +19,6 @@ def test_canonical_text_is_forced_to_lf_in_windows_checkouts():
             "contracts/vem_vision_v2/manifest.json",
             "ai-runtime-descriptor.json",
             "regional-evaluator-descriptor.json",
-            "trusted-signer-scripts.json",
-            ".github/workflows/trusted-ai-candidate-signer.yml",
             "requirements.txt",
         ],
         cwd=ROOT,

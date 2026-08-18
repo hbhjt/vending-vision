@@ -6,9 +6,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import stat
-import tempfile
 import zipfile
 
 
@@ -30,8 +28,6 @@ BINDING_PATHS = {
     "modelPackDescriptor": f'{LAYOUT["workerInternal"]}/official-ai-model-pack-descriptor.json',
 }
 _MAX_ARCHIVE_FILES = 100_000
-_MAX_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024
-_MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 
 
 def _sha256(path: Path) -> str:
@@ -149,143 +145,6 @@ def write_candidate_archive(
     return {
         "embeddedManifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "subjectSha256": _sha256(artifact),
-    }
-
-
-def _load_manifest(raw: bytes, expected_digest: str, expected_source_commit: str) -> dict:
-    if hashlib.sha256(raw).hexdigest() != expected_digest:
-        raise AssertionError("embedded manifest digest mismatch")
-    try:
-        manifest = json.loads(raw)
-    except ValueError as exc:
-        raise AssertionError("embedded manifest invalid") from exc
-    if canonical_json(manifest).encode("utf-8") != raw:
-        raise AssertionError("embedded manifest is not canonical")
-    if set(manifest) != {"schemaVersion", "sourceCommit", "layout", "bindings", "files"}:
-        raise AssertionError("embedded manifest shape mismatch")
-    if manifest["schemaVersion"] != SCHEMA or manifest["layout"] != LAYOUT:
-        raise AssertionError("embedded manifest contract mismatch")
-    if manifest["sourceCommit"] != expected_source_commit:
-        raise AssertionError("embedded manifest source commit mismatch")
-    return manifest
-
-
-def verify_candidate_archive(
-    artifact: Path,
-    destination: Path,
-    *,
-    expected_subject_sha256: str,
-    expected_manifest_sha256: str,
-    expected_source_commit: str,
-) -> dict:
-    if re.fullmatch(r"[0-9a-f]{64}", expected_subject_sha256) is None or re.fullmatch(
-        r"[0-9a-f]{64}", expected_manifest_sha256
-    ) is None:
-        raise AssertionError("external candidate trust digest missing")
-    if not artifact.is_file() or _sha256(artifact) != expected_subject_sha256:
-        raise AssertionError("trusted subject digest mismatch")
-    if not zipfile.is_zipfile(artifact):
-        raise AssertionError("candidate artifact is not a ZIP")
-    if destination.exists():
-        raise AssertionError("candidate extraction destination exists")
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent))
-    try:
-        with zipfile.ZipFile(artifact) as archive:
-            infos = archive.infolist()
-            if not infos or len(infos) > _MAX_ARCHIVE_FILES + 1:
-                raise AssertionError("candidate archive file count")
-            by_name: dict[str, zipfile.ZipInfo] = {}
-            seen_casefold: set[str] = set()
-            total = 0
-            for info in infos:
-                relative = _safe_relative(info.filename)
-                key = relative.as_posix().casefold()
-                mode = info.external_attr >> 16
-                file_type = stat.S_IFMT(mode)
-                if (
-                    info.is_dir()
-                    or info.compress_type != zipfile.ZIP_STORED
-                    or file_type not in {0, stat.S_IFREG}
-                ):
-                    raise AssertionError("candidate archive symlink special or compressed entry")
-                if key in seen_casefold:
-                    raise AssertionError("candidate archive path collision")
-                seen_casefold.add(key)
-                by_name[relative.as_posix()] = info
-                total += info.file_size
-                if total > _MAX_ARCHIVE_BYTES:
-                    raise AssertionError("candidate archive extracted size")
-            manifest_info = by_name.get(EMBEDDED_MANIFEST)
-            if manifest_info is None or manifest_info.file_size > _MAX_MANIFEST_BYTES:
-                raise AssertionError("embedded manifest missing or oversized")
-            manifest_raw = archive.read(manifest_info)
-            manifest = _load_manifest(
-                manifest_raw, expected_manifest_sha256, expected_source_commit
-            )
-            files = manifest["files"]
-            if not isinstance(files, list) or not files:
-                raise AssertionError("embedded manifest files missing")
-            expected_files: dict[str, dict] = {}
-            previous = ""
-            for item in files:
-                if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
-                    raise AssertionError("embedded manifest file shape")
-                relative = _safe_relative(item["path"]).as_posix()
-                if (
-                    relative <= previous
-                    or type(item["size"]) is not int
-                    or item["size"] < 0
-                    or re.fullmatch(r"[0-9a-f]{64}", item["sha256"] or "") is None
-                ):
-                    raise AssertionError("embedded manifest file value")
-                previous = relative
-                expected_files[relative] = item
-            if set(by_name) != {EMBEDDED_MANIFEST, *expected_files}:
-                raise AssertionError("candidate archive payload set mismatch")
-            bindings = manifest["bindings"]
-            if not isinstance(bindings, dict) or set(bindings) != set(BINDING_PATHS):
-                raise AssertionError("embedded manifest bindings mismatch")
-            for name, relative in BINDING_PATHS.items():
-                binding = bindings[name]
-                if (
-                    not isinstance(binding, dict)
-                    or set(binding) != {"path", "sha256"}
-                    or binding["path"] != relative
-                    or relative not in expected_files
-                    or binding["sha256"] != expected_files[relative]["sha256"]
-                ):
-                    raise AssertionError("embedded manifest binding mismatch")
-
-            for relative, item in expected_files.items():
-                info = by_name[relative]
-                if info.file_size != item["size"]:
-                    raise AssertionError("candidate archive payload size mismatch")
-                target = staging.joinpath(*PurePosixPath(relative).parts)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                digest = hashlib.sha256()
-                size = 0
-                with archive.open(info) as source, target.open("xb") as output:
-                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                        if size + len(chunk) > item["size"]:
-                            raise AssertionError("candidate archive payload size mismatch")
-                        output.write(chunk)
-                        digest.update(chunk)
-                        size += len(chunk)
-                if size != item["size"] or digest.hexdigest() != item["sha256"]:
-                    raise AssertionError("candidate archive payload digest mismatch")
-        os.replace(staging, destination)
-    except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-    return {
-        "root": destination,
-        "mainExecutable": destination / LAYOUT["mainExecutable"],
-        "workerExecutable": destination / LAYOUT["workerExecutable"],
-        "manifest": manifest,
-        "manifestSha256": expected_manifest_sha256,
-        "subjectSha256": expected_subject_sha256,
     }
 
 

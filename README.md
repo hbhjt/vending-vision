@@ -192,9 +192,8 @@ http://127.0.0.1:7892/proximity/debug
 ## 候选发布边界
 
 - PR 和普通 `main` 只运行验证，不发布可部署 bundle；仓库不再维护另一套 Development 构建。
-- 仅合并到 `main` 的受保护 `vX.Y.Z-rc.N` tag 触发 Experimental Candidate Release。
-- release 同时发布原始 zip、descriptor、由实际离线安装的完整依赖闭包和选中 wheel SHA-256 生成的 SPDX SBOM、SLSA provenance、artifact attestation，及与 VEM 验证器契约一致的 Ed25519 签名信封。SBOM 显式标注 `cv2-enumerate-cameras` 的 GPL-3.0-or-later 许可，发布前须完成相应合规审查。
-- VEM 之后由操作员手动输入 tag 与预期 bundle digest，执行独立 conformance/approval；供应仓不安装、不批准、也不重打包候选。
+- `main` CI 每次构建同一 commit 的 Windows runtime、录播 fixture 与候选交付包，并上传 `vending-vision-main-<commit>` 和 `vending-vision-candidate-<commit>` 两个 Actions artifacts；`vending-vision-main-artifacts.json` 以 SHA-256 锁定 runtime 与 fixture。
+- VEM 按 commit 下载成对 artifacts，校验候选 manifest 的 source commit、交付清单 SHA-256 与 fixture 摘要后原样使用；供应仓不安装、不批准、也不重打包候选。
 - `scripts/verify_real_camera_capability.py` 用于现场真实双摄核心能力验收，强制 `mockScenario=off` 并验证 presence、单人可用画像和离开。
 - `/dashboard` 与旧 `/camera/{role}/snapshot.jpg` 仅在供应方开发启动显式设置 `VISION_DEVELOPMENT_DASHBOARD=true` 时开放；托管生产模式固定关闭。
 

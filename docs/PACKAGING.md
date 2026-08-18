@@ -1,7 +1,7 @@
 # Windows 候选发布物打包
 
-Windows 候选版本使用 PyInstaller `onedir`。本地构建只属于开发产物；只有
-受保护 RC tag 工作流可以正式发布候选版本。
+Windows 候选版本使用 PyInstaller `onedir`。本地构建只属于开发产物；每次
+`main` CI 构建并上传同 commit 的候选交付包，供 VEM 验收使用。
 
 每个 Windows CI（含 PR）都会构建、验证并检查以下交付布局；只有成功的
 `main` Windows CI 会上传两个同提交的 Actions artifacts：
@@ -75,6 +75,6 @@ vending-vision.exe --no-browser --config C:\ProgramData\VEM\vision\config\site.j
   具体机器的现场配置保持在 bundle 外部。
 - `VISION_WORKDIR` 只指定日志等可变运行数据目录，不改变发布物身份。
 
-供应仓只发布原始 bundle 和供应方证据，不复制源码到 `C:\VEM\vision`、
+供应仓只发布原始 bundle 与 SHA-256 交付清单，不复制源码到 `C:\VEM\vision`、
 不在现场安装 Python，也不注册 `VEM\StartVisionServer`。版本选择、安装、
 健康验收和回滚均由 VEM factory/update 基础设施负责。

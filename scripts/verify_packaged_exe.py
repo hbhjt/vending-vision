@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.candidate_artifact_manifest import LAYOUT, verify_candidate_archive
+from scripts.candidate_artifact_manifest import LAYOUT
 from vision.regional_evaluator_provenance import (
     load_regional_evaluator_descriptor,
     verify_regional_evaluator_provenance_at_root,
@@ -78,19 +78,9 @@ def parse_args():
         nargs="?",
         default="dist/vending-vision/vending-vision.exe",
     )
-    parser.add_argument("--candidate-artifact")
-    parser.add_argument("--trusted-subject-sha256")
-    parser.add_argument("--expected-embedded-manifest-sha256")
-    parser.add_argument("--expected-source-commit")
-    parser.add_argument("--extract-root")
     parser.add_argument("--port", type=int, default=17892)
     parser.add_argument("--startup-timeout", type=float, default=45.0)
     parser.add_argument("--expected-version")
-    parser.add_argument(
-        "--require-ai-worker",
-        action="store_true",
-        help="require the packaged AI worker onedir and runtime boundary probe",
-    )
     return parser.parse_args()
 
 
@@ -623,36 +613,12 @@ def main():
     args = parse_args()
     root = Path(__file__).resolve().parents[1]
     ai_worker = None
-    if args.require_ai_worker:
-        if not all(
-            (
-                args.candidate_artifact,
-                args.trusted_subject_sha256,
-                args.expected_embedded_manifest_sha256,
-                args.expected_source_commit,
-                args.extract_root,
-            )
-        ):
-            raise AssertionError("full AI verification requires externally trusted candidate subject and manifest")
-        verified = verify_candidate_archive(
-            Path(args.candidate_artifact).resolve(),
-            Path(args.extract_root).resolve(),
-            expected_subject_sha256=args.trusted_subject_sha256,
-            expected_manifest_sha256=args.expected_embedded_manifest_sha256,
-            expected_source_commit=args.expected_source_commit,
-        )
-        exe_path = verified["mainExecutable"]
-        ai_worker = assert_ai_worker_layout(exe_path, required=True)
-        expected_worker_sha256 = verified["manifest"]["bindings"]["workerExecutable"]["sha256"]
-        if ai_worker["sha256"] != expected_worker_sha256:
-            raise AssertionError("verified worker digest changed after extraction")
-    else:
-        exe_path = Path(args.exe)
-        if not exe_path.is_absolute():
-            exe_path = root / exe_path
-        exe_path = exe_path.resolve()
-        if not exe_path.is_file():
-            raise FileNotFoundError(exe_path)
+    exe_path = Path(args.exe)
+    if not exe_path.is_absolute():
+        exe_path = root / exe_path
+    exe_path = exe_path.resolve()
+    if not exe_path.is_file():
+        raise FileNotFoundError(exe_path)
 
     assert_bundled_resources(exe_path)
     run_packaged_probe(

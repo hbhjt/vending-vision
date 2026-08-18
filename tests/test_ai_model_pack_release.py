@@ -1,5 +1,4 @@
 import hashlib
-import asyncio
 import json
 import struct
 import subprocess
@@ -16,8 +15,6 @@ from scripts.ai_model_pack_release import (
     install_model_pack_zip,
     verify_model_pack_zip,
 )
-from scripts.precutover_ai_model_pack import verify_and_install_model_pack
-from scripts.precutover_ai_worker_probe import probe_worker
 from vision.ai_model_pack import (
     MANIFEST_NAME,
     AiModelPackError,
@@ -174,70 +171,6 @@ def test_model_pack_zip_checker_rejects_unnecessary_or_duplicate_zip64_extra(tmp
 
     with pytest.raises(AiModelPackError, match="ai_model_zip_metadata"):
         verify_model_pack_zip(archive_path, descriptor)
-
-
-def test_precutover_proof_requires_actual_archive_and_installs_verified_bytes(tmp_path):
-    source = tmp_path / "source"
-    descriptor = mini_descriptor(source)
-    archive = tmp_path / "model-pack.zip"
-    archive_sha = build_model_pack_zip(source, archive, descriptor)
-    descriptor_text = canonical_ai_model_manifest_json(descriptor)
-    descriptor_path = tmp_path / "official-ai-model-pack-descriptor.json"
-    descriptor_path.write_text(descriptor_text, "utf-8")
-
-    report = verify_and_install_model_pack(
-        archive=archive,
-        descriptor_path=descriptor_path,
-        expected_archive_byte_size=archive.stat().st_size,
-        expected_archive_sha256=archive_sha,
-        expected_descriptor_sha256=hashlib.sha256(
-            descriptor_text.encode("utf-8"),
-        ).hexdigest(),
-        install_root=tmp_path / "private-install",
-    )
-
-    assert report["archive"] == {
-        "byteSize": archive.stat().st_size,
-        "sha256": archive_sha,
-    }
-    assert report["descriptor"]["catvtonSourceRevision"] == "mini-source"
-    assert Path(report["installedPack"]).is_dir()
-
-
-def test_precutover_verifier_imports_with_the_pinned_stdlib_python():
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-c",
-            (
-                "import sys;"
-                f"sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
-                "import scripts.precutover_ai_model_pack"
-            ),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shebang worker fixture")
-def test_precutover_worker_probe_uses_production_tree_supervisor(tmp_path):
-    worker = tmp_path / "worker"
-    worker.write_text(
-        "#!/usr/bin/python3\nimport json,sys\nprint(json.dumps({'probe':'official-catvton-worker-runtime'}))\n",
-        "utf-8",
-    )
-    worker.chmod(0o700)
-
-    result = asyncio.run(
-        probe_worker(worker=worker, mode="runtime", model_pack=None, timeout=2.0)
-    )
-
-    assert result["returncode"] == 0
-    assert json.loads(result["stdout"])["probe"] == "official-catvton-worker-runtime"
 
 
 def test_model_pack_zip_checker_streams_each_entry_and_rejects_same_size_tamper(tmp_path):
