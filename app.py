@@ -1014,9 +1014,7 @@ def read_runtime_roles():
 async def stop_runtime_role(role: str):
     """通过声明角色边界受控停止一个子进程，等待物理死亡后返回确认。"""
     if role == "observer":
-        stopped = await _get_acquisition_observer().abort_async(
-            reason="declared_role_stop"
-        )
+        stopped = await _get_acquisition_observer().kill_child()
     elif role == "broker":
         await _fast_render_broker.shutdown()
         stopped = _fast_render_broker.pid is None

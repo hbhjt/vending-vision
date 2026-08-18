@@ -591,6 +591,27 @@ class AcquisitionObservationWorker:
         async with self._stop_lock:
             return await self._abort_async_once(reason=reason)
 
+    async def kill_child(self) -> bool:
+        """Kill the observer child like an external process death.
+
+        The parent state is intentionally left untouched so the next observe()
+        detects the dead child and restarts it through the production self-heal
+        path.  This is the declared role-stop boundary for acceptance fault
+        injection.
+        """
+        with self._state_lock:
+            process = self._process
+        if process is None or not process.is_alive():
+            return False
+        try:
+            process.kill()
+        except (AttributeError, NotImplementedError, OSError):
+            try:
+                process.terminate()
+            except (AttributeError, NotImplementedError, OSError, PermissionError):
+                return False
+        return True
+
     async def _abort_async_once(self, *, reason: str) -> bool:
         """Stop physically, preserving the live handle until death is observed."""
         with self._state_lock:

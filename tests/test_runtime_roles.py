@@ -11,9 +11,7 @@ class ObserverStub:
         self.fatal_error = None
         self.stopped = False
 
-    async def abort_async(self, *, reason):
-        if reason != "declared_role_stop":
-            raise AssertionError(f"unexpected abort reason: {reason}")
+    async def kill_child(self):
         self.stopped = True
         return True
 
