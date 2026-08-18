@@ -450,6 +450,58 @@ def test_packaged_verifier_rejects_worker_that_does_not_emit_runtime_probe_json(
         raise AssertionError("worker without runtime probe JSON must fail")
 
 
+def test_candidate_archive_write_is_deterministic_and_binds_source_commit(tmp_path):
+    from scripts.candidate_artifact_manifest import (
+        EMBEDDED_MANIFEST,
+        write_candidate_archive,
+    )
+
+    dist = tmp_path / "dist"
+    main = dist / "vending-vision" / "vending-vision.exe"
+    worker = dist / "vending-vision-ai-worker" / "vending-vision-ai-worker.exe"
+    internal = worker.parent / "_internal"
+    main.parent.mkdir(parents=True)
+    internal.mkdir(parents=True)
+    main.write_bytes(b"main")
+    worker.write_bytes(b"worker")
+    for name in (
+        "ai-runtime-descriptor.json",
+        "requirements-ai.lock.json",
+        "official-ai-source-descriptor.json",
+        "official-ai-model-pack-descriptor.json",
+    ):
+        (internal / name).write_bytes(name.encode("ascii"))
+
+    artifact = tmp_path / "candidate.zip"
+    manifest_path = tmp_path / "candidate-manifest.json"
+    first = write_candidate_archive(
+        dist, artifact, manifest_path, source_commit="a" * 40
+    )
+    repeated_artifact = tmp_path / "candidate-repeat.zip"
+    repeated_manifest = tmp_path / "candidate-repeat.manifest.json"
+    second = write_candidate_archive(
+        dist, repeated_artifact, repeated_manifest, source_commit="a" * 40
+    )
+
+    assert first == second
+    assert artifact.read_bytes() == repeated_artifact.read_bytes()
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    assert manifest["schemaVersion"] == "vending-vision-candidate-artifact/v3"
+    assert manifest["sourceCommit"] == "a" * 40
+    assert (
+        manifest["bindings"]["mainExecutable"]["path"]
+        == "vending-vision/vending-vision.exe"
+    )
+    assert (
+        manifest["bindings"]["workerExecutable"]["path"]
+        == "vending-vision-ai-worker/vending-vision-ai-worker.exe"
+    )
+    with zipfile.ZipFile(artifact) as archive:
+        assert EMBEDDED_MANIFEST in archive.namelist()
+        assert "vending-vision/vending-vision.exe" in archive.namelist()
+        assert "vending-vision-ai-worker/vending-vision-ai-worker.exe" in archive.namelist()
+
+
 def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_publish():
     """Hosted publishing must join independent Windows test and packaging gates."""
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
