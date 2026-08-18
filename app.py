@@ -986,6 +986,47 @@ def health():
     }
 
 
+@app.get("/v2/runtime/roles")
+def read_runtime_roles():
+    """返回 Fast 渲染与采集观察子进程的角色声明，供受控验收故障注入使用。"""
+    broker = _fast_render_broker
+    observer = _get_acquisition_observer()
+    return {
+        "schemaVersion": "vem-vision-runtime-roles/v1",
+        "roles": [
+            {
+                "name": "observer",
+                "pid": observer.pid,
+                "ready": observer.ready,
+                "fatalError": observer.fatal_error,
+            },
+            {
+                "name": "broker",
+                "pid": broker.pid,
+                "ready": broker.ready,
+                "fatalError": getattr(broker, "fatal_error", None),
+            },
+        ],
+    }
+
+
+@app.post("/v2/runtime/roles/{role}/stop")
+async def stop_runtime_role(role: str):
+    """通过声明角色边界受控停止一个子进程，等待物理死亡后返回确认。"""
+    if role == "observer":
+        stopped = await _get_acquisition_observer().abort_async(
+            reason="declared_role_stop"
+        )
+    elif role == "broker":
+        await _fast_render_broker.shutdown()
+        stopped = _fast_render_broker.pid is None
+    else:
+        raise HTTPException(status_code=404, detail="unknown runtime role")
+    if not stopped:
+        raise HTTPException(status_code=409, detail="runtime role did not stop")
+    return {"role": role, "stopped": True}
+
+
 @app.get("/version")
 def version():
     return {
