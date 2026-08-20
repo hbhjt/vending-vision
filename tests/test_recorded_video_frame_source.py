@@ -14,6 +14,11 @@ import pytest
 import app as vision_app
 from vision import camera_manager
 from vision.config import settings
+from vision.acquisition_session import AcquisitionSession
+from vision.acquisition_observer import _observe_frame
+from vision.garment_composer import GarmentComposer, TransparentGarmentSource
+from vision.person_detector import PersonDetector
+from vision.pose_estimator import PoseEstimator
 from vision.try_on_attempt_registry import TryOnAttemptRegistry
 from vision.frame_source import RecordedVideoFrameSource
 from vision.presence_runtime import PresenceRuntime
@@ -210,6 +215,123 @@ def test_recorded_video_geometry_generator_is_byte_reproducible():
     subprocess.run([sys.executable, str(generator)], cwd=root.parents[1], check=True)
     after_second = {path.name: path.read_bytes() for path in root.glob("geometry-*.mp4")}
     assert before == after_first == after_second
+
+
+class _RecordedAcquisitionCamera:
+    """Public AcquisitionSession camera adapter backed by the production decoder."""
+
+    def __init__(self, video):
+        self._source = RecordedVideoFrameSource(
+            role="front",
+            config={"source": "recorded_video", "video_path": str(video), "loop": True},
+        )
+
+    async def acquire(self, attempt_id, deadline):
+        return attempt_id
+
+    async def read(self, _lease_token, _timeout):
+        return self._source.read(), self._source.last_frame() or {}
+
+    async def release(self, _attempt_id, _lease_token):
+        self._source.release()
+
+
+class _ProductionAcquisitionObserver:
+    def __init__(self):
+        self._detector = PersonDetector()
+        self._pose = PoseEstimator()
+
+    async def observe(self, frame, timeout):
+        return _observe_frame(self._detector, self._pose, frame)
+
+    async def wait_idle(self):
+        return None
+
+
+class _DiscardedPreview:
+    async def open(self, _attempt_id, _jpeg):
+        return "preview"
+
+    async def update(self, _attempt_id, _token, _jpeg):
+        return True
+
+    async def close(self, _attempt_id):
+        return None
+
+
+def _semantic_geometry_garment():
+    """A distinct magenta shirt silhouette makes decoded result pixels observable."""
+    garment = np.zeros((160, 180, 4), dtype=np.uint8)
+    garment[24:148, 42:138] = (255, 0, 255, 255)
+    garment[38:88, 12:46] = (255, 0, 255, 255)
+    garment[38:88, 134:168] = (255, 0, 255, 255)
+    ok, encoded = cv2.imencode(".png", garment)
+    assert ok
+    png = encoded.tobytes()
+    return TransparentGarmentSource(
+        png, "sha256:" + hashlib.sha256(png).hexdigest(), "tshirt_short_sleeve"
+    )
+
+
+def _magenta_bbox(result_png):
+    rendered = cv2.imdecode(np.frombuffer(result_png, dtype=np.uint8), cv2.IMREAD_COLOR)
+    mask = (rendered[:, :, 0] >= 180) & (rendered[:, :, 1] <= 80) & (rendered[:, :, 2] >= 180)
+    points = cv2.findNonZero(mask.astype(np.uint8))
+    assert points is not None
+    return cv2.boundingRect(points)
+
+
+def _assert_significant_geometry_steps(measurements):
+    widths, heights = zip(*measurements)
+    assert widths[1] >= widths[0] * 1.08
+    assert widths[2] >= widths[1] * 1.08
+    assert heights[1] >= heights[0] * 1.08
+    assert heights[2] >= heights[1] * 1.08
+
+
+def test_recorded_geometry_acquisition_capture_drives_production_composer_monotonically():
+    """Real captured frames, not labels or resized outputs, determine garment scale."""
+    async def scenario():
+        observer = _ProductionAcquisitionObserver()
+        composer = GarmentComposer(pose_estimator=PoseEstimator())
+        garment = _semantic_geometry_garment()
+        measurements = []
+        for name in ("geometryFar", "geometryMid", "geometryNear"):
+            video = FIXTURE_ROOT / fixture_manifest()["recordings"][name]["file"]
+            session = AcquisitionSession(
+                attempt_id=name,
+                camera=_RecordedAcquisitionCamera(video),
+                observer=observer,
+                preview=_DiscardedPreview(),
+                publish=lambda *_fact: asyncio.sleep(0),
+                stable_seconds=0,
+                timeout_seconds=4,
+                preview_interval_seconds=0.01,
+            )
+            captured = await session.acquire(
+                manual_requested=lambda: asyncio.sleep(0, result=False),
+                consume_manual=lambda: asyncio.sleep(0),
+            )
+            rendered = composer.compose(captured.frame, garment, 1.0)
+            _x, _y, width, height = _magenta_bbox(rendered.png)
+            measurements.append((width, height))
+        _assert_significant_geometry_steps(measurements)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "mutated",
+    (
+        ((100, 100), (101, 109), (126, 126)),
+        ((100, 100), (109, 109), (110, 126)),
+    ),
+    ids=("one-pixel-far-mid-step", "only-far-near-is-significant"),
+)
+def test_recorded_geometry_assertion_rejects_insignificant_adjacent_steps(mutated):
+    """One-pixel and skipped-middle mutations cannot satisfy the geometry journey."""
+    with pytest.raises(AssertionError):
+        _assert_significant_geometry_steps(mutated)
 
 
 def test_recorded_video_front_vertical_fixture_is_traceable_and_vertical():

@@ -1039,6 +1039,39 @@ def test_linux_and_windows_ci_run_hash_pinned_focused_quality_gates_outside_runt
     assert "mypy" not in package_job
 
 
+def _write_bound_geometry_fixture_manifest(recorded):
+    source = ROOT / "fixtures" / "recorded-video" / "sources" / "person-man-front.png"
+    source_target = recorded / "sources" / source.name
+    source_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, source_target)
+    (recorded / "generate-geometry-front.py").write_text("fixture generator", "utf-8")
+    recordings = {}
+    for key, filename in (
+        ("geometryFar", "geometry-far.mp4"),
+        ("geometryMid", "geometry-mid.mp4"),
+        ("geometryNear", "geometry-near.mp4"),
+    ):
+        payload = filename.encode()
+        (recorded / filename).write_bytes(payload)
+        recordings[key] = {
+            "file": filename,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "loop": True,
+            "source": "sources/person-man-front.png",
+            "sourceSha256": hashlib.sha256(source_target.read_bytes()).hexdigest(),
+            "generator": "generate-geometry-front.py",
+        }
+    (recorded / "expected-results.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": "vending-vision-recorded-video-fixture/v1",
+                "recordings": recordings,
+            }
+        ),
+        "utf-8",
+    )
+
+
 @pytest.mark.parametrize("missing", [None, "server-valid.json"])
 def test_main_artifact_runtime_allows_only_the_exact_v2_contract_fixtures(tmp_path, missing):
     """The frozen V2 bundle needs its four contract fixtures, not test video data."""
@@ -1051,11 +1084,9 @@ def test_main_artifact_runtime_allows_only_the_exact_v2_contract_fixtures(tmp_pa
     recorded.mkdir(parents=True)
     shutil.copy2(ROOT / "scripts" / "package_main_artifacts.ps1", scripts)
     (runtime / "vending-vision.exe").write_bytes(b"MZ")
-    (recorded / "expected-results.json").write_text("{}", "utf-8")
     (recorded / "top.mp4").write_bytes(b"top")
     (recorded / "front.mp4").write_bytes(b"front")
-    for name in ("geometry-far.mp4", "geometry-mid.mp4", "geometry-near.mp4"):
-        (recorded / name).write_bytes(name.encode())
+    _write_bound_geometry_fixture_manifest(recorded)
     for name in (
         "client-invalid.json",
         "client-valid.json",
@@ -1129,11 +1160,9 @@ def test_main_artifact_runtime_rejects_noncontract_fixture_paths(tmp_path):
         path = runtime / "_internal" / "contracts" / "vem_vision_v2" / "fixtures" / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("[]", "utf-8")
-    (recorded / "expected-results.json").write_text("{}", "utf-8")
     (recorded / "top.mp4").write_bytes(b"top")
     (recorded / "front.mp4").write_bytes(b"front")
-    for name in ("geometry-far.mp4", "geometry-mid.mp4", "geometry-near.mp4"):
-        (recorded / name).write_bytes(name.encode())
+    _write_bound_geometry_fixture_manifest(recorded)
 
     completed = subprocess.run(
         [
@@ -1156,6 +1185,19 @@ def test_main_artifact_runtime_rejects_noncontract_fixture_paths(tmp_path):
     assert "Runtime archive includes recorded-video fixtures" in (
         completed.stdout + completed.stderr
     )
+
+
+def test_main_artifact_fixture_archive_rejects_unbound_geometry_bytes(tmp_path):
+    """Fixture archive acceptance requires its canonical recording manifest, not names alone."""
+    root = _main_artifact_harness_root(tmp_path)
+    runtime = root / "dist" / "vending-vision"
+    _write_runtime_contract_fixtures(runtime, "contracts/vem_vision_v2/fixtures")
+    (root / "fixtures" / "recorded-video" / "expected-results.json").write_text("{}", "utf-8")
+
+    completed = _run_main_artifact_package(root)
+
+    assert completed.returncode != 0
+    assert "Fixture archive recording manifest is invalid" in completed.stdout + completed.stderr
 
 
 def _write_runtime_contract_fixtures(runtime, contract_root):
@@ -1197,11 +1239,9 @@ def _main_artifact_harness_root(tmp_path):
     recorded.mkdir(parents=True)
     shutil.copy2(ROOT / "scripts" / "package_main_artifacts.ps1", root / "scripts")
     (root / "dist" / "vending-vision" / "vending-vision.exe").write_bytes(b"MZ")
-    (recorded / "expected-results.json").write_text("{}", "utf-8")
     (recorded / "top.mp4").write_bytes(b"top")
     (recorded / "front.mp4").write_bytes(b"front")
-    for name in ("geometry-far.mp4", "geometry-mid.mp4", "geometry-near.mp4"):
-        (recorded / name).write_bytes(name.encode())
+    _write_bound_geometry_fixture_manifest(recorded)
     return root
 
 
@@ -1231,6 +1271,9 @@ def _run_main_artifact_archive_guard(root, runtime_entries):
         "$null = 1",
     ).replace(
         "Compress-Archive -Path (Join-Path $FixtureStage \"*\") -DestinationPath $FixtureArchive -CompressionLevel Optimal",
+        "$null = 1",
+    ).replace(
+        "Assert-FixtureRecordingManifest $FixtureArchive",
         "$null = 1",
     )
     script_path.write_text(script, "utf-8")

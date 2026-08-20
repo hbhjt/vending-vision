@@ -73,6 +73,73 @@ function Read-ZipJson([string]$Archive, [string]$EntryName) {
     }
 }
 
+function Get-ZipEntrySha256([string]$Archive, [string]$EntryName) {
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        $entry = $zip.GetEntry($EntryName)
+        if ($null -eq $entry) {
+            throw "Archive $Archive is missing $EntryName"
+        }
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        $stream = $entry.Open()
+        try {
+            return ([BitConverter]::ToString($hasher.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+        } finally {
+            $stream.Dispose()
+            $hasher.Dispose()
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+function Test-ZipEntry([string]$Archive, [string]$EntryName) {
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        return $null -ne $zip.GetEntry($EntryName)
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+function Assert-FixtureRecordingManifest([string]$Archive) {
+    try {
+        $fixtureManifest = Read-ZipJson $Archive "recorded-video/expected-results.json"
+        $expectedRecordings = @{
+            geometryFar = @{ file = "geometry-far.mp4"; loop = $true; source = "sources/person-man-front.png"; sourceSha256 = "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c"; generator = "generate-geometry-front.py" }
+            geometryMid = @{ file = "geometry-mid.mp4"; loop = $true; source = "sources/person-man-front.png"; sourceSha256 = "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c"; generator = "generate-geometry-front.py" }
+            geometryNear = @{ file = "geometry-near.mp4"; loop = $true; source = "sources/person-man-front.png"; sourceSha256 = "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c"; generator = "generate-geometry-front.py" }
+        }
+        if ($fixtureManifest.schemaVersion -ne "vending-vision-recorded-video-fixture/v1" -or $null -eq $fixtureManifest.recordings) {
+            throw "schema"
+        }
+        foreach ($recordingName in $expectedRecordings.Keys) {
+            $recording = $fixtureManifest.recordings.$recordingName
+            $expected = $expectedRecordings[$recordingName]
+            if ($null -eq $recording -or
+                $recording.file -ne $expected.file -or
+                $recording.loop -isnot [bool] -or
+                $recording.loop -ne $expected.loop -or
+                $recording.source -ne $expected.source -or
+                $recording.sourceSha256 -ne $expected.sourceSha256 -or
+                $recording.generator -ne $expected.generator -or
+                $recording.sha256 -notmatch '^[0-9a-f]{64}$') {
+                throw "recording:$recordingName"
+            }
+            $videoEntry = "recorded-video/$($recording.file)"
+            $sourceEntry = "recorded-video/$($recording.source)"
+            $generatorEntry = "recorded-video/$($recording.generator)"
+            if ((Get-ZipEntrySha256 $Archive $videoEntry) -ne $recording.sha256 -or
+                (Get-ZipEntrySha256 $Archive $sourceEntry) -ne $recording.sourceSha256 -or
+                -not (Test-ZipEntry $Archive $generatorEntry)) {
+                throw "archive:$recordingName"
+            }
+        }
+    } catch {
+        throw "Fixture archive recording manifest is invalid: $($_.Exception.Message)"
+    }
+}
+
 $runtimeEntries = Read-ZipEntries $RuntimeArchive
 $fixtureEntries = Read-ZipEntries $FixtureArchive
 if ($runtimeEntries -notcontains "vending-vision.exe") {
@@ -90,6 +157,7 @@ if ($fixtureEntries -notcontains "recorded-video/expected-results.json" -or
     $fixtureEntries -notcontains "vision-artifact.json") {
     throw "Fixture archive layout is incomplete"
 }
+Assert-FixtureRecordingManifest $FixtureArchive
 $allowedRuntimeContractFixtureNames = @(
     "_internal/contracts/vem_vision_v2/fixtures/client-invalid.json",
     "_internal/contracts/vem_vision_v2/fixtures/client-valid.json",
