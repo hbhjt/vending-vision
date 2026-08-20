@@ -2,7 +2,10 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 import threading
+from statistics import median
 
 import cv2
 import numpy as np
@@ -89,7 +92,8 @@ def test_recorded_video_fixture_manifest_binds_top_and_front_recordings():
 
     assert manifest["schemaVersion"] == "vending-vision-recorded-video-fixture/v1"
     assert set(manifest["recordings"]) == {
-        "top", "front", "manFront", "frontVertical", "frontVerticalUnstable", "manUnalignedFront", "emptyFront"
+        "top", "front", "manFront", "geometryFar", "geometryMid", "geometryNear",
+        "frontVertical", "frontVerticalUnstable", "manUnalignedFront", "emptyFront"
     }
     for role, recording in manifest["recordings"].items():
         video = FIXTURE_ROOT / recording["file"]
@@ -101,6 +105,111 @@ def test_recorded_video_fixture_manifest_binds_top_and_front_recordings():
         "vision.person_departed",
     ]
     assert manifest["expected"]["front"]["profile"]["minimumFields"]
+
+
+def test_recorded_video_geometry_fixtures_are_distinct_dynamic_and_traceable():
+    """The public fixture manifest exposes three reproducible live front clips."""
+    manifest = fixture_manifest()
+    source_sha = hashlib.sha256(
+        (FIXTURE_ROOT / "sources" / "person-man-front.png").read_bytes()
+    ).hexdigest()
+    recordings = [manifest["recordings"][name] for name in ("geometryFar", "geometryMid", "geometryNear")]
+
+    assert len({recording["file"] for recording in recordings}) == 3
+    assert len({recording["sha256"] for recording in recordings}) == 3
+    for recording in recordings:
+        assert recording["loop"] is True
+        assert recording["source"] == "sources/person-man-front.png"
+        assert recording["sourceSha256"] == source_sha
+        assert (FIXTURE_ROOT / recording["generator"]).is_file()
+        video = FIXTURE_ROOT / recording["file"]
+        assert recording["sha256"] == hashlib.sha256(video.read_bytes()).hexdigest()
+        capture = cv2.VideoCapture(str(video))
+        frames = []
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frames.append(frame)
+        capture.release()
+        assert len(frames) >= 24  # >=4 seconds at the documented 6fps.
+        assert len({hashlib.sha256(frame.tobytes()).hexdigest() for frame in frames}) >= 2
+
+
+def _preview_dom_hash(frame):
+    """Mirror the CDP preview rect normalization before hashing its pixels."""
+    height, width = frame.shape[:2]
+    scale = min(1, 16 / max(width, height))
+    preview = cv2.resize(
+        frame,
+        (round(width * scale), round(height * scale)),
+        interpolation=cv2.INTER_AREA,
+    )
+    return hashlib.sha256(preview.tobytes()).hexdigest()
+
+
+def test_recorded_video_geometry_preview_remains_live_after_cdp_rect_normalization():
+    """Every countdown bucket carries two distinct renderer-sized preview identities."""
+    for name in ("geometryFar", "geometryMid", "geometryNear"):
+        video = FIXTURE_ROOT / fixture_manifest()["recordings"][name]["file"]
+        capture = cv2.VideoCapture(str(video))
+        hashes = []
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            hashes.append(_preview_dom_hash(frame))
+        capture.release()
+        # Six fps yields twelve source frames for each of the three 2-second
+        # countdown buckets. The probe intentionally uses the actual 16px
+        # CDP normalization, not source-frame hashes.
+        assert len(hashes) == 36
+        assert all(len(set(hashes[offset : offset + 12])) >= 2 for offset in (0, 12, 24)), name
+
+
+def test_recorded_video_geometry_fixtures_pass_the_production_observer_with_monotonic_shoulders():
+    """Every decoded marker phase remains one aligned person at its fixed scale."""
+    from vision.acquisition_observer import _observe_frame
+    from vision.person_detector import PersonDetector
+    from vision.pose_estimator import PoseEstimator
+
+    detector = PersonDetector()
+    estimator = PoseEstimator()
+    shoulder_spans = []
+    for name in ("geometryFar", "geometryMid", "geometryNear"):
+        video = FIXTURE_ROOT / fixture_manifest()["recordings"][name]["file"]
+        capture = cv2.VideoCapture(str(video))
+        spans = []
+        frames = 0
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frames += 1
+            observation = _observe_frame(detector, estimator, frame)
+            assert observation.occupancy == "single", (name, frames)
+            assert observation.aligned is True, (name, frames)
+            landmarks = estimator.detect(frame).pose_landmarks.landmark
+            spans.append(abs(landmarks[11].x - landmarks[12].x))
+        capture.release()
+        assert frames == 36
+        # Marker luminance spans its complete cycle yet must not perturb pose.
+        assert max(spans) - min(spans) < 0.03
+        shoulder_spans.append(median(spans))
+    assert shoulder_spans[0] < shoulder_spans[1] < shoulder_spans[2]
+    assert min(shoulder_spans[1] - shoulder_spans[0], shoulder_spans[2] - shoulder_spans[1]) > 0.05
+
+
+def test_recorded_video_geometry_generator_is_byte_reproducible():
+    """Regenerating the fixture twice preserves the manifest-bound bytes and digests."""
+    root = FIXTURE_ROOT
+    generator = root / "generate-geometry-front.py"
+    before = {path.name: path.read_bytes() for path in root.glob("geometry-*.mp4")}
+    subprocess.run([sys.executable, str(generator)], cwd=root.parents[1], check=True)
+    after_first = {path.name: path.read_bytes() for path in root.glob("geometry-*.mp4")}
+    subprocess.run([sys.executable, str(generator)], cwd=root.parents[1], check=True)
+    after_second = {path.name: path.read_bytes() for path in root.glob("geometry-*.mp4")}
+    assert before == after_first == after_second
 
 
 def test_recorded_video_front_vertical_fixture_is_traceable_and_vertical():

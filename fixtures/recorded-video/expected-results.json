@@ -19,6 +19,30 @@
       "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
       "generator": "generate-man-front.py"
     },
+    "geometryFar": {
+      "file": "geometry-far.mp4",
+      "sha256": "9dec68bf2e82907d4567ebdf619c5b08a6a1b6f600b17b417612b1625ea08415",
+      "loop": true,
+      "source": "sources/person-man-front.png",
+      "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
+      "generator": "generate-geometry-front.py"
+    },
+    "geometryMid": {
+      "file": "geometry-mid.mp4",
+      "sha256": "b27b5b62a947506d6874f4b947d65d9b4f28deb4216315c805eb1e021755a4ee",
+      "loop": true,
+      "source": "sources/person-man-front.png",
+      "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
+      "generator": "generate-geometry-front.py"
+    },
+    "geometryNear": {
+      "file": "geometry-near.mp4",
+      "sha256": "846fd0f36b7f8258fb63cf102f962b91bc72de2c862837213106f2bd7e6a5a6f",
+      "loop": true,
+      "source": "sources/person-man-front.png",
+      "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
+      "generator": "generate-geometry-front.py"
+    },
     "frontVertical": {
       "file": "front-vertical.mp4",
       "sha256": "80f29c1cf42f16a3bc5aa8bc6df45db581d56e741cc5eac0edf3377d1768d7ff",

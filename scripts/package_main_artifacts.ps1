@@ -84,6 +84,9 @@ if ($runtimeEntries -notcontains "vision-artifact.json") {
 if ($fixtureEntries -notcontains "recorded-video/expected-results.json" -or
     $fixtureEntries -notcontains "recorded-video/top.mp4" -or
     $fixtureEntries -notcontains "recorded-video/front.mp4" -or
+    $fixtureEntries -notcontains "recorded-video/geometry-far.mp4" -or
+    $fixtureEntries -notcontains "recorded-video/geometry-mid.mp4" -or
+    $fixtureEntries -notcontains "recorded-video/geometry-near.mp4" -or
     $fixtureEntries -notcontains "vision-artifact.json") {
     throw "Fixture archive layout is incomplete"
 }

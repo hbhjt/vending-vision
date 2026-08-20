@@ -1054,6 +1054,8 @@ def test_main_artifact_runtime_allows_only_the_exact_v2_contract_fixtures(tmp_pa
     (recorded / "expected-results.json").write_text("{}", "utf-8")
     (recorded / "top.mp4").write_bytes(b"top")
     (recorded / "front.mp4").write_bytes(b"front")
+    for name in ("geometry-far.mp4", "geometry-mid.mp4", "geometry-near.mp4"):
+        (recorded / name).write_bytes(name.encode())
     for name in (
         "client-invalid.json",
         "client-valid.json",
@@ -1130,6 +1132,8 @@ def test_main_artifact_runtime_rejects_noncontract_fixture_paths(tmp_path):
     (recorded / "expected-results.json").write_text("{}", "utf-8")
     (recorded / "top.mp4").write_bytes(b"top")
     (recorded / "front.mp4").write_bytes(b"front")
+    for name in ("geometry-far.mp4", "geometry-mid.mp4", "geometry-near.mp4"):
+        (recorded / name).write_bytes(name.encode())
 
     completed = subprocess.run(
         [
@@ -1196,7 +1200,23 @@ def _main_artifact_harness_root(tmp_path):
     (recorded / "expected-results.json").write_text("{}", "utf-8")
     (recorded / "top.mp4").write_bytes(b"top")
     (recorded / "front.mp4").write_bytes(b"front")
+    for name in ("geometry-far.mp4", "geometry-mid.mp4", "geometry-near.mp4"):
+        (recorded / name).write_bytes(name.encode())
     return root
+
+
+@pytest.mark.parametrize("missing", ("geometry-far.mp4", "geometry-mid.mp4", "geometry-near.mp4"))
+def test_main_artifact_fixture_archive_requires_every_geometry_recording(tmp_path, missing):
+    """The Windows fixture artifact fails closed when a geometry journey clip is omitted."""
+    root = _main_artifact_harness_root(tmp_path)
+    runtime = root / "dist" / "vending-vision"
+    _write_runtime_contract_fixtures(runtime, "contracts/vem_vision_v2/fixtures")
+    (root / "fixtures" / "recorded-video" / missing).unlink()
+
+    completed = _run_main_artifact_package(root)
+
+    assert completed.returncode != 0
+    assert "Fixture archive layout is incomplete" in completed.stdout + completed.stderr
 
 
 def _run_main_artifact_archive_guard(root, runtime_entries):
@@ -1232,6 +1252,9 @@ def _run_main_artifact_archive_guard(root, runtime_entries):
             "recorded-video/expected-results.json",
             "recorded-video/top.mp4",
             "recorded-video/front.mp4",
+            "recorded-video/geometry-far.mp4",
+            "recorded-video/geometry-mid.mp4",
+            "recorded-video/geometry-near.mp4",
         ):
             archive.writestr(entry, b"x")
         archive.writestr("vision-artifact.json", manifest)
