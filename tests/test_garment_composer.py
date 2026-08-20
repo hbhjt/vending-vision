@@ -90,6 +90,49 @@ def _antialiased_boundary_short_source(*, fringe_alpha=100, fringe_length=24):
     return TransparentGarmentSource(png, "sha256:" + hashlib.sha256(png).hexdigest(), "tshirt_short_sleeve")
 
 
+def _low_confidence_short_source(*, high_alpha_pixel=False):
+    """同一低置信 T 恤可只改变一个像素，用于证明判定不依赖单点阈值。"""
+    image = np.zeros((140, 180, 4), dtype=np.uint8)
+    image[22:128, 30:150] = (20, 120, 220, 127)
+    image[38:82, 8:35] = (20, 120, 220, 127)
+    image[38:82, 145:172] = (20, 120, 220, 127)
+    if high_alpha_pixel:
+        image[64, 90, 3] = 128
+    ok, encoded = cv2.imencode(".png", image)
+    assert ok
+    png = encoded.tobytes()
+    return TransparentGarmentSource(png, "sha256:" + hashlib.sha256(png).hexdigest(), "tshirt_short_sleeve")
+
+
+def _right_edge_cropped_short_source(*, canvas_height=140, low_alpha_tail=False):
+    """同一 12px 实心右缘裁切主体，可增加无关纵向透明留白或近透明尾部。"""
+    image = np.zeros((canvas_height, 180, 4), dtype=np.uint8)
+    image[22:128, 30:150] = (20, 120, 220, 255)
+    image[38:82, 8:35] = (20, 120, 220, 255)
+    image[38:82, 145:179] = (20, 120, 220, 255)
+    image[38:50, 179] = (20, 120, 220, 255)
+    if low_alpha_tail:
+        image[50:54, 179] = (20, 120, 220, 1)
+    ok, encoded = cv2.imencode(".png", image)
+    assert ok
+    png = encoded.tobytes()
+    return TransparentGarmentSource(png, "sha256:" + hashlib.sha256(png).hexdigest(), "tshirt_short_sleeve")
+
+
+def _alpha_blend_probe_source(patch_alpha):
+    """固定透明开口的同一条抗锯齿边缘，只改变其 alpha 混合强度。"""
+    image = np.zeros((140, 180, 4), dtype=np.uint8)
+    image[22:128, 30:150] = (20, 120, 220, 255)
+    image[38:82, 8:35] = (20, 120, 220, 255)
+    image[38:82, 145:172] = (20, 120, 220, 255)
+    image[86:102, 76:104] = (240, 30, 20, 0)
+    image[86:102, 76:80] = (240, 30, 20, patch_alpha)
+    ok, encoded = cv2.imencode(".png", image)
+    assert ok
+    png = encoded.tobytes()
+    return TransparentGarmentSource(png, "sha256:" + hashlib.sha256(png).hexdigest(), "tshirt_short_sleeve")
+
+
 def _composer(*, crossed=False, arms=True, shoulder_width=0.30, torso=0.41, hips=None):
     return GarmentComposer(
         pose_estimator=_FixturePoseEstimator(
@@ -223,6 +266,19 @@ def test_compose_accepts_a_wide_constant_torso_short_source():
     assert _decoded(result).shape == (360, 480, 3)
 
 
+@pytest.mark.parametrize("high_alpha_pixel", (False, True))
+def test_compose_rejects_low_confidence_subject_without_a_single_pixel_verdict(
+    high_alpha_pixel,
+):
+    """全主体低 alpha 与仅一个越过 128 的像素都不是实质成衣主体。"""
+    with pytest.raises(GarmentFetchError, match="garment_quality"):
+        _composer().compose(
+            np.full((360, 480, 3), 180, dtype=np.uint8),
+            _low_confidence_short_source(high_alpha_pixel=high_alpha_pixel),
+            1.0,
+        )
+
+
 @pytest.mark.parametrize(
     ("fringe_alpha", "fringe_length"),
     ((127, 12), (128, 12), (220, 6), (255, 1), (255, 8)),
@@ -243,29 +299,58 @@ def test_compose_accepts_complete_short_source_with_a_small_edge_fringe(
     assert _decoded(result).shape == (360, 480, 3)
 
 
-def test_compose_renders_low_alpha_edge_antialiasing_as_a_local_output_difference():
-    """相同成衣只增加低 alpha 边缘，公开合成 PNG 必须出现局部像素变化。"""
-    frame = np.full((360, 480, 3), 180, dtype=np.uint8)
-    without_tail = _decoded(
-        _composer(arms=False).compose(
-            frame,
-            _antialiased_boundary_short_source(fringe_alpha=0),
+def test_compose_rejects_solid_edge_material_even_with_a_low_alpha_tail():
+    """近透明尾部不能稀释其前方已经成立的实心裁切核心。"""
+    with pytest.raises(GarmentFetchError, match="garment_cropped"):
+        _composer().compose(
+            np.full((360, 480, 3), 180, dtype=np.uint8),
+            _right_edge_cropped_short_source(low_alpha_tail=True),
             1.0,
         )
-    )
-    with_tail = _decoded(
-        _composer(arms=False).compose(
-            frame,
-            _antialiased_boundary_short_source(fringe_alpha=100),
-            1.0,
-        )
-    )
 
-    changed = np.any(with_tail != without_tail, axis=2)
-    _, changed_x = np.where(changed)
-    assert changed_x.size > 0
-    assert changed_x.mean() > frame.shape[1] * 0.5
-    assert changed_x.size < frame.shape[0] * frame.shape[1] * 0.10
+
+@pytest.mark.parametrize("canvas_height", (140, 401))
+def test_compose_cropped_verdict_is_unchanged_by_orthogonal_transparent_padding(
+    canvas_height,
+):
+    """12px 右缘材料约占主体高度 11%，不随 PNG 高度 140→401 改变判定。"""
+    with pytest.raises(GarmentFetchError, match="garment_cropped"):
+        _composer().compose(
+            np.full((360, 480, 3), 180, dtype=np.uint8),
+            _right_edge_cropped_short_source(canvas_height=canvas_height),
+            1.0,
+        )
+
+
+def test_compose_preserves_fractional_alpha_blend_strength():
+    """alpha=100 的公开合成强度必须严格位于 alpha=0 与 255 之间。"""
+    frame = np.full((360, 480, 3), 180, dtype=np.uint8)
+    outputs = {
+        alpha: _decoded(
+            _composer(arms=False).compose(
+                frame,
+                _alpha_blend_probe_source(alpha),
+                1.0,
+            )
+        )
+        for alpha in (0, 100, 255)
+    }
+
+    assert not np.array_equal(outputs[0], outputs[100])
+    assert not np.array_equal(outputs[100], outputs[255])
+    assert not np.array_equal(outputs[0], outputs[255])
+    affected_pixels = np.any(outputs[255] != outputs[0], axis=2)
+    assert np.count_nonzero(affected_pixels) > 0
+    increment_100 = np.abs(
+        outputs[100].astype(np.int16) - outputs[0].astype(np.int16)
+    )[affected_pixels].sum()
+    increment_255 = np.abs(
+        outputs[255].astype(np.int16) - outputs[0].astype(np.int16)
+    )[affected_pixels].sum()
+    observed_blend_ratio = float(increment_100) / float(increment_255)
+
+    assert 0 < increment_100 < increment_255
+    assert observed_blend_ratio == pytest.approx(100 / 255, abs=0.02)
 
 
 def test_compose_uses_an_orthonormal_uniform_basis_for_asymmetric_torso_pose():

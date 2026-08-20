@@ -111,16 +111,23 @@ _POSE_LANDMARKS = {
 # 裁切表示成衣的实质材料被画布持续切断，而不是 PNG 编码在画布边缘留下的
 # 单点或短小抗锯齿尾部。一个接触段必须同时满足以下可解释的业务事实：
 #
-# - 覆盖该边至少 3%，且不短于 12 个源像素；
+# - 覆盖主体在对应方向尺度的至少 3%，且不短于 12 个源像素；
 # - 其 alpha 总质量至少相当于同等长度 80% 不透明的连续材料。
 #
-# 例如在 140px 边上，12px 的 alpha=128 尾部只有 6 个不透明等效像素，低于
-# 9.6 的材料质量；8px 的 alpha=255 标记也短于最短材料段。72px 边上 24px
-# 的 alpha=255 连续接触则满足两项，代表真实裁切。它们只用于原图裁切证据，
-# 不参与 alpha 规范化、透明边界、模板或质量判断。
+# 例如主体对应方向尺度为 140px 时，12px 的 alpha=128 尾部只有 6 个不透明
+# 等效像素，低于 9.6 的材料质量；8px 的 alpha=255 标记也短于最短材料段。
+# 同一主体增加透明留白至 401px 不改变归一尺度；72px 主体上的 24px alpha=255
+# 连续接触则满足两项，代表真实裁切。它们只用于原图裁切证据，不参与 alpha
+# 规范化、透明边界、模板或质量判断。
 _CROPPED_EDGE_MINIMUM_RUN_PIXELS = 12
 _CROPPED_EDGE_MINIMUM_RUN_FRACTION = 0.03
 _CROPPED_EDGE_MINIMUM_SOLID_MATERIAL_RATIO = 0.80
+
+# 主体置信来自整件可见成衣的 alpha 不透明等效质量（各像素 alpha 值折算成
+# 完全不透明像素数）与可见面积之比，而不是任意单个像素越过阈值。
+# 例如，全主体 alpha=127 只有约 49.8% 的不透明等效质量；即使一个像素升到
+# 128，聚合结果也不会实质变化。正常不透明主体及现场纹理成衣则远高于 60%。
+_MINIMUM_SUBJECT_ALPHA_MASS_RATIO = 0.60
 
 
 def _source_row_edges(rows: np.ndarray, width: int) -> tuple[np.ndarray, np.ndarray]:
@@ -130,18 +137,24 @@ def _source_row_edges(rows: np.ndarray, width: int) -> tuple[np.ndarray, np.ndar
     return left, right
 
 
-def _has_persistent_cropped_edge_material(raw_alpha: np.ndarray) -> bool:
-    """判断原图边缘是否含有持续、近似实质不透明的成衣材料。"""
+def _has_persistent_cropped_edge_material(
+    raw_alpha: np.ndarray, source_alpha_mask: np.ndarray
+) -> bool:
+    """按原始主体尺度判断画布边缘是否含持续的实质成衣材料。"""
+    source_points = cv2.findNonZero(source_alpha_mask)
+    if source_points is None:
+        return False
+    _x, _y, subject_width, subject_height = cv2.boundingRect(source_points)
     edge_values = (
-        raw_alpha[0, :],
-        raw_alpha[-1, :],
-        raw_alpha[:, 0],
-        raw_alpha[:, -1],
+        (raw_alpha[0, :], subject_width),
+        (raw_alpha[-1, :], subject_width),
+        (raw_alpha[:, 0], subject_height),
+        (raw_alpha[:, -1], subject_height),
     )
-    for edge_alpha in edge_values:
+    for edge_alpha, subject_edge_scale in edge_values:
         minimum_run = max(
             _CROPPED_EDGE_MINIMUM_RUN_PIXELS,
-            math.ceil(edge_alpha.size * _CROPPED_EDGE_MINIMUM_RUN_FRACTION),
+            math.ceil(subject_edge_scale * _CROPPED_EDGE_MINIMUM_RUN_FRACTION),
         )
         run_start = None
         for index, alpha in enumerate(np.append(edge_alpha, 0)):
@@ -150,8 +163,18 @@ def _has_persistent_cropped_edge_material(raw_alpha: np.ndarray) -> bool:
             elif alpha == 0 and run_start is not None:
                 run_length = index - run_start
                 if run_length >= minimum_run:
-                    alpha_mass = float(edge_alpha[run_start:index].sum()) / 255.0
-                    if alpha_mass >= run_length * _CROPPED_EDGE_MINIMUM_SOLID_MATERIAL_RATIO:
+                    run_alpha = edge_alpha[run_start:index].astype(np.float32) / 255.0
+                    # 检查满足最短持续长度的材料子段，而不是让整个非零连续段的
+                    # 近透明尾部稀释其前方已经成立的实心裁切核心。
+                    material_windows = np.convolve(
+                        run_alpha,
+                        np.ones(minimum_run, dtype=np.float32),
+                        mode="valid",
+                    )
+                    if np.any(
+                        material_windows
+                        >= minimum_run * _CROPPED_EDGE_MINIMUM_SOLID_MATERIAL_RATIO
+                    ):
                         return True
                 run_start = None
     return False
@@ -353,12 +376,13 @@ class GarmentComposer:
         component_count, _labels = cv2.connectedComponents(alpha_mask)
         if component_count != 2:
             raise GarmentFetchError("garment_quality")
-        # 高置信主体仍是质量事实；裁切本身则由下方的原始边缘材料证据决定。
-        subject_mask = np.where(raw_alpha >= 128, 255, 0).astype(np.uint8)
-        subject_points = cv2.findNonZero(subject_mask)
-        if subject_points is None:
+        # 聚合整件可见主体的置信质量；单个像素跨阈值不能决定判定结果。
+        subject_area = int(np.count_nonzero(source_alpha_mask))
+        subject_alpha_mass = float(raw_alpha[source_alpha_mask > 0].sum()) / 255.0
+        subject_alpha_mass_ratio = subject_alpha_mass / subject_area
+        if subject_alpha_mass_ratio < _MINIMUM_SUBJECT_ALPHA_MASS_RATIO:
             raise GarmentFetchError("garment_quality")
-        if _has_persistent_cropped_edge_material(raw_alpha):
+        if _has_persistent_cropped_edge_material(raw_alpha, source_alpha_mask):
             raise GarmentFetchError("garment_cropped")
         sleeve_semantics = "long" if source.template == "tshirt_long_sleeve" else "short"
         source_bbox = source_alpha_mask[y : y + height, x : x + width] > 0
