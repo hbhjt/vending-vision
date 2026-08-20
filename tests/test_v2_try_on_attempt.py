@@ -269,6 +269,15 @@ class _SingleAlignedObserver:
         return None
 
 
+class _SingleMisalignedObserver(_SingleAlignedObserver):
+    def __init__(self):
+        self.observed = threading.Event()
+
+    async def observe(self, _frame, *, timeout=15.0):
+        self.observed.set()
+        return AcquisitionObservation(b"jpeg", "single", False)
+
+
 class _FatalAcquisitionObserver:
     ready = False
     fatal_error = "spawn_failed"
@@ -329,7 +338,297 @@ def _await_generating(socket):
         message = socket.receive_json()
         if message["type"] == "vision.try_on.attempt.generating":
             return message
-        assert message["type"] == "vision.try_on.attempt.acquiring"
+        assert message["type"] in {
+            "vision.try_on.attempt.acquiring",
+            "vision.try_on.attempt.captured",
+        }
+
+
+def test_v2_captured_resource_is_the_composer_input_and_stays_distinct_from_result(
+    monkeypatch, garment_reference
+):
+    """The V2 captured fact is an immutable capability, not a preview guess."""
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8")
+    )
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
+    monkeypatch.setattr(vision_app, "_acquisition_observer", _SingleAlignedObserver())
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
+    frame = np.full((32, 24, 3), (31, 101, 201), dtype=np.uint8)
+    composer_inputs = []
+    allow_result = threading.Event()
+
+    def read_front(_role, _warmup_frames=None):
+        return frame.copy(), {"source": "recorded_video"}
+
+    async def render(captured_frame, _garment, **_kwargs):
+        composer_inputs.append(captured_frame.copy())
+        await asyncio.to_thread(allow_result.wait)
+        return _png_bytes()
+
+    monkeypatch.setattr(vision_app, "read_camera_with_source", read_front)
+    monkeypatch.setattr(vision_app, "render_attempt_frame", render)
+    attempt_id = str(uuid4())
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(attempt_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            while True:
+                captured_event = socket.receive_json()
+                if captured_event["type"] == "vision.try_on.attempt.captured":
+                    break
+                assert captured_event["type"] == "vision.try_on.attempt.acquiring"
+            captured = captured_event["payload"]["captured"]
+            response = client.get(captured["reference"])
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("image/png")
+            assert captured["contentType"] == "image/png"
+            assert captured["byteSize"] == len(response.content)
+            assert captured["digest"] == f"sha256:{hashlib.sha256(response.content).hexdigest()}"
+            assert captured["width"] == frame.shape[1] and captured["height"] == frame.shape[0]
+            assert captured["frameId"].startswith("frame-")
+            assert client.get(captured["reference"].replace("token=", "token=wrong")).status_code == 404
+
+            generating = socket.receive_json()
+            assert generating["type"] == "vision.try_on.attempt.generating"
+            assert client.get(captured["reference"]).content == response.content
+            allow_result.set()
+            completed = socket.receive_json()
+            assert completed["type"] == "vision.try_on.attempt.completed"
+            result = completed["payload"]["result"]
+            assert result["reference"] != captured["reference"]
+            assert client.get(result["reference"]).status_code == 200
+
+    assert len(composer_inputs) == 1
+    ok, encoded = cv2.imencode(".png", composer_inputs[0])
+    assert ok and encoded.tobytes() == response.content
+
+
+def test_v2_manual_capture_never_bypasses_alignment(monkeypatch, garment_reference):
+    """Manual skips only stable waiting; an unaligned single person stays acquiring."""
+    manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
+    observer = _SingleMisalignedObserver()
+    monkeypatch.setattr(vision_app, "_acquisition_observer", observer)
+    frame = np.zeros((24, 24, 3), dtype=np.uint8)
+    monkeypatch.setattr(vision_app, "read_camera_with_source", lambda *_: (frame, {"source": "recorded_video"}))
+    attempt_id = str(uuid4())
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(attempt_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            while True:
+                acquiring = socket.receive_json()
+                if acquiring["type"] == "vision.try_on.attempt.acquiring":
+                    assert acquiring["payload"]["guidance"] == "align"
+                    break
+            observer.observed.clear()
+            socket.send_json(_envelope("vision.try_on.attempt.capture", {"attemptId": attempt_id}))
+            assert observer.observed.wait(1), "manual intent was not followed by an eligibility observation"
+            socket.send_json(_envelope("vision.try_on.attempt.cancel", {"attemptId": attempt_id, "reason": "user"}))
+            seen = []
+            while True:
+                event = socket.receive_json()
+                seen.append(event["type"])
+                if event["type"] == "vision.try_on.attempt.canceled":
+                    break
+                assert event["type"] == "vision.try_on.attempt.acquiring"
+            assert "vision.try_on.attempt.captured" not in seen
+            assert "vision.try_on.attempt.generating" not in seen
+
+
+def test_v2_acquisition_timeout_revokes_preview_and_releases_its_camera_lease(
+    monkeypatch, garment_reference
+):
+    """The public acquisition budget fails closed when no frame is eligible."""
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8")
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
+    monkeypatch.setattr(vision_app, "_acquisition_observer", _SingleMisalignedObserver())
+    monkeypatch.setattr(vision_app, "_ACQUISITION_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {"cameraReady": True, "modelReady": True, "tryOnReady": True, "tryOnPoseReady": True},
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "read_camera_with_source",
+        lambda *_args, **_kwargs: (
+            np.zeros((24, 24, 3), dtype=np.uint8),
+            {"source": "recorded_video"},
+        ),
+    )
+    attempt_id = str(uuid4())
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(attempt_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            preview_reference = None
+            while True:
+                event = socket.receive_json()
+                if event["type"] == "vision.try_on.attempt.acquiring":
+                    preview_reference = event["payload"]["preview"]["reference"]
+                    continue
+                assert event["type"] == "vision.try_on.attempt.canceled"
+                terminal = event
+                break
+
+        assert preview_reference is not None
+        assert terminal["payload"] == {"attemptId": attempt_id, "reason": "timeout"}
+        assert client.get(preview_reference).status_code == 404
+        assert vision_app.get_front_camera_owner()["owner"] == "idle"
+
+
+def test_v2_route_leave_retires_completed_attempt_media_capabilities(
+    monkeypatch, garment_reference
+):
+    """A route-equivalent cancel revokes completed captured and result grants."""
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8")
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
+    monkeypatch.setattr(vision_app, "_acquisition_observer", _SingleAlignedObserver())
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {"cameraReady": True, "modelReady": True, "tryOnReady": True, "tryOnPoseReady": True},
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "read_camera_with_source",
+        lambda *_args, **_kwargs: (
+            np.full((24, 24, 3), 90, dtype=np.uint8),
+            {"source": "recorded_video"},
+        ),
+    )
+    monkeypatch.setattr(vision_app, "render_attempt_frame", lambda *_args, **_kwargs: asyncio.sleep(0, result=_png_bytes()))
+    attempt_id = str(uuid4())
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(attempt_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            preview_reference = captured_reference = result_reference = None
+            while result_reference is None:
+                event = socket.receive_json()
+                if event["type"] == "vision.try_on.attempt.acquiring":
+                    preview_reference = event["payload"]["preview"]["reference"]
+                elif event["type"] == "vision.try_on.attempt.captured":
+                    captured_reference = event["payload"]["captured"]["reference"]
+                elif event["type"] == "vision.try_on.attempt.completed":
+                    result_reference = event["payload"]["result"]["reference"]
+                else:
+                    assert event["type"] == "vision.try_on.attempt.generating"
+
+            assert preview_reference is not None
+            assert captured_reference is not None
+            assert client.get(captured_reference).status_code == 200
+            assert client.get(result_reference).status_code == 200
+
+            socket.send_json(
+                _envelope("vision.try_on.attempt.cancel", {"attemptId": attempt_id, "reason": "route_leave"})
+            )
+            socket.send_json(_envelope("vision.ping", {}))
+            assert socket.receive_json()["type"] == "vision.pong"
+
+        assert client.get(preview_reference).status_code == 404
+        assert client.get(captured_reference).status_code == 404
+        assert client.get(result_reference).status_code == 404
+
+
+def test_v2_route_leave_fences_a_late_render_without_leaking_attempt_media(
+    monkeypatch, garment_reference
+):
+    """A render result delivered after route leave cannot replace its canceled terminal."""
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8")
+    )
+    render_entered = threading.Event()
+    render_release = threading.Event()
+    render_finished = threading.Event()
+
+    async def delayed_render(*_args, **_kwargs):
+        render_entered.set()
+        try:
+            await asyncio.to_thread(render_release.wait)
+        except asyncio.CancelledError:
+            await asyncio.to_thread(render_release.wait)
+        render_finished.set()
+        return _png_bytes()
+
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
+    monkeypatch.setattr(vision_app, "_acquisition_observer", _SingleAlignedObserver())
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {"cameraReady": True, "modelReady": True, "tryOnReady": True, "tryOnPoseReady": True},
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "read_camera_with_source",
+        lambda *_args, **_kwargs: (
+            np.full((24, 24, 3), 90, dtype=np.uint8),
+            {"source": "recorded_video"},
+        ),
+    )
+    monkeypatch.setattr(vision_app, "render_attempt_frame", delayed_render)
+    attempt_id = str(uuid4())
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(_hello(manifest))
+            assert socket.receive_json()["type"] == "vision.ready"
+            start = _start(attempt_id, garment_reference)
+            socket.send_json(start)
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            preview_reference = captured_reference = None
+            while True:
+                event = socket.receive_json()
+                if event["type"] == "vision.try_on.attempt.acquiring":
+                    preview_reference = event["payload"]["preview"]["reference"]
+                elif event["type"] == "vision.try_on.attempt.captured":
+                    captured_reference = event["payload"]["captured"]["reference"]
+                elif event["type"] == "vision.try_on.attempt.generating":
+                    break
+                else:
+                    raise AssertionError(f"unexpected lifecycle event: {event['type']}")
+
+            assert render_entered.wait(timeout=1)
+            assert preview_reference is not None
+            assert captured_reference is not None
+            socket.send_json(
+                _envelope("vision.try_on.attempt.cancel", {"attemptId": attempt_id, "reason": "route_leave"})
+            )
+            canceled = socket.receive_json()
+            assert canceled["type"] == "vision.try_on.attempt.canceled"
+            assert canceled["payload"] == {"attemptId": attempt_id, "reason": "route_leave"}
+            assert client.get(preview_reference).status_code == 404
+            assert client.get(captured_reference).status_code == 404
+
+            render_release.set()
+            assert render_finished.wait(timeout=1)
+            socket.send_json(start)
+            assert socket.receive_json() == canceled
 
 
 def await_no_active_try_on_attempt():
@@ -909,13 +1208,26 @@ def test_v2_try_on_attempt_replacement_joins_old_worker_before_new_admission(
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(first_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            _await_generating(socket)
+            captured_reference = None
+            while True:
+                first_event = socket.receive_json()
+                if first_event["type"] == "vision.try_on.attempt.captured":
+                    captured_reference = first_event["payload"]["captured"]["reference"]
+                if first_event["type"] == "vision.try_on.attempt.generating":
+                    break
+                assert first_event["type"] in {
+                    "vision.try_on.attempt.acquiring",
+                    "vision.try_on.attempt.captured",
+                }
+            assert captured_reference is not None
+            assert client.get(captured_reference).status_code == 200
             assert _GarmentHandler.entered.wait(timeout=2)
 
             socket.send_json(_start(second_id, garment_reference))
             replaced = socket.receive_json()
             assert replaced["type"] == "vision.try_on.attempt.canceled"
             assert replaced["payload"] == {"attemptId": first_id, "reason": "replaced"}
+            assert client.get(captured_reference).status_code == 404
 
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
             _await_generating(socket)
@@ -1328,10 +1640,16 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
         assert replacement_trace[0] == "vision.try_on.attempt.accepted"
         assert replacement_trace[-1] == "vision.try_on.attempt.completed"
         assert replacement_trace.count("vision.try_on.attempt.generating") == 1
+        captured_index = replacement_trace.index("vision.try_on.attempt.captured")
         assert all(
             message_type == "vision.try_on.attempt.acquiring"
-            for message_type in replacement_trace[1:-2]
+            for message_type in replacement_trace[1:captured_index]
         )
+        assert replacement_trace[captured_index:] == [
+            "vision.try_on.attempt.captured",
+            "vision.try_on.attempt.generating",
+            "vision.try_on.attempt.completed",
+        ]
         assert duplicate_messages == owner_messages[1:]
         replacement_pid = broker.pid
         assert replacement_pid is not None and replacement_pid != first_pid
@@ -1638,7 +1956,8 @@ def test_v2_try_on_attempt_reads_front_frame_in_parent_process(monkeypatch, garm
             completed = socket.receive_json()
 
     assert completed["type"] == "vision.try_on.attempt.completed"
-    assert read_pids == [(parent_pid, "front", 1)] * 1
+    assert read_pids
+    assert all(read_pid == parent_pid and role == "front" and warmup == 1 for read_pid, role, warmup in read_pids)
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 

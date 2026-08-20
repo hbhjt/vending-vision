@@ -85,6 +85,18 @@ def _envelope(message_type, payload):
     }
 
 
+def _await_generating(socket):
+    """Consume the public acquired still before the generating lifecycle fact."""
+    while True:
+        message = socket.receive_json()
+        if message["type"] == "vision.try_on.attempt.generating":
+            return message
+        assert message["type"] in {
+            "vision.try_on.attempt.acquiring",
+            "vision.try_on.attempt.captured",
+        }
+
+
 def _configure_recorded_front(monkeypatch, filename="front.mp4"):
     fixture_root = Path(__file__).parents[1] / "fixtures" / "recorded-video"
     monkeypatch.setattr(settings, "FRONT_CAMERA_CONFIG", {
@@ -564,8 +576,16 @@ def test_v2_manual_capture_bypasses_stability_but_not_single_person_alignment(mo
                 acquiring = socket.receive_json()
                 assert acquiring["payload"]["guidance"] == "counting_down"
                 socket.send_json(_envelope("vision.try_on.attempt.capture", {"attemptId": attempt_id}))
-                generating = socket.receive_json()
-                assert generating["type"] == "vision.try_on.attempt.generating"
+                captured = False
+                while True:
+                    event = socket.receive_json()
+                    if event["type"] == "vision.try_on.attempt.captured":
+                        captured = True
+                        continue
+                    if event["type"] == "vision.try_on.attempt.generating":
+                        assert captured, "generating may not precede captured"
+                        break
+                    assert event["type"] == "vision.try_on.attempt.acquiring"
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
     finally:
         server.shutdown()
@@ -607,8 +627,16 @@ def test_v2_recorded_production_observation_truthfully_blocks_capture(
                 assert acquiring["payload"]["manualCaptureAllowed"] is False
                 socket.send_json(_envelope("vision.try_on.attempt.capture", {"attemptId": attempt_id}))
                 socket.send_json(_envelope("vision.try_on.attempt.cancel", {"attemptId": attempt_id, "reason": "user"}))
-                canceled = socket.receive_json()
+                seen = []
+                while True:
+                    canceled = socket.receive_json()
+                    seen.append(canceled["type"])
+                    if canceled["type"] == "vision.try_on.attempt.canceled":
+                        break
+                    assert canceled["type"] == "vision.try_on.attempt.acquiring"
                 assert canceled["type"] == "vision.try_on.attempt.canceled"
+                assert "vision.try_on.attempt.captured" not in seen
+                assert "vision.try_on.attempt.generating" not in seen
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
     finally:
         server.shutdown()
@@ -643,8 +671,7 @@ def test_v2_recorded_close_up_single_person_manual_capture_proceeds_when_aligned
                 assert acquiring["payload"]["guidance"] == "counting_down"
                 assert acquiring["payload"]["manualCaptureAllowed"] is True
                 socket.send_json(_envelope("vision.try_on.attempt.capture", {"attemptId": attempt_id}))
-                generating = socket.receive_json()
-                assert generating["type"] == "vision.try_on.attempt.generating"
+                _await_generating(socket)
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
     finally:
         server.shutdown()
@@ -681,11 +708,7 @@ def test_v2_recorded_single_person_auto_capture_uses_production_yolo_and_pose(mo
                 assert acquiring["type"] == "vision.try_on.attempt.acquiring"
                 assert acquiring["payload"]["occupancy"] == "single"
                 assert acquiring["payload"]["guidance"] == "counting_down"
-                while True:
-                    message = socket.receive_json()
-                    if message["type"] == "vision.try_on.attempt.generating":
-                        break
-                    assert message["type"] == "vision.try_on.attempt.acquiring"
+                _await_generating(socket)
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
                 terminal = socket.receive_json()
                 assert terminal["type"] == "vision.try_on.attempt.completed", terminal
@@ -726,15 +749,8 @@ def test_v2_unstable_alignment_resets_countdown_and_manual_capture_still_complet
                 assert "align" in observed_guidances
                 assert "counting_down" in observed_guidances
                 socket.send_json(_envelope("vision.try_on.attempt.capture", {"attemptId": attempt_id}))
-                generating = None
-                deadline = time.monotonic() + 8.0
-                while time.monotonic() < deadline:
-                    message = socket.receive_json()
-                    if message["type"] == "vision.try_on.attempt.generating":
-                        generating = message
-                        break
-                    assert message["type"] == "vision.try_on.attempt.acquiring"
-                assert generating is not None
+                generating = _await_generating(socket)
+                assert generating["type"] == "vision.try_on.attempt.generating"
     finally:
         server.shutdown()
         server.server_close()

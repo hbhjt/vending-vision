@@ -17,9 +17,9 @@ import copy
 import hashlib
 import json
 import ipaddress
-import math
 import re
 import secrets
+import sys
 import threading
 from datetime import datetime
 from json import JSONDecodeError
@@ -70,6 +70,8 @@ from vision.try_on_adjustment_store import TryOnAdjustmentStore
 from vision.attempt_worker import AttemptWorkerError, TryOnRenderBroker, render_attempt_frame
 from vision.acquisition_preview import AcquisitionPreviewStore
 from vision.acquisition_observer import AcquisitionObservationWorker
+from vision.acquisition_session import CapturedFrameStore
+from vision.try_on_attempt_runtime import TryOnAttemptRuntime
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
@@ -100,8 +102,10 @@ _try_on_adjustment_store = TryOnAdjustmentStore(ttl_seconds=_TRY_ON_RESULT_TTL_S
 _try_on_attempt_task_slots = asyncio.Semaphore(_TRY_ON_ATTEMPT_MAX_TASKS)
 _try_on_render_broker = TryOnRenderBroker()
 _acquisition_previews = AcquisitionPreviewStore()
+_captured_frames = CapturedFrameStore()
 _acquisition_observer: AcquisitionObservationWorker | None = None
-_ACQUISITION_TIMEOUT_SECONDS = 20.0
+_try_on_attempt_runtime_module = TryOnAttemptRuntime(sys.modules[__name__])
+_ACQUISITION_TIMEOUT_SECONDS = 30.0
 # 首次识别到稳定后展示 3 秒倒计时，倒计时期间若再次失稳则重新计时；
 # 手动拍照仍可在对齐窗口内立即触发，不受该倒计时限制。
 _ACQUISITION_HOLD_SECONDS = 3.0
@@ -158,6 +162,7 @@ async def on_shutdown():
     except Exception as exc:
         preview_shutdown_error = exc
         logger.warning("Acquisition preview shutdown close failed: %s", exc)
+    await _captured_frames.clear()
     await _try_on_attempt_registry.shutdown()
     observer = _acquisition_observer
     if observer is not None:
@@ -432,6 +437,13 @@ def _acquisition_preview_reference(token: str) -> str:
     return f"http://{host}:{settings.PORT}/v2/try-on/acquisition/preview.mjpeg?token={token}"
 
 
+def _captured_frame_reference(token: str) -> str:
+    host = str(settings.HOST)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{settings.PORT}/v2/try-on/captured/frame.png?token={token}"
+
+
 def _get_acquisition_observer() -> AcquisitionObservationWorker:
     global _acquisition_observer
     if _acquisition_observer is None:
@@ -445,14 +457,6 @@ def _acquisition_observer_ready() -> bool:
         observer is not None
         and getattr(observer, "fatal_error", None) is None
     )
-
-
-def _acquisition_hold_remaining_ms(started_at: float | None, now: float) -> int | None:
-    """Milliseconds left in the continuous aligned hold, or None when not holding."""
-    if started_at is None:
-        return None
-    remaining = started_at + _ACQUISITION_HOLD_SECONDS - now
-    return max(0, math.ceil(remaining * 1000))
 
 
 def _acquiring_message(
@@ -588,6 +592,22 @@ async def read_acquisition_preview(request: Request, token: Optional[str] = None
             await _acquisition_previews.release(lease.lease_id)
 
     return StreamingResponse(frames(), media_type=media_type, headers={"Cache-Control": "no-store"})
+
+
+@app.api_route("/v2/try-on/captured/frame.png", methods=["GET", "HEAD"])
+async def read_captured_frame(request: Request, token: Optional[str] = None):
+    """Serve only the immutable, attempt-scoped captured-frame capability."""
+    raw_query = request.scope.get("query_string", b"")
+    if not isinstance(raw_query, bytes) or not re.fullmatch(rb"token=[A-Za-z0-9_-]{1,128}", raw_query):
+        raise HTTPException(status_code=404, detail="captured frame not found")
+    captured = await _captured_frames.get(raw_query[6:].decode("ascii"))
+    if captured is None:
+        raise HTTPException(status_code=404, detail="captured frame not found")
+    return Response(
+        content=b"" if request.method == "HEAD" else captured.png,
+        media_type="image/png",
+        headers={"Content-Length": str(len(captured.png)), "Cache-Control": "no-store"},
+    )
 
 
 def get_runtime_status():
@@ -1359,11 +1379,7 @@ async def _cancel_v2_attempt(*, attempt_id: str, terminal: dict) -> TerminalTran
     )
     if transition is None:
         return None
-    cleanup_errors = []
-    try:
-        await _acquisition_previews.close(attempt_id)
-    except Exception as exc:
-        cleanup_errors.append(f"preview_close:{type(exc).__name__}:{exc}")
+    cleanup_errors = await _revoke_try_on_attempt_media(attempt_id)
     owner = get_front_camera_owner()
     token = owner.get("leaseToken")
     if owner.get("owner") == "try_on_attempt" and isinstance(token, str) and token.startswith(
@@ -1381,6 +1397,18 @@ async def _cancel_v2_attempt(*, attempt_id: str, terminal: dict) -> TerminalTran
             cleanup_errors,
         )
     return transition
+
+
+async def _revoke_try_on_attempt_media(attempt_id: str) -> list[str]:
+    """Revoke the old attempt's non-result capabilities before its terminal is visible."""
+    errors: list[str] = []
+    await _captured_frames.discard(attempt_id)
+    _try_on_adjustment_store.discard(attempt_id)
+    try:
+        await _acquisition_previews.close(attempt_id)
+    except Exception as exc:
+        errors.append(f"preview_close:{type(exc).__name__}:{exc}")
+    return errors
 
 
 async def broadcast_profile_error(code: str, message: str, retryable: bool = True):
@@ -1604,243 +1632,10 @@ async def run_v2_try_on_attempt(
     connection_closed: asyncio.Event,
 ) -> None:
     """Run one bounded Try-On attempt without holding a WS or store lock on I/O."""
-    try:
-        parsed = parse_v2_client_message(message)
-        if parsed.type != "vision.try_on.attempt.start":
-            raise ValueError("invalid_v2_boundary_message")
-        payload = parsed.payload.model_dump()
-    except (V2ContractBundleUnavailable, ValueError):
-        async with send_lock:
-            await send_error(
-                websocket,
-                code="invalid_message",
-                message="invalid_v2_boundary_message",
-                retryable=False,
-                message_id=message.get("messageId"),
-            )
-        return
-
-    # Handshake readiness is a negotiation fact, not a lifetime lease on the
-    # render process.  Every attempt must also observe the live broker before
-    # constructing admission replay.
-    try_on_ready = bool(
-        try_on_ready
-        and _try_on_render_broker.ready
-        and _try_on_render_broker.pose_ready
-        and _acquisition_observer_ready()
+    return await _try_on_attempt_runtime_module.run(
+        websocket, send_lock, message, try_on_ready,
+        owned_try_on_attempt_receipts, connection_closed,
     )
-    attempt_id = payload["attemptId"]
-    unavailable_terminal = _generated_v2_envelope(
-        "vision.try_on.attempt.failed",
-        {"attemptId": attempt_id, "reason": "try_on_unavailable"},
-    )
-    canceled_terminal = _generated_v2_envelope(
-        "vision.try_on.attempt.canceled",
-        {"attemptId": attempt_id, "reason": "replaced"},
-    )
-    accepted = (
-        _generated_v2_envelope("vision.try_on.attempt.accepted", {"attemptId": attempt_id})
-        if try_on_ready
-        else None
-    )
-    preparation = await _try_on_attempt_registry.prepare_admission(
-        attempt_id=attempt_id,
-        websocket=websocket,
-        send_lock=send_lock,
-        task=asyncio.current_task(),
-        canceled_terminal=canceled_terminal,
-        owner_receipts=owned_try_on_attempt_receipts,
-    )
-    for transition in preparation.transitions:
-        await _publish_try_on_transition(transition)
-    admission = await _try_on_attempt_registry.commit_prepared_admission(
-        preparation,
-        accepted=accepted,
-        generating=None,
-        unavailable_terminal=unavailable_terminal,
-        readiness=lambda: bool(
-            try_on_ready
-            and _try_on_render_broker.ready
-            and _try_on_render_broker.pose_ready
-            and _acquisition_observer_ready()
-        ),
-    )
-    if not admission.is_owner:
-        for replay_message in admission.replay:
-            await _send_json_bounded(websocket, send_lock, replay_message)
-        return
-    receipt = admission.receipt
-    assert receipt is not None
-    if connection_closed.is_set():
-        await _publish_try_on_transition(
-            await _try_on_attempt_registry.cancel_owner_and_join(receipt)
-        )
-        return
-    stored_result = None
-    lease_token = f"try-on:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}"
-    lease_acquired = False
-    try:
-        for replay_message in admission.replay:
-            await _send_json_bounded(websocket, send_lock, replay_message)
-        await _acquire_front_io_until(
-            asyncio.get_running_loop().time() + _ACQUISITION_TIMEOUT_SECONDS
-        )
-        try:
-            owner = acquire_front_camera(
-                "try_on_attempt", reason=f"try_on_acquisition:{attempt_id}", lease_token=lease_token
-            )
-        finally:
-            release_front_camera_io_lock()
-        if not owner.get("ok"):
-            raise GarmentFetchError(owner.get("error") or "front_camera_busy")
-        lease_acquired = True
-
-        hold_started_at = None
-        last_guidance = None
-        captured_frame = None
-        source_frame = None
-        deadline = asyncio.get_running_loop().time() + _ACQUISITION_TIMEOUT_SECONDS
-        preview_token = None
-        while asyncio.get_running_loop().time() < deadline:
-            remaining = max(0.001, deadline - asyncio.get_running_loop().time())
-            frame, source = await _read_attempt_front_frame(
-                receipt, timeout=remaining, lease_token=lease_token
-            )
-            observation = await _get_acquisition_observer().observe(frame, timeout=remaining)
-            jpeg = observation.jpeg
-            if preview_token is None:
-                preview_token = await _acquisition_previews.open(attempt_id, jpeg)
-            else:
-                await _acquisition_previews.update(attempt_id, preview_token, jpeg)
-            occupancy, aligned = observation.occupancy, observation.aligned
-            now = asyncio.get_running_loop().time()
-            if occupancy == "single" and aligned:
-                if hold_started_at is None:
-                    hold_started_at = now
-            else:
-                hold_started_at = None
-            hold_remaining_ms = _acquisition_hold_remaining_ms(hold_started_at, now)
-            stable = hold_remaining_ms == 0
-            acquiring = _acquiring_message(
-                attempt_id,
-                preview_token,
-                occupancy,
-                aligned,
-                hold_remaining_ms,
-            )
-            if acquiring["payload"]["guidance"] != last_guidance:
-                await _publish_try_on_transition(
-                    await _try_on_attempt_registry.publish_nonterminal(receipt, acquiring)
-                )
-                last_guidance = acquiring["payload"]["guidance"]
-            manual = await _try_on_attempt_registry.manual_capture_requested(receipt)
-            if stable or (manual and occupancy == "single" and aligned):
-                if not stable:
-                    await _try_on_attempt_registry.consume_manual_capture_request(receipt)
-                # The source frame remains Vision memory, never the MJPEG representation.
-                captured_frame, source_frame = frame.copy(), source
-                break
-            await asyncio.sleep(_ACQUISITION_POLL_SECONDS)
-        if captured_frame is None:
-            raise asyncio.TimeoutError()
-
-        # Capture transitions are ordered: capability close + lease release,
-        # then public generating.  Profile ownership can resume before render.
-        cleanup_errors = await _release_acquisition_resources(receipt, lease_token)
-        lease_acquired = False
-        if cleanup_errors:
-            raise RuntimeError("acquisition_cleanup_failed")
-        generating = _generated_v2_envelope(
-            "vision.try_on.attempt.generating", {"attemptId": attempt_id, "stage": "preparing"}
-        )
-        await _publish_try_on_transition(
-            await _try_on_attempt_registry.publish_nonterminal(receipt, generating)
-        )
-        garment_source = await asyncio.wait_for(
-            _try_on_runtime.fetch_garment(
-                payload["garment"], await _try_on_attempt_registry.cancel_event_for(receipt)
-            ), timeout=_TRY_ON_ATTEMPT_TIMEOUT_SECONDS,
-        )
-        result_image = await _run_owned_attempt_step(
-            receipt,
-            render_attempt_frame(
-                captured_frame,
-                garment_source.png_bytes,
-                digest=garment_source.digest,
-                template=garment_source.template,
-                timeout=_TRY_ON_ATTEMPT_TIMEOUT_SECONDS,
-                broker=_try_on_render_broker,
-            ),
-            timeout=_TRY_ON_ATTEMPT_TIMEOUT_SECONDS,
-        )
-        stored_result, result = _prepare_try_on_result(attempt_id, result_image)
-        # A completed Try-On result may be re-scaled around its locked center.
-        # Retain exactly the re-render inputs while the result itself lives;
-        # the snapshot is Vision-owned, bounded, and never sent to Machine.
-        _try_on_adjustment_store.admit(
-            attempt_id,
-            captured_frame,
-            garment_source.png_bytes,
-            garment_source.digest,
-            garment_source.template,
-        )
-        logger.info(
-            "Try-On attempt completed attemptId=%s frameSource=%s",
-            attempt_id,
-            source_frame.get("source") if isinstance(source_frame, dict) else "unknown",
-        )
-        terminal = _generated_v2_envelope(
-            "vision.try_on.attempt.completed", {"attemptId": attempt_id, "result": result}
-        )
-    except PoseUnavailableError as error:
-        # The contract's existing try_on_failed terminal is the stable local
-        # equivalent of pose_unavailable; never publish a result without
-        # valid official shoulder/hip geometry.
-        logger.warning("Try-On pose unavailable attemptId=%s reason=%s", attempt_id, error)
-        terminal = _generated_v2_envelope(
-            "vision.try_on.attempt.failed",
-            {"attemptId": attempt_id, "reason": "try_on_failed"},
-        )
-    except GarmentFetchError as error:
-        terminal = _generated_v2_envelope(
-            "vision.try_on.attempt.canceled"
-            if str(error) == "attempt_canceled"
-            else "vision.try_on.attempt.failed",
-            {"attemptId": attempt_id, "reason": "replaced"}
-            if str(error) == "attempt_canceled"
-            else {"attemptId": attempt_id, "reason": "garment_rejected"},
-        )
-    except asyncio.TimeoutError:
-        terminal = _generated_v2_envelope(
-            "vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "timeout"}
-        )
-    except Exception:
-        logger.exception("Try-On attempt failed attemptId=%s", attempt_id)
-        terminal = _generated_v2_envelope(
-            "vision.try_on.attempt.failed",
-            {"attemptId": attempt_id, "reason": "try_on_failed"},
-        )
-    except asyncio.CancelledError:
-        terminal = _generated_v2_envelope(
-            "vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "replaced"}
-        )
-    finally:
-        if lease_acquired:
-            await _release_acquisition_resources(receipt, lease_token)
-        # The registry's cleanup barrier retains admission ownership until the
-        # one worker slot is physically idle, even when a model call was slow.
-        await _get_acquisition_observer().wait_idle()
-    # Preparation is deliberately private until the completed contract is
-    # encoded and validated.  Any failure above commits the one failed
-    # terminal without passing staged token, reference, or bytes across the
-    # registry's atomic boundary.
-    if terminal.get("type") != "vision.try_on.attempt.completed":
-        stored_result = None
-    transition = await _try_on_attempt_registry.commit_terminal_transition(
-        receipt, terminal, stored_result
-    )
-    if transition is not None:
-        await _publish_try_on_transition(transition)
 
 
 async def run_v2_try_on_adjustment(
@@ -2181,15 +1976,22 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 continue
 
             if message_type == "vision.try_on.attempt.cancel":
-                if payload.get("reason") == "route_leave":
+                route_leave = payload.get("reason") == "route_leave"
+                if route_leave:
                     _try_on_adjustment_store.discard(payload["attemptId"])
                 terminal = _generated_v2_envelope(
                     "vision.try_on.attempt.canceled",
                     {"attemptId": payload["attemptId"], "reason": payload["reason"]},
                 )
-                await _publish_try_on_transition(await _cancel_v2_attempt(
+                transition = await _cancel_v2_attempt(
                     attempt_id=payload["attemptId"], terminal=terminal
-                ))
+                )
+                if transition is None and route_leave:
+                    # A completed terminal is no longer active, but departure
+                    # must still revoke every customer-scoped capability.
+                    await _try_on_attempt_registry.discard_terminal(payload["attemptId"])
+                    await _revoke_try_on_attempt_media(payload["attemptId"])
+                await _publish_try_on_transition(transition)
                 continue
 
             if message_type == "vision.ping":

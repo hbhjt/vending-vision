@@ -869,6 +869,15 @@ class TryOnAttemptRegistry:
             entry = self._results._get_unlocked(attempt_id, token)
             return entry.stored() if entry is not None else None
 
+    async def discard_terminal(self, attempt_id: str) -> bool:
+        """Retire a completed attempt and its result grant on customer departure."""
+        async with self._gate:
+            self._prune_unlocked()
+            if self._terminals.pop(attempt_id, None) is None:
+                return False
+            self._results._remove_unlocked(attempt_id)
+            return True
+
     async def replace_completed_result(
         self, attempt_id: str, stored_result: dict
     ) -> dict | None:
