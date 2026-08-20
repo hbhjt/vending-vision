@@ -15,7 +15,7 @@ import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Protocol
 
 import cv2
 import numpy as np
@@ -23,6 +23,32 @@ import numpy as np
 
 class AcquisitionError(RuntimeError):
     pass
+
+
+class AcquisitionCameraPort(Protocol):
+    """Attempt-bound front-camera adapter used by one acquisition session."""
+
+    async def acquire(self, attempt_id: str, deadline: float) -> str: ...
+
+    async def read(
+        self, lease_token: str, timeout: float
+    ) -> tuple[np.ndarray, dict[str, Any]]: ...
+
+    async def release(self, attempt_id: str, lease_token: str) -> None: ...
+
+
+class AcquisitionObserverPort(Protocol):
+    async def observe(self, frame: np.ndarray, *, timeout: float) -> object: ...
+
+    async def wait_idle(self) -> None: ...
+
+
+class AcquisitionPreviewPort(Protocol):
+    async def open(self, attempt_id: str, jpeg: bytes) -> str: ...
+
+    async def update(self, attempt_id: str, token: str, jpeg: bytes) -> bool: ...
+
+    async def close(self, attempt_id: str) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -111,24 +137,24 @@ class AcquisitionSession:
     def __init__(
         self,
         *,
-        read_frame: Callable[[float], Awaitable[tuple[np.ndarray, dict[str, Any]]]],
-        observe: Callable[[np.ndarray, float], Awaitable[Any]],
-        preview_open: Callable[[str, bytes], Awaitable[str]],
-        preview_update: Callable[[str, str, bytes], Awaitable[bool]],
+        camera: AcquisitionCameraPort,
+        observer: AcquisitionObserverPort,
+        preview: AcquisitionPreviewPort,
         publish: Callable[[str, str, str, bool, int | None], Awaitable[None]],
         attempt_id: str,
         timeout_seconds: float = 30.0,
+        deadline: float | None = None,
         stable_seconds: float = 3.0,
         preview_interval_seconds: float = 0.05,
         clock: Callable[[], float] | None = None,
     ) -> None:
-        self._read_frame = read_frame
-        self._observe = observe
-        self._preview_open = preview_open
-        self._preview_update = preview_update
+        self._camera = camera
+        self._observer = observer
+        self._preview = preview
         self._publish = publish
         self._attempt_id = attempt_id
         self._timeout_seconds = timeout_seconds
+        self._deadline = deadline
         self._stable_seconds = stable_seconds
         self._preview_interval_seconds = preview_interval_seconds
         self._clock = clock or asyncio.get_running_loop().time
@@ -167,7 +193,43 @@ class AcquisitionSession:
         stale work or stop tokenized preview updates.
         """
         started = self._clock()
-        deadline = started + self._timeout_seconds
+        deadline = (
+            self._deadline
+            if self._deadline is not None
+            else started + self._timeout_seconds
+        )
+        lease_token = await self._camera.acquire(self._attempt_id, deadline)
+        try:
+            return await self._acquire_with_lease(
+                lease_token=lease_token,
+                deadline=deadline,
+                manual_requested=manual_requested,
+                consume_manual=consume_manual,
+            )
+        finally:
+            cleanup_errors = []
+            for cleanup_name, cleanup in (
+                ("preview", self._preview.close(self._attempt_id)),
+                ("camera", self._camera.release(self._attempt_id, lease_token)),
+                ("observer", self._observer.wait_idle()),
+            ):
+                try:
+                    await cleanup
+                except BaseException as error:
+                    cleanup_errors.append(f"{cleanup_name}:{type(error).__name__}")
+            if cleanup_errors:
+                raise AcquisitionError(
+                    f"acquisition_cleanup_failed:{','.join(cleanup_errors)}"
+                )
+
+    async def _acquire_with_lease(
+        self,
+        *,
+        lease_token: str,
+        deadline: float,
+        manual_requested: Callable[[], Awaitable[bool]],
+        consume_manual: Callable[[], Awaitable[None]],
+    ) -> CapturedFrame:
         latest: _Frame | None = None
         latest_changed = asyncio.Event()
         stop = asyncio.Event()
@@ -180,15 +242,21 @@ class AcquisitionSession:
             sequence = 0
             try:
                 while not stop.is_set() and self._clock() < deadline:
-                    frame, source = await self._read_frame(max(0.001, deadline - self._clock()))
+                    frame, source = await self._camera.read(
+                        lease_token, max(0.001, deadline - self._clock())
+                    )
                     sequence += 1
                     candidate = _Frame(frame.copy(), dict(source or {}), sequence)
                     jpeg = self._jpeg(candidate.value)
                     async with preview_lock:
                         if preview_token is None:
-                            preview_token = await self._preview_open(self._attempt_id, jpeg)
+                            preview_token = await self._preview.open(
+                                self._attempt_id, jpeg
+                            )
                         else:
-                            await self._preview_update(self._attempt_id, preview_token, jpeg)
+                            await self._preview.update(
+                                self._attempt_id, preview_token, jpeg
+                            )
                     latest = candidate
                     latest_changed.set()
                     await asyncio.sleep(self._preview_interval_seconds)
@@ -196,7 +264,9 @@ class AcquisitionSession:
                 producer_error = error
                 latest_changed.set()
 
-        producer_task = asyncio.create_task(producer(), name=f"acquisition-preview:{self._attempt_id}")
+        producer_task = asyncio.create_task(
+            producer(), name=f"acquisition-preview:{self._attempt_id}"
+        )
         consumed = 0
         stable_started: float | None = None
         last_qualified: _Frame | None = None
@@ -215,7 +285,12 @@ class AcquisitionSession:
             remaining = (
                 None
                 if stable_started is None
-                else max(0, math.ceil((stable_started + self._stable_seconds - now) * 1000))
+                else max(
+                    0,
+                    math.ceil(
+                        (stable_started + self._stable_seconds - now) * 1000
+                    ),
+                )
             )
             fact = (occupancy, aligned, remaining)
             async with fact_lock:
@@ -224,38 +299,47 @@ class AcquisitionSession:
                 token = preview_token
                 if token is None:
                     return
+                guidance = (
+                    "counting_down"
+                    if eligible
+                    else "no_person"
+                    if occupancy == "none"
+                    else "multiple_people"
+                    if occupancy == "multiple"
+                    else "align"
+                )
                 await self._publish(
-                    token,
-                    occupancy,
-                    "counting_down" if eligible else (
-                        "no_person" if occupancy == "none" else "multiple_people" if occupancy == "multiple" else "align"
-                    ),
-                    aligned,
-                    remaining,
+                    token, occupancy, guidance, aligned, remaining
                 )
                 last_fact = fact
 
         async def countdown_truth() -> None:
-            # This independent publisher is the source of the live countdown
-            # fact even when inference is temporarily slow.  It does not make
-            # capture decisions: capture remains gated by a checked frame.
             while not stop.is_set() and self._clock() < deadline:
                 await publish_current()
                 await asyncio.sleep(min(0.1, self._preview_interval_seconds))
 
-        ticker_task = asyncio.create_task(countdown_truth(), name=f"acquisition-countdown:{self._attempt_id}")
+        ticker_task = asyncio.create_task(
+            countdown_truth(), name=f"acquisition-countdown:{self._attempt_id}"
+        )
         try:
             while self._clock() < deadline:
                 if producer_error is not None:
                     raise producer_error
-                await asyncio.wait_for(latest_changed.wait(), timeout=max(0.001, deadline - self._clock()))
+                await asyncio.wait_for(
+                    latest_changed.wait(),
+                    timeout=max(0.001, deadline - self._clock()),
+                )
                 latest_changed.clear()
                 frame = latest
                 if frame is None or frame.sequence == consumed:
                     continue
                 consumed = frame.sequence
-                observation = await self._observe(frame.value, max(0.001, deadline - self._clock()))
-                occupancy, aligned = observation.occupancy, bool(observation.aligned)
+                observation = await self._observer.observe(
+                    frame.value,
+                    timeout=max(0.001, deadline - self._clock()),
+                )
+                occupancy = getattr(observation, "occupancy")
+                aligned = bool(getattr(observation, "aligned"))
                 state = (occupancy, aligned)
                 observed = True
                 now = self._clock()
@@ -272,13 +356,16 @@ class AcquisitionSession:
                 if manual and eligible:
                     await consume_manual()
                     return self._captured(frame)
-                if stable_started is not None and now >= stable_started + self._stable_seconds:
-                    if last_qualified is None:
-                        continue
-                    return self._captured(last_qualified)
+                if stable_started is not None and now >= (
+                    stable_started + self._stable_seconds
+                ):
+                    if last_qualified is not None:
+                        return self._captured(last_qualified)
             raise asyncio.TimeoutError()
         finally:
             stop.set()
             producer_task.cancel()
             ticker_task.cancel()
-            await asyncio.gather(producer_task, ticker_task, return_exceptions=True)
+            await asyncio.gather(
+                producer_task, ticker_task, return_exceptions=True
+            )

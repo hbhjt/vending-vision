@@ -1,336 +1,546 @@
-"""Deep runtime for the one V2 Virtual Try-On attempt lifecycle.
-
-The application supplies its concrete camera, registry, worker and transport
-adapters as one private port.  This module owns the externally observable
-attempt identity and state order; callers never orchestrate capture, render or
-terminal fencing themselves.
-"""
+"""Deep runtime for the single V2 Virtual Try-On attempt lifecycle."""
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Protocol
+import logging
+from dataclasses import dataclass
+from typing import Awaitable, Protocol, cast
 
-from vision.acquisition_session import AcquisitionSession
+import numpy as np
+
+from vision.acquisition_session import (
+    AcquisitionCameraPort,
+    AcquisitionObserverPort,
+    AcquisitionPreviewPort,
+    AcquisitionSession,
+    CapturedFrame,
+)
+from vision.attempt_worker import AttemptWorkerError
+from vision.garment_composer import (
+    GarmentFetchError,
+    PoseUnavailableError,
+    TransparentGarmentSource,
+)
+from vision.try_on_adjustment_store import TryOnAdjustmentSnapshot
+from vision.try_on_attempt_registry import (
+    AttemptReceipt,
+    TerminalTransition,
+    TryOnAttemptRegistry,
+)
+from vision.v2_contract_bundle import V2ContractBundleUnavailable
 
 
-class TryOnAttemptPorts(Protocol):
-    """Explicit host seam required by the attempt runtime.
+class AttemptRegistryPort(Protocol):
+    @property
+    def current(self) -> TryOnAttemptRegistry: ...
 
-    The concrete app adapter deliberately exposes only these named members;
-    transport module globals outside this interface are not runtime inputs.
-    """
 
-    V2ContractBundleUnavailable: type[Exception]
-    GarmentFetchError: type[Exception]
-    PoseUnavailableError: type[Exception]
-    AttemptWorkerError: type[Exception]
-    _ACQUISITION_TIMEOUT_SECONDS: float
-    _ACQUISITION_HOLD_SECONDS: float
-    _ACQUISITION_POLL_SECONDS: float
-    _TRY_ON_ATTEMPT_TIMEOUT_SECONDS: float
-    _try_on_attempt_registry: Any
-    _try_on_render_broker: Any
-    _acquisition_previews: Any
-    _captured_frames: Any
-    _try_on_adjustment_store: Any
-    _try_on_runtime: Any
-    logger: Any
-    parse_v2_client_message: Any
-    send_error: Any
-    _acquisition_observer_ready: Any
-    _generated_v2_envelope: Any
-    _publish_try_on_transition: Any
-    _send_json_bounded: Any
-    _acquire_front_io_until: Any
-    acquire_front_camera: Any
-    release_front_camera_io_lock: Any
-    _acquiring_message: Any
-    _read_attempt_front_frame: Any
-    _get_acquisition_observer: Any
-    _captured_frame_reference: Any
-    _release_acquisition_resources: Any
-    _run_owned_attempt_step: Any
-    render_attempt_frame: Any
-    _prepare_try_on_result: Any
-    get_front_camera_owner: Any
-    release_front_camera: Any
-    _await_cleanup_uncancelled: Any
+class AttemptMediaPort(Protocol):
+    @property
+    def preview(self) -> AcquisitionPreviewPort: ...
+
+    async def store_captured(
+        self, attempt_id: str, captured: CapturedFrame
+    ) -> dict[str, object]: ...
+
+    async def read_captured(self, token: str) -> CapturedFrame | None: ...
+
+    async def revoke(self, attempt_id: str) -> None: ...
+
+    def prepare_result(
+        self, attempt_id: str, image: bytes
+    ) -> tuple[dict, dict[str, object]]: ...
+
+    def retain_adjustment(
+        self, attempt_id: str, frame: np.ndarray, garment: TransparentGarmentSource
+    ) -> None: ...
+
+    def adjustment(self, attempt_id: str) -> TryOnAdjustmentSnapshot | None: ...
+
+    def preview_public(self, token: str) -> dict[str, object]: ...
+
+
+class AttemptRenderPort(Protocol):
+    @property
+    def ready(self) -> bool: ...
+
+    @property
+    def pose_ready(self) -> bool: ...
+
+    async def fetch_garment(
+        self, descriptor: dict[str, object], cancel_event: asyncio.Event
+    ) -> TransparentGarmentSource: ...
+
+    async def render(
+        self,
+        frame: np.ndarray,
+        garment: TransparentGarmentSource,
+        *,
+        timeout: float,
+        garment_scale: float = 1.0,
+    ) -> bytes: ...
+
+
+class AttemptCameraPort(Protocol):
+    def ready(self) -> bool: ...
+
+    def bind(self, receipt: AttemptReceipt) -> AcquisitionCameraPort: ...
+
+    def observer(self) -> AcquisitionObserverPort: ...
+
+    async def wait_released(self, attempt_id: str) -> bool: ...
+
+
+class AttemptTransportPort(Protocol):
+    def parse_start(self, message: dict) -> dict[str, object]: ...
+
+    def envelope(
+        self, message_type: str, payload: dict[str, object]
+    ) -> dict: ...
+
+    async def publish(self, transition: TerminalTransition | None) -> None: ...
+
+    async def send(
+        self, websocket: object, send_lock: asyncio.Lock, message: dict
+    ) -> None: ...
+
+    async def send_error(
+        self,
+        websocket: object,
+        send_lock: asyncio.Lock,
+        *,
+        code: str,
+        message: str,
+        retryable: bool,
+        message_id: str | None,
+    ) -> None: ...
+
+
+class AttemptRuntimeConfig(Protocol):
+    @property
+    def acquisition_timeout_seconds(self) -> float: ...
+
+    @property
+    def acquisition_hold_seconds(self) -> float: ...
+
+    @property
+    def acquisition_poll_seconds(self) -> float: ...
+
+    @property
+    def render_timeout_seconds(self) -> float: ...
+
+
+@dataclass(frozen=True)
+class TryOnAttemptPorts:
+    registry: AttemptRegistryPort
+    media: AttemptMediaPort
+    render: AttemptRenderPort
+    camera: AttemptCameraPort
+    transport: AttemptTransportPort
+    config: AttemptRuntimeConfig
 
 
 class TryOnAttemptRuntime:
-    """Run one V2 request through admission, capture, generation and terminal."""
+    """Own admission, capture, generation, cleanup and terminal replay."""
 
     def __init__(self, ports: TryOnAttemptPorts) -> None:
         self._ports = ports
+        self._logger = logging.getLogger("vending_vision.try_on_attempt")
 
-    async def run(self, websocket, send_lock, message, try_on_ready, owned_receipts, connection_closed) -> None:
+    async def run(
+        self,
+        websocket: object,
+        send_lock: asyncio.Lock,
+        message: dict,
+        try_on_ready: bool,
+        owned_receipts: set[AttemptReceipt],
+        connection_closed: asyncio.Event,
+    ) -> None:
         p = self._ports
+        registry = p.registry.current
         try:
-            parsed = p.parse_v2_client_message(message)
-            if parsed.type != "vision.try_on.attempt.start":
-                raise ValueError("invalid_v2_boundary_message")
-            payload = parsed.payload.model_dump()
-        except (p.V2ContractBundleUnavailable, ValueError):
-            async with send_lock:
-                await p.send_error(websocket, code="invalid_message", message="invalid_v2_boundary_message", retryable=False, message_id=message.get("messageId"))
+            payload = p.transport.parse_start(message)
+        except (V2ContractBundleUnavailable, ValueError):
+            await p.transport.send_error(
+                websocket,
+                send_lock,
+                code="invalid_message",
+                message="invalid_v2_boundary_message",
+                retryable=False,
+                message_id=cast(str | None, message.get("messageId")),
+            )
             return
 
-        try_on_ready = bool(try_on_ready and p._try_on_render_broker.ready and p._try_on_render_broker.pose_ready and p._acquisition_observer_ready())
-        attempt_id = payload["attemptId"]
-        unavailable = p._generated_v2_envelope("vision.try_on.attempt.failed", {"attemptId": attempt_id, "reason": "try_on_unavailable"})
-        replaced = p._generated_v2_envelope("vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "replaced"})
-        accepted = p._generated_v2_envelope("vision.try_on.attempt.accepted", {"attemptId": attempt_id}) if try_on_ready else None
-        preparation = await p._try_on_attempt_registry.prepare_admission(
-            attempt_id=attempt_id, websocket=websocket, send_lock=send_lock,
-            task=asyncio.current_task(), canceled_terminal=replaced,
+        try_on_ready = bool(
+            try_on_ready
+            and p.render.ready
+            and p.render.pose_ready
+            and p.camera.ready()
+        )
+        attempt_id = cast(str, payload["attemptId"])
+        unavailable = p.transport.envelope(
+            "vision.try_on.attempt.failed",
+            {"attemptId": attempt_id, "reason": "try_on_unavailable"},
+        )
+        replaced = p.transport.envelope(
+            "vision.try_on.attempt.canceled",
+            {"attemptId": attempt_id, "reason": "replaced"},
+        )
+        accepted = (
+            p.transport.envelope(
+                "vision.try_on.attempt.accepted", {"attemptId": attempt_id}
+            )
+            if try_on_ready
+            else None
+        )
+        preparation = await registry.prepare_admission(
+            attempt_id=attempt_id,
+            websocket=websocket,
+            send_lock=send_lock,
+            task=cast(asyncio.Task, asyncio.current_task()),
+            canceled_terminal=replaced,
             owner_receipts=owned_receipts,
         )
         for transition in preparation.transitions:
-            # Replacement makes its canceled terminal externally observable
-            # before the old task has joined.  Revoke its media now, rather
-            # than letting that brief handoff retain a usable captured token.
             if transition.message.get("type") == "vision.try_on.attempt.canceled":
-                await self._revoke_media(
-                    transition.message["payload"]["attemptId"]
+                await p.media.revoke(
+                    cast(str, transition.message["payload"]["attemptId"])
                 )
-            await p._publish_try_on_transition(transition)
-        admission = await p._try_on_attempt_registry.commit_prepared_admission(
-            preparation, accepted=accepted, generating=None, unavailable_terminal=unavailable,
-            readiness=lambda: bool(try_on_ready and p._try_on_render_broker.ready and p._try_on_render_broker.pose_ready and p._acquisition_observer_ready()),
+            await p.transport.publish(transition)
+        admission = await registry.commit_prepared_admission(
+            preparation,
+            accepted=accepted,
+            generating=None,
+            unavailable_terminal=unavailable,
+            readiness=lambda: bool(
+                try_on_ready
+                and p.render.ready
+                and p.render.pose_ready
+                and p.camera.ready()
+            ),
         )
         if not admission.is_owner:
             for replay in admission.replay:
-                await p._send_json_bounded(websocket, send_lock, replay)
+                await p.transport.send(websocket, send_lock, replay)
             return
         receipt = admission.receipt
         assert receipt is not None
         if connection_closed.is_set():
-            await p._publish_try_on_transition(await p._try_on_attempt_registry.cancel_owner_and_join(receipt))
+            await p.transport.publish(await registry.cancel_owner_and_join(receipt))
             return
 
-        stored_result = None
-        lease_token = f"try-on:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}"
-        lease_acquired = False
         acquisition_deadline = (
-            asyncio.get_running_loop().time() + p._ACQUISITION_TIMEOUT_SECONDS
+            asyncio.get_running_loop().time()
+            + p.config.acquisition_timeout_seconds
         )
+        stored_result = None
         try:
             for replay in admission.replay:
-                await p._send_json_bounded(websocket, send_lock, replay)
-            await p._acquire_front_io_until(acquisition_deadline)
-            try:
-                owner = p.acquire_front_camera("try_on_attempt", reason=f"try_on_acquisition:{attempt_id}", lease_token=lease_token)
-            finally:
-                p.release_front_camera_io_lock()
-            if not owner.get("ok"):
-                raise p.GarmentFetchError(owner.get("error") or "front_camera_busy")
-            lease_acquired = True
+                await p.transport.send(websocket, send_lock, replay)
 
-            async def publish(preview_token, occupancy, _guidance, aligned, remaining):
-                acquiring = p._acquiring_message(attempt_id, preview_token, occupancy, aligned, remaining)
-                await p._publish_try_on_transition(await p._try_on_attempt_registry.publish_nonterminal(receipt, acquiring))
+            async def publish(
+                preview_token: str,
+                occupancy: str,
+                guidance: str,
+                aligned: bool,
+                remaining: int | None,
+            ) -> None:
+                acquiring = p.transport.envelope(
+                    "vision.try_on.attempt.acquiring",
+                    self._acquiring_payload(
+                        attempt_id,
+                        preview_token,
+                        occupancy,
+                        guidance,
+                        aligned,
+                        remaining,
+                    ),
+                )
+                await p.transport.publish(
+                    await registry.publish_nonterminal(receipt, acquiring)
+                )
 
             acquisition = AcquisitionSession(
                 attempt_id=attempt_id,
+                deadline=acquisition_deadline,
                 timeout_seconds=max(
-                    0.0, acquisition_deadline - asyncio.get_running_loop().time()
+                    0.0,
+                    acquisition_deadline - asyncio.get_running_loop().time(),
                 ),
-                stable_seconds=p._ACQUISITION_HOLD_SECONDS, preview_interval_seconds=p._ACQUISITION_POLL_SECONDS,
-                read_frame=lambda timeout: p._read_attempt_front_frame(receipt, timeout=timeout, lease_token=lease_token),
-                observe=lambda frame, timeout: p._get_acquisition_observer().observe(frame, timeout=timeout),
-                preview_open=p._acquisition_previews.open, preview_update=p._acquisition_previews.update,
+                stable_seconds=p.config.acquisition_hold_seconds,
+                preview_interval_seconds=p.config.acquisition_poll_seconds,
+                camera=p.camera.bind(receipt),
+                observer=p.camera.observer(),
+                preview=p.media.preview,
                 publish=publish,
             )
             captured = await acquisition.acquire(
-                manual_requested=lambda: p._try_on_attempt_registry.manual_capture_requested(receipt),
-                consume_manual=lambda: p._try_on_attempt_registry.consume_manual_capture_request(receipt),
+                manual_requested=lambda: registry.manual_capture_requested(receipt),
+                consume_manual=lambda: registry.consume_manual_capture_request(
+                    receipt
+                ),
             )
-            captured_token = await p._captured_frames.admit(attempt_id, captured)
-            captured_event = p._generated_v2_envelope("vision.try_on.attempt.captured", {"attemptId": attempt_id, "captured": captured.public(p._captured_frame_reference(captured_token))})
-            await p._publish_try_on_transition(await p._try_on_attempt_registry.publish_nonterminal(receipt, captured_event))
-            cleanup_errors = await p._release_acquisition_resources(receipt, lease_token)
-            lease_acquired = False
-            if cleanup_errors:
-                raise RuntimeError("acquisition_cleanup_failed")
-            generating = p._generated_v2_envelope("vision.try_on.attempt.generating", {"attemptId": attempt_id, "stage": "preparing"})
-            await p._publish_try_on_transition(await p._try_on_attempt_registry.publish_nonterminal(receipt, generating))
-            garment = await asyncio.wait_for(p._try_on_runtime.fetch_garment(payload["garment"], await p._try_on_attempt_registry.cancel_event_for(receipt)), timeout=p._TRY_ON_ATTEMPT_TIMEOUT_SECONDS)
-            result_image = await p._run_owned_attempt_step(
-                receipt, p.render_attempt_frame(captured.frame, garment.png_bytes, digest=garment.digest, template=garment.template, timeout=p._TRY_ON_ATTEMPT_TIMEOUT_SECONDS, broker=p._try_on_render_broker), timeout=p._TRY_ON_ATTEMPT_TIMEOUT_SECONDS,
+            captured_public = await p.media.store_captured(attempt_id, captured)
+            captured_event = p.transport.envelope(
+                "vision.try_on.attempt.captured",
+                {"attemptId": attempt_id, "captured": captured_public},
             )
-            stored_result, result = p._prepare_try_on_result(attempt_id, result_image)
-            p._try_on_adjustment_store.admit(attempt_id, captured.frame, garment.png_bytes, garment.digest, garment.template)
-            terminal = p._generated_v2_envelope("vision.try_on.attempt.completed", {"attemptId": attempt_id, "result": result})
-        except p.PoseUnavailableError:
-            terminal = p._generated_v2_envelope("vision.try_on.attempt.failed", {"attemptId": attempt_id, "reason": "try_on_failed"})
-        except p.GarmentFetchError as error:
-            terminal = p._generated_v2_envelope("vision.try_on.attempt.canceled" if str(error) == "attempt_canceled" else "vision.try_on.attempt.failed", {"attemptId": attempt_id, "reason": "replaced"} if str(error) == "attempt_canceled" else {"attemptId": attempt_id, "reason": "garment_rejected"})
+            await p.transport.publish(
+                await registry.publish_nonterminal(receipt, captured_event)
+            )
+            generating = p.transport.envelope(
+                "vision.try_on.attempt.generating",
+                {"attemptId": attempt_id, "stage": "preparing"},
+            )
+            await p.transport.publish(
+                await registry.publish_nonterminal(receipt, generating)
+            )
+            garment = await asyncio.wait_for(
+                p.render.fetch_garment(
+                    cast(dict[str, object], payload["garment"]),
+                    await registry.cancel_event_for(receipt),
+                ),
+                timeout=p.config.render_timeout_seconds,
+            )
+            result_image = await self._run_owned_render(
+                receipt,
+                p.render.render(
+                    captured.frame,
+                    garment,
+                    timeout=p.config.render_timeout_seconds,
+                ),
+                timeout=p.config.render_timeout_seconds,
+            )
+            stored_result, result = p.media.prepare_result(
+                attempt_id, result_image
+            )
+            p.media.retain_adjustment(attempt_id, captured.frame, garment)
+            terminal = p.transport.envelope(
+                "vision.try_on.attempt.completed",
+                {"attemptId": attempt_id, "result": result},
+            )
+        except PoseUnavailableError:
+            terminal = p.transport.envelope(
+                "vision.try_on.attempt.failed",
+                {"attemptId": attempt_id, "reason": "try_on_failed"},
+            )
+        except GarmentFetchError as error:
+            canceled = str(error) == "attempt_canceled"
+            terminal = p.transport.envelope(
+                "vision.try_on.attempt.canceled"
+                if canceled
+                else "vision.try_on.attempt.failed",
+                {
+                    "attemptId": attempt_id,
+                    "reason": "replaced" if canceled else "garment_rejected",
+                },
+            )
         except asyncio.TimeoutError:
-            terminal = p._generated_v2_envelope("vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "timeout"})
+            terminal = p.transport.envelope(
+                "vision.try_on.attempt.canceled",
+                {"attemptId": attempt_id, "reason": "timeout"},
+            )
         except asyncio.CancelledError:
-            terminal = p._generated_v2_envelope("vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "replaced"})
+            terminal = p.transport.envelope(
+                "vision.try_on.attempt.canceled",
+                {"attemptId": attempt_id, "reason": "replaced"},
+            )
         except Exception:
-            p.logger.exception("Try-On attempt failed attemptId=%s", attempt_id)
-            terminal = p._generated_v2_envelope("vision.try_on.attempt.failed", {"attemptId": attempt_id, "reason": "try_on_failed"})
-        finally:
-            if lease_acquired:
-                await p._release_acquisition_resources(receipt, lease_token)
-            await p._get_acquisition_observer().wait_idle()
+            self._logger.exception("Try-On attempt failed attemptId=%s", attempt_id)
+            terminal = p.transport.envelope(
+                "vision.try_on.attempt.failed",
+                {"attemptId": attempt_id, "reason": "try_on_failed"},
+            )
+
         if terminal.get("type") != "vision.try_on.attempt.completed":
             stored_result = None
-            await self._revoke_media(attempt_id)
-        transition = await p._try_on_attempt_registry.commit_terminal_transition(receipt, terminal, stored_result)
-        if transition is None:
-            # A cancel/replacement may have won while an uncooperative worker
-            # was returning.  Its staged source and captured capability are
-            # never valid without the matching terminal ownership.
-            await self._revoke_media(attempt_id)
-        if transition is not None:
-            await p._publish_try_on_transition(transition)
+            await p.media.revoke(attempt_id)
+        final_transition = await registry.commit_terminal_transition(
+            receipt, terminal, stored_result
+        )
+        if final_transition is None:
+            await p.media.revoke(attempt_id)
+        else:
+            await p.transport.publish(final_transition)
 
-    async def read_captured(self, token: str):
-        """Resolve one immutable captured capability for the HTTP adapter."""
-        return await self._ports._captured_frames.get(token)
+    def _acquiring_payload(
+        self,
+        attempt_id: str,
+        preview_token: str,
+        occupancy: str,
+        guidance: str,
+        aligned: bool,
+        remaining: int | None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "attemptId": attempt_id,
+            "preview": self._ports.media.preview_public(preview_token),
+            "occupancy": occupancy,
+            "guidance": guidance,
+            "manualCaptureAllowed": occupancy == "single" and aligned,
+        }
+        if guidance == "counting_down":
+            payload["holdRemainingMs"] = min(int(remaining or 0), 10_000)
+        return payload
 
-    async def _revoke_media(self, attempt_id: str) -> list[str]:
-        """Revoke all non-terminal customer capabilities for one attempt."""
-        p = self._ports
-        errors: list[str] = []
-        await p._captured_frames.discard(attempt_id)
-        p._try_on_adjustment_store.discard(attempt_id)
+    async def _run_owned_render(
+        self,
+        receipt: AttemptReceipt,
+        operation: Awaitable[bytes],
+        *,
+        timeout: float,
+    ) -> bytes:
+        registry = self._ports.registry.current
+        if not await registry.is_current(receipt):
+            raise GarmentFetchError("attempt_canceled")
+        async def wait_operation() -> object:
+            return await operation
+
+        worker: asyncio.Task[object] = asyncio.create_task(wait_operation())
+        cancel_event = await registry.cancel_event_for(receipt)
+        cancel_waiter: asyncio.Task[object] = asyncio.create_task(cancel_event.wait())
         try:
-            await p._acquisition_previews.close(attempt_id)
-        except Exception as exc:
-            errors.append(f"preview_close:{type(exc).__name__}:{exc}")
-        return errors
+            done, _ = await asyncio.wait(
+                {worker, cancel_waiter},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if worker in done and not cancel_event.is_set():
+                return cast(bytes, worker.result())
+            if cancel_event.is_set() or cancel_waiter in done:
+                raise GarmentFetchError("attempt_canceled")
+            raise asyncio.TimeoutError()
+        except (asyncio.TimeoutError, asyncio.CancelledError, GarmentFetchError):
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            raise
+        finally:
+            cancel_waiter.cancel()
+            await asyncio.gather(cancel_waiter, return_exceptions=True)
+            if not await registry.is_current(receipt):
+                raise GarmentFetchError("attempt_canceled")
+
+    async def read_captured(self, token: str) -> CapturedFrame | None:
+        return await self._ports.media.read_captured(token)
 
     async def cancel(self, attempt_id: str, reason: str):
-        """Fence an active attempt and revoke its media before publication."""
         p = self._ports
-        terminal = p._generated_v2_envelope(
+        registry = p.registry.current
+        terminal = p.transport.envelope(
             "vision.try_on.attempt.canceled",
             {"attemptId": attempt_id, "reason": reason},
         )
-        transition = await p._try_on_attempt_registry.cancel_current(
+        transition = await registry.cancel_current(
             attempt_id=attempt_id, terminal=terminal
         )
         if transition is None:
             if reason == "route_leave":
-                await p._try_on_attempt_registry.discard_terminal(attempt_id)
-                await self._revoke_media(attempt_id)
+                await registry.revoke_completed_result(attempt_id)
+                await p.media.revoke(attempt_id)
             return None
-        cleanup_errors = await self._revoke_media(attempt_id)
-        owner = p.get_front_camera_owner()
-        token = owner.get("leaseToken")
-        if (
-            owner.get("owner") == "try_on_attempt"
-            and isinstance(token, str)
-            and token.startswith(f"try-on:{attempt_id}:")
-        ):
-            released = p.release_front_camera(
-                "try_on_attempt",
-                reason=f"try_on_canceled:{attempt_id}",
-                lease_token=token,
-            )
-            if not released.get("ok"):
-                cleanup_errors.append(f"front_release:{released.get('error')}")
-        if cleanup_errors:
-            p.logger.warning(
-                "V2 attempt cancellation cleanup completed with errors "
-                "attemptId=%s errors=%s",
-                attempt_id,
-                cleanup_errors,
-            )
-        await p._publish_try_on_transition(transition)
+        await p.media.revoke(attempt_id)
+        await p.camera.wait_released(attempt_id)
+        await p.transport.publish(transition)
         return transition
 
     async def cancel_active(self, reason: str) -> None:
-        """Cancel the currently active attempt, if one exists."""
-        attempt_id = await self._ports._try_on_attempt_registry.active_attempt_id()
+        registry = self._ports.registry.current
+        attempt_id = await registry.active_attempt_id()
         if attempt_id is not None:
             await self.cancel(attempt_id, reason)
+        if reason == "departure":
+            for completed_attempt_id in await registry.revoke_current_owner_results():
+                await self._ports.media.revoke(completed_attempt_id)
 
-    async def adjust(self, websocket, send_lock, message: dict) -> None:
-        """Re-render one completed attempt through its retained source."""
+    async def adjust(
+        self, websocket: object, send_lock: asyncio.Lock, message: dict
+    ) -> None:
         p = self._ports
-        payload = message["payload"]
-        attempt_id = payload["attemptId"]
-        scale = payload["garmentScale"]
-        snapshot = p._try_on_adjustment_store.get(attempt_id)
+        payload = cast(dict[str, object], message["payload"])
+        attempt_id = cast(str, payload["attemptId"])
+        scale = float(cast(float, payload["garmentScale"]))
+        snapshot = p.media.adjustment(attempt_id)
         if snapshot is None:
-            async with send_lock:
-                await p.send_error(
-                    websocket,
-                    code="adjustment_unavailable",
-                    message="the Try-On adjustment source is no longer retained",
-                    retryable=False,
-                    message_id=message.get("messageId"),
-                )
+            await p.transport.send_error(
+                websocket,
+                send_lock,
+                code="adjustment_unavailable",
+                message="the Try-On adjustment source is no longer retained",
+                retryable=False,
+                message_id=cast(str | None, message.get("messageId")),
+            )
             return
         try:
-            result_image = await p.render_attempt_frame(
-                snapshot.frame,
-                snapshot.garment_png,
+            garment = TransparentGarmentSource(
+                png_bytes=snapshot.garment_png,
                 digest=snapshot.garment_digest,
                 template=snapshot.template,
-                timeout=p._TRY_ON_ATTEMPT_TIMEOUT_SECONDS,
-                broker=p._try_on_render_broker,
+            )
+            result_image = await p.render.render(
+                cast(np.ndarray, snapshot.frame),
+                garment,
+                timeout=p.config.render_timeout_seconds,
                 garment_scale=scale,
             )
-            stored_result, _ = p._prepare_try_on_result(attempt_id, result_image)
-            replaced = await p._try_on_attempt_registry.replace_completed_result(
+            stored_result, _ = p.media.prepare_result(attempt_id, result_image)
+            replaced = await p.registry.current.replace_completed_result(
                 attempt_id, stored_result
             )
             if replaced is None:
                 raise RuntimeError("try_on_adjustment_target_unavailable")
-            adjusted = p._generated_v2_envelope(
+            adjusted = p.transport.envelope(
                 "vision.try_on.result.adjusted",
                 {"attemptId": attempt_id, "result": replaced},
             )
-            async with send_lock:
-                await websocket.send_json(adjusted)
-        except (
-            p.PoseUnavailableError,
-            p.AttemptWorkerError,
-            RuntimeError,
-            TimeoutError,
-        ):
-            p.logger.exception(
-                "Try-On adjustment failed attemptId=%s scale=%s",
-                attempt_id,
-                scale,
+            await p.transport.send(websocket, send_lock, adjusted)
+        except (PoseUnavailableError, AttemptWorkerError, RuntimeError, TimeoutError):
+            self._logger.exception(
+                "Try-On adjustment failed attemptId=%s scale=%s", attempt_id, scale
             )
-            async with send_lock:
-                await p.send_error(
-                    websocket,
-                    code="internal_error",
-                    message="the Try-On result could not be adjusted",
-                    retryable=False,
-                    message_id=message.get("messageId"),
-                )
+            await p.transport.send_error(
+                websocket,
+                send_lock,
+                code="internal_error",
+                message="the Try-On result could not be adjusted",
+                retryable=False,
+                message_id=cast(str | None, message.get("messageId")),
+            )
 
-    async def disconnect(self, websocket, owner_receipts, attempt_tasks) -> None:
-        """Finish all attempt cleanup owned by one disconnected transport."""
+    async def disconnect(
+        self,
+        websocket: object,
+        owner_receipts: set[AttemptReceipt],
+        attempt_tasks: set[asyncio.Task],
+    ) -> None:
         p = self._ports
-        await p._await_cleanup_uncancelled(
-            p._try_on_attempt_registry.detach_subscriber(websocket)
-        )
+        registry = p.registry.current
+        await self._await_uncancelled(registry.detach_subscriber(websocket))
         for receipt in list(owner_receipts):
-            transition = await p._try_on_attempt_registry.cancel_owner_and_join(
+            transition = await registry.cancel_owner_and_join(
                 receipt,
-                p._generated_v2_envelope(
+                p.transport.envelope(
                     "vision.try_on.attempt.canceled",
                     {"attemptId": receipt.attempt_id, "reason": "disconnect"},
                 ),
             )
-            await p._publish_try_on_transition(transition)
+            await p.transport.publish(transition)
         if attempt_tasks:
-            await p._await_cleanup_uncancelled(
+            await self._await_uncancelled(
                 asyncio.gather(*list(attempt_tasks), return_exceptions=True)
             )
-        completed_attempt_ids = await p._await_cleanup_uncancelled(
-            p._try_on_attempt_registry.revoke_completed_owner_results(websocket)
+        completed_attempt_ids = await self._await_uncancelled(
+            registry.revoke_completed_owner_results(websocket)
         )
         for attempt_id in completed_attempt_ids:
-            await p._await_cleanup_uncancelled(self._revoke_media(attempt_id))
+            await self._await_uncancelled(p.media.revoke(attempt_id))
+
+    @staticmethod
+    async def _await_uncancelled(awaitable):
+        task = asyncio.ensure_future(awaitable)
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        return task.result()

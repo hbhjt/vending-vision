@@ -63,14 +63,21 @@ from vision.profile_push import collect_front_profile_update, collect_profile_up
 from vision.protocol import APP_VERSION, PROTOCOL, envelope, error_envelope
 from vision.self_check import check_camera, run_self_check
 from vision.session_state import get_vision_session_status
-from vision.garment_composer import GarmentComposer, GarmentFetchError, PoseUnavailableError
+from vision.garment_composer import (
+    GarmentComposer,
+    GarmentFetchError,
+    TransparentGarmentSource,
+)
 from vision.try_on_attempt_registry import AttemptReceipt, TryOnAttemptRegistry, TerminalTransition
 from vision.try_on_adjustment_store import TryOnAdjustmentStore
-from vision.attempt_worker import AttemptWorkerError, TryOnRenderBroker, render_attempt_frame
+from vision.attempt_worker import TryOnRenderBroker, render_attempt_frame
 from vision.acquisition_preview import AcquisitionPreviewStore
 from vision.acquisition_observer import AcquisitionObservationWorker
-from vision.acquisition_session import CapturedFrameStore
-from vision.try_on_attempt_runtime import TryOnAttemptPorts, TryOnAttemptRuntime
+from vision.acquisition_session import CapturedFrame, CapturedFrameStore
+from vision.try_on_attempt_runtime import (
+    TryOnAttemptPorts,
+    TryOnAttemptRuntime,
+)
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
@@ -1603,79 +1610,235 @@ async def reject_v2_try_on_attempt_for_backpressure(
         await _send_json_bounded(websocket, send_lock, replay)
 
 
-class _AppTryOnAttemptPorts:
-    """Narrow, explicit adapter from FastAPI wiring to the attempt runtime."""
+class _AppAttemptRegistry:
+    @property
+    def current(self) -> TryOnAttemptRegistry:
+        return _try_on_attempt_registry
 
-    V2ContractBundleUnavailable = V2ContractBundleUnavailable
-    GarmentFetchError = GarmentFetchError
-    PoseUnavailableError = PoseUnavailableError
-    AttemptWorkerError = AttemptWorkerError
 
-    def __getattribute__(self, name: str):
-        # Mutable runtime adapters are intentionally resolved at use time so
-        # startup replacement and test boundary adapters remain observable.
-        dynamic = {
-            "_try_on_attempt_registry": "_try_on_attempt_registry",
-            "_try_on_render_broker": "_try_on_render_broker",
-            "_acquisition_previews": "_acquisition_previews",
-            "_captured_frames": "_captured_frames",
-            "_try_on_adjustment_store": "_try_on_adjustment_store",
-            "_try_on_runtime": "_try_on_runtime",
-            "logger": "logger",
+class _AppAttemptMedia:
+    @property
+    def preview(self) -> AcquisitionPreviewStore:
+        return _acquisition_previews
+
+    def preview_public(self, token: str) -> dict[str, object]:
+        return {
+            "reference": _acquisition_preview_reference(token),
+            "streamType": "mjpeg",
         }
-        global_name = dynamic.get(name)
-        if global_name is not None:
-            return globals()[global_name]
-        return object.__getattribute__(self, name)
+
+    async def store_captured(
+        self, attempt_id: str, captured: CapturedFrame
+    ) -> dict[str, object]:
+        token = await _captured_frames.admit(attempt_id, captured)
+        return captured.public(_captured_frame_reference(token))
+
+    async def read_captured(self, token: str) -> CapturedFrame | None:
+        return await _captured_frames.get(token)
+
+    async def revoke(self, attempt_id: str) -> None:
+        await _captured_frames.discard(attempt_id)
+        _try_on_adjustment_store.discard(attempt_id)
+        try:
+            await _acquisition_previews.close(attempt_id)
+        except Exception:
+            logger.exception(
+                "Try-On media cleanup failed attemptId=%s", attempt_id
+            )
+
+    def prepare_result(
+        self, attempt_id: str, image: bytes
+    ) -> tuple[dict, dict[str, object]]:
+        return _prepare_try_on_result(attempt_id, image)
+
+    def retain_adjustment(
+        self,
+        attempt_id: str,
+        frame: np.ndarray,
+        garment: TransparentGarmentSource,
+    ) -> None:
+        _try_on_adjustment_store.admit(
+            attempt_id,
+            frame,
+            garment.png_bytes,
+            garment.digest,
+            garment.template,
+        )
+
+    def adjustment(self, attempt_id: str):
+        return _try_on_adjustment_store.get(attempt_id)
+
+
+class _AppAttemptRender:
+    @property
+    def ready(self) -> bool:
+        return bool(_try_on_render_broker.ready)
 
     @property
-    def _ACQUISITION_TIMEOUT_SECONDS(self) -> float:
+    def pose_ready(self) -> bool:
+        return bool(_try_on_render_broker.pose_ready)
+
+    async def fetch_garment(
+        self, descriptor: dict[str, object], cancel_event: asyncio.Event
+    ) -> TransparentGarmentSource:
+        return await _try_on_runtime.fetch_garment(descriptor, cancel_event)
+
+    async def render(
+        self,
+        frame: np.ndarray,
+        garment: TransparentGarmentSource,
+        *,
+        timeout: float,
+        garment_scale: float = 1.0,
+    ) -> bytes:
+        if garment_scale == 1.0:
+            return await render_attempt_frame(
+                frame,
+                garment.png_bytes,
+                digest=garment.digest,
+                template=garment.template,
+                timeout=timeout,
+                broker=_try_on_render_broker,
+            )
+        return await render_attempt_frame(
+            frame,
+            garment.png_bytes,
+            digest=garment.digest,
+            template=garment.template,
+            timeout=timeout,
+            garment_scale=garment_scale,
+            broker=_try_on_render_broker,
+        )
+
+
+class _AppAcquisitionCamera:
+    def __init__(self, receipt: AttemptReceipt) -> None:
+        self._receipt = receipt
+
+    async def acquire(self, attempt_id: str, deadline: float) -> str:
+        lease_token = (
+            f"try-on:{attempt_id}:{self._receipt.generation}:"
+            f"{self._receipt.owner_token}"
+        )
+        await _acquire_front_io_until(deadline)
+        try:
+            owner = acquire_front_camera(
+                "try_on_attempt",
+                reason=f"try_on_acquisition:{attempt_id}",
+                lease_token=lease_token,
+            )
+        finally:
+            release_front_camera_io_lock()
+        if not owner.get("ok"):
+            raise GarmentFetchError(owner.get("error") or "front_camera_busy")
+        return lease_token
+
+    async def read(self, lease_token: str, timeout: float):
+        return await _read_attempt_front_frame(
+            self._receipt, timeout=timeout, lease_token=lease_token
+        )
+
+    async def release(self, attempt_id: str, lease_token: str) -> None:
+        released = release_front_camera(
+            "try_on_attempt",
+            reason=f"try_on_acquisition_done:{attempt_id}",
+            lease_token=lease_token,
+        )
+        if not released.get("ok"):
+            raise RuntimeError(released.get("error") or "front_camera_release_failed")
+
+
+class _AppAttemptCamera:
+    def ready(self) -> bool:
+        return _acquisition_observer_ready()
+
+    def bind(self, receipt: AttemptReceipt) -> _AppAcquisitionCamera:
+        return _AppAcquisitionCamera(receipt)
+
+    def observer(self) -> AcquisitionObservationWorker:
+        return _get_acquisition_observer()
+
+    async def wait_released(self, attempt_id: str) -> bool:
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while asyncio.get_running_loop().time() < deadline:
+            owner = get_front_camera_owner()
+            token = owner.get("leaseToken")
+            if not (
+                owner.get("owner") == "try_on_attempt"
+                and isinstance(token, str)
+                and token.startswith(f"try-on:{attempt_id}:")
+            ):
+                return True
+            await asyncio.sleep(0.001)
+        return False
+
+
+class _AppAttemptTransport:
+    def parse_start(self, message: dict) -> dict[str, object]:
+        parsed = parse_v2_client_message(message)
+        if parsed.type != "vision.try_on.attempt.start":
+            raise ValueError("invalid_v2_boundary_message")
+        return parsed.payload.model_dump()
+
+    def envelope(
+        self, message_type: str, payload: dict[str, object]
+    ) -> dict:
+        return _generated_v2_envelope(message_type, payload)
+
+    async def publish(self, transition: TerminalTransition | None) -> None:
+        await _publish_try_on_transition(transition)
+
+    async def send(
+        self, websocket: WebSocket, send_lock: asyncio.Lock, message: dict
+    ) -> None:
+        await _send_json_bounded(websocket, send_lock, message)
+
+    async def send_error(
+        self,
+        websocket: WebSocket,
+        send_lock: asyncio.Lock,
+        *,
+        code: str,
+        message: str,
+        retryable: bool,
+        message_id: str | None,
+    ) -> None:
+        async with send_lock:
+            await send_error(
+                websocket,
+                code=code,
+                message=message,
+                retryable=retryable,
+                message_id=message_id,
+            )
+
+
+class _AppAttemptConfig:
+    @property
+    def acquisition_timeout_seconds(self) -> float:
         return _ACQUISITION_TIMEOUT_SECONDS
 
     @property
-    def _ACQUISITION_HOLD_SECONDS(self) -> float:
+    def acquisition_hold_seconds(self) -> float:
         return _ACQUISITION_HOLD_SECONDS
 
     @property
-    def _ACQUISITION_POLL_SECONDS(self) -> float:
+    def acquisition_poll_seconds(self) -> float:
         return _ACQUISITION_POLL_SECONDS
 
     @property
-    def _TRY_ON_ATTEMPT_TIMEOUT_SECONDS(self) -> float:
+    def render_timeout_seconds(self) -> float:
         return _TRY_ON_ATTEMPT_TIMEOUT_SECONDS
 
-    @property
-    def render_attempt_frame(self):
-        return render_attempt_frame
 
-    def __getattr__(self, name: str):
-        allowed = {
-            "parse_v2_client_message",
-            "send_error",
-            "_acquisition_observer_ready",
-            "_generated_v2_envelope",
-            "_publish_try_on_transition",
-            "_send_json_bounded",
-            "_acquire_front_io_until",
-            "acquire_front_camera",
-            "release_front_camera_io_lock",
-            "_acquiring_message",
-            "_read_attempt_front_frame",
-            "_get_acquisition_observer",
-            "_captured_frame_reference",
-            "_release_acquisition_resources",
-            "_run_owned_attempt_step",
-            "_prepare_try_on_result",
-            "get_front_camera_owner",
-            "release_front_camera",
-            "_await_cleanup_uncancelled",
-        }
-        if name not in allowed:
-            raise AttributeError(name)
-        return globals()[name]
-
-
-_try_on_attempt_ports: TryOnAttemptPorts = _AppTryOnAttemptPorts()
+_try_on_attempt_ports = TryOnAttemptPorts(
+    registry=_AppAttemptRegistry(),
+    media=_AppAttemptMedia(),
+    render=_AppAttemptRender(),
+    camera=_AppAttemptCamera(),
+    transport=_AppAttemptTransport(),
+    config=_AppAttemptConfig(),
+)
 _try_on_attempt_runtime_module = TryOnAttemptRuntime(_try_on_attempt_ports)
 
 

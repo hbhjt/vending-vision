@@ -9,6 +9,111 @@ from vision.acquisition_observer import AcquisitionObservation
 from vision.acquisition_session import AcquisitionSession
 
 
+class _LeaseCamera:
+    def __init__(self, read_frame):
+        self._read_frame = read_frame
+        self.acquired = asyncio.Event()
+        self.read_started = asyncio.Event()
+        self.released = asyncio.Event()
+        self.tokens = []
+
+    async def acquire(self, _attempt_id, _deadline):
+        token = f"lease-{len(self.tokens) + 1}"
+        self.tokens.append(token)
+        self.acquired.set()
+        return token
+
+    async def read(self, token, timeout):
+        assert token == self.tokens[-1]
+        self.read_started.set()
+        return await self._read_frame(timeout)
+
+    async def release(self, _attempt_id, token):
+        assert token == self.tokens[-1]
+        self.released.set()
+
+
+class _Observer:
+    def __init__(self, observe):
+        self._observe = observe
+
+    async def observe(self, frame, timeout):
+        return await self._observe(frame, timeout)
+
+    async def wait_idle(self):
+        return None
+
+
+class _Preview:
+    def __init__(self, open_preview=None, update_preview=None):
+        self._open_preview = open_preview
+        self._update_preview = update_preview
+
+    async def open(self, attempt_id, jpeg):
+        if self._open_preview is not None:
+            return await self._open_preview(attempt_id, jpeg)
+        return "preview-token"
+
+    async def update(self, attempt_id, token, jpeg):
+        if self._update_preview is not None:
+            return await self._update_preview(attempt_id, token, jpeg)
+        return True
+
+    async def close(self, _attempt_id):
+        return None
+
+
+@pytest.mark.parametrize("outcome", ["success", "timeout", "cancel"])
+def test_acquisition_session_owns_camera_lease_lifetime(outcome):
+    """Every public acquisition outcome releases the lease it acquired."""
+
+    async def scenario():
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        hold_observation = asyncio.Event()
+
+        async def read_frame(_timeout):
+            return frame, {"source": "recorded_video"}
+
+        async def observe(_frame, _timeout):
+            if outcome == "cancel":
+                await hold_observation.wait()
+            return AcquisitionObservation(
+                b"unused", "single", outcome != "timeout"
+            )
+
+        camera = _LeaseCamera(read_frame)
+        session = AcquisitionSession(
+            attempt_id="attempt",
+            camera=camera,
+            observer=_Observer(observe),
+            preview=_Preview(),
+            publish=lambda *_fact: asyncio.sleep(0),
+            stable_seconds=0,
+            timeout_seconds=0.03,
+            preview_interval_seconds=0.001,
+        )
+        task = asyncio.create_task(
+            session.acquire(
+                manual_requested=lambda: asyncio.sleep(0, result=False),
+                consume_manual=lambda: asyncio.sleep(0),
+            )
+        )
+        await asyncio.wait_for(camera.acquired.wait(), timeout=0.5)
+        if outcome == "cancel":
+            await asyncio.wait_for(camera.read_started.wait(), timeout=0.5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif outcome == "timeout":
+            with pytest.raises(asyncio.TimeoutError):
+                await task
+        else:
+            assert (await task).frame_id.startswith("frame-")
+        assert camera.released.is_set()
+
+    asyncio.run(scenario())
+
+
 def test_slow_observer_does_not_freeze_preview_and_capture_uses_a_newer_checked_frame():
     """A blocked inference boundary cannot turn preview into a stale still."""
 
@@ -49,10 +154,9 @@ def test_slow_observer_does_not_freeze_preview_and_capture_uses_a_newer_checked_
 
         session = AcquisitionSession(
             attempt_id="attempt",
-            read_frame=read_frame,
-            observe=observe,
-            preview_open=open_preview,
-            preview_update=update_preview,
+            camera=_LeaseCamera(read_frame),
+            observer=_Observer(observe),
+            preview=_Preview(open_preview, update_preview),
             publish=publish,
             stable_seconds=0.02,
             timeout_seconds=2,
@@ -107,10 +211,9 @@ def test_countdown_truth_restarts_after_instability_and_captures_only_after_one_
 
         session = AcquisitionSession(
             attempt_id="attempt",
-            read_frame=read_frame,
-            observe=observe,
-            preview_open=preview_open,
-            preview_update=preview_update,
+            camera=_LeaseCamera(read_frame),
+            observer=_Observer(observe),
+            preview=_Preview(preview_open, preview_update),
             publish=publish,
             stable_seconds=3,
             timeout_seconds=6,
@@ -146,7 +249,15 @@ def test_manual_capture_does_not_bypass_single_person_alignment():
         async def open(_id, _jpeg): return "token"
         async def update(_id, _token, _jpeg): return True
         async def publish(*fact): published.append(fact)
-        session = AcquisitionSession(attempt_id="a", read_frame=frame, observe=observe, preview_open=open, preview_update=update, publish=publish, timeout_seconds=0.05, preview_interval_seconds=0.001)
+        session = AcquisitionSession(
+            attempt_id="a",
+            camera=_LeaseCamera(frame),
+            observer=_Observer(observe),
+            preview=_Preview(open, update),
+            publish=publish,
+            timeout_seconds=0.05,
+            preview_interval_seconds=0.001,
+        )
         with pytest.raises(asyncio.TimeoutError):
             await session.acquire(manual_requested=lambda: asyncio.sleep(0, result=True), consume_manual=lambda: asyncio.sleep(0))
         assert any(fact[2] == "align" for fact in published)

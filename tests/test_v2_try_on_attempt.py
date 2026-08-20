@@ -35,22 +35,31 @@ def test_try_on_attempt_runtime_uses_explicit_ports_and_owns_attempt_lifecycle()
     import vision.try_on_attempt_runtime as attempt_runtime
 
     app_source = Path(vision_app.__file__).read_text("utf-8")
+    runtime_source = Path(attempt_runtime.__file__).read_text("utf-8")
     constructor = inspect.signature(attempt_runtime.TryOnAttemptRuntime.__init__)
 
     assert "sys.modules" not in app_source
+    assert "globals()" not in app_source
+    assert "from typing import Any" not in runtime_source
     assert constructor.parameters["ports"].annotation in {
         "TryOnAttemptPorts",
         attempt_runtime.TryOnAttemptPorts,
     }
     assert constructor.parameters["ports"].annotation != "Any"
-    assert {
-        "_try_on_attempt_registry",
-        "_try_on_render_broker",
-        "_captured_frames",
-        "_try_on_adjustment_store",
-        "parse_v2_client_message",
-        "render_attempt_frame",
-    } <= set(attempt_runtime.TryOnAttemptPorts.__annotations__)
+    assert set(attempt_runtime.TryOnAttemptPorts.__annotations__) == {
+        "registry",
+        "media",
+        "render",
+        "camera",
+        "transport",
+        "config",
+    }
+    assert "_AppTryOnAttemptPorts" not in app_source
+    assert "_try_on_attempt_ports = TryOnAttemptPorts(" in app_source
+    assert "_acquire_front_io_until" not in runtime_source
+    assert "_release_acquisition_resources" not in runtime_source
+    assert "acquire_front_camera" not in runtime_source
+    assert "release_front_camera" not in runtime_source
     assert {
         "adjust",
         "cancel",
@@ -381,13 +390,22 @@ class _RuntimeAsyncioClock:
 class _TimeoutingAcquisitionSession:
     """Public acquisition adapter which records the runtime's remaining budget."""
 
-    requested_timeouts = []
+    requested_timeouts: list[float] = []
+    clock: _ControlledMonotonicLoop | None = None
 
-    def __init__(self, *, timeout_seconds, **_kwargs):
-        self.requested_timeouts.append(timeout_seconds)
+    def __init__(self, *, camera, attempt_id, deadline, **_kwargs):
+        self.camera = camera
+        self.attempt_id = attempt_id
+        self.deadline = deadline
 
     async def acquire(self, **_kwargs):
-        raise asyncio.TimeoutError()
+        token = await self.camera.acquire(self.attempt_id, self.deadline)
+        try:
+            assert self.clock is not None
+            self.requested_timeouts.append(self.deadline - self.clock.now)
+            raise asyncio.TimeoutError()
+        finally:
+            await self.camera.release(self.attempt_id, token)
 
 
 def _envelope(message_type, payload):
@@ -620,6 +638,132 @@ def test_v2_route_leave_retires_completed_attempt_media_capabilities(
         assert client.get(preview_reference).status_code == 404
         assert client.get(captured_reference).status_code == 404
         assert client.get(result_reference).status_code == 404
+
+        with client.websocket_connect("/ws") as replay:
+            replay.send_json(_hello(manifest))
+            assert replay.receive_json()["type"] == "vision.ready"
+            replay.send_json(_start(attempt_id, garment_reference))
+            replayed_terminal = replay.receive_json()
+            replay.send_json(
+                _envelope(
+                    "vision.try_on.attempt.adjust",
+                    {"attemptId": attempt_id, "garmentScale": 1.05},
+                )
+            )
+            adjustment_error = replay.receive_json()
+
+    assert replayed_terminal == event
+    assert adjustment_error["type"] == "vision.error"
+    assert adjustment_error["payload"]["code"] == "adjustment_unavailable"
+
+
+def test_v2_departure_retires_completed_attempt_media_but_replays_its_terminal(
+    monkeypatch, garment_reference
+):
+    """A completed customer's departure revokes media without reopening identity."""
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    depart = threading.Event()
+    departed_once = threading.Event()
+
+    def collect_departure(_status, _ambient, include_departure):
+        if depart.is_set() and include_departure and not departed_once.is_set():
+            departed_once.set()
+            return {
+                "message_type": "vision.person_departed",
+                "payload": {
+                    "source": "top",
+                    "reason": "no_person",
+                    "occupancy": {"state": "none"},
+                },
+            }
+        return None
+
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", True)
+    monkeypatch.setattr(vision_app.settings, "MOCK_SCENARIO", "departure-test")
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 5)
+    monkeypatch.setattr(vision_app, "collect_profile_update", collect_departure)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
+    monkeypatch.setattr(vision_app, "_acquisition_observer", _SingleAlignedObserver())
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "tryOnReady": True,
+            "tryOnPoseReady": True,
+        },
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "read_camera_with_source",
+        lambda *_args, **_kwargs: (
+            np.full((24, 24, 3), 90, dtype=np.uint8),
+            {"source": "recorded_video"},
+        ),
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "render_attempt_frame",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=_png_bytes()),
+    )
+    attempt_id = str(uuid4())
+
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json(
+                _hello_with_capabilities(manifest, ["try_on", "person_departed"])
+            )
+            assert socket.receive_json()["type"] == "vision.ready"
+            socket.send_json(_start(attempt_id, garment_reference))
+            assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+            captured_reference = result_reference = None
+            completed = None
+            while completed is None:
+                event = socket.receive_json()
+                if event["type"] == "vision.try_on.attempt.captured":
+                    captured_reference = event["payload"]["captured"]["reference"]
+                elif event["type"] == "vision.try_on.attempt.completed":
+                    result_reference = event["payload"]["result"]["reference"]
+                    completed = event
+                else:
+                    assert event["type"] in {
+                        "vision.try_on.attempt.acquiring",
+                        "vision.try_on.attempt.generating",
+                    }
+            assert captured_reference is not None
+            assert result_reference is not None
+            assert client.get(captured_reference).status_code == 200
+            assert client.get(result_reference).status_code == 200
+
+            depart.set()
+            while socket.receive_json()["type"] != "vision.person_departed":
+                pass
+
+            assert client.get(captured_reference).status_code == 404
+            assert client.get(result_reference).status_code == 404
+
+        with client.websocket_connect("/ws") as replay:
+            replay.send_json(_hello_with_capabilities(manifest, ["try_on"]))
+            assert replay.receive_json()["type"] == "vision.ready"
+            replay.send_json(_start(attempt_id, garment_reference))
+            assert replay.receive_json() == completed
+            replay.send_json(
+                _envelope(
+                    "vision.try_on.attempt.adjust",
+                    {"attemptId": attempt_id, "garmentScale": 1.05},
+                )
+            )
+            adjustment_error = replay.receive_json()
+
+    assert departed_once.is_set()
+    assert adjustment_error["type"] == "vision.error"
+    assert adjustment_error["payload"]["code"] == "adjustment_unavailable"
 
 
 def test_v2_disconnect_retires_only_its_completed_attempt_media_and_replays_terminal(
@@ -2049,6 +2193,7 @@ def test_v2_acquisition_budget_starts_at_admission_and_survives_a_contended_io_l
     )
     clock = _ControlledMonotonicLoop()
     _TimeoutingAcquisitionSession.requested_timeouts = []
+    _TimeoutingAcquisitionSession.clock = clock
 
     async def contended_lease(deadline):
         assert deadline == pytest.approx(30.0)
