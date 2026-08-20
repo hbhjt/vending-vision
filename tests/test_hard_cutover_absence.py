@@ -104,7 +104,7 @@ FORBIDDEN_PATTERNS = (
 
 STANDALONE_PROVENANCE_ALLOWANCES = {
     (ROOT / "fixtures/recorded-video/README.md").resolve(): {
-        "sha256": "e2076983553408705fe4e5f17d2f252f9ef14b3ebf5d31f1690a26ea1aa56960",
+        "sha256": "a65e04230edc74228419c3fcf509aafee3f8e186aa2b29ce650a9355a70094f2",
         "occurrences": {"standalone-repository-url": 1},
     },
 }
@@ -798,6 +798,43 @@ def _recorded_fixture_entry(path: str, payload: bytes) -> dict[str, str]:
 def test_retired_vision_session_and_v1_surface_is_absent():
     assert not (ROOT / "vision" / "try_on_session.py").exists()
     assert find_violations(ROOT) == []
+
+
+def test_recorded_geometry_videos_have_individual_digest_allowlist_entries():
+    """Each dynamic geometry clip is independently approved, never by a prefix."""
+    allowlist = json.loads((ROOT / BINARY_ALLOWLIST_NAME).read_text("utf-8"))
+    entries = {entry["path"]: entry for entry in allowlist["entries"]}
+    for filename in ("geometry-far.mp4", "geometry-mid.mp4", "geometry-near.mp4"):
+        path = f"fixtures/recorded-video/{filename}"
+        assert entries[path] == _recorded_fixture_entry(
+            path, (ROOT / path).read_bytes()
+        )
+
+
+@pytest.mark.parametrize("duplicate", (False, True), ids=("changed-bytes", "second-reference-url"))
+def test_standalone_provenance_allowance_rejects_changed_bytes_and_second_url(
+    tmp_path, monkeypatch, duplicate
+):
+    """The one approved provenance reference is pinned to exact README bytes."""
+    _init_guard_repo(tmp_path)
+    readme = tmp_path / "fixtures/recorded-video/README.md"
+    readme.parent.mkdir(parents=True)
+    reference = "https://github.com/hbhjt/" + "virtual-tryon\n"
+    original = reference
+    readme.write_text(original, "utf-8")
+    subprocess.run(["git", "add", str(readme.relative_to(tmp_path))], cwd=tmp_path, check=True)
+    monkeypatch.setitem(
+        STANDALONE_PROVENANCE_ALLOWANCES,
+        readme.resolve(),
+        {
+            "sha256": hashlib.sha256(original.encode()).hexdigest(),
+            "occurrences": {"standalone-repository-url": 1},
+        },
+    )
+    assert find_violations(tmp_path) == []
+
+    readme.write_text(reference + reference if duplicate else "fixture provenance changed\n", "utf-8")
+    assert f"{readme}: standalone-provenance-integrity" in find_violations(tmp_path)
 
 
 def test_hard_cutover_guard_rejects_new_retired_try_on_path(tmp_path):
