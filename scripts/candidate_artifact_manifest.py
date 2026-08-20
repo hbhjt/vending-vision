@@ -66,6 +66,30 @@ _MODEL_ARTIFACT_SUFFIXES = {
     ".tflite",
 }
 
+# Exact model-shaped runtime data from the locked mediapipe 0.10.14
+# cp311-win_amd64 wheel (whose digest is pinned in requirements.txt).
+# These canonical candidate paths bind copied bytes; they do not permit a
+# prefix, suffix, or alternate dependency version generally.
+DEPENDENCY_MODEL_DATA_WHEEL_SHA256 = (
+    "1b7687d3b63590bcc601ad195b923b80a1b2d6be5cdf43711edc661cecd3dd47"
+)
+DEPENDENCY_MODEL_DATA_ALLOWLIST = {
+    "vending-vision/_internal/mediapipe/modules/face_detection/face_detection_full_range_sparse.tflite": (676746, "2c3728e6da56f21e21a320433396fb06d40d9088f2247c05e5635a688d45dfe1"),
+    "vending-vision/_internal/mediapipe/modules/face_detection/face_detection_short_range.tflite": (229714, "bbff11cebd1eb27a1e004cae0b0e63ec8c551cbf34a4451148b4908b8db3eca8"),
+    "vending-vision/_internal/mediapipe/modules/face_landmark/face_landmark.tflite": (1242398, "1055cb9d4a9ca8b8c688902a3a5194311138ba256bcc94e336d8373a5f30c814"),
+    "vending-vision/_internal/mediapipe/modules/face_landmark/face_landmark_with_attention.tflite": (2495106, "e06a804e0144f9929eda782122916b35d60c697c3c9344013ca2bbe76a6ce2b4"),
+    "vending-vision/_internal/mediapipe/modules/hand_landmark/hand_landmark_full.tflite": (5478917, "11c272b891e1a99ab034208e23937a8008388cf11ed2a9d776ed3d01d0ba00e3"),
+    "vending-vision/_internal/mediapipe/modules/hand_landmark/hand_landmark_lite.tflite": (2071597, "048edd3645c9bf7397d19a9f6e3a42957d6e414c9bea6598030a2e9b624156e6"),
+    "vending-vision/_internal/mediapipe/modules/holistic_landmark/hand_recrop.tflite": (123792, "67d996ce96f9d36fe17d2693022c6da93168026ab2f028f9e2365398d8ac7d5d"),
+    "vending-vision/_internal/mediapipe/modules/iris_landmark/iris_landmark.tflite": (2640568, "d1744d2a09c25f501d39eba4faff47e53ecca8852c5ce19bce8eeac39357521f"),
+    "vending-vision/_internal/mediapipe/modules/palm_detection/palm_detection_full.tflite": (2339846, "1b14e9422c6ad006cde6581a46c8b90dd573c07ab7f3934b5589e7cea3f89a54"),
+    "vending-vision/_internal/mediapipe/modules/palm_detection/palm_detection_lite.tflite": (1985440, "e9a4aaddf90dda56a87235303cf00e4c2d3fb28725f68fd88772997dac905c18"),
+    "vending-vision/_internal/mediapipe/modules/pose_detection/pose_detection.tflite": (2959046, "9ba9dd3d42efaaba86b4ff0122b06f29c4122e756b329d89dca1e297fd8f866c"),
+    "vending-vision/_internal/mediapipe/modules/pose_landmark/pose_landmark_full.tflite": (6440512, "e9a5c5cb17f736fafd4c2ec1da3b3d331d6edbe8a0d32395855aeb2cdfd64b9f"),
+    "vending-vision/_internal/mediapipe/modules/selfie_segmentation/selfie_segmentation.tflite": (249505, "9ee168ec7c8f2a16c56fe8e1cfbc514974cbbb7e434051b455635f1bd1462f5c"),
+    "vending-vision/_internal/mediapipe/modules/selfie_segmentation/selfie_segmentation_landscape.tflite": (250145, "a77d03f4659b9f6b6c1f5106947bf40e99d7655094b6527f214ea7d451106edd"),
+}
+
 
 class GzipPackageData(TypedDict):
     compressedSha256: str
@@ -195,14 +219,27 @@ def audit_packaged_model_files(payload: list[tuple[str, Path]]) -> None:
         or not all(re.fullmatch(r"[0-9a-f]{64}", digest) for digest in declared.values())
     ):
         raise RuntimeError("candidate_model_manifest")
+    expected_model_artifacts = {
+        **declared,
+        **{
+            path: digest
+            for path, (_, digest) in DEPENDENCY_MODEL_DATA_ALLOWLIST.items()
+        },
+    }
     packaged_model_artifacts = {
         relative
         for relative in by_relative
         if PurePosixPath(relative).suffix.casefold() in _MODEL_ARTIFACT_SUFFIXES
     }
-    if packaged_model_artifacts != set(declared):
+    if packaged_model_artifacts != set(expected_model_artifacts):
         raise RuntimeError("candidate_model_set")
-    if any(_sha256(by_relative[relative]) != digest for relative, digest in declared.items()):
+    if any(
+        _sha256(by_relative[relative]) != digest
+        for relative, digest in expected_model_artifacts.items()
+    ) or any(
+        by_relative[relative].stat().st_size != size
+        for relative, (size, _) in DEPENDENCY_MODEL_DATA_ALLOWLIST.items()
+    ):
         raise RuntimeError("candidate_model_digest")
 
 

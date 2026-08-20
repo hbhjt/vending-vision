@@ -303,6 +303,35 @@ def _copy_candidate_models(repository, dist):
     )
 
 
+def _without_dependency_model_data(monkeypatch):
+    import scripts.candidate_artifact_manifest as manifest
+
+    monkeypatch.setattr(manifest, "DEPENDENCY_MODEL_DATA_ALLOWLIST", {})
+
+
+def _current_model_payload_with_locked_dependency_data():
+    from scripts.candidate_artifact_manifest import DEPENDENCY_MODEL_DATA_ALLOWLIST
+
+    model_root = ROOT / "models"
+    payload = [
+        (
+            "vending-vision/_internal/models/" + path.relative_to(model_root).as_posix(),
+            path,
+        )
+        for path in model_root.rglob("*")
+        if path.is_file()
+    ]
+    mediapipe_root = ROOT / ".venv" / "lib" / "python3.11" / "site-packages"
+    payload.extend(
+        (
+            relative_path,
+            mediapipe_root / relative_path.removeprefix("vending-vision/_internal/"),
+        )
+        for relative_path in DEPENDENCY_MODEL_DATA_ALLOWLIST
+    )
+    return payload
+
+
 def _write_packaged_build_marker(dist, source_commit):
     from vision.build_identity import write_packaged_build_identity
 
@@ -330,12 +359,13 @@ def test_packaged_commit_identity_keeps_production_config_version_parseable(
 
 
 def test_candidate_archive_write_is_deterministic_and_binds_clean_head_and_build_marker(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
     from scripts.candidate_artifact_manifest import (
         EMBEDDED_MANIFEST,
         write_candidate_archive,
     )
+    _without_dependency_model_data(monkeypatch)
 
     repository = tmp_path / "repository"
     source_commit = _init_candidate_repository(repository)
@@ -441,9 +471,10 @@ def test_candidate_archive_rejects_commit_marker_mismatch_and_dirty_head(tmp_pat
 
 
 def test_candidate_archive_rejects_nonignored_untracked_and_allows_ignored_outputs(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
     from scripts.candidate_artifact_manifest import write_candidate_archive
+    _without_dependency_model_data(monkeypatch)
 
     repository = tmp_path / "repository"
     source_commit = _init_candidate_repository(repository)
@@ -479,9 +510,10 @@ def test_candidate_archive_rejects_nonignored_untracked_and_allows_ignored_outpu
 
 
 def test_candidate_archive_allows_only_the_build_core_venv_as_ignored_output(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
     from scripts.candidate_artifact_manifest import write_candidate_archive
+    _without_dependency_model_data(monkeypatch)
 
     assert ".venv-packaging-core/" in (ROOT / ".gitignore").read_text("utf-8")
 
@@ -524,8 +556,9 @@ def test_candidate_archive_allows_only_the_build_core_venv_as_ignored_output(
         )
 
 
-def test_candidate_source_ignores_only_root_release_workspaces(tmp_path):
+def test_candidate_source_ignores_only_root_release_workspaces(tmp_path, monkeypatch):
     from scripts.candidate_artifact_manifest import write_candidate_archive
+    _without_dependency_model_data(monkeypatch)
 
     assert "/.venv-packaging-core/" in (ROOT / ".gitignore").read_text("utf-8")
     assert "/wheelhouse/" in (ROOT / ".gitignore").read_text("utf-8")
@@ -709,9 +742,10 @@ def test_candidate_archive_rejects_package_without_bound_model_manifest(tmp_path
     ),
 )
 def test_candidate_archive_binds_model_path_role_and_digest_to_clean_source_manifest(
-    tmp_path, field, value
+    tmp_path, field, value, monkeypatch
 ):
     from scripts.candidate_artifact_manifest import write_candidate_archive
+    _without_dependency_model_data(monkeypatch)
 
     repository = tmp_path / "repository"
     source_commit = _init_candidate_repository(repository)
@@ -1052,8 +1086,11 @@ def test_candidate_archive_rejects_each_retired_runtime_distribution_metadata(
         audit_packaged_archives([("vending-vision/_internal/base_library.zip", archive)])
 
 
-def test_candidate_models_reject_weight_not_declared_by_packaged_manifest(tmp_path):
+def test_candidate_models_reject_weight_not_declared_by_packaged_manifest(
+    tmp_path, monkeypatch
+):
     from scripts.candidate_artifact_manifest import audit_packaged_model_files
+    _without_dependency_model_data(monkeypatch)
 
     declared = tmp_path / "declared.onnx"
     declared.write_bytes(b"declared")
@@ -1100,9 +1137,10 @@ def test_candidate_models_reject_weight_not_declared_by_packaged_manifest(tmp_pa
     ),
 )
 def test_candidate_models_reject_model_suffix_outside_canonical_directory(
-    tmp_path, relative_path
+    tmp_path, relative_path, monkeypatch
 ):
     from scripts.candidate_artifact_manifest import audit_packaged_model_files
+    _without_dependency_model_data(monkeypatch)
 
     model_root = ROOT / "models"
     payload = [
@@ -1122,7 +1160,10 @@ def test_candidate_models_reject_model_suffix_outside_canonical_directory(
 
 
 def test_candidate_models_accept_exact_current_production_manifest():
-    from scripts.candidate_artifact_manifest import audit_packaged_model_files
+    from scripts.candidate_artifact_manifest import (
+        DEPENDENCY_MODEL_DATA_ALLOWLIST,
+        audit_packaged_model_files,
+    )
 
     model_root = ROOT / "models"
     payload = [
@@ -1133,8 +1174,137 @@ def test_candidate_models_accept_exact_current_production_manifest():
         for path in model_root.rglob("*")
         if path.is_file()
     ]
+    mediapipe_root = ROOT / ".venv" / "lib" / "python3.11" / "site-packages"
+    payload.extend(
+        (
+            relative_path,
+            mediapipe_root / relative_path.removeprefix("vending-vision/_internal/"),
+        )
+        for relative_path in DEPENDENCY_MODEL_DATA_ALLOWLIST
+    )
 
     audit_packaged_model_files(payload)
+
+
+def test_candidate_models_accept_exact_locked_mediapipe_dependency_data():
+    from scripts.candidate_artifact_manifest import (
+        DEPENDENCY_MODEL_DATA_ALLOWLIST,
+        audit_packaged_model_files,
+    )
+
+    model_root = ROOT / "models"
+    payload = [
+        (
+            "vending-vision/_internal/models/" + path.relative_to(model_root).as_posix(),
+            path,
+        )
+        for path in model_root.rglob("*")
+        if path.is_file()
+    ]
+    mediapipe_root = ROOT / ".venv" / "lib" / "python3.11" / "site-packages"
+    for relative_path in DEPENDENCY_MODEL_DATA_ALLOWLIST:
+        source = mediapipe_root / relative_path.removeprefix("vending-vision/_internal/")
+        assert source.is_file(), source
+        payload.append((relative_path, source))
+
+    audit_packaged_model_files(payload)
+
+
+def test_candidate_models_rejects_locked_mediapipe_dependency_byte_mutation(tmp_path):
+    from scripts.candidate_artifact_manifest import (
+        DEPENDENCY_MODEL_DATA_ALLOWLIST,
+        audit_packaged_model_files,
+    )
+
+    model_root = ROOT / "models"
+    payload = [
+        (
+            "vending-vision/_internal/models/" + path.relative_to(model_root).as_posix(),
+            path,
+        )
+        for path in model_root.rglob("*")
+        if path.is_file()
+    ]
+    relative_path = next(iter(DEPENDENCY_MODEL_DATA_ALLOWLIST))
+    mediapipe_root = ROOT / ".venv" / "lib" / "python3.11" / "site-packages"
+    payload.extend(
+        (
+            dependency_path,
+            mediapipe_root / dependency_path.removeprefix("vending-vision/_internal/"),
+        )
+        for dependency_path in DEPENDENCY_MODEL_DATA_ALLOWLIST
+        if dependency_path != relative_path
+    )
+    mutation = tmp_path / "mutated.tflite"
+    mutation.write_bytes(b"changed dependency model")
+    payload.append((relative_path, mutation))
+
+    with pytest.raises(RuntimeError, match="candidate_model_digest"):
+        audit_packaged_model_files(payload)
+
+
+def test_dependency_model_data_allowlist_is_exactly_locked_mediapipe_014_data():
+    from scripts.candidate_artifact_manifest import (
+        DEPENDENCY_MODEL_DATA_ALLOWLIST,
+        DEPENDENCY_MODEL_DATA_WHEEL_SHA256,
+    )
+
+    assert len(DEPENDENCY_MODEL_DATA_ALLOWLIST) == 14
+    assert all(
+        path.startswith("vending-vision/_internal/mediapipe/modules/")
+        and path.endswith(".tflite")
+        and isinstance(size, int)
+        and len(digest) == 64
+        for path, (size, digest) in DEPENDENCY_MODEL_DATA_ALLOWLIST.items()
+    )
+    requirements = (ROOT / "requirements.txt").read_text("utf-8")
+    assert "mediapipe==0.10.14 \\" in requirements
+    assert DEPENDENCY_MODEL_DATA_WHEEL_SHA256 in requirements
+
+
+def test_candidate_models_rejects_missing_renamed_or_extra_dependency_model_data(
+    tmp_path,
+):
+    from scripts.candidate_artifact_manifest import (
+        DEPENDENCY_MODEL_DATA_ALLOWLIST,
+        audit_packaged_model_files,
+    )
+
+    payload = _current_model_payload_with_locked_dependency_data()
+    dependency_path = next(iter(DEPENDENCY_MODEL_DATA_ALLOWLIST))
+
+    missing = [(path, file) for path, file in payload if path != dependency_path]
+    with pytest.raises(RuntimeError, match="candidate_model_set"):
+        audit_packaged_model_files(missing)
+
+    renamed = [
+        (
+            "vending-vision/_internal/mediapipe/alternate/renamed.tflite"
+            if path == dependency_path
+            else path,
+            file,
+        )
+        for path, file in payload
+    ]
+    with pytest.raises(RuntimeError, match="candidate_model_set"):
+        audit_packaged_model_files(renamed)
+
+    extra = tmp_path / "extra.tflite"
+    extra.write_bytes(b"not a locked dependency model")
+    with pytest.raises(RuntimeError, match="candidate_model_set"):
+        audit_packaged_model_files(
+            [*payload, ("vending-vision/_internal/mediapipe/modules/extra.tflite", extra)]
+        )
+
+    size_mutation = tmp_path / "size-mutated.tflite"
+    size_mutation.write_bytes(b"short")
+    with pytest.raises(RuntimeError, match="candidate_model_digest"):
+        audit_packaged_model_files(
+            [
+                (path, size_mutation if path == dependency_path else file)
+                for path, file in payload
+            ]
+        )
 
 
 def test_windows_build_preserves_the_single_core_supply_chain_gates():
