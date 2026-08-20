@@ -19,7 +19,6 @@ import json
 import ipaddress
 import re
 import secrets
-import sys
 import threading
 from datetime import datetime
 from json import JSONDecodeError
@@ -71,7 +70,7 @@ from vision.attempt_worker import AttemptWorkerError, TryOnRenderBroker, render_
 from vision.acquisition_preview import AcquisitionPreviewStore
 from vision.acquisition_observer import AcquisitionObservationWorker
 from vision.acquisition_session import CapturedFrameStore
-from vision.try_on_attempt_runtime import TryOnAttemptRuntime
+from vision.try_on_attempt_runtime import TryOnAttemptPorts, TryOnAttemptRuntime
 from vision.v2_contract_bundle import (
     V2ContractBundleUnavailable,
     load_v2_contract_identity,
@@ -104,7 +103,7 @@ _try_on_render_broker = TryOnRenderBroker()
 _acquisition_previews = AcquisitionPreviewStore()
 _captured_frames = CapturedFrameStore()
 _acquisition_observer: AcquisitionObservationWorker | None = None
-_try_on_attempt_runtime_module = TryOnAttemptRuntime(sys.modules[__name__])
+_try_on_attempt_runtime_module: TryOnAttemptRuntime
 _ACQUISITION_TIMEOUT_SECONDS = 30.0
 # 首次识别到稳定后展示 3 秒倒计时，倒计时期间若再次失稳则重新计时；
 # 手动拍照仍可在对齐窗口内立即触发，不受该倒计时限制。
@@ -206,17 +205,6 @@ async def _await_cleanup_uncancelled(awaitable):
         except asyncio.CancelledError:
             continue
     return task.result()
-
-
-async def _cancel_disconnect_owner_and_publish(receipt: AttemptReceipt) -> None:
-    transition = await _try_on_attempt_registry.cancel_owner_and_join(
-        receipt,
-        _generated_v2_envelope(
-            "vision.try_on.attempt.canceled",
-            {"attemptId": receipt.attempt_id, "reason": "disconnect"},
-        ),
-    )
-    await _publish_try_on_transition(transition)
 
 
 async def _run_owned_attempt_step(receipt: AttemptReceipt, operation, *, timeout: float):
@@ -600,7 +588,9 @@ async def read_captured_frame(request: Request, token: Optional[str] = None):
     raw_query = request.scope.get("query_string", b"")
     if not isinstance(raw_query, bytes) or not re.fullmatch(rb"token=[A-Za-z0-9_-]{1,128}", raw_query):
         raise HTTPException(status_code=404, detail="captured frame not found")
-    captured = await _captured_frames.get(raw_query[6:].decode("ascii"))
+    captured = await _try_on_attempt_runtime_module.read_captured(
+        raw_query[6:].decode("ascii")
+    )
     if captured is None:
         raise HTTPException(status_code=404, detail="captured frame not found")
     return Response(
@@ -1358,59 +1348,6 @@ async def broadcast_profile_update(update: dict):
         await unregister_profile_client(websocket)
 
 
-async def _cancel_active_attempt(reason: str) -> None:
-    """Top-camera departure fences the current try-on without stopping top work."""
-    attempt_id = await _try_on_attempt_registry.active_attempt_id()
-    if attempt_id is None:
-        return
-    await _publish_try_on_transition(await _cancel_v2_attempt(
-        attempt_id=attempt_id,
-        terminal=_generated_v2_envelope(
-            "vision.try_on.attempt.canceled",
-            {"attemptId": attempt_id, "reason": reason},
-        ),
-    ))
-
-
-async def _cancel_v2_attempt(*, attempt_id: str, terminal: dict) -> TerminalTransition | None:
-    """Make cancellation immediately relinquish acquisition-only capabilities."""
-    transition = await _try_on_attempt_registry.cancel_current(
-        attempt_id=attempt_id, terminal=terminal
-    )
-    if transition is None:
-        return None
-    cleanup_errors = await _revoke_try_on_attempt_media(attempt_id)
-    owner = get_front_camera_owner()
-    token = owner.get("leaseToken")
-    if owner.get("owner") == "try_on_attempt" and isinstance(token, str) and token.startswith(
-        f"try-on:{attempt_id}:"
-    ):
-        release = release_front_camera(
-            "try_on_attempt", reason=f"try_on_canceled:{attempt_id}", lease_token=token
-        )
-        if not release.get("ok"):
-            cleanup_errors.append(f"front_release:{release.get('error')}")
-    if cleanup_errors:
-        logger.warning(
-            "V2 attempt cancellation cleanup completed with errors attemptId=%s errors=%s",
-            attempt_id,
-            cleanup_errors,
-        )
-    return transition
-
-
-async def _revoke_try_on_attempt_media(attempt_id: str) -> list[str]:
-    """Revoke the old attempt's non-result capabilities before its terminal is visible."""
-    errors: list[str] = []
-    await _captured_frames.discard(attempt_id)
-    _try_on_adjustment_store.discard(attempt_id)
-    try:
-        await _acquisition_previews.close(attempt_id)
-    except Exception as exc:
-        errors.append(f"preview_close:{type(exc).__name__}:{exc}")
-    return errors
-
-
 async def broadcast_profile_error(code: str, message: str, retryable: bool = True):
     clients = await profile_client_snapshot()
     stale_clients = []
@@ -1493,10 +1430,8 @@ async def presence_broadcast_loop():
                     "person_departed" in capabilities,
                 )
                 if mock_update is not None:
-                    # Do not auto-cancel an active front-camera try-on attempt on
-                    # an overhead presence departure (same rule as the real
-                    # presence path): the top camera can lose its overhead
-                    # bounding box when the customer leans into the touchscreen.
+                    if mock_update["message_type"] == "vision.person_departed":
+                        await _try_on_attempt_runtime_module.cancel_active("departure")
                     await broadcast_profile_update(mock_update)
                 await asyncio.sleep(settings.PROFILE_PUSH_INTERVAL_MS / 1000.0)
                 continue
@@ -1522,14 +1457,8 @@ async def presence_broadcast_loop():
                     "presence_worker_update_total",
                     message_type=result.update["message_type"],
                 )
-                # Do not auto-cancel an active front-camera try-on attempt on an
-                # overhead presence departure: the top camera can lose its
-                # overhead bounding box when the customer leans into the
-                # touchscreen, which must not interrupt the front-camera flow.
                 if result.update["message_type"] == "vision.person_departed":
-                    # The departed customer's retained re-render source must
-                    # never survive into another customer's interaction.
-                    _try_on_adjustment_store.discard_all()
+                    await _try_on_attempt_runtime_module.cancel_active("departure")
                 await broadcast_profile_update(result.update)
 
             if (
@@ -1638,64 +1567,6 @@ async def run_v2_try_on_attempt(
     )
 
 
-async def run_v2_try_on_adjustment(
-    websocket: WebSocket,
-    send_lock: asyncio.Lock,
-    message: dict,
-) -> None:
-    """Re-render one completed Try-On result at a customer-chosen garment scale."""
-    payload = message["payload"]
-    attempt_id = payload["attemptId"]
-    scale = payload["garmentScale"]
-    snapshot = _try_on_adjustment_store.get(attempt_id)
-    if snapshot is None:
-        async with send_lock:
-            await send_error(
-                websocket,
-                code="adjustment_unavailable",
-                message="the Try-On adjustment source is no longer retained",
-                retryable=False,
-                message_id=message.get("messageId"),
-            )
-        return
-    try:
-        result_image = await render_attempt_frame(
-            snapshot.frame,
-            snapshot.garment_png,
-            digest=snapshot.garment_digest,
-            template=snapshot.template,
-            timeout=_TRY_ON_ATTEMPT_TIMEOUT_SECONDS,
-            broker=_try_on_render_broker,
-            garment_scale=scale,
-        )
-        stored_result, _public_result = _prepare_try_on_result(attempt_id, result_image)
-        replaced = await _try_on_attempt_registry.replace_completed_result(
-            attempt_id, stored_result
-        )
-        if replaced is None:
-            raise RuntimeError("try_on_adjustment_target_unavailable")
-        adjusted = _generated_v2_envelope(
-            "vision.try_on.result.adjusted",
-            {"attemptId": attempt_id, "result": replaced},
-        )
-        async with send_lock:
-            await websocket.send_json(adjusted)
-    except (PoseUnavailableError, AttemptWorkerError, RuntimeError, TimeoutError):
-        logger.exception(
-            "Try-On adjustment failed attemptId=%s scale=%s",
-            attempt_id,
-            scale,
-        )
-        async with send_lock:
-            await send_error(
-                websocket,
-                code="internal_error",
-                message="the Try-On result could not be adjusted",
-                retryable=False,
-                message_id=message.get("messageId"),
-            )
-
-
 async def reject_v2_try_on_attempt_for_backpressure(
     websocket: WebSocket, send_lock: asyncio.Lock, message: dict
 ) -> None:
@@ -1730,6 +1601,82 @@ async def reject_v2_try_on_attempt_for_backpressure(
     )
     for replay in admission.replay:
         await _send_json_bounded(websocket, send_lock, replay)
+
+
+class _AppTryOnAttemptPorts:
+    """Narrow, explicit adapter from FastAPI wiring to the attempt runtime."""
+
+    V2ContractBundleUnavailable = V2ContractBundleUnavailable
+    GarmentFetchError = GarmentFetchError
+    PoseUnavailableError = PoseUnavailableError
+    AttemptWorkerError = AttemptWorkerError
+
+    def __getattribute__(self, name: str):
+        # Mutable runtime adapters are intentionally resolved at use time so
+        # startup replacement and test boundary adapters remain observable.
+        dynamic = {
+            "_try_on_attempt_registry": "_try_on_attempt_registry",
+            "_try_on_render_broker": "_try_on_render_broker",
+            "_acquisition_previews": "_acquisition_previews",
+            "_captured_frames": "_captured_frames",
+            "_try_on_adjustment_store": "_try_on_adjustment_store",
+            "_try_on_runtime": "_try_on_runtime",
+            "logger": "logger",
+        }
+        global_name = dynamic.get(name)
+        if global_name is not None:
+            return globals()[global_name]
+        return object.__getattribute__(self, name)
+
+    @property
+    def _ACQUISITION_TIMEOUT_SECONDS(self) -> float:
+        return _ACQUISITION_TIMEOUT_SECONDS
+
+    @property
+    def _ACQUISITION_HOLD_SECONDS(self) -> float:
+        return _ACQUISITION_HOLD_SECONDS
+
+    @property
+    def _ACQUISITION_POLL_SECONDS(self) -> float:
+        return _ACQUISITION_POLL_SECONDS
+
+    @property
+    def _TRY_ON_ATTEMPT_TIMEOUT_SECONDS(self) -> float:
+        return _TRY_ON_ATTEMPT_TIMEOUT_SECONDS
+
+    @property
+    def render_attempt_frame(self):
+        return render_attempt_frame
+
+    def __getattr__(self, name: str):
+        allowed = {
+            "parse_v2_client_message",
+            "send_error",
+            "_acquisition_observer_ready",
+            "_generated_v2_envelope",
+            "_publish_try_on_transition",
+            "_send_json_bounded",
+            "_acquire_front_io_until",
+            "acquire_front_camera",
+            "release_front_camera_io_lock",
+            "_acquiring_message",
+            "_read_attempt_front_frame",
+            "_get_acquisition_observer",
+            "_captured_frame_reference",
+            "_release_acquisition_resources",
+            "_run_owned_attempt_step",
+            "_prepare_try_on_result",
+            "get_front_camera_owner",
+            "release_front_camera",
+            "_await_cleanup_uncancelled",
+        }
+        if name not in allowed:
+            raise AttributeError(name)
+        return globals()[name]
+
+
+_try_on_attempt_ports: TryOnAttemptPorts = _AppTryOnAttemptPorts()
+_try_on_attempt_runtime_module = TryOnAttemptRuntime(_try_on_attempt_ports)
 
 
 def websocket_origin_allowed(websocket: WebSocket) -> bool:
@@ -1972,26 +1919,15 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 continue
 
             if message_type == "vision.try_on.attempt.adjust":
-                await run_v2_try_on_adjustment(websocket, send_lock, message)
+                await _try_on_attempt_runtime_module.adjust(
+                    websocket, send_lock, message
+                )
                 continue
 
             if message_type == "vision.try_on.attempt.cancel":
-                route_leave = payload.get("reason") == "route_leave"
-                if route_leave:
-                    _try_on_adjustment_store.discard(payload["attemptId"])
-                terminal = _generated_v2_envelope(
-                    "vision.try_on.attempt.canceled",
-                    {"attemptId": payload["attemptId"], "reason": payload["reason"]},
+                await _try_on_attempt_runtime_module.cancel(
+                    payload["attemptId"], payload["reason"]
                 )
-                transition = await _cancel_v2_attempt(
-                    attempt_id=payload["attemptId"], terminal=terminal
-                )
-                if transition is None and route_leave:
-                    # A completed terminal is no longer active, but departure
-                    # must still revoke every customer-scoped capability.
-                    await _try_on_attempt_registry.discard_terminal(payload["attemptId"])
-                    await _revoke_try_on_attempt_media(payload["attemptId"])
-                await _publish_try_on_transition(transition)
                 continue
 
             if message_type == "vision.ping":
@@ -2034,15 +1970,11 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
         logger.info("WebSocket client disconnected")
     finally:
         connection_closed.set()
-        await _await_cleanup_uncancelled(_try_on_attempt_registry.detach_subscriber(websocket))
-        for receipt in list(owned_try_on_attempt_receipts):
-            await _await_cleanup_uncancelled(
-                _cancel_disconnect_owner_and_publish(receipt)
-            )
-        if try_on_attempt_tasks:
-            await _await_cleanup_uncancelled(
-                asyncio.gather(*list(try_on_attempt_tasks), return_exceptions=True)
-            )
+        await _try_on_attempt_runtime_module.disconnect(
+            websocket,
+            owned_try_on_attempt_receipts,
+            try_on_attempt_tasks,
+        )
         await _await_cleanup_uncancelled(unregister_profile_client(websocket))
 
 

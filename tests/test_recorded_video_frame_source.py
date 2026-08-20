@@ -345,7 +345,9 @@ def test_recorded_top_departure_cancels_active_public_attempt_once(monkeypatch, 
             )
             if result.update and result.update["message_type"] == "vision.person_departed":
                 departure = result.update
-                await vision_app._cancel_active_attempt("departure")
+                await vision_app._try_on_attempt_runtime_module.cancel_active(
+                    "departure"
+                )
                 break
 
         assert departure is not None

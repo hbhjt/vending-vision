@@ -284,8 +284,8 @@ def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkey
         vision_app._acquisition_observer = None
 
 
-def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile_events(monkeypatch):
-    """Production top presence departure must not cancel a public WS attempt; the stream keeps reporting Vision facts."""
+def test_public_recorded_top_departure_cancels_attempt_and_keeps_profile_events(monkeypatch):
+    """Production departure cancels its public attempt while profile facts continue."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     recorded_manifest = json.loads(
         (Path(__file__).parents[1] / "fixtures/recorded-video/expected-results.json").read_text(
@@ -347,6 +347,7 @@ def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile
     thread.start()
     attempt_id = str(uuid4())
     completed = []
+    canceled = []
     departures = []
     seen_types = []
     post_departure_presence = False
@@ -362,8 +363,8 @@ def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile
             missing.append("person departure")
         if not generating_seen:
             missing.append("generating")
-        if not completed:
-            missing.append("completion after departure")
+        if not canceled:
+            missing.append("cancellation after departure")
         if not post_departure_presence:
             missing.append("post-departure presence")
         if not front_idle_after_generating:
@@ -389,8 +390,7 @@ def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile
     async def render_until_departure(*_args, **_kwargs):
         generating_started.set()
         # Hold generation until the recorded departure edge has been observed
-        # and broadcast: a top-camera departure must not cancel the active
-        # front-camera attempt.
+        # so the departure fence wins over an uncooperative late render.
         assert await asyncio.to_thread(
             _wait_for_recorded_fixture_event, departure_seen, timeout=8
         ), "recorded departure edge did not arrive while the attempt was generating"
@@ -430,10 +430,12 @@ def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile
                         profile_after_generating = True
                     if message["type"] == "vision.try_on.attempt.completed":
                         completed.append(message)
+                    if message["type"] == "vision.try_on.attempt.canceled":
+                        canceled.append(message)
                     if message["type"] == "vision.person_departed":
                         departures.append(message)
                         departure_seen.set()
-                    if completed and message["type"] == "vision.presence_status":
+                    if canceled and message["type"] == "vision.presence_status":
                         post_departure_presence = True
                     if message["type"] in {
                         "vision.presence_status",
@@ -447,14 +449,13 @@ def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile
                     f"missing facts before deadline: {missing_facts()}; "
                     f"seen types: {seen_types}"
                 )
-                assert len(completed) == 1
-                assert completed[0]["payload"]["attemptId"] == attempt_id
-                assert isinstance(completed[0]["payload"].get("result"), dict)
-                assert isinstance(
-                    completed[0]["payload"]["result"].get("reference"), str
-                )
-                assert isinstance(completed[0]["payload"]["result"].get("digest"), str)
-                assert "vision.try_on.attempt.canceled" not in seen_types
+                assert completed == []
+                assert len(canceled) == 1
+                assert canceled[0]["payload"] == {
+                    "attemptId": attempt_id,
+                    "reason": "departure",
+                }
+                assert "vision.try_on.attempt.canceled" in seen_types
                 assert "vision.try_on.attempt.failed" not in seen_types
                 assert generating_seen
                 assert front_idle_after_generating

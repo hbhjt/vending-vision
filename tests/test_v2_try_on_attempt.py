@@ -30,6 +30,39 @@ from vision.attempt_worker import TryOnRenderBroker
 from vision.acquisition_observer import AcquisitionObservation
 
 
+def test_try_on_attempt_runtime_uses_explicit_ports_and_owns_attempt_lifecycle():
+    """The app is transport wiring; Runtime owns attempt and media lifecycle."""
+    import vision.try_on_attempt_runtime as attempt_runtime
+
+    app_source = Path(vision_app.__file__).read_text("utf-8")
+    constructor = inspect.signature(attempt_runtime.TryOnAttemptRuntime.__init__)
+
+    assert "sys.modules" not in app_source
+    assert constructor.parameters["ports"].annotation in {
+        "TryOnAttemptPorts",
+        attempt_runtime.TryOnAttemptPorts,
+    }
+    assert constructor.parameters["ports"].annotation != "Any"
+    assert {
+        "_try_on_attempt_registry",
+        "_try_on_render_broker",
+        "_captured_frames",
+        "_try_on_adjustment_store",
+        "parse_v2_client_message",
+        "render_attempt_frame",
+    } <= set(attempt_runtime.TryOnAttemptPorts.__annotations__)
+    assert {
+        "adjust",
+        "cancel",
+        "cancel_active",
+        "disconnect",
+        "read_captured",
+    } <= set(vars(attempt_runtime.TryOnAttemptRuntime))
+    assert "async def run_v2_try_on_adjustment(" not in app_source
+    assert "async def _cancel_v2_attempt(" not in app_source
+    assert "async def _revoke_try_on_attempt_media(" not in app_source
+
+
 def test_try_on_worker_fixture_is_spawn_safe():
     """Broker child targets must not import the application test module on spawn."""
     module = importlib.import_module("tests.try_on_worker_fixture")
@@ -322,6 +355,41 @@ class _DeadlineRecordingObserver:
         return None
 
 
+class _ControlledMonotonicLoop:
+    """A deterministic clock for the public runtime deadline hand-off."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+
+class _RuntimeAsyncioClock:
+    """Replace only the runtime module's clock lookup, not asyncio globally."""
+
+    def __init__(self, clock):
+        self._clock = clock
+
+    def get_running_loop(self):
+        return self._clock
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+
+class _TimeoutingAcquisitionSession:
+    """Public acquisition adapter which records the runtime's remaining budget."""
+
+    requested_timeouts = []
+
+    def __init__(self, *, timeout_seconds, **_kwargs):
+        self.requested_timeouts.append(timeout_seconds)
+
+    async def acquire(self, **_kwargs):
+        raise asyncio.TimeoutError()
+
+
 def _envelope(message_type, payload):
     return {
         "protocol": "vem.vision.v2",
@@ -554,6 +622,114 @@ def test_v2_route_leave_retires_completed_attempt_media_capabilities(
         assert client.get(result_reference).status_code == 404
 
 
+def test_v2_disconnect_retires_only_its_completed_attempt_media_and_replays_terminal(
+    monkeypatch, garment_reference
+):
+    """Disconnect revokes customer media without erasing canonical completion."""
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
+    monkeypatch.setattr(vision_app, "_acquisition_observer", _SingleAlignedObserver())
+    monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "tryOnReady": True,
+            "tryOnPoseReady": True,
+        },
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "read_camera_with_source",
+        lambda *_args, **_kwargs: (
+            np.full((24, 24, 3), 90, dtype=np.uint8),
+            {"source": "recorded_video"},
+        ),
+    )
+    monkeypatch.setattr(
+        vision_app,
+        "render_attempt_frame",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=_png_bytes()),
+    )
+
+    def complete(socket, attempt_id):
+        socket.send_json(_start(attempt_id, garment_reference))
+        assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+        captured_reference = result_reference = None
+        completed = None
+        while completed is None:
+            event = socket.receive_json()
+            if event["type"] == "vision.try_on.attempt.captured":
+                captured_reference = event["payload"]["captured"]["reference"]
+            elif event["type"] == "vision.try_on.attempt.completed":
+                result_reference = event["payload"]["result"]["reference"]
+                completed = event
+            else:
+                assert event["type"] in {
+                    "vision.try_on.attempt.acquiring",
+                    "vision.try_on.attempt.generating",
+                }
+        assert captured_reference is not None
+        assert result_reference is not None
+        return completed, captured_reference, result_reference
+
+    departed_id = str(uuid4())
+    survivor_id = str(uuid4())
+    with TestClient(vision_app.app) as client:
+        with client.websocket_connect("/ws") as departed:
+            departed.send_json(_hello(manifest))
+            assert departed.receive_json()["type"] == "vision.ready"
+            departed_terminal, departed_captured, departed_result = complete(
+                departed, departed_id
+            )
+
+            with client.websocket_connect("/ws") as survivor:
+                survivor.send_json(_hello(manifest))
+                assert survivor.receive_json()["type"] == "vision.ready"
+                survivor_terminal, survivor_captured, survivor_result = complete(
+                    survivor, survivor_id
+                )
+                assert client.get(departed_captured).status_code == 200
+                assert client.get(departed_result).status_code == 200
+                assert client.get(survivor_captured).status_code == 200
+                assert client.get(survivor_result).status_code == 200
+
+                departed.close()
+
+                assert client.get(departed_captured).status_code == 404
+                assert client.get(departed_result).status_code == 404
+                assert client.get(survivor_captured).status_code == 200
+                assert client.get(survivor_result).status_code == 200
+                survivor.send_json(_envelope("vision.ping", {}))
+                assert survivor.receive_json()["type"] == "vision.pong"
+
+        with client.websocket_connect("/ws") as replay:
+            replay.send_json(_hello(manifest))
+            assert replay.receive_json()["type"] == "vision.ready"
+            replay.send_json(_start(departed_id, garment_reference))
+            assert replay.receive_json() == departed_terminal
+            replay.send_json(
+                _envelope(
+                    "vision.try_on.attempt.adjust",
+                    {"attemptId": departed_id, "garmentScale": 1.05},
+                )
+            )
+            adjustment_error = replay.receive_json()
+
+            replay.send_json(_start(survivor_id, garment_reference))
+            assert replay.receive_json() == survivor_terminal
+
+    assert adjustment_error["type"] == "vision.error"
+    assert adjustment_error["payload"]["code"] == "adjustment_unavailable"
+
+
 def test_v2_route_leave_fences_a_late_render_without_leaking_attempt_media(
     monkeypatch, garment_reference
 ):
@@ -694,19 +870,21 @@ def test_v2_try_on_attempt_accepts_generated_start_and_returns_tokenized_png(
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
             _await_generating(socket)
             completed = socket.receive_json()
-        assert vision_app._try_on_render_broker.pid == render_pid
+            assert vision_app._try_on_render_broker.pid == render_pid
 
-        assert completed["type"] == "vision.try_on.attempt.completed"
-        result = completed["payload"]["result"]
-        response = client.get(result["reference"])
-        parsed_result = urlsplit(result["reference"])
-        grant_path = f"{parsed_result.path}?{parsed_result.query}"
-        head = client.head(grant_path)
-        wrong_grant = client.get(f"{parsed_result.path}?token=wrong-token")
-        missing_grant = client.get(parsed_result.path)
-        extra_grant = client.get(f"{grant_path}&extra=true")
-        duplicate_grant = client.get(f"{grant_path}&token=second")
-        wrong_method = client.post(grant_path)
+            assert completed["type"] == "vision.try_on.attempt.completed"
+            result = completed["payload"]["result"]
+            response = client.get(result["reference"])
+            parsed_result = urlsplit(result["reference"])
+            grant_path = f"{parsed_result.path}?{parsed_result.query}"
+            head = client.head(grant_path)
+            wrong_grant = client.get(f"{parsed_result.path}?token=wrong-token")
+            missing_grant = client.get(parsed_result.path)
+            extra_grant = client.get(f"{grant_path}&extra=true")
+            duplicate_grant = client.get(f"{grant_path}&token=second")
+            wrong_method = client.post(grant_path)
+
+        revoked_after_disconnect = client.get(grant_path)
 
     assert vision_app._try_on_render_broker.pid is None
 
@@ -717,6 +895,7 @@ def test_v2_try_on_attempt_accepts_generated_start_and_returns_tokenized_png(
     assert wrong_grant.status_code == missing_grant.status_code == 404
     assert extra_grant.status_code == duplicate_grant.status_code == 404
     assert wrong_method.status_code == 405
+    assert revoked_after_disconnect.status_code == 404
     result_image = cv2.imdecode(
         np.frombuffer(response.content, dtype=np.uint8), cv2.IMREAD_UNCHANGED
     )
@@ -837,10 +1016,10 @@ def test_v2_try_on_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(
             assert socket.receive_json()["type"] == "vision.try_on.attempt.completed"
 
 
-def test_v2_top_departure_does_not_cancel_active_generated_attempt_without_late_completion(
+def test_v2_top_departure_cancels_active_generated_attempt_and_fences_late_completion(
     monkeypatch, garment_reference
 ):
-    """A production presence departure must not cancel the active attempt through the public WS."""
+    """The public departure event cancels its active attempt before render can finish."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", True)
@@ -849,11 +1028,13 @@ def test_v2_top_departure_does_not_cancel_active_generated_attempt_without_late_
     _configure_recorded_front(monkeypatch)
     depart = threading.Event()
     departed_once = threading.Event()
-    departure_seen = threading.Event()
+    render_release = threading.Event()
+    render_finished = threading.Event()
 
     def collect_departure(_status, _ambient, include_departure):
         if depart.is_set() and include_departure and not departed_once.is_set():
             departed_once.set()
+            depart.set()
             return {
                 "message_type": "vision.person_departed",
                 "payload": {
@@ -866,11 +1047,14 @@ def test_v2_top_departure_does_not_cancel_active_generated_attempt_without_late_
 
     monkeypatch.setattr(vision_app, "collect_profile_update", collect_departure)
     async def render_until_departure(*_args, **_kwargs):
-        # Hold generation until the recorded departure edge has been observed:
-        # a top-camera departure must not cancel the active front-camera attempt.
-        assert await asyncio.to_thread(departure_seen.wait, 5), (
-            "recorded departure edge did not arrive while the attempt was generating"
-        )
+        # Keep the render uncooperative after the departure edge.  The public
+        # canceled terminal must be visible before this old worker can return.
+        assert await asyncio.to_thread(depart.wait, 5)
+        try:
+            await asyncio.to_thread(render_release.wait, 5)
+        except asyncio.CancelledError:
+            await asyncio.to_thread(render_release.wait, 5)
+        render_finished.set()
         return _png_bytes()
 
     monkeypatch.setattr(vision_app, "render_attempt_frame", render_until_departure)
@@ -887,27 +1071,45 @@ def test_v2_top_departure_does_not_cancel_active_generated_attempt_without_late_
             assert socket.receive_json()["type"] == "vision.ready"
             socket.send_json(_start(attempt_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
-            _await_generating(socket)
+            captured_reference = None
+            while True:
+                lifecycle = socket.receive_json()
+                if lifecycle["type"] == "vision.try_on.attempt.captured":
+                    captured_reference = lifecycle["payload"]["captured"]["reference"]
+                if lifecycle["type"] == "vision.try_on.attempt.generating":
+                    break
+                assert lifecycle["type"] in {
+                    "vision.try_on.attempt.acquiring",
+                    "vision.try_on.attempt.captured",
+                }
+            assert captured_reference is not None
+            assert client.get(captured_reference).status_code == 200
 
             depart.set()
-            while len(messages) < 20:
+            terminal = None
+            departed = False
+            while terminal is None or not departed:
                 messages.append(socket.receive_json())
-                if any(message["type"] == "vision.person_departed" for message in messages):
-                    departure_seen.set()
-                    break
-
-            while True:
-                message = socket.receive_json()
-                messages.append(message)
+                message = messages[-1]
+                if message["type"] == "vision.person_departed":
+                    departed = True
                 if message["type"] in {
                     "vision.try_on.attempt.completed",
                     "vision.try_on.attempt.failed",
                     "vision.try_on.attempt.canceled",
                 } and message["payload"].get("attemptId") == attempt_id:
-                    break
+                    terminal = message
+                    render_release.set()
 
         assert await_no_active_try_on_attempt()
         assert vision_app.get_front_camera_owner()["owner"] == "idle"
+        assert render_finished.wait(timeout=1)
+
+        with client.websocket_connect("/ws") as replay:
+            replay.send_json(_hello_with_capabilities(manifest, ["try_on"]))
+            assert replay.receive_json()["type"] == "vision.ready"
+            replay.send_json(_start(attempt_id, garment_reference))
+            replayed_terminal = replay.receive_json()
 
     completed = [
         message for message in messages
@@ -917,9 +1119,11 @@ def test_v2_top_departure_does_not_cancel_active_generated_attempt_without_late_
         message for message in messages
         if message["type"] == "vision.try_on.attempt.canceled"
     ]
-    assert len(completed) == 1
-    assert completed[0]["payload"]["attemptId"] == attempt_id
-    assert canceled == []
+    assert completed == []
+    assert len(canceled) == 1
+    assert canceled[0]["payload"] == {"attemptId": attempt_id, "reason": "departure"}
+    assert replayed_terminal == canceled[0]
+    assert client.get(captured_reference).status_code == 404
     assert any(
         message["type"] == "vision.person_departed"
         for message in messages
@@ -1828,6 +2032,65 @@ def test_v2_acquisition_observer_uses_remaining_attempt_deadline(monkeypatch, ga
             Decimal(str(timeout)) <= requested_deadline + float_clock_epsilon
             for timeout in observer.timeouts
         )
+    finally:
+        vision_app._acquisition_observer = None
+
+
+def test_v2_acquisition_budget_starts_at_admission_and_survives_a_contended_io_lease(
+    monkeypatch, garment_reference
+):
+    """A lease consuming 29s leaves at most 1s for the public acquisition session."""
+    import vision.try_on_attempt_runtime as attempt_runtime
+
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
+            "utf-8"
+        )
+    )
+    clock = _ControlledMonotonicLoop()
+    _TimeoutingAcquisitionSession.requested_timeouts = []
+
+    async def contended_lease(deadline):
+        assert deadline == pytest.approx(30.0)
+        assert vision_app.try_acquire_front_camera_io_lock()
+        clock.now = 29.0
+
+    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
+    monkeypatch.setattr(vision_app, "_acquisition_observer", _SingleMisalignedObserver())
+    monkeypatch.setattr(vision_app, "_ACQUISITION_TIMEOUT_SECONDS", 30.0)
+    monkeypatch.setattr(vision_app, "_acquire_front_io_until", contended_lease)
+    monkeypatch.setattr(attempt_runtime, "AcquisitionSession", _TimeoutingAcquisitionSession)
+    monkeypatch.setattr(attempt_runtime, "asyncio", _RuntimeAsyncioClock(clock))
+    monkeypatch.setattr(
+        vision_app,
+        "get_runtime_status",
+        lambda: {
+            "cameraReady": True,
+            "modelReady": True,
+            "tryOnReady": True,
+            "tryOnPoseReady": True,
+            "acquisitionObserverReady": True,
+        },
+    )
+    attempt_id = str(uuid4())
+
+    try:
+        with TestClient(vision_app.app) as client:
+            with client.websocket_connect("/ws") as socket:
+                socket.send_json(_hello(manifest))
+                assert socket.receive_json()["type"] == "vision.ready"
+                socket.send_json(_start(attempt_id, garment_reference))
+                assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
+                terminal = socket.receive_json()
+
+            owner = client.get("/camera/front/owner").json()
+
+        assert terminal["type"] == "vision.try_on.attempt.canceled"
+        assert terminal["payload"] == {"attemptId": attempt_id, "reason": "timeout"}
+        assert _TimeoutingAcquisitionSession.requested_timeouts
+        assert _TimeoutingAcquisitionSession.requested_timeouts[-1] <= 1.0
+        assert owner["owner"] == "idle"
     finally:
         vision_app._acquisition_observer = None
 

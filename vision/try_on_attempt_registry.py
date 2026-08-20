@@ -55,6 +55,7 @@ class TerminalAttempt:
     result: dict | None
     terminal_at: float
     expires_at: float
+    owner_subscriber_key: int | None = None
 
 
 @dataclass
@@ -204,7 +205,11 @@ class TryOnAttemptRegistry:
                 self._terminals.pop(attempt_id, None)
 
     def _new_terminal(
-        self, message: dict, result: dict | None = None
+        self,
+        message: dict,
+        result: dict | None = None,
+        *,
+        owner_subscriber_key: int | None = None,
     ) -> TerminalAttempt:
         terminal_at = time.monotonic()
         return TerminalAttempt(
@@ -212,6 +217,7 @@ class TryOnAttemptRegistry:
             result=copy.deepcopy(result),
             terminal_at=terminal_at,
             expires_at=terminal_at + self._terminal_ttl_seconds,
+            owner_subscriber_key=owner_subscriber_key,
         )
 
     @staticmethod
@@ -742,7 +748,9 @@ class TryOnAttemptRegistry:
                 for evicted_id in admission.evicted_attempt_ids:
                     self._terminals.pop(evicted_id, None)
         self._terminals[active.receipt.attempt_id] = self._new_terminal(
-            canonical, admitted_result.public() if admitted_result is not None else None
+            canonical,
+            admitted_result.public() if admitted_result is not None else None,
+            owner_subscriber_key=active.owner_subscriber_key,
         )
         self._terminals.move_to_end(active.receipt.attempt_id)
         subscribers = list(active.subscribers.values())
@@ -877,6 +885,23 @@ class TryOnAttemptRegistry:
                 return False
             self._results._remove_unlocked(attempt_id)
             return True
+
+    async def revoke_completed_owner_results(self, websocket: Any) -> tuple[str, ...]:
+        """Revoke only completed grants whose admission owner disconnected."""
+        owner_key = id(websocket)
+        async with self._gate:
+            self._prune_unlocked()
+            revoked = []
+            for attempt_id, terminal in self._terminals.items():
+                if (
+                    terminal.owner_subscriber_key == owner_key
+                    and terminal.message.get("type")
+                    == "vision.try_on.attempt.completed"
+                ):
+                    self._results._remove_unlocked(attempt_id)
+                    terminal.result = None
+                    revoked.append(attempt_id)
+            return tuple(revoked)
 
     async def replace_completed_result(
         self, attempt_id: str, stored_result: dict
