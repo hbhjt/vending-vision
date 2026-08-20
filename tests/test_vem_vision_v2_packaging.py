@@ -1,11 +1,14 @@
 from pathlib import Path
+import gzip
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import zipfile
 
 import pytest
@@ -257,6 +260,8 @@ def _init_candidate_repository(root):
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.email", "tests@example.invalid"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.name", "Candidate Tests"], cwd=root, check=True)
+    (root / ".gitignore").write_text("dist/\nignored-cache/\n", "utf-8")
+    (root / ".python-version").write_text("3.11.13\n", "utf-8")
     (root / "tracked.txt").write_text("candidate source\n", "utf-8")
     source_model = root / "models" / "current" / "model.onnx"
     source_model.parent.mkdir(parents=True)
@@ -280,7 +285,11 @@ def _init_candidate_repository(root):
         + "\n",
         "utf-8",
     )
-    subprocess.run(["git", "add", "tracked.txt", "models"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "add", ".gitignore", ".python-version", "tracked.txt", "models"],
+        cwd=root,
+        check=True,
+    )
     subprocess.run(["git", "commit", "-qm", "candidate source"], cwd=root, check=True)
     return subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
@@ -431,6 +440,44 @@ def test_candidate_archive_rejects_commit_marker_mismatch_and_dirty_head(tmp_pat
         )
 
 
+def test_candidate_archive_rejects_nonignored_untracked_and_allows_ignored_outputs(
+    tmp_path,
+):
+    from scripts.candidate_artifact_manifest import write_candidate_archive
+
+    repository = tmp_path / "repository"
+    source_commit = _init_candidate_repository(repository)
+    dist = repository / "dist"
+    executable = dist / "vending-vision" / "vending-vision.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"main")
+    _write_packaged_build_marker(dist, source_commit)
+    _copy_candidate_models(repository, dist)
+
+    untracked = repository / "runtime_extension.py"
+    untracked.write_text("pass\n", "utf-8")
+    with pytest.raises(RuntimeError, match="candidate_source_dirty"):
+        write_candidate_archive(
+            dist,
+            tmp_path / "untracked.zip",
+            tmp_path / "untracked.json",
+            source_commit=source_commit,
+            repository_root=repository,
+        )
+
+    untracked.unlink()
+    ignored = repository / "ignored-cache" / "runtime.cache"
+    ignored.parent.mkdir()
+    ignored.write_bytes(b"ignored build output")
+    write_candidate_archive(
+        dist,
+        tmp_path / "ignored.zip",
+        tmp_path / "ignored.json",
+        source_commit=source_commit,
+        repository_root=repository,
+    )
+
+
 def test_candidate_archive_rejects_package_without_bound_model_manifest(tmp_path):
     from scripts.candidate_artifact_manifest import write_candidate_archive
 
@@ -452,11 +499,66 @@ def test_candidate_archive_rejects_package_without_bound_model_manifest(tmp_path
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("path", "models/hidden/model.onnx"),
+        ("role", "hidden_generative_model"),
+        ("sha256", "0" * 64),
+    ),
+)
+def test_candidate_archive_binds_model_path_role_and_digest_to_clean_source_manifest(
+    tmp_path, field, value
+):
+    from scripts.candidate_artifact_manifest import write_candidate_archive
+
+    repository = tmp_path / "repository"
+    source_commit = _init_candidate_repository(repository)
+    dist = repository / "dist"
+    executable = dist / "vending-vision" / "vending-vision.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"main")
+    _write_packaged_build_marker(dist, source_commit)
+    _copy_candidate_models(repository, dist)
+    packaged_manifest = (
+        dist
+        / "vending-vision"
+        / "_internal"
+        / "models"
+        / "model-manifest.json"
+    )
+    payload = json.loads(packaged_manifest.read_text("utf-8"))
+    payload["models"][0][field] = value
+    packaged_manifest.write_text(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
+        "utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="candidate_model_manifest"):
+        write_candidate_archive(
+            dist,
+            tmp_path / f"changed-{field}.zip",
+            tmp_path / f"changed-{field}.json",
+            source_commit=source_commit,
+            repository_root=repository,
+        )
+
+
 def _zip_bytes(entries, *, compression=zipfile.ZIP_STORED):
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=compression) as archive:
         for name, payload in entries:
             archive.writestr(name, payload)
+    return output.getvalue()
+
+
+def _tar_bytes():
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w") as archive:
+        info = tarfile.TarInfo("legacy-worker.py")
+        payload = b"pass\n"
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
     return output.getvalue()
 
 
@@ -528,6 +630,60 @@ def test_candidate_archive_accepts_bounded_stdlib_base_library(tmp_path):
     audit_packaged_archives([("vending-vision/_internal/base_library.zip", archive)])
 
 
+@pytest.mark.parametrize(
+    ("name", "payload"),
+    (
+        ("runtime.dat", _tar_bytes()),
+        ("runtime.dat", gzip.compress(b"legacy worker")),
+        ("runtime.dat", b"7z\xbc\xaf\x27\x1c" + b"legacy worker"),
+        ("runtime.tar", b"not really a tar archive"),
+        ("runtime.gz", b"not really a gzip archive"),
+        ("runtime.7z", b"not really a 7z archive"),
+    ),
+    ids=(
+        "renamed-tar",
+        "renamed-gzip",
+        "renamed-7z",
+        "tar-suffix",
+        "gzip-suffix",
+        "7z-suffix",
+    ),
+)
+def test_candidate_archive_rejects_non_zip_container_suffixes_and_magic(
+    tmp_path, name, payload
+):
+    from scripts.candidate_artifact_manifest import audit_packaged_archives
+
+    disguised = tmp_path / name
+    disguised.write_bytes(payload)
+
+    with pytest.raises(RuntimeError, match="candidate_archive_container"):
+        audit_packaged_archives([(f"vending-vision/_internal/{name}", disguised)])
+
+
+@pytest.mark.parametrize(
+    "nested_payload",
+    (
+        _tar_bytes(),
+        gzip.compress(b"legacy worker"),
+        b"7z\xbc\xaf\x27\x1clegacy worker",
+    ),
+    ids=("tar", "gzip", "7z"),
+)
+def test_candidate_archive_rejects_non_zip_container_nested_in_zip(
+    tmp_path, nested_payload
+):
+    from scripts.candidate_artifact_manifest import audit_packaged_archives
+
+    archive = tmp_path / "base_library.zip"
+    archive.write_bytes(_zip_bytes([("vendor/runtime.dat", nested_payload)]))
+
+    with pytest.raises(RuntimeError, match="candidate_archive_container"):
+        audit_packaged_archives(
+            [("vending-vision/_internal/base_library.zip", archive)]
+        )
+
+
 def test_candidate_archive_rejects_more_than_three_nested_archive_layers(tmp_path):
     from scripts.candidate_artifact_manifest import audit_packaged_archives
 
@@ -541,16 +697,36 @@ def test_candidate_archive_rejects_more_than_three_nested_archive_layers(tmp_pat
         audit_packaged_archives([("vending-vision/_internal/base_library.zip", archive)])
 
 
-def test_candidate_archive_detects_zip_magic_behind_nonarchive_name(tmp_path):
+@pytest.mark.parametrize("prefix", (b"", b"MZ-STUB-PREFIX"))
+def test_candidate_archive_detects_parseable_zip_behind_nonarchive_name(
+    tmp_path, prefix
+):
     from scripts.candidate_artifact_manifest import audit_packaged_archives
 
     disguised = tmp_path / "runtime.dat"
     disguised.write_bytes(
-        _zip_bytes([("vision/" + "a" + "i" + "/attempt_worker.py", b"pass\n")])
+        prefix
+        + _zip_bytes(
+            [("vision/" + "a" + "i" + "/attempt_worker.py", b"pass\n")]
+        )
     )
 
     with pytest.raises(RuntimeError, match="candidate_archive_retired"):
         audit_packaged_archives([("vending-vision/_internal/runtime.dat", disguised)])
+
+
+def test_candidate_archive_rejects_model_suffix_inside_nested_zip(tmp_path):
+    from scripts.candidate_artifact_manifest import audit_packaged_archives
+
+    nested = tmp_path / "base_library.zip"
+    nested.write_bytes(
+        _zip_bytes([("vendor/generative/weights.ckpt", b"hidden model")])
+    )
+
+    with pytest.raises(RuntimeError, match="candidate_model_set"):
+        audit_packaged_archives(
+            [("vending-vision/_internal/base_library.zip", nested)]
+        )
 
 
 @pytest.mark.parametrize(
@@ -643,6 +819,37 @@ def test_candidate_models_reject_weight_not_declared_by_packaged_manifest(tmp_pa
         )
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "vending-vision/_internal/assets/hidden-generative.onnx",
+        "vending-vision/_internal/vendor/generative/weights.ckpt",
+        "vending-vision/_internal/assets/hidden-generative.pb",
+        "vending-vision/_internal/vendor/generative/weights.tflite",
+    ),
+)
+def test_candidate_models_reject_model_suffix_outside_canonical_directory(
+    tmp_path, relative_path
+):
+    from scripts.candidate_artifact_manifest import audit_packaged_model_files
+
+    model_root = ROOT / "models"
+    payload = [
+        (
+            "vending-vision/_internal/models/"
+            + path.relative_to(model_root).as_posix(),
+            path,
+        )
+        for path in model_root.rglob("*")
+        if path.is_file()
+    ]
+    hidden_model = tmp_path / Path(relative_path).name
+    hidden_model.write_bytes(b"undeclared generative model")
+
+    with pytest.raises(RuntimeError, match="candidate_model_set"):
+        audit_packaged_model_files([*payload, (relative_path, hidden_model)])
+
+
 def test_candidate_models_accept_exact_current_production_manifest():
     from scripts.candidate_artifact_manifest import audit_packaged_model_files
 
@@ -675,7 +882,7 @@ def test_windows_build_preserves_the_single_core_supply_chain_gates():
         '-m PyInstaller --clean --noconfirm',
         'scripts\\verify_packaged_exe.py',
         'git -C $Root rev-parse HEAD',
-        'git -C $Root status --porcelain --untracked-files=no',
+        'git -C $Root status --porcelain --untracked-files=normal',
         'scripts\\write_packaged_build_identity.py',
         '_build_identity.json',
     ):
@@ -686,6 +893,47 @@ def test_windows_build_preserves_the_single_core_supply_chain_gates():
     assert 'foreach ($Environment in @($CoreVenv))' in build
     assert 'foreach ($Output in @($CoreWork, $CoreDist, $FinalDist))' in build
     assert "worker" not in build.lower()
+
+
+def test_windows_build_rejects_nonignored_untracked_and_allows_ignored_outputs(
+    tmp_path,
+):
+    repository = tmp_path / "repository"
+    _init_candidate_repository(repository)
+    untracked = repository / "runtime_extension.py"
+    untracked.write_text("pass\n", "utf-8")
+    command = [
+        "pwsh",
+        "-NoProfile",
+        "-File",
+        str(ROOT / "scripts" / "build_exe.ps1"),
+        "-Wheelhouse",
+        str(repository / "missing-wheelhouse"),
+        "-SourceRoot",
+        str(repository),
+    ]
+
+    environment = os.environ.copy()
+    environment["PATH"] = (
+        str(Path(sys.executable).parent) + os.pathsep + environment.get("PATH", "")
+    )
+    rejected = subprocess.run(
+        command, capture_output=True, text=True, env=environment
+    )
+    assert rejected.returncode != 0
+    assert "Build source has tracked or non-ignored untracked changes" in (
+        rejected.stdout + rejected.stderr
+    )
+
+    untracked.unlink()
+    ignored = repository / "ignored-cache" / "runtime.cache"
+    ignored.parent.mkdir()
+    ignored.write_bytes(b"ignored build output")
+    allowed = subprocess.run(command, capture_output=True, text=True, env=environment)
+    combined = allowed.stdout + allowed.stderr
+    assert allowed.returncode != 0
+    assert "A pre-validated offline core wheelhouse is required" in combined
+    assert "Build source has tracked or non-ignored untracked changes" not in combined
 
 
 def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_publish():

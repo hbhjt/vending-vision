@@ -31,12 +31,12 @@ $FinalDist = Join-Path $Root "dist"
 $ExpectedPythonVersion = (Get-Content (Join-Path $Root ".python-version") -Raw).Trim()
 $RepositoryRoot = (Invoke-Checked git -C $Root rev-parse --show-toplevel).Trim()
 $ActualSourceCommit = (Invoke-Checked git -C $Root rev-parse HEAD).Trim()
-$TrackedStatus = (Invoke-Checked git -C $Root status --porcelain --untracked-files=no)
+$TrackedStatus = (Invoke-Checked git -C $Root status --porcelain --untracked-files=normal)
 if ([IO.Path]::GetFullPath($RepositoryRoot) -cne [IO.Path]::GetFullPath($Root)) {
     throw "Build source must be the Git repository root"
 }
 if (-not [string]::IsNullOrWhiteSpace($TrackedStatus)) {
-    throw "Build source has tracked changes"
+    throw "Build source has tracked or non-ignored untracked changes"
 }
 if ([string]::IsNullOrWhiteSpace($SourceCommit)) {
     $SourceCommit = $ActualSourceCommit

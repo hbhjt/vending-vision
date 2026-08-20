@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import PurePosixPath
 import re
+import tomllib
 
 
 _MODE_FIELD = "".join(("mo", "de"))
@@ -32,6 +34,13 @@ _DENIED_DISTRIBUTION_PREFIXES = {
     "-".join(("requirements", "ai", "")),
 }
 _TEXT_AUDIT_SUFFIXES = {".ps1", ".spec", ".yaml", ".yml"}
+_POLICY_EXCLUDED_PARTS = {"archive", "archives", "fixtures", "tests"}
+_DEPENDENCY_CONFIG_KEYS = {
+    "dependencies",
+    "dependency",
+    "runtimedependencies",
+    "runtimedependency",
+}
 
 
 def _canonical_token(value: str) -> str:
@@ -57,9 +66,12 @@ def is_retired_runtime_dependency(value: str) -> bool:
 
 def _production_python_path(relative_path: str) -> bool:
     path = PurePosixPath(relative_path)
-    return path.suffix == ".py" and (
-        path.as_posix() in {"app.py", "run_vision_server.py"}
-        or (bool(path.parts) and path.parts[0] in {"vision", "scripts"})
+    return (
+        path.suffix == ".py"
+        and bool(path.parts)
+        and not any(
+            part.casefold() in _POLICY_EXCLUDED_PARTS for part in path.parts
+        )
     )
 
 
@@ -96,38 +108,114 @@ class _TryOnModeVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.in_try_on = False
         self.found = False
+        self.payload_aliases: set[str] = set()
 
     def _visit_function(self, node: ast.AST) -> None:
-        previous = self.in_try_on
-        self.in_try_on = previous or _semantic_function(node)
+        previous_in_try_on = self.in_try_on
+        previous_aliases = self.payload_aliases
+        self.in_try_on = _semantic_function(node)
+        self.payload_aliases = {"payload"} if self.in_try_on else set()
         self.generic_visit(node)
-        self.in_try_on = previous
+        self.in_try_on = previous_in_try_on
+        self.payload_aliases = previous_aliases
 
     visit_FunctionDef = _visit_function
     visit_AsyncFunctionDef = _visit_function
 
+    def _is_payload(self, value: ast.AST) -> bool:
+        return (
+            isinstance(value, ast.Name) and value.id in self.payload_aliases
+        ) or _semantic_payload(value, in_try_on=self.in_try_on)
+
+    def _is_alias_source(self, value: ast.AST) -> bool:
+        if self._is_payload(value):
+            return True
+        return (
+            isinstance(value, ast.Call)
+            and not value.args
+            and not value.keywords
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "copy"
+            and self._is_payload(value.func.value)
+        )
+
+    def _record_alias(self, target: ast.AST, value: ast.AST) -> None:
+        if not self.in_try_on or not isinstance(target, ast.Name):
+            return
+        if self._is_alias_source(value):
+            self.payload_aliases.add(target.id)
+        else:
+            self.payload_aliases.discard(target.id)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            self._record_alias(target, node.value)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is not None:
+            self._record_alias(node.target, node.value)
+        self.generic_visit(node)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        before = set(self.payload_aliases)
+        self.payload_aliases = set(before)
+        for statement in node.body:
+            self.visit(statement)
+        body_aliases = set(self.payload_aliases)
+        self.payload_aliases = set(before)
+        for statement in node.orelse:
+            self.visit(statement)
+        self.payload_aliases |= body_aliases
+
     def visit_Subscript(self, node: ast.Subscript) -> None:
         if (
             _string_key(node.slice) == _MODE_FIELD
-            and _semantic_payload(node.value, in_try_on=self.in_try_on)
+            and self._is_payload(node.value)
         ):
             self.found = True
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if node.attr == _MODE_FIELD and _semantic_payload(
-            node.value, in_try_on=self.in_try_on
-        ):
+        if node.attr == _MODE_FIELD and self._is_payload(node.value):
             self.found = True
         self.generic_visit(node)
+
+    def _update_contains_mode(self, node: ast.Call) -> bool:
+        if any(keyword.arg == _MODE_FIELD for keyword in node.keywords):
+            return True
+        candidates = [*node.args, *(keyword.value for keyword in node.keywords)]
+        for candidate in candidates:
+            if isinstance(candidate, ast.Dict) and any(
+                key is not None and _string_key(key) == _MODE_FIELD
+                for key in candidate.keys
+            ):
+                return True
+            if isinstance(candidate, (ast.List, ast.Tuple)) and any(
+                isinstance(item, (ast.List, ast.Tuple))
+                and bool(item.elts)
+                and _string_key(item.elts[0]) == _MODE_FIELD
+                for item in candidate.elts
+            ):
+                return True
+        return False
 
     def visit_Call(self, node: ast.Call) -> None:
         if (
             isinstance(node.func, ast.Attribute)
-            and node.func.attr == "get"
-            and node.args
-            and _string_key(node.args[0]) == _MODE_FIELD
-            and _semantic_payload(node.func.value, in_try_on=self.in_try_on)
+            and self._is_payload(node.func.value)
+            and (
+                (
+                    node.func.attr in {"get", "pop", "setdefault"}
+                    and bool(node.args)
+                    and _string_key(node.args[0]) == _MODE_FIELD
+                )
+                or (
+                    node.func.attr == "update"
+                    and self._update_contains_mode(node)
+                )
+            )
         ):
             self.found = True
         call_name = ""
@@ -160,6 +248,23 @@ def _contains_denied_python_import(tree: ast.AST) -> bool:
         elif isinstance(node, ast.ImportFrom) and node.module:
             if is_retired_runtime_dependency(node.module):
                 return True
+        elif isinstance(node, ast.Call) and node.args:
+            module = _string_key(node.args[0])
+            if module is None:
+                continue
+            is_builtin_import = (
+                isinstance(node.func, ast.Name) and node.func.id == "__import__"
+            )
+            is_importlib_import = (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "importlib"
+                and node.func.attr == "import_module"
+            )
+            if (is_builtin_import or is_importlib_import) and is_retired_runtime_dependency(
+                module
+            ):
+                return True
     return False
 
 
@@ -168,6 +273,53 @@ def _contains_denied_text_token(source: str) -> bool:
         is_retired_runtime_dependency(token)
         for token in re.findall(r"[A-Za-z0-9_.-]+", source)
     )
+
+
+def _contains_denied_structured_dependency(
+    value: object, *, dependency_context: bool = False
+) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized_key = re.sub(r"[^a-z]", "", str(key).casefold())
+            if _contains_denied_structured_dependency(
+                nested,
+                dependency_context=(
+                    dependency_context or normalized_key in _DEPENDENCY_CONFIG_KEYS
+                ),
+            ):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(
+            _contains_denied_structured_dependency(
+                nested, dependency_context=dependency_context
+            )
+            for nested in value
+        )
+    return (
+        dependency_context
+        and isinstance(value, str)
+        and _contains_denied_text_token(value)
+    )
+
+
+def _contains_denied_config_dependency(relative_path: str, source: str) -> bool:
+    path = PurePosixPath(relative_path)
+    if (
+        not path.parts
+        or any(part.casefold() in _POLICY_EXCLUDED_PARTS for part in path.parts)
+        or path.suffix.casefold() not in {".json", ".toml"}
+    ):
+        return False
+    try:
+        parsed = (
+            json.loads(source)
+            if path.suffix.casefold() == ".json"
+            else tomllib.loads(source)
+        )
+    except (json.JSONDecodeError, tomllib.TOMLDecodeError):
+        return False
+    return _contains_denied_structured_dependency(parsed)
 
 
 def semantic_policy_categories(relative_path: str, source: str) -> set[str]:
@@ -186,5 +338,7 @@ def semantic_policy_categories(relative_path: str, source: str) -> set[str]:
         path.name.startswith("requirements")
         or path.suffix in _TEXT_AUDIT_SUFFIXES
     ) and _contains_denied_text_token(source):
+        categories.add("retired-generative-runtime-dependency")
+    if _contains_denied_config_dependency(relative_path, source):
         categories.add("retired-generative-runtime-dependency")
     return categories

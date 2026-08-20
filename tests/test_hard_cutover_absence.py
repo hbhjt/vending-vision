@@ -874,6 +874,7 @@ def test_hard_cutover_guard_rejects_ai_mode_readiness_role_and_artifact_variants
         "retired-try-on-payload-mode",
         "retired-fast-try-on-role",
         "retired-try-on-mode-symbol",
+        "retired-try-on-mode-access",
     }
 
 
@@ -970,6 +971,61 @@ def test_hard_cutover_guard_semantically_rejects_try_on_payload_mode_accesses(tm
     )
 
 
+@pytest.mark.parametrize(
+    "body",
+    (
+        "request = payload.copy()\n    return request['mode']",
+        "request = payload\n    return request.get('mode')",
+        "return payload.pop('mode')",
+        "request = payload.copy()\n    return request.setdefault('mode', 'automatic')",
+        "request = payload.copy()\n    request.update({'mode': 'automatic'})",
+        "request = payload\n    alias = request.copy()\n    alias.update(mode='automatic')",
+        (
+            "request = payload\n    if reset:\n        request = {}\n"
+            "    return request.get('mode')"
+        ),
+    ),
+    ids=(
+        "copy-subscript",
+        "direct-get",
+        "direct-pop",
+        "setdefault",
+        "update-map",
+        "transitive-update-keyword",
+        "conditional-reassignment",
+    ),
+)
+def test_hard_cutover_guard_rejects_try_on_payload_alias_mode_operations(
+    tmp_path, body
+):
+    _init_guard_repo(tmp_path)
+    source = f"def handle_try_on(payload):\n    {body}\n"
+    (tmp_path / "app.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_path, check=True)
+
+    assert any(
+        item.endswith(": retired-try-on-mode-access")
+        for item in find_violations(tmp_path)
+    )
+
+
+def test_hard_cutover_guard_allows_unconditionally_replaced_try_on_alias(tmp_path):
+    _init_guard_repo(tmp_path)
+    source = "\n".join(
+        (
+            "def handle_try_on(payload):",
+            "    request = payload.copy()",
+            "    request = {}",
+            "    return request.get('mode')",
+            "",
+        )
+    )
+    (tmp_path / "app.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_path, check=True)
+
+    assert find_violations(tmp_path) == []
+
+
 def test_hard_cutover_guard_allows_unrelated_semantic_mode_uses(tmp_path):
     _init_guard_repo(tmp_path)
     source = "\n".join(
@@ -1023,6 +1079,127 @@ def test_hard_cutover_guard_rejects_generative_runtime_dependencies_everywhere(t
         if item.endswith(": retired-generative-runtime-dependency")
     }
     assert dependency_paths == set(fixtures)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import importlib\nruntime = importlib.import_module('torch')\n",
+        "runtime = __import__('diffusers')\n",
+    ),
+    ids=("importlib", "builtin-import"),
+)
+def test_hard_cutover_guard_rejects_constant_dynamic_runtime_imports(
+    tmp_path, source
+):
+    _init_guard_repo(tmp_path)
+    path = tmp_path / "vision" / "dynamic_loader.py"
+    path.parent.mkdir()
+    path.write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", "vision/dynamic_loader.py"], cwd=tmp_path, check=True)
+
+    assert any(
+        item.endswith(": retired-generative-runtime-dependency")
+        for item in find_violations(tmp_path)
+    )
+
+
+def test_hard_cutover_guard_scans_new_tracked_production_python_without_root_allowlist(
+    tmp_path,
+):
+    _init_guard_repo(tmp_path)
+    production = tmp_path / "runtime_plugin.py"
+    production.write_text("import transformers\n", encoding="utf-8")
+    for relative_path in ("tests/attack_fixture.py", "archive/legacy_runtime.py"):
+        historical = tmp_path / relative_path
+        historical.parent.mkdir(parents=True, exist_ok=True)
+        historical.write_text("import diffusers\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "git",
+            "add",
+            "runtime_plugin.py",
+            "tests/attack_fixture.py",
+            "archive/legacy_runtime.py",
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    dependency_paths = {
+        Path(item.rsplit(": ", 1)[0]).relative_to(tmp_path).as_posix()
+        for item in find_violations(tmp_path)
+        if item.endswith(": retired-generative-runtime-dependency")
+    }
+    assert dependency_paths == {"runtime_plugin.py"}
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source"),
+    (
+        (
+            "pyproject.toml",
+            "[project]\nname='attack'\ndependencies=['diffusers==1.0']\n",
+        ),
+        (
+            "config/runtime.json",
+            '{"runtimeDependency":"transformers"}\n',
+        ),
+    ),
+    ids=("pyproject-dependency", "runtime-json-dependency"),
+)
+def test_hard_cutover_guard_rejects_consumed_dependency_and_config_entries(
+    tmp_path, relative_path, source
+):
+    _init_guard_repo(tmp_path)
+    path = tmp_path / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", relative_path], cwd=tmp_path, check=True)
+
+    assert any(
+        item.endswith(": retired-generative-runtime-dependency")
+        for item in find_violations(tmp_path)
+    )
+
+
+def test_hard_cutover_guard_allows_production_non_generative_configs(tmp_path):
+    _init_guard_repo(tmp_path)
+    fixtures = {
+        "pyproject.toml": (
+            "[project]\nname='runtime'\ndependencies=['fastapi==1.0', 'airflow-monitor==1.0']\n"
+        ),
+        "config/runtime.json": (
+            '{"cameraMode":"dshow","imageMode":"RGBA",'
+            '"genderMode":"automatic","runtimeDependency":"fastapi"}\n'
+        ),
+    }
+    for relative_path, source in fixtures.items():
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", *fixtures], cwd=tmp_path, check=True)
+
+    assert find_violations(tmp_path) == []
+
+
+def test_hard_cutover_guard_excludes_nested_test_fixtures_and_historical_archives(
+    tmp_path,
+):
+    _init_guard_repo(tmp_path)
+    fixtures = {
+        "contracts/v2/fixtures/attack.json": (
+            '{"runtimeDependency":"transformers"}\n'
+        ),
+        "docs/archive/legacy.toml": "dependencies=['diffusers==1.0']\n",
+    }
+    for relative_path, source in fixtures.items():
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", *fixtures], cwd=tmp_path, check=True)
+
+    assert find_violations(tmp_path) == []
 
 
 def test_hard_cutover_guard_allows_similar_runtime_dependencies(tmp_path):

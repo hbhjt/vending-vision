@@ -38,6 +38,30 @@ _MAX_NESTED_ARCHIVE_BYTES = 512 * 1024 * 1024
 _MAX_ARCHIVE_ENTRY_BYTES = 128 * 1024 * 1024
 _MAX_ARCHIVE_COMPRESSION_RATIO = 200
 _ARCHIVE_SUFFIXES = {".pyz", ".whl", ".zip"}
+_NON_ZIP_CONTAINER_SUFFIXES = {
+    ".7z",
+    ".bz2",
+    ".gz",
+    ".gzip",
+    ".tar",
+    ".tbz",
+    ".tbz2",
+    ".tgz",
+    ".txz",
+    ".xz",
+}
+_MODEL_ARTIFACT_SUFFIXES = {
+    ".bin",
+    ".caffemodel",
+    ".ckpt",
+    ".onnx",
+    ".pb",
+    ".pt",
+    ".pth",
+    ".prototxt",
+    ".safetensors",
+    ".tflite",
+}
 
 
 def retired_packaged_entries(entries, *, include_historical_generic_modules=True):
@@ -145,20 +169,10 @@ def audit_packaged_model_files(payload: list[tuple[str, Path]]) -> None:
         or not all(re.fullmatch(r"[0-9a-f]{64}", digest) for digest in declared.values())
     ):
         raise RuntimeError("candidate_model_manifest")
-    model_artifact_suffixes = {
-        ".bin",
-        ".caffemodel",
-        ".ckpt",
-        ".onnx",
-        ".pt",
-        ".pth",
-        ".prototxt",
-        ".safetensors",
-    }
     packaged_model_artifacts = {
         relative
-        for relative in model_members
-        if PurePosixPath(relative).suffix.casefold() in model_artifact_suffixes
+        for relative in by_relative
+        if PurePosixPath(relative).suffix.casefold() in _MODEL_ARTIFACT_SUFFIXES
     }
     if packaged_model_artifacts != set(declared):
         raise RuntimeError("candidate_model_set")
@@ -182,8 +196,21 @@ def _safe_archive_entry(value: str) -> str:
 
 
 def _archive_payload(name: str, payload: bytes) -> bool:
-    return PurePosixPath(name).suffix.casefold() in _ARCHIVE_SUFFIXES or payload.startswith(
-        b"PK\x03\x04"
+    return (
+        PurePosixPath(name).suffix.casefold() in _ARCHIVE_SUFFIXES
+        or zipfile.is_zipfile(io.BytesIO(payload))
+    )
+
+
+def _non_zip_container(name: str, payload: bytes) -> bool:
+    suffix = PurePosixPath(name).suffix.casefold()
+    return (
+        suffix in _NON_ZIP_CONTAINER_SUFFIXES
+        or payload.startswith(b"7z\xbc\xaf\x27\x1c")
+        or payload.startswith(b"BZh")
+        or payload.startswith(b"\x1f\x8b")
+        or payload.startswith(b"\xfd7zXZ\x00")
+        or (len(payload) >= 262 and payload[257:262] == b"ustar")
     )
 
 
@@ -222,6 +249,8 @@ def _scan_archive(payload: bytes, name: str, depth: int, state: dict[str, int]) 
             ):
                 raise RuntimeError("candidate_archive_ratio")
             nested_name = f"{name}:{normalized}"
+            if PurePosixPath(normalized).suffix.casefold() in _MODEL_ARTIFACT_SUFFIXES:
+                raise RuntimeError("candidate_model_set")
             if retired_packaged_entries([nested_name]):
                 raise RuntimeError("candidate_archive_retired")
             try:
@@ -230,18 +259,23 @@ def _scan_archive(payload: bytes, name: str, depth: int, state: dict[str, int]) 
                 raise RuntimeError("candidate_archive_uninspectable") from error
             if _archive_payload(normalized, nested_payload):
                 _scan_archive(nested_payload, nested_name, depth + 1, state)
+            elif _non_zip_container(normalized, nested_payload):
+                raise RuntimeError("candidate_archive_container")
 
 
 def audit_packaged_archives(payload: list[tuple[str, Path]]) -> None:
     """Recursively audit ZIP-compatible runtime members under explicit bounds."""
     state = {"files": 0, "bytes": 0}
     for relative, path in payload:
-        with path.open("rb") as stream:
-            signature = stream.read(4)
+        is_zip = zipfile.is_zipfile(path)
         if (
             PurePosixPath(relative).suffix.casefold() not in _ARCHIVE_SUFFIXES
-            and signature != b"PK\x03\x04"
+            and not is_zip
         ):
+            with path.open("rb") as stream:
+                header = stream.read(512)
+            if _non_zip_container(relative, header):
+                raise RuntimeError("candidate_archive_container")
             continue
         if path.stat().st_size > _MAX_NESTED_ARCHIVE_BYTES:
             raise RuntimeError("candidate_archive_uncompressed_size")
@@ -315,8 +349,8 @@ def _assert_source_identity(dist_root: Path, source_commit: str, repository_root
             capture_output=True,
             text=True,
         ).stdout.strip()
-        tracked_status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
+        source_status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
             cwd=repository_root,
             check=True,
             capture_output=True,
@@ -326,7 +360,7 @@ def _assert_source_identity(dist_root: Path, source_commit: str, repository_root
         raise RuntimeError("candidate_source_repository") from error
     if Path(actual_root).resolve() != repository_root.resolve() or actual_head != source_commit:
         raise RuntimeError("candidate_source_commit")
-    if tracked_status:
+    if source_status:
         raise RuntimeError("candidate_source_dirty")
     marker_root = dist_root / LAYOUT["mainOnedir"] / "_internal" / "vision"
     try:
