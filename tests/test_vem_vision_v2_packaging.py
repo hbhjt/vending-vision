@@ -478,6 +478,207 @@ def test_candidate_archive_rejects_nonignored_untracked_and_allows_ignored_outpu
     )
 
 
+def test_candidate_archive_allows_only_the_build_core_venv_as_ignored_output(
+    tmp_path,
+):
+    from scripts.candidate_artifact_manifest import write_candidate_archive
+
+    assert ".venv-packaging-core/" in (ROOT / ".gitignore").read_text("utf-8")
+
+    repository = tmp_path / "repository"
+    source_commit = _init_candidate_repository(repository)
+    (repository / ".gitignore").write_text(
+        (ROOT / ".gitignore").read_text("utf-8"), "utf-8"
+    )
+    subprocess.run(["git", "add", ".gitignore"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "ignore build core venv"], cwd=repository, check=True)
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    dist = repository / "dist"
+    executable = dist / "vending-vision" / "vending-vision.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"main")
+    _write_packaged_build_marker(dist, source_commit)
+    _copy_candidate_models(repository, dist)
+
+    build_venv = repository / ".venv-packaging-core" / "Scripts" / "python.exe"
+    build_venv.parent.mkdir(parents=True)
+    build_venv.write_bytes(b"ephemeral build interpreter")
+    write_candidate_archive(
+        dist,
+        tmp_path / "core-venv.zip",
+        tmp_path / "core-venv.json",
+        source_commit=source_commit,
+        repository_root=repository,
+    )
+
+    (repository / "untracked-runtime.py").write_text("pass\n", "utf-8")
+    with pytest.raises(RuntimeError, match="candidate_source_dirty"):
+        write_candidate_archive(
+            dist,
+            tmp_path / "other-untracked.zip",
+            tmp_path / "other-untracked.json",
+            source_commit=source_commit,
+            repository_root=repository,
+        )
+
+
+def test_candidate_source_ignores_only_root_release_workspaces(tmp_path):
+    from scripts.candidate_artifact_manifest import write_candidate_archive
+
+    assert "/.venv-packaging-core/" in (ROOT / ".gitignore").read_text("utf-8")
+    assert "/wheelhouse/" in (ROOT / ".gitignore").read_text("utf-8")
+    assert "/main-artifacts/" in (ROOT / ".gitignore").read_text("utf-8")
+    assert "/candidate-artifacts/" in (ROOT / ".gitignore").read_text("utf-8")
+
+    repository = tmp_path / "repository"
+    source_commit = _init_candidate_repository(repository)
+    (repository / ".gitignore").write_text(
+        (ROOT / ".gitignore").read_text("utf-8"), "utf-8"
+    )
+    subprocess.run(["git", "add", ".gitignore"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "root release workspaces"], cwd=repository, check=True)
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    dist = repository / "dist"
+    executable = dist / "vending-vision" / "vending-vision.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"main")
+    _write_packaged_build_marker(dist, source_commit)
+    _copy_candidate_models(repository, dist)
+    for name in (".venv-packaging-core", "wheelhouse", "main-artifacts", "candidate-artifacts"):
+        path = repository / name / "generated.bin"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"release workspace")
+    write_candidate_archive(
+        dist, tmp_path / "root-workspaces.zip", tmp_path / "root-workspaces.json",
+        source_commit=source_commit, repository_root=repository,
+    )
+
+    nested = repository / "nested" / "wheelhouse" / "surprise.whl"
+    nested.parent.mkdir(parents=True)
+    nested.write_bytes(b"must remain dirty")
+    with pytest.raises(RuntimeError, match="candidate_source_dirty"):
+        write_candidate_archive(
+            dist, tmp_path / "nested-workspace.zip", tmp_path / "nested-workspace.json",
+            source_commit=source_commit, repository_root=repository,
+        )
+
+
+def test_candidate_archive_rejects_zip_at_allowlisted_gzip_path(tmp_path, monkeypatch):
+    from scripts import candidate_artifact_manifest as candidate
+
+    relative = "vending-vision/_internal/vendor/allowed-data.gz"
+    path = tmp_path / "allowed-data.gz"
+    payload = _zip_bytes([("safe.py", b"pass\n")])
+    path.write_bytes(payload)
+    monkeypatch.setattr(
+        candidate,
+        "GZIP_PACKAGE_DATA_ALLOWLIST",
+        {relative: {"compressedSha256": hashlib.sha256(payload).hexdigest(), "decompressedSha256": "0" * 64, "decompressedSize": 0, "tar": False}},
+    )
+    with pytest.raises(RuntimeError, match="candidate_archive_container"):
+        candidate.audit_packaged_archives([(relative, path)])
+
+
+def test_candidate_archive_rejects_nested_zip_in_allowlisted_gzip_tar(tmp_path, monkeypatch):
+    from scripts import candidate_artifact_manifest as candidate
+
+    nested = _zip_bytes([("weights.ckpt", b"hidden model")])
+    tar_payload = io.BytesIO()
+    with tarfile.open(fileobj=tar_payload, mode="w") as archive:
+        info = tarfile.TarInfo("data.zip")
+        info.size = len(nested)
+        archive.addfile(info, io.BytesIO(nested))
+    raw_tar = tar_payload.getvalue()
+    compressed = gzip.compress(raw_tar, mtime=0)
+    relative = "vending-vision/_internal/vendor/allowed-data.tar.gz"
+    monkeypatch.setattr(candidate, "GZIP_PACKAGE_DATA_ALLOWLIST", {relative: {
+        "compressedSha256": hashlib.sha256(compressed).hexdigest(),
+        "decompressedSha256": hashlib.sha256(raw_tar).hexdigest(),
+        "decompressedSize": len(raw_tar), "tar": True,
+    }})
+    path = tmp_path / "allowed-data.tar.gz"
+    path.write_bytes(compressed)
+    with pytest.raises(RuntimeError, match="candidate_model_set"):
+        candidate.audit_packaged_archives([(relative, path)])
+
+
+def test_candidate_archive_rejects_tar_duplicate_casefold_and_special_members(tmp_path, monkeypatch):
+    from scripts import candidate_artifact_manifest as candidate
+
+    tar_payload = io.BytesIO()
+    with tarfile.open(fileobj=tar_payload, mode="w") as archive:
+        for name in ("same.txt", "SAME.txt"):
+            info = tarfile.TarInfo(name)
+            info.size = 1
+            archive.addfile(info, io.BytesIO(b"x"))
+    raw_tar = tar_payload.getvalue()
+    compressed = gzip.compress(raw_tar, mtime=0)
+    relative = "vending-vision/_internal/vendor/allowed-data.tar.gz"
+    monkeypatch.setattr(candidate, "GZIP_PACKAGE_DATA_ALLOWLIST", {relative: {
+        "compressedSha256": hashlib.sha256(compressed).hexdigest(),
+        "decompressedSha256": hashlib.sha256(raw_tar).hexdigest(),
+        "decompressedSize": len(raw_tar), "tar": True,
+    }})
+    path = tmp_path / "allowed-data.tar.gz"
+    path.write_bytes(compressed)
+    with pytest.raises(RuntimeError, match="candidate_archive_duplicate"):
+        candidate.audit_packaged_archives([(relative, path)])
+
+
+@pytest.mark.parametrize("member_type", (tarfile.SYMTYPE, tarfile.FIFOTYPE, tarfile.CHRTYPE))
+def test_candidate_archive_rejects_symlink_fifo_and_special_tar_members(
+    tmp_path, monkeypatch, member_type
+):
+    from scripts import candidate_artifact_manifest as candidate
+
+    tar_payload = io.BytesIO()
+    with tarfile.open(fileobj=tar_payload, mode="w") as archive:
+        info = tarfile.TarInfo("unsafe-entry")
+        info.type = member_type
+        info.linkname = "ordinary.txt"
+        archive.addfile(info)
+    raw_tar = tar_payload.getvalue()
+    compressed = gzip.compress(raw_tar, mtime=0)
+    relative = "vending-vision/_internal/vendor/allowed-data.tar.gz"
+    monkeypatch.setattr(candidate, "GZIP_PACKAGE_DATA_ALLOWLIST", {relative: {
+        "compressedSha256": hashlib.sha256(compressed).hexdigest(),
+        "decompressedSha256": hashlib.sha256(raw_tar).hexdigest(),
+        "decompressedSize": len(raw_tar), "tar": True,
+    }})
+    path = tmp_path / "allowed-data.tar.gz"
+    path.write_bytes(compressed)
+    with pytest.raises(RuntimeError, match="candidate_archive_unsafe_path"):
+        candidate.audit_packaged_archives([(relative, path)])
+
+
+def test_candidate_archive_allows_forward_hardlink_to_regular_member_in_allowlisted_tar(tmp_path, monkeypatch):
+    from scripts import candidate_artifact_manifest as candidate
+
+    tar_payload = io.BytesIO()
+    with tarfile.open(fileobj=tar_payload, mode="w") as archive:
+        link = tarfile.TarInfo("forward-link")
+        link.type = tarfile.LNKTYPE
+        link.linkname = "ordinary.txt"
+        archive.addfile(link)
+        ordinary = tarfile.TarInfo("ordinary.txt")
+        ordinary.size = 1
+        archive.addfile(ordinary, io.BytesIO(b"x"))
+    raw_tar = tar_payload.getvalue()
+    compressed = gzip.compress(raw_tar, mtime=0)
+    relative = "vending-vision/_internal/vendor/allowed-data.tar.gz"
+    monkeypatch.setattr(candidate, "GZIP_PACKAGE_DATA_ALLOWLIST", {relative: {
+        "compressedSha256": hashlib.sha256(compressed).hexdigest(),
+        "decompressedSha256": hashlib.sha256(raw_tar).hexdigest(),
+        "decompressedSize": len(raw_tar), "tar": True,
+    }})
+    path = tmp_path / "allowed-data.tar.gz"
+    path.write_bytes(compressed)
+    candidate.audit_packaged_archives([(relative, path)])
+
 def test_candidate_archive_rejects_package_without_bound_model_manifest(tmp_path):
     from scripts.candidate_artifact_manifest import write_candidate_archive
 
@@ -659,6 +860,76 @@ def test_candidate_archive_rejects_non_zip_container_suffixes_and_magic(
 
     with pytest.raises(RuntimeError, match="candidate_archive_container"):
         audit_packaged_archives([(f"vending-vision/_internal/{name}", disguised)])
+
+
+def test_candidate_archive_allows_only_exact_audited_gzip_package_data(
+    tmp_path, monkeypatch
+):
+    from scripts import candidate_artifact_manifest as candidate
+
+    plain = b"safe package data"
+    allowed = gzip.compress(plain, mtime=0)
+    relative = "vending-vision/_internal/vendor/allowed-data.gz"
+    monkeypatch.setattr(
+        candidate,
+        "GZIP_PACKAGE_DATA_ALLOWLIST",
+        {
+            relative: {
+                "compressedSha256": hashlib.sha256(allowed).hexdigest(),
+                "decompressedSha256": hashlib.sha256(plain).hexdigest(),
+                "decompressedSize": len(plain),
+                "tar": False,
+            }
+        },
+    )
+    path = tmp_path / "allowed-data.gz"
+    path.write_bytes(allowed)
+
+    candidate.audit_packaged_archives([(relative, path)])
+
+    with pytest.raises(RuntimeError, match="candidate_archive_container"):
+        candidate.audit_packaged_archives(
+            [("vending-vision/_internal/vendor/third-data.gz", path)]
+        )
+    with pytest.raises(RuntimeError, match="candidate_archive_container"):
+        candidate.audit_packaged_archives(
+            [("vending-vision/_internal/vendor/allowed-data.dat", path)]
+        )
+
+    path.write_bytes(gzip.compress(b"altered package data", mtime=0))
+    with pytest.raises(RuntimeError, match="candidate_archive_container"):
+        candidate.audit_packaged_archives([(relative, path)])
+
+
+def test_candidate_archive_rejects_retired_member_inside_allowlisted_gzip_tar(
+    tmp_path, monkeypatch
+):
+    from scripts import candidate_artifact_manifest as candidate
+
+    tar_payload = io.BytesIO()
+    with tarfile.open(fileobj=tar_payload, mode="w") as archive:
+        member = tarfile.TarInfo("vision/ai/attempt_worker.py")
+        member.size = len(b"pass\n")
+        archive.addfile(member, io.BytesIO(b"pass\n"))
+    compressed = gzip.compress(tar_payload.getvalue(), mtime=0)
+    relative = "vending-vision/_internal/vendor/allowed-data.tar.gz"
+    monkeypatch.setattr(
+        candidate,
+        "GZIP_PACKAGE_DATA_ALLOWLIST",
+        {
+            relative: {
+                "compressedSha256": hashlib.sha256(compressed).hexdigest(),
+                "decompressedSha256": hashlib.sha256(tar_payload.getvalue()).hexdigest(),
+                "decompressedSize": len(tar_payload.getvalue()),
+                "tar": True,
+            }
+        },
+    )
+    path = tmp_path / "allowed-data.tar.gz"
+    path.write_bytes(compressed)
+
+    with pytest.raises(RuntimeError, match="candidate_archive_retired"):
+        candidate.audit_packaged_archives([(relative, path)])
 
 
 @pytest.mark.parametrize(

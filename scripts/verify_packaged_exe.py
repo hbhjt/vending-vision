@@ -210,7 +210,11 @@ def assert_hard_cutover_archive_absence(exe_path):
         raise AssertionError(f"retired modules remain in packaged archive: {violations}")
     audit_packaged_archives(
         [
-            (f"resource:{path.relative_to(internal).as_posix()}", path)
+            (
+                f"{LAYOUT['mainOnedir']}/_internal/"
+                f"{path.relative_to(internal).as_posix()}",
+                path,
+            )
             for path in internal.rglob("*")
             if path.is_file()
         ]

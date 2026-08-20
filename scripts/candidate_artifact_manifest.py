@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import io
 import json
@@ -11,7 +12,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
+from typing import TypedDict
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +64,29 @@ _MODEL_ARTIFACT_SUFFIXES = {
     ".prototxt",
     ".safetensors",
     ".tflite",
+}
+
+
+class GzipPackageData(TypedDict):
+    compressedSha256: str
+    decompressedSha256: str
+    decompressedSize: int
+    tar: bool
+
+
+GZIP_PACKAGE_DATA_ALLOWLIST: dict[str, GzipPackageData] = {
+    "vending-vision/_internal/dateutil/zoneinfo/dateutil-zoneinfo.tar.gz": {
+        "compressedSha256": "d3ea52e7b6e968de0d884df1288193596fa95b803db4f92a18279a7398004475",
+        "decompressedSha256": "33d76217f5e23f073cbf0a38b50b841fa4040bdf2d442650363d1b06c43ad02e",
+        "decompressedSize": 1_474_560,
+        "tar": True,
+    },
+    "vending-vision/_internal/matplotlib/mpl-data/sample_data/s1045.ima.gz": {
+        "compressedSha256": "32b424d64f62b7e71cb24d29fd53938ad5664d608055a67ab2b2af4369f8b89e",
+        "decompressedSha256": "3ffa4a44bef1c3d3fc689570c059778d0e94efb461802a563c8c4b611d2a2dfb",
+        "decompressedSize": 131_072,
+        "tar": False,
+    },
 }
 
 
@@ -214,6 +240,92 @@ def _non_zip_container(name: str, payload: bytes) -> bool:
     )
 
 
+def _audit_tar_payload(relative: str, payload: bytes, state: dict[str, int]) -> None:
+    try:
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
+            members = archive.getmembers()
+            if len(members) > _MAX_NESTED_ARCHIVE_FILES:
+                raise RuntimeError("candidate_archive_file_count")
+            regular: set[str] = set()
+            hardlinks: list[tarfile.TarInfo] = []
+            seen: set[str] = set()
+            folded: set[str] = set()
+            for member in members:
+                name = _safe_archive_entry(member.name)
+                if name in seen or name.casefold() in folded:
+                    raise RuntimeError("candidate_archive_duplicate")
+                seen.add(name)
+                folded.add(name.casefold())
+                if retired_packaged_entries([f"{relative}:{name}"]):
+                    raise RuntimeError("candidate_archive_retired")
+                if PurePosixPath(name).suffix.casefold() in _MODEL_ARTIFACT_SUFFIXES:
+                    raise RuntimeError("candidate_model_set")
+                if member.size < 0 or member.size > _MAX_ARCHIVE_ENTRY_BYTES:
+                    raise RuntimeError("candidate_archive_uncompressed_size")
+                if member.isdir():
+                    continue
+                if member.islnk():
+                    hardlinks.append(member)
+                    continue
+                if not member.isreg():
+                    raise RuntimeError("candidate_archive_unsafe_path")
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise RuntimeError("candidate_archive_uninspectable")
+                data = stream.read(member.size + 1)
+                if len(data) != member.size:
+                    raise RuntimeError("candidate_archive_uninspectable")
+                state["files"] += 1
+                state["bytes"] += member.size
+                if state["files"] > _MAX_NESTED_ARCHIVE_FILES:
+                    raise RuntimeError("candidate_archive_file_count")
+                if state["bytes"] > _MAX_NESTED_ARCHIVE_BYTES:
+                    raise RuntimeError("candidate_archive_uncompressed_size")
+                nested_name = f"{relative}:{name}"
+                if _archive_payload(name, data):
+                    _scan_archive(data, nested_name, 2, state)
+                elif _non_zip_container(name, data):
+                    raise RuntimeError("candidate_archive_container")
+                regular.add(name)
+            for member in hardlinks:
+                target = _safe_archive_entry(member.linkname)
+                if target not in regular:
+                    raise RuntimeError("candidate_archive_unsafe_path")
+                if retired_packaged_entries([f"{relative}:{target}"]):
+                    raise RuntimeError("candidate_archive_retired")
+                if PurePosixPath(target).suffix.casefold() in _MODEL_ARTIFACT_SUFFIXES:
+                    raise RuntimeError("candidate_model_set")
+    except (OSError, tarfile.TarError) as error:
+        raise RuntimeError("candidate_archive_uninspectable") from error
+
+
+def _allowlisted_gzip_payload(relative: str, path: Path, state: dict[str, int]) -> bool:
+    expected = GZIP_PACKAGE_DATA_ALLOWLIST.get(relative)
+    if expected is None:
+        return False
+    payload = path.read_bytes()
+    if not payload.startswith(b"\x1f\x8b"):
+        return False
+    if hashlib.sha256(payload).hexdigest() != expected["compressedSha256"]:
+        return False
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(payload)) as stream:
+            decompressed = stream.read(expected["decompressedSize"] + 1)
+            if stream.read(1):
+                return False
+    except OSError:
+        return False
+    if (
+        len(decompressed) != expected["decompressedSize"]
+        or hashlib.sha256(decompressed).hexdigest() != expected["decompressedSha256"]
+    ):
+        return False
+    if not expected["tar"]:
+        return True
+    _audit_tar_payload(relative, decompressed, state)
+    return True
+
+
 def _scan_archive(payload: bytes, name: str, depth: int, state: dict[str, int]) -> None:
     if depth > _MAX_NESTED_ARCHIVE_DEPTH:
         raise RuntimeError("candidate_archive_depth")
@@ -267,13 +379,20 @@ def audit_packaged_archives(payload: list[tuple[str, Path]]) -> None:
     """Recursively audit ZIP-compatible runtime members under explicit bounds."""
     state = {"files": 0, "bytes": 0}
     for relative, path in payload:
+        suffix = PurePosixPath(relative).suffix.casefold()
+        with path.open("rb") as stream:
+            header = stream.read(512)
+        if relative in GZIP_PACKAGE_DATA_ALLOWLIST:
+            if suffix != ".gz" or not _allowlisted_gzip_payload(relative, path, state):
+                raise RuntimeError("candidate_archive_container")
+            continue
+        if suffix in _NON_ZIP_CONTAINER_SUFFIXES:
+            raise RuntimeError("candidate_archive_container")
         is_zip = zipfile.is_zipfile(path)
         if (
-            PurePosixPath(relative).suffix.casefold() not in _ARCHIVE_SUFFIXES
+            suffix not in _ARCHIVE_SUFFIXES
             and not is_zip
         ):
-            with path.open("rb") as stream:
-                header = stream.read(512)
             if _non_zip_container(relative, header):
                 raise RuntimeError("candidate_archive_container")
             continue

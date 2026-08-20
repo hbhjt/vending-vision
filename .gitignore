@@ -7,6 +7,10 @@ __pycache__/
 # Virtual environments
 .venv/
 .venv-packaging/
+/.venv-packaging-core/
+/wheelhouse/
+/main-artifacts/
+/candidate-artifacts/
 venv/
 env/
 ENV/
