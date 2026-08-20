@@ -310,7 +310,19 @@ class GarmentComposer:
         component_count, _labels = cv2.connectedComponents(alpha_mask)
         if component_count != 2:
             raise GarmentFetchError("garment_quality")
-        if x == 0 or y == 0 or x + width == rgba.shape[1] or y + height == rgba.shape[0]:
+        # 裁切是原图事实，必须观察原始高置信主体，不能让形态学处理将低 alpha
+        # 编码边缘扩张到画布后误判为裁切。
+        subject_mask = np.where(rgba[:, :, 3] >= 128, 255, 0).astype(np.uint8)
+        subject_points = cv2.findNonZero(subject_mask)
+        if subject_points is None:
+            raise GarmentFetchError("garment_quality")
+        subject_x, subject_y, subject_width, subject_height = cv2.boundingRect(subject_points)
+        if (
+            subject_x == 0
+            or subject_y == 0
+            or subject_x + subject_width == rgba.shape[1]
+            or subject_y + subject_height == rgba.shape[0]
+        ):
             raise GarmentFetchError("garment_cropped")
         sleeve_semantics = "long" if source.template == "tshirt_long_sleeve" else "short"
         source_bbox = source_alpha_mask[y : y + height, x : x + width] > 0

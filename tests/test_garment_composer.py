@@ -77,6 +77,20 @@ def _wide_torso_short_source():
     return TransparentGarmentSource(png, "sha256:" + hashlib.sha256(png).hexdigest(), "tshirt_short_sleeve")
 
 
+def _antialiased_boundary_short_source():
+    """完整短袖主体只留一像素边距，右侧只有低 alpha 抗锯齿尾部触边。"""
+    image = np.zeros((140, 180, 4), dtype=np.uint8)
+    image[1:128, 30:150] = (20, 120, 220, 255)
+    image[38:82, 8:35] = (20, 120, 220, 255)
+    image[38:82, 145:179] = (20, 120, 220, 255)
+    # 这是编码边缘，不是可见主体：只以 alpha>=12 二值化会把它误作裁切。
+    image[48:72, 179] = (20, 120, 220, 100)
+    ok, encoded = cv2.imencode(".png", image)
+    assert ok
+    png = encoded.tobytes()
+    return TransparentGarmentSource(png, "sha256:" + hashlib.sha256(png).hexdigest(), "tshirt_short_sleeve")
+
+
 def _composer(*, crossed=False, arms=True, shoulder_width=0.30, torso=0.41, hips=None):
     return GarmentComposer(
         pose_estimator=_FixturePoseEstimator(
@@ -207,6 +221,17 @@ def test_compose_accepts_a_wide_constant_torso_short_source():
         _wide_torso_short_source(),
         1.0,
     )
+    assert _decoded(result).shape == (360, 480, 3)
+
+
+def test_compose_accepts_complete_antialiased_short_source_near_canvas_boundary():
+    """完整高置信主体不得因边缘抗锯齿或 close 扩张而被当作裁切。"""
+    result = _composer().compose(
+        np.full((360, 480, 3), 180, dtype=np.uint8),
+        _antialiased_boundary_short_source(),
+        1.0,
+    )
+
     assert _decoded(result).shape == (360, 480, 3)
 
 
