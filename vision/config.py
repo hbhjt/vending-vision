@@ -11,11 +11,19 @@
 
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
 import jsonschema
+from vision.build_identity import BuildIdentity, load_build_identity
+
+
+def load_runtime_build_identity() -> BuildIdentity:
+    """Expose the identity production config uses for version/readiness facts."""
+    return load_build_identity(
+        Path(__file__).with_name("_build_version.py").parent,
+        require_source_commit=bool(getattr(sys, "frozen", False)),
+    )
 
 
 def _load_build_app_version() -> str:
@@ -27,17 +35,12 @@ def _load_build_app_version() -> str:
     generated source file.
     """
 
-    try:
-        raw = Path(__file__).with_name("_build_version.py").read_text("utf-8")
-    except OSError as exc:
-        raise RuntimeError("build version marker is unavailable") from exc
-    match = re.fullmatch(r'APP_VERSION = "([0-9A-Za-z.-]+)"\n', raw)
-    if match is None:
-        raise RuntimeError("build version marker is invalid")
-    return match.group(1)
+    return load_runtime_build_identity().app_version
 
 
-BUILD_APP_VERSION = _load_build_app_version()
+BUILD_IDENTITY = load_runtime_build_identity()
+BUILD_APP_VERSION = BUILD_IDENTITY.app_version
+BUILD_SOURCE_COMMIT = BUILD_IDENTITY.source_commit
 
 # ---------------------------------------------------------------------------
 # 路径解析
@@ -213,7 +216,7 @@ def get_config_value(key, env_key, default):
     自动根据默认值类型进行类型转换（bool/int/float/str）。
     """
     if not MANAGED_CONFIG_MODE and env_key in os.environ:
-        value = os.getenv(env_key)
+        value = os.environ[env_key]
 
         if isinstance(default, bool):
             return str(value).lower() == "true"
@@ -244,7 +247,7 @@ def get_json_config_value(key, env_key, default):
 def get_nested_config_value(section, key, env_key, default):
     """获取嵌套配置值（从 config.json 的某个 section 下读取 key）。"""
     if not MANAGED_CONFIG_MODE and env_key in os.environ:
-        value = os.getenv(env_key)
+        value = os.environ[env_key]
 
         if isinstance(default, bool):
             return str(value).lower() == "true"
@@ -352,6 +355,7 @@ def bool_config_value(value, default=False):
 class Settings:
     APP_NAME = "Vending Vision Module"
     APP_VERSION = BUILD_APP_VERSION
+    SOURCE_COMMIT = BUILD_SOURCE_COMMIT
     PROTOCOL = "vem.vision.v2"
     PERSON_DETECTOR_CONFIG = get_model_config(
         "person_detector",

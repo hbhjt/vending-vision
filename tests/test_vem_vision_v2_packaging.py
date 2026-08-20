@@ -1,4 +1,6 @@
 from pathlib import Path
+import hashlib
+import io
 import json
 import re
 import shutil
@@ -59,6 +61,36 @@ def test_packaged_archive_guard_rejects_retired_modules_and_resources():
             *retired_ai_entries,
         ]
     )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    (
+        "vision/" + "/".join(("a" + "i", "attempt_worker.py")),
+        ".".join(("vision", "a" + "i", "attempt_worker")),
+        "VISION\\" + "A" + "I" + "\\ATTEMPT-WORKER.PY",
+        "resource:pkg/deep/" + "a" + "i" + "_source_provenance.py",
+        "base_library.zip:vendor/model/weights." + "safe" + "tensors",
+        "runtime.zip:layer.whl:vision.vendor." + "cat" + "vton" + ".pipeline",
+    ),
+)
+def test_packaged_archive_guard_normalizes_retired_entry_variants(entry):
+    from scripts.candidate_artifact_manifest import retired_packaged_entries
+
+    assert retired_packaged_entries([entry]) == [entry]
+
+
+def test_packaged_archive_guard_allows_normal_stdlib_base_library_entries():
+    from scripts.candidate_artifact_manifest import retired_packaged_entries
+
+    entries = {
+        "resource:_internal/base_library.zip",
+        "base_library.zip:asyncio.base_events",
+        "base_library.zip:importlib._bootstrap",
+        "base_library.zip:email.message",
+    }
+
+    assert retired_packaged_entries(entries) == []
 
 
 def test_frozen_spec_keeps_the_generated_v2_bundle_and_static_boundary_import():
@@ -154,21 +186,26 @@ def test_packaged_verifier_rejects_missing_release_version_runtime_marker(tmp_pa
         'APP_VERSION = "1.2.3"\n',
         'APP_VERSION = "1.2.3-rc.12"\n',
         'APP_VERSION = "1.2.3-alpha-"\n',
-        'APP_VERSION = "1.2.3+build.7"\n',
-        'APP_VERSION = "1.2.3-rc.12+build.007"\n',
     ),
 )
 def test_packaged_verifier_accepts_semver_release_version_runtime_marker(
     tmp_path, marker
 ):
     from scripts.verify_packaged_exe import assert_release_version_runtime_marker
+    from vision.build_identity import write_packaged_build_identity
 
     suffix = ".exe" if sys.platform == "win32" else ""
     exe = tmp_path / "vending-vision" / f"vending-vision{suffix}"
     internal = exe.parent / "_internal"
     (internal / "vision").mkdir(parents=True)
     exe.write_bytes(b"main")
-    (internal / "vision" / "_build_version.py").write_text(marker, "utf-8")
+    version_marker = internal / "vision" / "_build_version.py"
+    version_marker.write_text(marker, "utf-8")
+    write_packaged_build_identity(
+        version_marker,
+        internal / "vision" / "_build_identity.json",
+        "a" * 40,
+    )
 
     assert_release_version_runtime_marker(exe)
 
@@ -182,6 +219,8 @@ def test_packaged_verifier_accepts_semver_release_version_runtime_marker(
         'APP_VERSION = "1.2.3+build..7"\n',
         'APP_VERSION = "1.2.3+build."\n',
         'APP_VERSION = "1.2.3+build_7"\n',
+        'APP_VERSION = "1.2.3+build.7"\n',
+        'APP_VERSION = "1.2.3-rc.12+build.007"\n',
     ),
 )
 def test_packaged_verifier_rejects_noncanonical_release_version_runtime_marker(
@@ -195,38 +234,133 @@ def test_packaged_verifier_rejects_noncanonical_release_version_runtime_marker(
     (internal / "vision").mkdir(parents=True)
     exe.write_bytes(b"main")
     (internal / "vision" / "_build_version.py").write_text(marker, "utf-8")
+    (internal / "vision" / "_build_identity.json").write_text(
+        json.dumps(
+            {
+                "appVersion": "1.2.3",
+                "schemaVersion": "vending-vision-build-identity/v1",
+                "sourceCommit": "a" * 40,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        "utf-8",
+    )
 
     with pytest.raises(AssertionError, match="invalid release version runtime marker"):
         assert_release_version_runtime_marker(exe)
 
 
-def test_candidate_archive_write_is_deterministic_and_binds_source_commit(tmp_path):
+def _init_candidate_repository(root):
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.invalid"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Candidate Tests"], cwd=root, check=True)
+    (root / "tracked.txt").write_text("candidate source\n", "utf-8")
+    source_model = root / "models" / "current" / "model.onnx"
+    source_model.parent.mkdir(parents=True)
+    source_model.write_bytes(b"current production model")
+    source_manifest = root / "models" / "model-manifest.json"
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "vending-vision-model-manifest/v1",
+                "models": [
+                    {
+                        "role": "current_model",
+                        "path": "models/current/model.onnx",
+                        "sha256": hashlib.sha256(source_model.read_bytes()).hexdigest(),
+                    }
+                ],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        "utf-8",
+    )
+    subprocess.run(["git", "add", "tracked.txt", "models"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "candidate source"], cwd=root, check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _copy_candidate_models(repository, dist):
+    shutil.copytree(
+        repository / "models",
+        dist / "vending-vision" / "_internal" / "models",
+    )
+
+
+def _write_packaged_build_marker(dist, source_commit):
+    from vision.build_identity import write_packaged_build_identity
+
+    runtime_root = dist / "vending-vision" / "_internal" / "vision"
+    marker = runtime_root / "_build_version.py"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('APP_VERSION = "1.2.3"\n', "utf-8")
+    write_packaged_build_identity(
+        marker, runtime_root / "_build_identity.json", source_commit
+    )
+
+
+def test_packaged_commit_identity_keeps_production_config_version_parseable(
+    tmp_path, monkeypatch
+):
+    from vision import config as production_config
+
+    dist = tmp_path / "dist"
+    _write_packaged_build_marker(dist, "a" * 40)
+    packaged_vision = dist / "vending-vision" / "_internal" / "vision"
+    monkeypatch.setattr(production_config, "__file__", str(packaged_vision / "config.py"))
+
+    assert production_config._load_build_app_version() == "1.2.3"
+    assert production_config.load_runtime_build_identity().source_commit == "a" * 40
+
+
+def test_candidate_archive_write_is_deterministic_and_binds_clean_head_and_build_marker(
+    tmp_path,
+):
     from scripts.candidate_artifact_manifest import (
         EMBEDDED_MANIFEST,
         write_candidate_archive,
     )
 
-    dist = tmp_path / "dist"
+    repository = tmp_path / "repository"
+    source_commit = _init_candidate_repository(repository)
+    dist = repository / "dist"
     main = dist / "vending-vision" / "vending-vision.exe"
     main.parent.mkdir(parents=True)
     main.write_bytes(b"main")
+    _write_packaged_build_marker(dist, source_commit)
+    _copy_candidate_models(repository, dist)
 
     artifact = tmp_path / "candidate.zip"
     manifest_path = tmp_path / "candidate-manifest.json"
     first = write_candidate_archive(
-        dist, artifact, manifest_path, source_commit="a" * 40
+        dist,
+        artifact,
+        manifest_path,
+        source_commit=source_commit,
+        repository_root=repository,
     )
     repeated_artifact = tmp_path / "candidate-repeat.zip"
     repeated_manifest = tmp_path / "candidate-repeat.manifest.json"
     second = write_candidate_archive(
-        dist, repeated_artifact, repeated_manifest, source_commit="a" * 40
+        dist,
+        repeated_artifact,
+        repeated_manifest,
+        source_commit=source_commit,
+        repository_root=repository,
     )
 
     assert first == second
     assert artifact.read_bytes() == repeated_artifact.read_bytes()
     manifest = json.loads(manifest_path.read_text("utf-8"))
     assert manifest["schemaVersion"] == "vending-vision-candidate-artifact/v3"
-    assert manifest["sourceCommit"] == "a" * 40
+    assert manifest["sourceCommit"] == source_commit
     assert (
         manifest["bindings"]["mainExecutable"]["path"]
         == "vending-vision/vending-vision.exe"
@@ -246,7 +380,8 @@ def test_candidate_archive_write_is_deterministic_and_binds_source_commit(tmp_pa
             dist,
             tmp_path / "candidate-extra.zip",
             tmp_path / "candidate-extra.manifest.json",
-            source_commit="a" * 40,
+            source_commit=source_commit,
+            repository_root=repository,
         )
 
     shutil.rmtree(retired.parent)
@@ -259,8 +394,269 @@ def test_candidate_archive_write_is_deterministic_and_binds_source_commit(tmp_pa
             dist,
             tmp_path / "candidate-retired.zip",
             tmp_path / "candidate-retired.manifest.json",
-            source_commit="a" * 40,
+            source_commit=source_commit,
+            repository_root=repository,
         )
+
+
+def test_candidate_archive_rejects_commit_marker_mismatch_and_dirty_head(tmp_path):
+    from scripts.candidate_artifact_manifest import write_candidate_archive
+
+    repository = tmp_path / "repository"
+    source_commit = _init_candidate_repository(repository)
+    dist = repository / "dist"
+    executable = dist / "vending-vision" / "vending-vision.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"main")
+    _write_packaged_build_marker(dist, "b" * 40)
+
+    with pytest.raises(RuntimeError, match="candidate_build_commit"):
+        write_candidate_archive(
+            dist,
+            tmp_path / "marker.zip",
+            tmp_path / "marker.json",
+            source_commit=source_commit,
+            repository_root=repository,
+        )
+
+    _write_packaged_build_marker(dist, source_commit)
+    (repository / "tracked.txt").write_text("dirty\n", "utf-8")
+    with pytest.raises(RuntimeError, match="candidate_source_dirty"):
+        write_candidate_archive(
+            dist,
+            tmp_path / "dirty.zip",
+            tmp_path / "dirty.json",
+            source_commit=source_commit,
+            repository_root=repository,
+        )
+
+
+def test_candidate_archive_rejects_package_without_bound_model_manifest(tmp_path):
+    from scripts.candidate_artifact_manifest import write_candidate_archive
+
+    repository = tmp_path / "repository"
+    source_commit = _init_candidate_repository(repository)
+    dist = repository / "dist"
+    executable = dist / "vending-vision" / "vending-vision.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"main")
+    _write_packaged_build_marker(dist, source_commit)
+
+    with pytest.raises(RuntimeError, match="candidate_model_manifest"):
+        write_candidate_archive(
+            dist,
+            tmp_path / "missing-models.zip",
+            tmp_path / "missing-models.json",
+            source_commit=source_commit,
+            repository_root=repository,
+        )
+
+
+def _zip_bytes(entries, *, compression=zipfile.ZIP_STORED):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=compression) as archive:
+        for name, payload in entries:
+            archive.writestr(name, payload)
+    return output.getvalue()
+
+
+def _mark_zip_encrypted(payload):
+    encrypted = bytearray(payload)
+    local = encrypted.find(b"PK\x03\x04")
+    central = encrypted.find(b"PK\x01\x02")
+    assert local >= 0 and central >= 0
+    encrypted[local + 6 : local + 8] = (
+        int.from_bytes(encrypted[local + 6 : local + 8], "little") | 1
+    ).to_bytes(2, "little")
+    encrypted[central + 8 : central + 10] = (
+        int.from_bytes(encrypted[central + 8 : central + 10], "little") | 1
+    ).to_bytes(2, "little")
+    return bytes(encrypted)
+
+
+@pytest.mark.parametrize(
+    ("archive_payload", "error"),
+    (
+        (
+            _zip_bytes(
+                [
+                    (
+                        "nested/runtime.whl",
+                        _zip_bytes(
+                            [("vision/" + "a" + "i" + "/attempt_worker.py", b"pass\n")]
+                        ),
+                    )
+                ]
+            ),
+            "candidate_archive_retired",
+        ),
+        (_zip_bytes([("../escape.py", b"pass\n")]), "candidate_archive_unsafe_path"),
+        (_mark_zip_encrypted(_zip_bytes([("safe.py", b"pass\n")])), "candidate_archive_encrypted"),
+        (
+            _zip_bytes([("zeros.bin", b"0" * (2 * 1024 * 1024))], compression=zipfile.ZIP_DEFLATED),
+            "candidate_archive_ratio",
+        ),
+        (b"not a zip", "candidate_archive_uninspectable"),
+    ),
+)
+def test_candidate_archive_recursively_rejects_unsafe_or_uninspectable_archives(
+    tmp_path, archive_payload, error
+):
+    from scripts.candidate_artifact_manifest import audit_packaged_archives
+
+    archive = tmp_path / "base_library.zip"
+    archive.write_bytes(archive_payload)
+
+    with pytest.raises(RuntimeError, match=error):
+        audit_packaged_archives([("vending-vision/_internal/base_library.zip", archive)])
+
+
+def test_candidate_archive_accepts_bounded_stdlib_base_library(tmp_path):
+    from scripts.candidate_artifact_manifest import audit_packaged_archives
+
+    archive = tmp_path / "base_library.zip"
+    archive.write_bytes(
+        _zip_bytes(
+            [
+                ("asyncio/base_events.pyc", b"stdlib"),
+                ("importlib/_bootstrap.pyc", b"stdlib"),
+                ("email/message.pyc", b"stdlib"),
+            ]
+        )
+    )
+
+    audit_packaged_archives([("vending-vision/_internal/base_library.zip", archive)])
+
+
+def test_candidate_archive_rejects_more_than_three_nested_archive_layers(tmp_path):
+    from scripts.candidate_artifact_manifest import audit_packaged_archives
+
+    payload = _zip_bytes([("stdlib.pyc", b"stdlib")])
+    for depth in range(4):
+        payload = _zip_bytes([(f"layer-{depth}.zip", payload)])
+    archive = tmp_path / "base_library.zip"
+    archive.write_bytes(payload)
+
+    with pytest.raises(RuntimeError, match="candidate_archive_depth"):
+        audit_packaged_archives([("vending-vision/_internal/base_library.zip", archive)])
+
+
+def test_candidate_archive_detects_zip_magic_behind_nonarchive_name(tmp_path):
+    from scripts.candidate_artifact_manifest import audit_packaged_archives
+
+    disguised = tmp_path / "runtime.dat"
+    disguised.write_bytes(
+        _zip_bytes([("vision/" + "a" + "i" + "/attempt_worker.py", b"pass\n")])
+    )
+
+    with pytest.raises(RuntimeError, match="candidate_archive_retired"):
+        audit_packaged_archives([("vending-vision/_internal/runtime.dat", disguised)])
+
+
+@pytest.mark.parametrize(
+    "runtime_dependency",
+    (
+        "".join(("tor", "ch")),
+        "".join(("torch", "vision")),
+        "".join(("diff", "users")),
+        "".join(("transform", "ers")),
+        "".join(("acceler", "ate")),
+        "".join(("safe", "tensors")),
+        "".join(("huggingface", "_hub")),
+    ),
+)
+def test_candidate_archive_rejects_each_retired_runtime_dependency_in_nested_wheel(
+    tmp_path, runtime_dependency
+):
+    from scripts.candidate_artifact_manifest import audit_packaged_archives
+
+    wheel = _zip_bytes([(runtime_dependency + "/__init__.py", b"pass\n")])
+    archive = tmp_path / "base_library.zip"
+    archive.write_bytes(_zip_bytes([("nested/runtime.whl", wheel)]))
+
+    with pytest.raises(RuntimeError, match="candidate_archive_retired"):
+        audit_packaged_archives([("vending-vision/_internal/base_library.zip", archive)])
+
+
+@pytest.mark.parametrize(
+    "runtime_distribution",
+    (
+        "".join(("tor", "ch")),
+        "".join(("torch", "vision")),
+        "".join(("diff", "users")),
+        "".join(("transform", "ers")),
+        "".join(("acceler", "ate")),
+        "".join(("safe", "tensors")),
+        "".join(("huggingface", "_hub")),
+    ),
+)
+def test_candidate_archive_rejects_each_retired_runtime_distribution_metadata(
+    tmp_path, runtime_distribution
+):
+    from scripts.candidate_artifact_manifest import audit_packaged_archives
+
+    wheel = _zip_bytes(
+        [(runtime_distribution + "-1.0.dist-info/METADATA", b"Metadata-Version: 2.1\n")]
+    )
+    archive = tmp_path / "base_library.zip"
+    archive.write_bytes(_zip_bytes([("nested/runtime.whl", wheel)]))
+
+    with pytest.raises(RuntimeError, match="candidate_archive_retired"):
+        audit_packaged_archives([("vending-vision/_internal/base_library.zip", archive)])
+
+
+def test_candidate_models_reject_weight_not_declared_by_packaged_manifest(tmp_path):
+    from scripts.candidate_artifact_manifest import audit_packaged_model_files
+
+    declared = tmp_path / "declared.onnx"
+    declared.write_bytes(b"declared")
+    declared_digest = hashlib.sha256(declared.read_bytes()).hexdigest()
+    manifest = tmp_path / "model-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "vending-vision-model-manifest/v1",
+                "models": [
+                    {
+                        "role": "person_detection",
+                        "path": "models/person_detection/declared.onnx",
+                        "sha256": declared_digest,
+                    }
+                ],
+            }
+        ),
+        "utf-8",
+    )
+    undeclared = tmp_path / "undeclared.onnx"
+    undeclared.write_bytes(b"model")
+
+    with pytest.raises(RuntimeError, match="candidate_model_set"):
+        audit_packaged_model_files(
+            [
+                ("vending-vision/_internal/models/model-manifest.json", manifest),
+                (
+                    "vending-vision/_internal/models/person_detection/declared.onnx",
+                    declared,
+                ),
+                ("vending-vision/_internal/models/hidden/undeclared.onnx", undeclared),
+            ]
+        )
+
+
+def test_candidate_models_accept_exact_current_production_manifest():
+    from scripts.candidate_artifact_manifest import audit_packaged_model_files
+
+    model_root = ROOT / "models"
+    payload = [
+        (
+            "vending-vision/_internal/models/" + path.relative_to(model_root).as_posix(),
+            path,
+        )
+        for path in model_root.rglob("*")
+        if path.is_file()
+    ]
+
+    audit_packaged_model_files(payload)
 
 
 def test_windows_build_preserves_the_single_core_supply_chain_gates():
@@ -278,9 +674,13 @@ def test_windows_build_preserves_the_single_core_supply_chain_gates():
         'from vision.model_manifest import verify_model_manifest',
         '-m PyInstaller --clean --noconfirm',
         'scripts\\verify_packaged_exe.py',
+        'git -C $Root rev-parse HEAD',
+        'git -C $Root status --porcelain --untracked-files=no',
+        'scripts\\write_packaged_build_identity.py',
+        '_build_identity.json',
     ):
         assert required in build
-    assert build.count("Invoke-Checked $CorePython") == 4
+    assert build.count("Invoke-Checked $CorePython") == 5
     assert '$CoreVenv = Join-Path $Root ".venv-packaging-core"' in build
     assert '$CoreDist = Join-Path $BuildDir "dist-core"' in build
     assert 'foreach ($Environment in @($CoreVenv))' in build
@@ -316,7 +716,8 @@ def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_pub
     )
     build = (
         "./scripts/build_exe.ps1 "
-        "-Wheelhouse (Join-Path $PWD \"wheelhouse\")"
+        "-Wheelhouse (Join-Path $PWD \"wheelhouse\") "
+        "-SourceCommit \"${{ github.sha }}\""
     )
 
     assert build in build_run
@@ -347,6 +748,47 @@ def test_windows_ci_runs_tests_and_digest_bound_packaging_in_parallel_before_pub
         r"\s+path: main-artifacts/\*\n\s+if-no-files-found: error",
         publish_job,
     )
+
+
+def test_linux_and_windows_ci_run_hash_pinned_focused_quality_gates_outside_runtime_closure():
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    quality_lock = (ROOT / "requirements-quality.txt").read_text("utf-8")
+    runtime_lock = (ROOT / "requirements.txt").read_text("utf-8")
+    linux_job = ci.split("test:", 1)[1].split("windows-test:", 1)[0]
+    windows_job = ci.split("windows-test:", 1)[1].split("windows-package:", 1)[0]
+    package_job = ci.split("windows-package:", 1)[1].split(
+        "publish-main-artifacts:", 1
+    )[0]
+    lint_command = (
+        "python -m ruff check --select E4,E7,E9,F "
+        "vision/build_identity.py vision/config.py vision/v2_contract_bundle.py "
+        "scripts/candidate_artifact_manifest.py scripts/hard_cutover_policy.py "
+        "scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py"
+    )
+    type_command = (
+        "python -m mypy --follow-imports=skip --ignore-missing-imports "
+        "--check-untyped-defs "
+        "vision/build_identity.py vision/config.py vision/v2_contract_bundle.py "
+        "scripts/candidate_artifact_manifest.py scripts/hard_cutover_policy.py "
+        "scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py"
+    )
+
+    assert "ruff==0.12.11 \\\n" in quality_lock
+    assert "mypy==1.17.1 \\\n" in quality_lock
+    assert "mypy_extensions==1.1.0 \\\n" in quality_lock
+    assert "pathspec==1.1.1 \\\n" in quality_lock
+    assert "typing_extensions==4.16.0 \\\n" in quality_lock
+    assert quality_lock.count("--hash=sha256:") == 7
+    assert "ruff==" not in runtime_lock
+    assert "mypy==" not in runtime_lock
+    for job in (linux_job, windows_job):
+        assert "requirements-quality.txt" in job
+        assert "--require-hashes" in job
+        assert lint_command in " ".join(job.split())
+        assert type_command in " ".join(job.split())
+    assert "requirements-quality.txt" not in package_job
+    assert "ruff check" not in package_job
+    assert "mypy" not in package_job
 
 
 @pytest.mark.parametrize("missing", [None, "server-valid.json"])

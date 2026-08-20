@@ -12,6 +12,7 @@ import zlib
 import pytest
 
 from scripts.candidate_artifact_manifest import retired_packaged_entries
+from scripts.hard_cutover_policy import semantic_policy_categories
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -750,6 +751,8 @@ def find_violations(
             if _matches_are_exact_audited_lines(path, category, source, matches):
                 continue
             violations.append(f"{path}: {category}")
+        for category in sorted(semantic_policy_categories(relative_path, source)):
+            violations.append(f"{path}: {category}")
     for path in sorted(actual_binary.keys() - approved_binary.keys()):
         violations.append(f"{root / path}: binary-unapproved")
     for path in sorted(approved_binary.keys() - actual_binary.keys()):
@@ -934,6 +937,104 @@ def test_hard_cutover_guard_allows_future_scoped_generic_runtime_modules(tmp_pat
     fixtures = {
         "vision/directshow/source_provenance.py": "class DirectShowProvenance:\n    pass\n",
         "tools/process_supervisor.py": "class MaintenanceSupervisor:\n    pass\n",
+    }
+    for relative_path, source in fixtures.items():
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", *fixtures], cwd=tmp_path, check=True)
+
+    assert find_violations(tmp_path) == []
+
+
+def test_hard_cutover_guard_semantically_rejects_try_on_payload_mode_accesses(tmp_path):
+    _init_guard_repo(tmp_path)
+    mode_key = "".join(("mo", "de"))
+    source = "\n".join(
+        (
+            "def run_v2_try_on_attempt(payload, try_on_payload):",
+            f'    direct = payload["{mode_key}"]',
+            f'    optional = payload.get("{mode_key}")',
+            f"    attribute = try_on_payload.{mode_key}",
+            f"    request = TryOnStart({mode_key}=automatic)",
+            "    return direct, optional, attribute, request",
+            "",
+        )
+    )
+    (tmp_path / "app.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_path, check=True)
+
+    assert any(
+        item.endswith(": retired-try-on-mode-access")
+        for item in find_violations(tmp_path)
+    )
+
+
+def test_hard_cutover_guard_allows_unrelated_semantic_mode_uses(tmp_path):
+    _init_guard_repo(tmp_path)
+    source = "\n".join(
+        (
+            "from fastapi import FastAPI",
+            "def configure_camera(camera_payload, image, gender_mode):",
+            '    camera_mode = camera_payload.get("mode")',
+            "    image_mode = image.mode",
+            '    camera = Camera(mode="dshow")',
+            '    pipeline = Pipeline(mode="airflow")',
+            "    return camera_mode, image_mode, gender_mode, camera, pipeline",
+            "",
+        )
+    )
+    path = tmp_path / "vision" / "camera.py"
+    path.parent.mkdir()
+    path.write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", "vision/camera.py"], cwd=tmp_path, check=True)
+
+    assert find_violations(tmp_path) == []
+
+
+def test_hard_cutover_guard_rejects_generative_runtime_dependencies_everywhere(tmp_path):
+    _init_guard_repo(tmp_path)
+    joined = "".join
+    fixtures = {
+        "requirements.txt": joined(("tor", "ch")) + "==2.0.0\n",
+        "requirements-build.txt": joined(("torch", "vision")) + "==0.15.0\n",
+        "vision/runtime.py": "import " + joined(("diff", "users")) + "\n",
+        "vision/loader.py": "from " + joined(("transform", "ers")) + " import AutoModel\n",
+        "scripts/runtime.py": "import " + joined(("acceler", "ate")) + "\n",
+        "scripts/weights.py": "from " + joined(("safe", "tensors")) + " import safe_open\n",
+        "scripts/hub.py": "import " + joined(("huggingface", "_hub")) + "\n",
+        "vending_vision.spec": (
+            "hiddenimports = [\"" + joined(("cat", "vton")) + "\"]\n"
+        ),
+        ".github/workflows/ci.yml": (
+            "steps:\n  - run: pip install " + joined(("diff", "users")) + "\n"
+        ),
+    }
+    for relative_path, source in fixtures.items():
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", *fixtures], cwd=tmp_path, check=True)
+
+    violations = find_violations(tmp_path)
+    dependency_paths = {
+        Path(item.rsplit(": ", 1)[0]).relative_to(tmp_path).as_posix()
+        for item in violations
+        if item.endswith(": retired-generative-runtime-dependency")
+    }
+    assert dependency_paths == set(fixtures)
+
+
+def test_hard_cutover_guard_allows_similar_runtime_dependencies(tmp_path):
+    _init_guard_repo(tmp_path)
+    fixtures = {
+        "requirements.txt": "fastapi==1.0.0\nairflow-monitor==1.0.0\n",
+        "vision/runtime.py": (
+            "from fastapi import FastAPI\n"
+            "import airflow_monitor\n"
+            "from vision.age_gender_estimator import AgeGenderEstimator\n"
+        ),
+        "vending_vision.spec": 'hiddenimports = ["fastapi", "vision.model_manifest"]\n',
     }
     for relative_path, source in fixtures.items():
         path = tmp_path / relative_path

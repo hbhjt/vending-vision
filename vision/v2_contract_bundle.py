@@ -30,6 +30,23 @@ _MANIFEST_METADATA = {
 }
 _DIGEST_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 _WINDOWS_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:")
+_TRY_ON_START_TYPE = "vision.try_on.attempt.start"
+_TRY_ON_START_FIELDS = {"attemptId", "variantId", "garment"}
+_TRY_ON_GARMENT_FIELDS = {
+    "assetId",
+    "reference",
+    "digest",
+    "contentType",
+    "byteSize",
+    "template",
+}
+_CLIENT_MESSAGE_TYPES = {
+    "vision.hello",
+    "vision.try_on.attempt.start",
+    "vision.try_on.attempt.capture",
+    "vision.try_on.attempt.cancel",
+    "vision.try_on.attempt.adjust",
+}
 
 
 class V2ContractBundleUnavailable(RuntimeError):
@@ -82,6 +99,61 @@ def _canonical_bundle_path(relative_path: object, bundle_root: Path) -> Path | N
     except ValueError:
         return None
     return path
+
+
+def _assert_single_path_client_schema(schema: object) -> None:
+    """Pin the generated start payload to the retired-mode-free public contract."""
+    if (
+        not isinstance(schema, dict)
+        or set(schema) != {"$schema", "oneOf"}
+        or not isinstance(schema.get("oneOf"), list)
+    ):
+        raise ValueError("client schema shape")
+    discriminators = [
+        branch.get("properties", {}).get("type", {}).get("const")
+        if isinstance(branch, dict)
+        else None
+        for branch in schema["oneOf"]
+    ]
+    if len(discriminators) != len(_CLIENT_MESSAGE_TYPES) or set(
+        discriminators
+    ) != _CLIENT_MESSAGE_TYPES:
+        raise ValueError("client schema discriminators")
+    starts = [
+        branch
+        for branch in schema["oneOf"]
+        if isinstance(branch, dict)
+        and branch.get("properties", {}).get("type", {}).get("const")
+        == _TRY_ON_START_TYPE
+    ]
+    if len(starts) != 1:
+        raise ValueError("try-on start discriminator")
+    payload = starts[0].get("properties", {}).get("payload")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("type") != "object"
+        or payload.get("additionalProperties") is not False
+        or set(payload.get("properties", {})) != _TRY_ON_START_FIELDS
+        or payload.get("required") != ["attemptId", "variantId", "garment"]
+    ):
+        raise ValueError("try-on start payload shape")
+    garment = payload["properties"]["garment"]
+    if (
+        not isinstance(garment, dict)
+        or garment.get("type") != "object"
+        or garment.get("additionalProperties") is not False
+        or set(garment.get("properties", {})) != _TRY_ON_GARMENT_FIELDS
+        or garment.get("required")
+        != [
+            "assetId",
+            "reference",
+            "digest",
+            "contentType",
+            "byteSize",
+            "template",
+        ]
+    ):
+        raise ValueError("try-on garment payload shape")
 
 
 @dataclass(frozen=True)
@@ -141,6 +213,9 @@ def load_v2_contract_identity() -> V2ContractIdentity:
         for relative_path, path in paths.items():
             if not path.is_file() or _sha256(path.read_bytes()) != declared[relative_path]:
                 raise ValueError("bundle file digest")
+        _assert_single_path_client_schema(
+            json.loads(paths["vision-v2.client.schema.json"].read_text("utf-8"))
+        )
         metadata = {**_MANIFEST_METADATA, "files": declared}
         if _sha256(_canonical_json(metadata)) != manifest["bundleDigest"]:
             raise ValueError("bundle digest")

@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$Wheelhouse,
-    [string]$SourceRoot
+    [string]$SourceRoot,
+    [string]$SourceCommit
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,6 +29,21 @@ $CoreWork = Join-Path $BuildDir "pyinstaller-core"
 $CoreDist = Join-Path $BuildDir "dist-core"
 $FinalDist = Join-Path $Root "dist"
 $ExpectedPythonVersion = (Get-Content (Join-Path $Root ".python-version") -Raw).Trim()
+$RepositoryRoot = (Invoke-Checked git -C $Root rev-parse --show-toplevel).Trim()
+$ActualSourceCommit = (Invoke-Checked git -C $Root rev-parse HEAD).Trim()
+$TrackedStatus = (Invoke-Checked git -C $Root status --porcelain --untracked-files=no)
+if ([IO.Path]::GetFullPath($RepositoryRoot) -cne [IO.Path]::GetFullPath($Root)) {
+    throw "Build source must be the Git repository root"
+}
+if (-not [string]::IsNullOrWhiteSpace($TrackedStatus)) {
+    throw "Build source has tracked changes"
+}
+if ([string]::IsNullOrWhiteSpace($SourceCommit)) {
+    $SourceCommit = $ActualSourceCommit
+}
+if ($SourceCommit -cne $ActualSourceCommit -or $SourceCommit -notmatch '^[0-9a-f]{40}$') {
+    throw "Build source commit does not match clean Git HEAD"
+}
 
 if (-not (Test-Path -LiteralPath $Wheelhouse -PathType Container)) {
     throw "A pre-validated offline core wheelhouse is required: $Wheelhouse"
@@ -65,6 +81,13 @@ Invoke-Checked $CorePython -m PyInstaller --clean --noconfirm --workpath $CoreWo
 
 New-Item -ItemType Directory -Force $FinalDist | Out-Null
 Copy-Item -LiteralPath (Join-Path $CoreDist "vending-vision") -Destination $FinalDist -Recurse
+
+$SourceBuildMarker = Join-Path $Root "vision\_build_version.py"
+$PackagedBuildIdentity = Join-Path $FinalDist "vending-vision\_internal\vision\_build_identity.json"
+Invoke-Checked $CorePython (Join-Path $ToolRoot "scripts\write_packaged_build_identity.py") `
+    --version-marker $SourceBuildMarker `
+    --identity-output $PackagedBuildIdentity `
+    --source-commit $SourceCommit
 
 $MainExe = Join-Path $FinalDist "vending-vision\vending-vision.exe"
 if (-not (Test-Path -LiteralPath $MainExe -PathType Leaf)) { throw "main Vision exe missing after build: $MainExe" }

@@ -21,7 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.candidate_artifact_manifest import LAYOUT, retired_packaged_entries
+from vision.build_identity import load_build_identity  # noqa: E402
+from scripts.candidate_artifact_manifest import (  # noqa: E402
+    LAYOUT,
+    audit_packaged_archives,
+    audit_packaged_model_files,
+    retired_packaged_entries,
+)
 
 
 CONTRACT_ROOT = Path(__file__).resolve().parents[1] / "contracts" / "vem_vision_v2"
@@ -35,14 +41,6 @@ PROFILE_FIELDS = {
     "upperColor",
     "confidence",
 }
-BUILD_VERSION_MARKER_RE = re.compile(
-    r'^APP_VERSION = "(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
-    r'(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
-    r'(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?'
-    r'(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"\n$'
-)
-
-
 def create_managed_maintenance_fixture(temp_dir, *, port):
     """Create a managed config for the plain loopback v2 maintenance smoke."""
     temp_dir = Path(temp_dir)
@@ -210,15 +208,28 @@ def assert_hard_cutover_archive_absence(exe_path):
     violations = retired_packaged_entries(entries)
     if violations:
         raise AssertionError(f"retired modules remain in packaged archive: {violations}")
+    audit_packaged_archives(
+        [
+            (f"resource:{path.relative_to(internal).as_posix()}", path)
+            for path in internal.rglob("*")
+            if path.is_file()
+        ]
+    )
+    audit_packaged_model_files(
+        [
+            (f"{LAYOUT['mainOnedir']}/_internal/{path.relative_to(internal).as_posix()}", path)
+            for path in internal.rglob("*")
+            if path.is_file()
+        ]
+    )
 
 
 def assert_release_version_runtime_marker(exe_path):
-    marker = exe_path.parent / "_internal" / "vision" / "_build_version.py"
-    if not marker.is_file():
-        raise AssertionError("missing release version runtime marker")
-    source = marker.read_text("utf-8")
-    if BUILD_VERSION_MARKER_RE.fullmatch(source) is None:
-        raise AssertionError("invalid release version runtime marker")
+    marker_root = exe_path.parent / "_internal" / "vision"
+    try:
+        load_build_identity(marker_root, require_source_commit=True)
+    except RuntimeError as error:
+        raise AssertionError("invalid release version runtime marker") from error
 
 
 def assert_bundled_resources(exe_path):
@@ -241,6 +252,7 @@ def assert_bundled_resources(exe_path):
         contract_root / "fixtures" / "server-valid.json",
         contract_root / "fixtures" / "server-invalid.json",
         internal / "models" / "person_detection" / "person_yolov8n.onnx",
+        internal / "models" / "model-manifest.json",
         internal / "models" / "face_detection" / "face_detection_yunet_2023mar.onnx",
         internal / "models" / "age_gender" / "age_net.caffemodel",
         internal / "models" / "age_gender" / "gender_net.caffemodel",
@@ -527,10 +539,10 @@ def main():
     ensure_port_available(managed_port)
 
     with tempfile.TemporaryDirectory(prefix="vending-vision-package-") as temp_dir:
-        temp_dir = Path(temp_dir)
+        temp_path = Path(temp_dir)
         # Exercise the supported supplier-development config path; managed
         # production is verified separately below and must keep this route hidden.
-        dev_config_path = temp_dir / "config.json"
+        dev_config_path = temp_path / "config.json"
         dev_config_path.write_text(
             json.dumps(
                 {

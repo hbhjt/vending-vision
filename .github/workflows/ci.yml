@@ -22,10 +22,19 @@ jobs:
         run: >-
           python -m pip download --only-binary=:all: --require-hashes
           --dest wheelhouse -r requirements.txt
+      - name: 下载锁定质量工具
+        run: >-
+          python -m pip download --only-binary=:all: --require-hashes
+          --dest quality-wheelhouse -r requirements-quality.txt
       - name: 离线安装并校验锁定闭包
         run: |
           python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
           python scripts/dependency_lock.py --wheelhouse wheelhouse --python python
+      - name: 运行聚焦 Python lint/type
+        run: |
+          python -m pip install --no-index --find-links quality-wheelhouse --require-hashes -r requirements-quality.txt
+          python -m ruff check --select E4,E7,E9,F vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/candidate_artifact_manifest.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
+          python -m mypy --follow-imports=skip --ignore-missing-imports --check-untyped-defs vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/candidate_artifact_manifest.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
       - run: python -m pytest -q
       - run: python -m py_compile app.py run_vision_server.py vision/*.py scripts/*.py
       - run: python -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
@@ -50,10 +59,19 @@ jobs:
         run: >-
           python -m pip download --only-binary=:all: --require-hashes
           --dest wheelhouse -r requirements.txt
+      - name: 下载锁定质量工具
+        run: >-
+          python -m pip download --only-binary=:all: --require-hashes
+          --dest quality-wheelhouse -r requirements-quality.txt
       - name: 离线安装并校验锁定闭包
         run: |
           python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
           python scripts/dependency_lock.py --wheelhouse wheelhouse --python python --target-sys-platform win32
+      - name: 运行聚焦 Python lint/type
+        run: |
+          python -m pip install --no-index --find-links quality-wheelhouse --require-hashes -r requirements-quality.txt
+          python -m ruff check --select E4,E7,E9,F vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/candidate_artifact_manifest.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
+          python -m mypy --follow-imports=skip --ignore-missing-imports --check-untyped-defs vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/candidate_artifact_manifest.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
       - name: 运行完整测试
         run: python -m pytest -q
       - name: 校验 Python 源码
@@ -88,7 +106,7 @@ jobs:
       - name: 构建并验证 Windows runtime 与录播交付包
         shell: pwsh
         run: |
-          ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse")
+          ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse") -SourceCommit "${{ github.sha }}"
           & (Join-Path $PWD ".venv-packaging-core\Scripts\python.exe") scripts/verify_packaged_exe.py
           ./scripts/package_main_artifacts.ps1 -Commit "${{ github.sha }}" -OutputDirectory (Join-Path $PWD "main-artifacts")
       - name: 暂存同提交 Vision artifacts
