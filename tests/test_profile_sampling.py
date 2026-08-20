@@ -152,13 +152,13 @@ class ProfileSamplingTest(unittest.TestCase):
 
         self.assertEqual(len(samples), 2)
 
-    def test_profile_three_frame_sequence_keeps_fast_out_until_all_gaps_finish(self):
+    def test_profile_three_frame_sequence_keeps_try_on_out_until_all_gaps_finish(self):
         frame = np.full((24, 32, 3), 128, dtype=np.uint8)
         gap_started = threading.Event()
         allow_gap = threading.Event()
         sequence_done = threading.Event()
-        fast_acquired = threading.Event()
-        fast_inserted_during_sequence = []
+        try_on_acquired = threading.Event()
+        try_on_inserted_during_sequence = []
         reads = []
         lease_token = "profile:test-sequence"
         acquired = acquire_front_camera(
@@ -176,11 +176,11 @@ class ProfileSamplingTest(unittest.TestCase):
             gap_started.set()
             self.assertTrue(allow_gap.wait(timeout=1.0))
 
-        def fast_reader():
+        def try_on_reader():
             self.assertTrue(gap_started.wait(timeout=1.0))
             with front_camera_io_lock():
-                fast_inserted_during_sequence.append(not sequence_done.is_set())
-                fast_acquired.set()
+                try_on_inserted_during_sequence.append(not sequence_done.is_set())
+                try_on_acquired.set()
 
         config = {
             "duration_sec": 1.0,
@@ -211,12 +211,12 @@ class ProfileSamplingTest(unittest.TestCase):
             }
         ), patch.object(profile_sampling.time, "sleep", side_effect=interval_barrier):
             collector = threading.Thread(target=collect)
-            contender = threading.Thread(target=fast_reader)
+            contender = threading.Thread(target=try_on_reader)
             collector.start()
             contender.start()
             self.assertTrue(gap_started.wait(timeout=1.0))
             real_sleep(0.05)
-            self.assertFalse(fast_acquired.is_set())
+            self.assertFalse(try_on_acquired.is_set())
             allow_gap.set()
             collector.join(timeout=2.0)
             contender.join(timeout=2.0)
@@ -224,7 +224,7 @@ class ProfileSamplingTest(unittest.TestCase):
         try:
             self.assertEqual(len(worker_result["samples"]), 3)
             self.assertEqual(reads, [1, 2, 3])
-            self.assertEqual(fast_inserted_during_sequence, [False])
+            self.assertEqual(try_on_inserted_during_sequence, [False])
             self.assertEqual(get_front_camera_owner()["leaseToken"], lease_token)
         finally:
             release_front_camera("vision", reason="profile_test_done", lease_token=lease_token)

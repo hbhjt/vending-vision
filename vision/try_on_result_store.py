@@ -1,4 +1,4 @@
-"""Bounded, attempt-scoped storage for generated Fast result bytes.
+"""Bounded, attempt-scoped storage for generated Try-On result bytes.
 
 The store deliberately has a very small interface.  Entries are immutable
 snapshots and reads never turn into writes: in particular a read cannot extend
@@ -63,7 +63,7 @@ class ResultAdmission:
     evicted_attempt_ids: tuple[str, ...]
 
 
-class FastResultStore:
+class TryOnResultStore:
     """An in-memory bounded result store with atomic admission planning."""
 
     def __init__(
@@ -77,7 +77,7 @@ class FastResultStore:
     ):
         single_limit = max_bytes if single_max_bytes is None else int(single_max_bytes)
         if max_count < 1 or max_bytes < 1 or single_limit < 1 or ttl_seconds <= 0:
-            raise ValueError("invalid Fast result store limits")
+            raise ValueError("invalid Try-On result store limits")
         self.max_count = int(max_count)
         self.max_bytes = int(max_bytes)
         self.single_max_bytes = single_limit

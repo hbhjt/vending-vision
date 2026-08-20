@@ -2,8 +2,8 @@ import asyncio
 
 import pytest
 
-from vision.fast_attempt_registry import FastAttemptRegistry
-from vision.fast_result_store import FastResultStore, ResultAdmissionError
+from vision.try_on_attempt_registry import TryOnAttemptRegistry
+from vision.try_on_result_store import TryOnResultStore, ResultAdmissionError
 
 
 def _result(token: str, size: int) -> dict:
@@ -18,9 +18,9 @@ def _result(token: str, size: int) -> dict:
     }
 
 
-def test_fast_result_store_evicts_oldest_entries_to_both_caps():
+def test_try_on_result_store_evicts_oldest_entries_to_both_caps():
     async def scenario():
-        store = FastResultStore(max_count=3, max_bytes=8, ttl_seconds=60)
+        store = TryOnResultStore(max_count=3, max_bytes=8, ttl_seconds=60)
         for attempt_id, size in (("old-1", 3), ("old-2", 3), ("old-3", 3)):
             await store.admit(attempt_id, _result(attempt_id, size))
 
@@ -32,9 +32,9 @@ def test_fast_result_store_evicts_oldest_entries_to_both_caps():
     asyncio.run(scenario())
 
 
-def test_fast_result_store_reports_every_capacity_eviction_in_order():
+def test_try_on_result_store_reports_every_capacity_eviction_in_order():
     async def scenario():
-        store = FastResultStore(max_count=3, max_bytes=10, ttl_seconds=60)
+        store = TryOnResultStore(max_count=3, max_bytes=10, ttl_seconds=60)
         for attempt_id in ("old-1", "old-2", "old-3"):
             await store.admit(attempt_id, _result(attempt_id, 3))
 
@@ -47,9 +47,9 @@ def test_fast_result_store_reports_every_capacity_eviction_in_order():
     asyncio.run(scenario())
 
 
-def test_fast_result_store_overwrite_failure_preserves_old_entry():
+def test_try_on_result_store_overwrite_failure_preserves_old_entry():
     async def scenario():
-        store = FastResultStore(max_count=2, max_bytes=10, ttl_seconds=60)
+        store = TryOnResultStore(max_count=2, max_bytes=10, ttl_seconds=60)
         await store.admit("same", _result("old-token", 4))
         with pytest.raises(ResultAdmissionError, match="result_store_too_large"):
             await store.admit("same", _result("new-token", 11))
@@ -61,10 +61,10 @@ def test_fast_result_store_overwrite_failure_preserves_old_entry():
     asyncio.run(scenario())
 
 
-def test_fast_result_store_expiry_is_complete_and_reads_do_not_renew_or_reorder():
+def test_try_on_result_store_expiry_is_complete_and_reads_do_not_renew_or_reorder():
     async def scenario():
         now = [100.0]
-        store = FastResultStore(max_count=10, max_bytes=100, ttl_seconds=5, clock=lambda: now[0])
+        store = TryOnResultStore(max_count=10, max_bytes=100, ttl_seconds=5, clock=lambda: now[0])
         await store.admit("first", _result("first-token", 2))
         now[0] += 1
         await store.admit("second", _result("second-token", 2))
@@ -78,18 +78,17 @@ def test_fast_result_store_expiry_is_complete_and_reads_do_not_renew_or_reorder(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("mode,reason", [("fast", "fast_failed"), ("ai", "ai_failed")])
-def test_terminal_commit_failure_has_one_mode_correct_failed_terminal_and_no_orphan_grant(mode, reason):
+def test_terminal_commit_failure_has_one_single_path_failed_terminal_and_no_orphan_grant():
     async def scenario():
-        registry = FastAttemptRegistry(
+        registry = TryOnAttemptRegistry(
             terminal_ttl_seconds=60,
-            result_store=FastResultStore(max_count=2, max_bytes=4, ttl_seconds=60),
+            result_store=TryOnResultStore(max_count=2, max_bytes=4, ttl_seconds=60),
         )
         attempt_id = "attempt"
         accepted = {
             "type": "vision.try_on.attempt.accepted",
             "messageId": "accepted",
-            "payload": {"attemptId": attempt_id, "mode": mode},
+            "payload": {"attemptId": attempt_id},
         }
         completed = {
             "type": "vision.try_on.attempt.completed",
@@ -113,7 +112,7 @@ def test_terminal_commit_failure_has_one_mode_correct_failed_terminal_and_no_orp
         assert transition.message["type"] == "vision.try_on.attempt.failed"
         assert transition.message["payload"] == {
             "attemptId": attempt_id,
-            "reason": reason,
+            "reason": "try_on_failed",
         }
         assert await registry.get_result(attempt_id, "secret") is None
 
@@ -126,9 +125,9 @@ def test_terminal_commit_failure_has_one_mode_correct_failed_terminal_and_no_orp
 )
 def test_registry_never_admits_a_result_for_a_noncompleted_terminal(terminal_type):
     async def scenario():
-        registry = FastAttemptRegistry(
+        registry = TryOnAttemptRegistry(
             terminal_ttl_seconds=60,
-            result_store=FastResultStore(max_count=2, max_bytes=16, ttl_seconds=60),
+            result_store=TryOnResultStore(max_count=2, max_bytes=16, ttl_seconds=60),
         )
         attempt_id = "failed-attempt"
         admission = await registry.admit(
@@ -144,7 +143,7 @@ def test_registry_never_admits_a_result_for_a_noncompleted_terminal(terminal_typ
             admission.receipt,
             {
                 "type": terminal_type,
-                "payload": {"attemptId": attempt_id, "reason": "fast_failed"},
+                "payload": {"attemptId": attempt_id, "reason": "try_on_failed"},
             },
             _result("sentinel-result-token", 4),
         )
@@ -167,9 +166,9 @@ def test_registry_never_admits_a_result_for_a_noncompleted_terminal(terminal_typ
 
 def test_capacity_eviction_removes_dead_completed_replay_before_new_is_visible():
     async def scenario():
-        registry = FastAttemptRegistry(
+        registry = TryOnAttemptRegistry(
             terminal_ttl_seconds=60,
-            result_store=FastResultStore(max_count=2, max_bytes=1024, ttl_seconds=60),
+            result_store=TryOnResultStore(max_count=2, max_bytes=1024, ttl_seconds=60),
         )
 
         async def complete(attempt_id, token, size):
@@ -208,7 +207,7 @@ def test_capacity_eviction_removes_dead_completed_replay_before_new_is_visible()
         assert old_readmission.replay == []
         assert await registry.commit_terminal(
             old_readmission.receipt,
-            {"type": "vision.try_on.attempt.failed", "payload": {"attemptId": "old", "reason": "fast_failed"}},
+            {"type": "vision.try_on.attempt.failed", "payload": {"attemptId": "old", "reason": "try_on_failed"}},
         )
         assert old["type"] == "vision.try_on.attempt.completed"
 
@@ -217,9 +216,9 @@ def test_capacity_eviction_removes_dead_completed_replay_before_new_is_visible()
 
 def test_result_expiry_removes_its_completed_terminal_before_same_id_replay():
     async def scenario():
-        registry = FastAttemptRegistry(
+        registry = TryOnAttemptRegistry(
             terminal_ttl_seconds=60,
-            result_store=FastResultStore(max_count=2, max_bytes=16, ttl_seconds=0.01),
+            result_store=TryOnResultStore(max_count=2, max_bytes=16, ttl_seconds=0.01),
         )
         attempt_id = "expired-result"
         admission = await registry.admit(
@@ -249,9 +248,9 @@ def test_result_expiry_removes_its_completed_terminal_before_same_id_replay():
 
 def test_failed_new_result_admission_keeps_existing_terminal_and_grant_intact():
     async def scenario():
-        registry = FastAttemptRegistry(
+        registry = TryOnAttemptRegistry(
             terminal_ttl_seconds=60,
-            result_store=FastResultStore(max_count=1, max_bytes=4, ttl_seconds=60),
+            result_store=TryOnResultStore(max_count=1, max_bytes=4, ttl_seconds=60),
         )
 
         old_admission = await registry.admit(
@@ -292,9 +291,9 @@ def test_failed_new_result_admission_keeps_existing_terminal_and_grant_intact():
 
 def test_evicted_attempt_duplicate_race_has_one_new_owner_and_no_stale_replay():
     async def scenario():
-        registry = FastAttemptRegistry(
+        registry = TryOnAttemptRegistry(
             terminal_ttl_seconds=60,
-            result_store=FastResultStore(max_count=1, max_bytes=8, ttl_seconds=60),
+            result_store=TryOnResultStore(max_count=1, max_bytes=8, ttl_seconds=60),
         )
 
         async def complete(attempt_id, token):
@@ -326,7 +325,7 @@ def test_evicted_attempt_duplicate_race_has_one_new_owner_and_no_stale_replay():
         )
         await registry.commit_terminal(
             owners[0].receipt,
-            {"type": "vision.try_on.attempt.failed", "payload": {"attemptId": "old", "reason": "fast_failed"}},
+            {"type": "vision.try_on.attempt.failed", "payload": {"attemptId": "old", "reason": "try_on_failed"}},
         )
 
     asyncio.run(scenario())

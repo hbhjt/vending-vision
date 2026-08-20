@@ -9,6 +9,10 @@ import struct
 import subprocess
 import zlib
 
+import pytest
+
+from scripts.candidate_artifact_manifest import retired_packaged_entries
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY_ALLOWLIST_NAME = "hard-cutover-binary-allowlist.json"
@@ -98,15 +102,94 @@ FORBIDDEN_PATTERNS = (
 )
 
 STANDALONE_PROVENANCE_ALLOWANCES = {
-    (ROOT / "vision/vendor/catvton/PROVENANCE.md").resolve(): {
-        "sha256": "9afdf1fe17cdc7b8287ee008488bd902a1de27b7f0121c6d03913cd04f73bd73",
-        "occurrences": {"standalone-repository-url": 1},
-    },
     (ROOT / "fixtures/recorded-video/README.md").resolve(): {
-        "sha256": "5297c02093e360696832533993fcaa5f8c3a7c5f32d6e0104e63afff58c0dfa5",
+        "sha256": "e2076983553408705fe4e5f17d2f252f9ef14b3ebf5d31f1690a26ea1aa56960",
         "occurrences": {"standalone-repository-url": 1},
     },
 }
+
+_GENERATION_PREFIX = "".join(("a", "i"))
+_QUICK_PREFIX = "".join(("fa", "st"))
+_PROFILE_RETIRED_ROLE = "".join(("profile", "_fast", "_try_on"))
+_VENDOR_RUNTIME = "".join(("cat", "vton"))
+_REGIONAL_RUNTIME = "".join(("regional", "_evaluator"))
+_REGIONAL_SYMBOL = "".join(("Regional", "Evaluator"))
+_RETIRED_MODE_VALUES = "|".join((_GENERATION_PREFIX, _QUICK_PREFIX))
+
+RETIRED_TRY_ON_EXACT_PATHS = {
+    "vision/process_supervisor.py",
+    "vision/source_provenance.py",
+}
+
+SINGLE_PATH_CONTENT_RULES = (
+    (
+        "retired-ai-try-on-mode",
+        re.compile(
+            rf"(?<![\w])(?:[\"']mode[\"']|mode)\s*[:=]\s*"
+            rf"(?:[\"'](?:{_RETIRED_MODE_VALUES})[\"']|(?:{_RETIRED_MODE_VALUES})(?!\w))",
+            re.I,
+        ),
+    ),
+    (
+        "retired-ai-try-on-bracket-mode",
+        re.compile(
+            rf"payload\[\s*[\"']mode[\"']\s*\]\s*=\s*"
+            r"(?:[\"'][^\"'\r\n]+[\"']|[A-Za-z_]\w*)",
+            re.I,
+        ),
+    ),
+    (
+        "retired-try-on-start-mode",
+        re.compile(
+            r"\b(?:TryOnStart|Start)\s*\([^)]*\bmode\s*=\s*"
+            r"(?:[\"'][^\"'\r\n]+[\"']|[A-Za-z_]\w*)",
+            re.I,
+        ),
+    ),
+    (
+        "retired-try-on-payload-mode",
+        re.compile(
+            r"\btry_on(?:_start)?_payload\s*=\s*\{[^}\r\n]*"
+            r"(?:[\"']mode[\"']|mode)\s*:",
+            re.I,
+        ),
+    ),
+    (
+        "retired-try-on-mode-symbol",
+        re.compile(
+            rf"\b(?:try_on_(?:{_GENERATION_PREFIX}|{_QUICK_PREFIX})|{_PROFILE_RETIRED_ROLE})\b",
+            re.I,
+        ),
+    ),
+    ("retired-ai-try-on-readiness", re.compile(r"\b(?:ai|fast)(?:Ready|ReadinessDiagnostic)\b", re.I)),
+    (
+        "retired-ai-try-on-terminal",
+        re.compile(rf"\b(?:{_GENERATION_PREFIX}|{_QUICK_PREFIX})_failed\b", re.I),
+    ),
+    (
+        "retired-try-on-compatibility-symbol",
+        re.compile(
+            rf"\b(?:{_QUICK_PREFIX}(?:RenderBroker|AttemptRegistry|ResultStore|AdjustmentStore)"
+            rf"|{_GENERATION_PREFIX}(?:AcceptanceEvidence|AttemptProcess|AttemptWorker|ModelPack|ProcessTreeWorker|RuntimeDescriptor)"
+            rf"|{_REGIONAL_SYMBOL})\b"
+            rf"|(?<![\w])_(?:{_QUICK_PREFIX}|{_GENERATION_PREFIX})_"
+            r"(?:runtime|render_broker|attempt_registry|result_store|adjustment_store)\b",
+            re.I,
+        ),
+    ),
+    ("retired-fast-try-on-role", re.compile(r"\bprofile_fast_try_on\b")),
+    (
+        "retired-ai-try-on-artifact",
+        re.compile(
+            rf"\b(?:VEM_{_GENERATION_PREFIX}_[A-Z0-9_]+"
+            rf"|vending[-_]vision[-_]{_GENERATION_PREFIX}[-_]worker"
+            rf"|requirements-{_GENERATION_PREFIX}|official-{_GENERATION_PREFIX}"
+            rf"|{_VENDOR_RUNTIME}|regional[-_]evaluator"
+            rf"|{_GENERATION_PREFIX}[-_](?:worker|runtime|model(?:[-_]pack)?|wheelhouse|env(?:ironment)?))\b",
+            re.I,
+        ),
+    ),
+)
 
 # The guard scans this test too. Only these exact line bytes and occurrence
 # counts may contain the retired tokens needed to define and assert the guard.
@@ -614,6 +697,14 @@ def find_violations(
             continue
         raw_source = path.read_bytes()
         relative_path = path.relative_to(root).as_posix()
+        if (
+            relative_path.lower() in RETIRED_TRY_ON_EXACT_PATHS
+            or retired_packaged_entries(
+                [relative_path], include_historical_generic_modules=False
+            )
+        ):
+            violations.append(f"{path}: retired-try-on-path")
+            continue
         if relative_path in approved_binary:
             actual_binary[relative_path] = {
                 "gitMode": git_mode,
@@ -650,6 +741,13 @@ def find_violations(
                 continue
             permitted = allowance["occurrences"].get(category) if allowance_valid else None
             if permitted == len(matches):
+                continue
+            violations.append(f"{path}: {category}")
+        for category, pattern in SINGLE_PATH_CONTENT_RULES:
+            matches = list(pattern.finditer(source))
+            if not matches:
+                continue
+            if _matches_are_exact_audited_lines(path, category, source, matches):
                 continue
             violations.append(f"{path}: {category}")
     for path in sorted(actual_binary.keys() - approved_binary.keys()):
@@ -697,6 +795,172 @@ def _recorded_fixture_entry(path: str, payload: bytes) -> dict[str, str]:
 def test_retired_vision_session_and_v1_surface_is_absent():
     assert not (ROOT / "vision" / "try_on_session.py").exists()
     assert find_violations(ROOT) == []
+
+
+def test_hard_cutover_guard_rejects_new_retired_try_on_path(tmp_path):
+    _init_guard_repo(tmp_path)
+    retired = tmp_path / "vision" / "ai_attempt_runtime.py"
+    retired.parent.mkdir()
+    retired.write_text("pass\n", encoding="utf-8")
+    subprocess.run(["git", "add", "vision/ai_attempt_runtime.py"], cwd=tmp_path, check=True)
+    assert any("retired-try-on-path" in item for item in find_violations(tmp_path))
+
+
+def test_hard_cutover_guard_rejects_ai_mode_readiness_role_and_artifact_variants(tmp_path):
+    _init_guard_repo(tmp_path)
+    joined = "".join
+    payload_mode_assignment = joined(('payload["', "mode", '"] = '))
+    fixtures = {
+        "object.py": '{"mode":"' + joined(("a", "i")) + '"}\n',
+        "object.ts": 'const request = { mode: "' + _QUICK_PREFIX + '" };\n',
+        "constructor.py": 'request = Start(mode="' + joined(("a", "i")) + '")\n',
+        "bracket.py": payload_mode_assignment + '"' + _QUICK_PREFIX + '"\n',
+        "bare-object.py": 'request = { mode: ' + joined(("a", "i")) + ' }\n',
+        "bare-assignment.py": 'mode = ' + _QUICK_PREFIX + '\n',
+        "bare-bracket.py": payload_mode_assignment + joined(("a", "i")) + '\n',
+        "automatic.py": payload_mode_assignment + joined(("auto", "matic")) + '\n',
+        "start-automatic.py": (
+            'request = ' + joined(("Try", "On", "Start"))
+            + '(mode="' + joined(("auto", "matic")) + '")\n'
+        ),
+        "named-payload.py": (
+            joined(("try", "_on", "_payload"))
+            + ' = {"' + joined(("mo", "de")) + '": "legacy"}\n'
+        ),
+        "ready.py": 'state = "' + joined(("a", "i", "Ready")) + '"\n',
+        "quick-ready.py": 'state = "' + _QUICK_PREFIX + 'ReadinessDiagnostic"\n',
+        "role.json": '{"role":"' + joined(("profile", "_fast", "_try_on")) + '"}\n',
+        "symbol.py": (
+            'handler = ' + joined(("try_on_", "a", "i"))
+            + ' or ' + joined(("try_on_", "fa", "st")) + '\n'
+        ),
+        "artifact.py": 'env = "VEM_' + joined(("A", "I", "_MODEL_PACK")) + '"\n',
+        "worker.py": 'entry = "' + joined(("a", "i", "-worker")) + '"\n',
+        "environment.py": 'root = "' + joined(("a", "i", "_wheelhouse")) + '"\n',
+        "model.py": 'package = "' + joined(("a", "i", "-model-pack")) + '"\n',
+        "vendor.py": 'runtime = "' + joined(("Cat", "VTON")) + '"\n',
+        "regional.py": 'descriptor = "' + joined(("regional", "_evaluator")) + '"\n',
+        "runtime.py": 'runtime = "' + joined(("a", "i", "_runtime")) + '"\n',
+        "terminal.py": 'reason = "' + joined(("a", "i", "_failed")) + '"\n',
+        "compatibility.py": (
+            'broker = ' + joined(("Fa", "st", "RenderBroker"))
+            + '; registry = ' + joined(("Fa", "st", "AttemptRegistry"))
+            + '; runtime = _' + joined(("fa", "st", "_runtime")) + '\n'
+        ),
+        "generation-symbol.py": (
+            'process = ' + joined(("A", "i", "AttemptProcess"))
+            + '; evidence = ' + joined(("A", "i", "AcceptanceEvidence"))
+            + '; tree = ' + joined(("A", "i", "ProcessTreeWorker"))
+            + '; regional = ' + joined(("Regional", "Evaluator")) + '\n'
+        ),
+    }
+    for name, source in fixtures.items():
+        (tmp_path / name).write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", *fixtures], cwd=tmp_path, check=True)
+    violations = find_violations(tmp_path)
+    violated_paths = {Path(item.rsplit(": ", 1)[0]).name for item in violations}
+    assert violated_paths == set(fixtures)
+    assert {item.rsplit(": ", 1)[-1] for item in violations} == {
+        "retired-ai-try-on-artifact",
+        "retired-ai-try-on-bracket-mode",
+        "retired-ai-try-on-mode",
+        "retired-ai-try-on-readiness",
+        "retired-ai-try-on-terminal",
+        "retired-try-on-compatibility-symbol",
+        "retired-try-on-start-mode",
+        "retired-try-on-payload-mode",
+        "retired-fast-try-on-role",
+        "retired-try-on-mode-symbol",
+    }
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "vision/" + "".join(("try_on_", "a", "i", ".py")),
+        "vision/" + "".join(("try_on_", "fa", "st", ".py")),
+        "config/" + "".join(("profile", "_fast", "_try_on.json")),
+        "runtime/" + "".join(("a", "i", "-worker/entry.py")),
+        "models/" + "".join(("a", "i", "_model_pack/manifest.json")),
+        "vision/" + "".join(("regional", "_evaluator/runtime.py")),
+        "vision/" + "".join(("a", "i", "_acceptance_evidence.py")),
+        "tests/" + "".join(("a", "i", "_process_tree_worker.py")),
+        "scripts/" + "".join(("materialize_", "a", "i", "_wheelhouse.py")),
+        "scripts/" + "".join(("verify_", "a", "i", "_wheelhouse.py")),
+        "scripts/" + "".join(("render_", "a", "i", "_build_requirements.py")),
+        "vision/" + "".join(("process", "_supervisor.py")),
+        "vision/" + "".join(("source", "_provenance.py")),
+    ),
+)
+def test_hard_cutover_guard_rejects_every_retired_path_category(
+    tmp_path, relative_path
+):
+    _init_guard_repo(tmp_path)
+    retired = tmp_path / relative_path
+    retired.parent.mkdir(parents=True, exist_ok=True)
+    retired.write_text("pass\n", encoding="utf-8")
+    subprocess.run(["git", "add", relative_path], cwd=tmp_path, check=True)
+
+    assert any("retired-try-on-path" in item for item in find_violations(tmp_path))
+
+
+def test_hard_cutover_guard_allows_framework_performance_and_production_models(tmp_path):
+    _init_guard_repo(tmp_path)
+    fixtures = {
+        "framework.py": "from fastapi import FastAPI\napp = FastAPI()\n",
+        "performance.md": "Fast startup and fast frame processing are performance goals.\n",
+        "mode.py": 'mode = "performance"\n',
+        "automatic-mode.py": 'mode = "automatic"\n',
+        "framework-mode.py": 'mode = "fastapi"\n',
+        "performance-mode.py": 'mode = fastest\n',
+        "pipeline-mode.py": 'mode = airflow\n',
+        "official-air-guide.md": "Official airflow guidance.\n",
+        "requirements-airflow.md": "Requirements for airflow monitoring.\n",
+        "models.json": (
+            '{"weights":["models/age_gender/age_net.caffemodel",'
+            '"models/age_gender/gender_net.caffemodel",'
+            '"models/person_detection/person_yolov8n.onnx"]}\n'
+        ),
+    }
+    for name, source in fixtures.items():
+        (tmp_path / name).write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", *fixtures], cwd=tmp_path, check=True)
+
+    assert find_violations(tmp_path) == []
+
+
+def test_hard_cutover_guard_allows_future_scoped_generic_runtime_modules(tmp_path):
+    _init_guard_repo(tmp_path)
+    fixtures = {
+        "vision/directshow/source_provenance.py": "class DirectShowProvenance:\n    pass\n",
+        "tools/process_supervisor.py": "class MaintenanceSupervisor:\n    pass\n",
+    }
+    for relative_path, source in fixtures.items():
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+    subprocess.run(["git", "add", *fixtures], cwd=tmp_path, check=True)
+
+    assert find_violations(tmp_path) == []
+
+
+def test_hard_cutover_guard_does_not_trust_a_same_named_test_file(tmp_path):
+    _init_guard_repo(tmp_path)
+    disguised = tmp_path / "tests" / "test_hard_cutover_absence.py"
+    disguised.parent.mkdir()
+    disguised.write_text(
+        'payload["mode"] = "' + _QUICK_PREFIX + '"\n', encoding="utf-8"
+    )
+    subprocess.run(
+        ["git", "add", "tests/test_hard_cutover_absence.py"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    assert any(
+        "retired-ai-try-on-bracket-mode" in item
+        for item in find_violations(tmp_path)
+    )
 
 
 def test_hard_cutover_guard_detects_every_forbidden_category(tmp_path):

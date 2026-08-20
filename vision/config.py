@@ -21,11 +21,10 @@ import jsonschema
 def _load_build_app_version() -> str:
     """Read the release-materialized display version without importing its module.
 
-    The regional evaluator imports this configuration module through the pose
-    adapter.  Its provenance descriptor must bind evaluator code, while the
-    release-only display marker is deliberately materialized after checkout.
-    Parse the single trusted marker as data so that materialization cannot
-    invalidate that evaluator source closure.
+    The marker belongs to the main runtime and is materialized only after
+    checkout. Parse the single trusted assignment as data so startup and the
+    packaged verifier enforce the same release identity without executing a
+    generated source file.
     """
 
     try:
@@ -93,7 +92,7 @@ def _validate_managed_config(config, config_path):
         "backend", "width", "height", "fps", "fourcc", "role",
         "keep_open", "rotate", "roi", "source", "video_path", "loop",
     }
-    expected_roles = {"top": "presence", "front": "profile_fast_try_on"}
+    expected_roles = {"top": "presence", "front": "profile_try_on"}
     camera_sources = {}
     for camera_name, camera in cameras.items():
         if not isinstance(camera, dict):

@@ -35,7 +35,7 @@ three are in the manifest.
 same `sources/person-man-front.png` by `generate-front-vertical.py`.  It
 reproduces the physical front-camera field condition: the single person is
 centered and aligned by the shoulder rule while the lower body (hips) falls
-beyond the bottom frame edge.  The acquisition and fast try-on tracks use it
+beyond the bottom frame edge.  The acquisition and try-on tracks use it
 as the front recorded source on the installed-Windows VM so vertical frames,
 close-up shoulder alignment, and inferred-hip generation are exercised through
 the production boundary.

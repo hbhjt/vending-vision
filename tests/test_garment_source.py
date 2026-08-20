@@ -193,7 +193,7 @@ def test_garment_source_cancels_a_slow_drip_and_closes_its_stream():
                 canceled,
             )
         )
-        # This only bounds a hung test fixture.  It does not change Fast's
+        # This only bounds a hung test fixture. It does not change Try-On's
         # five-second fetch deadline or its cancellation contract.
         assert await asyncio.to_thread(SlowDripHandler.streaming.wait, 5.0)
         canceled.set()

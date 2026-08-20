@@ -196,7 +196,7 @@
             "source": { "enum": ["dshow", "recorded_video"] },
             "video_path": { "type": "string", "minLength": 1 },
             "loop": { "type": "boolean" },
-            "role": { "const": "profile_fast_try_on" }
+            "role": { "const": "profile_try_on" }
           },
           "allOf": [
             {

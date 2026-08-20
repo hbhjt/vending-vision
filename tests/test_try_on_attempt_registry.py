@@ -5,8 +5,8 @@ from uuid import uuid4
 
 import pytest
 
-from vision import fast_attempt_registry
-from vision.fast_attempt_registry import FastAttemptRegistry
+from vision import try_on_attempt_registry
+from vision.try_on_attempt_registry import TryOnAttemptRegistry
 
 
 def _message(message_type: str, attempt_id: str, message_id: str) -> dict:
@@ -20,7 +20,7 @@ def _message(message_type: str, attempt_id: str, message_id: str) -> dict:
 def test_cancel_wins_over_completed_with_one_canonical_terminal():
     """Cancellation CAS clears active work and makes the terminal replayable."""
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         attempt_id = str(uuid4())
         accepted = _message("vision.try_on.attempt.accepted", attempt_id, "accepted-1")
         generating = _message("vision.try_on.attempt.generating", attempt_id, "generating-1")
@@ -60,7 +60,7 @@ def test_cancel_wins_over_completed_with_one_canonical_terminal():
 def test_disconnect_keeps_cleanup_barrier_before_another_socket_can_admit():
     """A disconnect terminal fences new owners until the disconnected worker joins."""
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         old_id, new_id = str(uuid4()), str(uuid4())
         release_old = asyncio.Event()
 
@@ -121,7 +121,7 @@ def test_disconnect_keeps_cleanup_barrier_before_another_socket_can_admit():
 def test_replacement_cancels_blocked_owner_and_joins_cleanup_before_admission():
     """Replacement must interrupt a blocked owner, then admit only after its cleanup."""
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         old_id, new_id = str(uuid4()), str(uuid4())
         cleanup_done = asyncio.Event()
 
@@ -172,7 +172,7 @@ def test_replacement_cancels_blocked_owner_and_joins_cleanup_before_admission():
 def test_completed_wins_over_later_cancel_with_one_canonical_terminal():
     """A success committed first cannot be overwritten by a late cancellation."""
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         attempt_id = str(uuid4())
         accepted = _message("vision.try_on.attempt.accepted", attempt_id, "accepted-2")
         generating = _message("vision.try_on.attempt.generating", attempt_id, "generating-2")
@@ -207,7 +207,7 @@ def test_completed_wins_over_later_cancel_with_one_canonical_terminal():
 def test_explicit_cancel_publishes_before_blocked_owner_cleanup_finishes():
     """A WebSocket cancel must not wait for a blocked renderer to receive ping."""
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         attempt_id = str(uuid4())
         release_owner = asyncio.Event()
 
@@ -240,7 +240,7 @@ def test_explicit_cancel_publishes_before_blocked_owner_cleanup_finishes():
 def test_waiting_replacement_rechecks_after_same_id_backpressure_terminal():
     """A waiting replacement must not overwrite a same-ID terminal won meanwhile."""
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         first_id = str(uuid4())
         replacement_id = str(uuid4())
         join_released = asyncio.Event()
@@ -303,7 +303,7 @@ def test_prior_join_outcome_is_consumed_before_pending_admission_recheck(
     prior_outcome, ready
 ):
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         unhandled_contexts = []
         asyncio.get_running_loop().set_exception_handler(
             lambda _loop, context: unhandled_contexts.append(context)
@@ -422,7 +422,7 @@ def test_prepared_admission_atomically_binds_active_state_to_resolved_accepted(
     initially_ready, ready_at_commit
 ):
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         attempt_id = str(uuid4())
         accepted = _message(
             "vision.try_on.attempt.accepted", attempt_id, "accepted"
@@ -470,7 +470,7 @@ def test_prepared_admission_atomically_binds_active_state_to_resolved_accepted(
 
 def test_cancelled_pending_owner_keeps_cleanup_barrier_until_prior_task_ends():
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         first_id, pending_id, next_id = str(uuid4()), str(uuid4()), str(uuid4())
         prior_release = asyncio.Event()
         prior_done = asyncio.Event()
@@ -590,7 +590,7 @@ def test_repeated_pending_cancel_waits_for_failed_prior_and_keeps_cancelled_erro
     prior_outcome,
 ):
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         first_id, pending_id, next_id = str(uuid4()), str(uuid4()), str(uuid4())
         prior_release = asyncio.Event()
         prior_exited = asyncio.Event()
@@ -696,7 +696,7 @@ def test_repeated_pending_cancel_waits_for_failed_prior_and_keeps_cancelled_erro
 
 def test_shutdown_during_pending_cancel_waits_for_prior_cleanup_barrier():
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         first_id, pending_id, next_id = str(uuid4()), str(uuid4()), str(uuid4())
         prior_release = asyncio.Event()
         prior_done = asyncio.Event()
@@ -800,7 +800,7 @@ def test_shutdown_during_pending_cancel_waits_for_prior_cleanup_barrier():
 
 def test_repeated_outer_cancel_keeps_cleanup_barrier_until_old_owner_stops():
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         old_id = str(uuid4())
         new_id = str(uuid4())
         old_stop_released = asyncio.Event()
@@ -878,13 +878,13 @@ def test_terminal_ttl_prunes_all_expired_records_not_only_lru_head(monkeypatch):
     """Replaying one terminal must not hide older expired records behind it."""
     clock = [0.0]
     monkeypatch.setattr(
-        fast_attempt_registry,
+        try_on_attempt_registry,
         "time",
         SimpleNamespace(monotonic=lambda: clock[0]),
     )
 
     async def scenario():
-        registry = FastAttemptRegistry(terminal_ttl_seconds=0.05, terminal_max_count=10)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=0.05, terminal_max_count=10)
         oldest = str(uuid4())
         middle = str(uuid4())
         newest = str(uuid4())

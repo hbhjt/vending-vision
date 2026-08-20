@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 import vision.attempt_worker as attempt_worker_module
-from vision.attempt_worker import AttemptWorkerError, FastRenderBroker, render_attempt_frame
+from vision.attempt_worker import AttemptWorkerError, TryOnRenderBroker, render_attempt_frame
 from vision.render_worker_target import _render, render_worker_entry
 from vision.shared_ipc_slot import _HEADER
 
@@ -307,7 +307,7 @@ def _stale_response_render_target(connection):
 
 def test_production_render_target_rejects_test_arguments():
     with pytest.raises(ValueError, match="does not accept test arguments"):
-        FastRenderBroker(
+        TryOnRenderBroker(
             target=render_worker_entry, target_args=(_TEST_POSE_FIXTURE,)
         )
 
@@ -340,7 +340,7 @@ def test_render_spawn_failure_unlinks_slot_and_closes_process_handle():
 
     before = set(os.listdir("/dev/shm")) if os.path.isdir("/dev/shm") else set()
     context = StartFailureContext()
-    broker = FastRenderBroker(context=context)
+    broker = TryOnRenderBroker(context=context)
 
     with pytest.raises(AttemptWorkerError, match="spawn denied"):
         broker._start_sync()
@@ -439,7 +439,7 @@ def test_live_render_prewarm_corrupt_ready_stops_child_and_fails_closed():
     unrelated.start()
     assert unrelated_ready.wait(timeout=2.0)
     context = RecordingContext(real_context)
-    broker = FastRenderBroker(context=context, target=_corrupt_ready_render_target)
+    broker = TryOnRenderBroker(context=context, target=_corrupt_ready_render_target)
 
     try:
         with pytest.raises(AttemptWorkerError, match="readiness"):
@@ -508,7 +508,7 @@ def test_prestarted_render_broker_rejects_real_max_images_without_blocking_or_le
     )
 
     async def scenario():
-        broker = FastRenderBroker()
+        broker = TryOnRenderBroker()
         await broker.start()
         assert broker.ready
         broker_child = broker.pid
@@ -566,7 +566,7 @@ def test_prestarted_render_broker_completes_one_real_encoded_job():
     async def scenario():
         # This is a broker/resource test.  The explicit worker-only fixture
         # avoids claiming a blank frame is a real production person.
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             target=_test_fixture_render_worker_target,
             target_args=(_TEST_POSE_FIXTURE,),
         )
@@ -593,7 +593,7 @@ def test_prestarted_render_broker_completes_one_real_encoded_job():
 
 
 def test_production_render_request_does_not_call_parent_connection_send(monkeypatch):
-    """Fast render request metadata must not depend on parent-side Pipe send."""
+    """Try-On render request metadata must not depend on parent-side Pipe send."""
     from multiprocessing.connection import Connection
 
     garment = _short_sleeve_garment(256, 192)
@@ -603,7 +603,7 @@ def test_production_render_request_does_not_call_parent_connection_send(monkeypa
     frame = np.full((96, 72, 3), (235, 220, 205), dtype=np.uint8)
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             target=_test_fixture_render_worker_target,
             target_args=(_TEST_POSE_FIXTURE,),
         )
@@ -794,7 +794,7 @@ def test_parent_cv2_encode_block_cannot_enter_the_prestarted_render_path(monkeyp
         raise AssertionError("parent cv2.imencode must not run")
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             target=_test_fixture_render_worker_target,
             target_args=(_TEST_POSE_FIXTURE,),
         )
@@ -827,7 +827,7 @@ def test_parent_cv2_encode_block_cannot_enter_the_prestarted_render_path(monkeyp
     assert not parent_encode_entered
     assert isinstance(result, bytes)
     assert not any(
-        thread.name == "fast-render-encode" and thread.is_alive()
+        thread.name == "try_on-render-request" and thread.is_alive()
         for thread in threading.enumerate()
     )
 
@@ -845,7 +845,7 @@ def test_cancel_joins_blocked_native_encode_then_readies_one_replacement():
     frame = np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_blocked_worker_encode_target,
             target_args=(entered, _TEST_POSE_FIXTURE),
@@ -888,7 +888,7 @@ def test_cancel_joins_blocked_native_encode_then_readies_one_replacement():
     assert active_requests == 0
     assert child_pids == {pid}
     assert not any(
-        thread.name == "fast-render-encode" and thread.is_alive()
+        thread.name == "try_on-render-request" and thread.is_alive()
         for thread in threading.enumerate()
     )
 
@@ -906,7 +906,7 @@ def test_worker_slow_encode_times_out_then_readies_one_replacement():
     frame = np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_slow_worker_encode_target,
             target_args=(entered, 0.2, _TEST_POSE_FIXTURE),
@@ -963,7 +963,7 @@ def test_cancelled_blocked_render_is_joined_before_controlled_recovery():
     frame = np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_block_first_render_target,
             target_args=(counter,),
@@ -1012,7 +1012,7 @@ def test_crashed_render_is_joined_and_one_replacement_is_prestarted():
     frame = np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_crash_first_render_target,
             target_args=(counter,),
@@ -1066,7 +1066,7 @@ def test_pose_failures_are_typed_attempt_outcomes_and_keep_the_worker_pid():
     digest = "sha256:" + hashlib.sha256(garment_png).hexdigest()
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_pose_error_then_success_target,
             target_args=(counter,),
@@ -1107,7 +1107,7 @@ def test_stale_render_ipc_response_aborts_slot_and_fails_closed_without_restart(
     frame = np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
 
     async def scenario():
-        broker = FastRenderBroker(context=context, target=_stale_response_render_target)
+        broker = TryOnRenderBroker(context=context, target=_stale_response_render_target)
         await broker.start()
         first_pid = broker.pid
         assert first_pid is not None
@@ -1151,7 +1151,7 @@ def test_stubborn_kill_oserror_retains_handle_and_fails_closed_without_restart()
             raise OSError("join denied")
 
     async def scenario():
-        broker = FastRenderBroker()
+        broker = TryOnRenderBroker()
         broker._process = KillDeniedProcess()
         broker._ready = True
         assert broker.ready
@@ -1207,7 +1207,7 @@ def test_render_shutdown_accepts_process_sentinel_before_is_alive_reap_catches_u
     )
 
     async def scenario():
-        broker = FastRenderBroker()
+        broker = TryOnRenderBroker()
         broker._process = process
         broker._ready = True
         await broker.shutdown()
@@ -1246,7 +1246,7 @@ def test_render_shutdown_does_not_call_stubborn_blocking_join_before_dead():
                     time.sleep(1)
 
     async def scenario():
-        broker = FastRenderBroker()
+        broker = TryOnRenderBroker()
         live = LiveProcess()
         broker._process = live
         broker._ready = True
@@ -1265,7 +1265,7 @@ def test_render_shutdown_does_not_call_stubborn_blocking_join_before_dead():
     with pytest.raises(AttemptWorkerError, match="unavailable"):
         asyncio.run(broker.start())
     assert not any(
-        thread.name == "fast-render-shutdown" and thread.is_alive()
+        thread.name == "try_on-render-shutdown" and thread.is_alive()
         for thread in threading.enumerate()
     )
 
@@ -1275,7 +1275,7 @@ def test_render_pid_probe_never_touches_unowned_multiprocessing_children():
     unrelated = context.Process(target=time.sleep, args=(5,))
     unrelated.start()
     try:
-        broker = FastRenderBroker()
+        broker = TryOnRenderBroker()
         broker._fatal_error = "render_broker_readiness_timeout"
 
         assert broker.pid is None
@@ -1296,7 +1296,7 @@ def test_cancelled_render_start_caller_does_not_cancel_shared_worker_start():
     ready_gate = context.Event()
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_delayed_ready_render_target,
             target_args=(starts, ready_gate),
@@ -1342,7 +1342,7 @@ def test_concurrent_render_start_is_rejected_without_worker_or_queue_growth():
     frame = np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_block_first_render_target,
             target_args=(counter,),
@@ -1392,7 +1392,7 @@ def test_concurrent_render_starts_join_one_shared_worker():
     baseline = {child.pid for child in multiprocessing.active_children()}
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_delayed_ready_render_target,
             target_args=(starts, ready_gate),
@@ -1434,7 +1434,7 @@ def test_render_shutdown_waits_for_shared_start_then_stops_the_worker():
     ready_gate = context.Event()
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_delayed_ready_render_target,
             target_args=(starts, ready_gate),
@@ -1467,7 +1467,7 @@ def test_render_shutdown_reaps_worker_immediately_after_ack_before_native_teardo
     teardown_started = context.Event()
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_ack_then_slow_native_teardown_target,
             target_args=(teardown_started,),
@@ -1490,7 +1490,7 @@ def test_render_shutdown_does_not_trust_invalid_or_missing_ack(response_mode):
     context = multiprocessing.get_context("spawn")
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_invalid_shutdown_ack_target,
             target_args=(response_mode,),
@@ -1514,7 +1514,7 @@ def test_render_broker_can_start_a_new_generation_after_completed_shutdown():
     ready_gate.set()
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_delayed_ready_render_target,
             target_args=(starts, ready_gate),
@@ -1554,7 +1554,7 @@ def test_shutdown_joins_a_blocked_render_without_starting_a_replacement():
     frame = np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_block_first_render_target,
             target_args=(counter,),
@@ -1603,7 +1603,7 @@ def test_blocked_render_timeout_joins_before_controlled_recovery():
     frame = np.full((80, 60, 3), (235, 220, 205), dtype=np.uint8)
 
     async def scenario():
-        broker = FastRenderBroker(
+        broker = TryOnRenderBroker(
             context=context,
             target=_block_first_render_target,
             target_args=(counter,),

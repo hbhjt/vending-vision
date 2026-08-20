@@ -59,7 +59,7 @@ def valid_config():
         "port": 7892,
         "cameras": {
             "top": {"role": "presence", "rotate": 0},
-        "front": {"role": "profile_fast_try_on", "rotate": 270},
+        "front": {"role": "profile_try_on", "rotate": 270},
         },
         "allowed_origins": ["http://tauri.localhost"],
     }
@@ -87,7 +87,7 @@ def test_managed_config_values_come_from_the_frozen_site_source(tmp_path):
     result = import_config_values(config)
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "127.0.0.1:17892:presence:profile_fast_try_on"
+    assert result.stdout.strip() == "127.0.0.1:17892:presence:profile_try_on"
 
 
 def test_managed_config_is_required_and_validated(tmp_path):

@@ -73,18 +73,6 @@ def parse_args(argv=None):
         action="store_true",
         help="verify frozen V2 try-on worker spawn and shared IPC boundaries",
     )
-    parser.add_argument(
-        "--verify-ai-worker-boundary",
-        action="store_true",
-        help="verify frozen AI worker import/supervisor runtime contract boundary",
-    )
-    parser.add_argument("--ai-attempt-worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--model-pack", help=argparse.SUPPRESS)
-    parser.add_argument("--probe-runtime", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--person", help=argparse.SUPPRESS)
-    parser.add_argument("--garment", help=argparse.SUPPRESS)
-    parser.add_argument("--output", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -110,62 +98,11 @@ def verify_v2_contract_bundle():
     raise RuntimeError("V2 contract bundle accepted its rejected fixture")
 
 
-def run_ai_attempt_worker(args):
-    from vision.ai_attempt_worker import main as worker_main
-
-    if args.probe_runtime:
-        raise SystemExit(worker_main(["--probe-runtime"]))
-    worker_args = ["--model-pack", args.model_pack]
-    if args.probe:
-        worker_args.append("--probe")
-    else:
-        worker_args.extend(
-            [
-                "--person",
-                args.person,
-                "--garment",
-                args.garment,
-                "--output",
-                args.output,
-            ]
-        )
-    raise SystemExit(worker_main(worker_args))
-
-
-def verify_ai_worker_boundary():
-    """Probe the frozen AI child boundary without a model pack or inference."""
-
-    from vision.ai_attempt_process import ai_runtime_worker_command, probe_ai_attempt_worker, probe_ai_runtime_worker
-    from vision.ai_model_pack import (
-        official_ai_readiness,
-    )
-    from vision import ai_attempt_worker  # noqa: F401
-
-    if official_ai_readiness(None):
-        raise RuntimeError("missing official AI pack must not report ready")
-    probe_ai_runtime_worker(timeout=15.0)
-    model_pack = os.getenv("VEM_AI_MODEL_PACK")
-    if model_pack:
-        probe_ai_attempt_worker(Path(model_pack))
-        command = [*ai_runtime_worker_command()]
-        availability_note = "verified official model pack"
-    else:
-        command = [*ai_runtime_worker_command()]
-        availability_note = "AI unavailable: missing official model pack"
-    test_selector_flags = ["--" + "".join(("fa", "ke")) + "-worker", "--config"]
-    if any(flag in command for flag in test_selector_flags):
-        raise RuntimeError("AI worker command exposed a test selector")
-    print(f"AI runtime worker contract probe passed ({availability_note})")
-
-
 def main():
     """主入口函数：配置环境并启动 uvicorn 服务器。"""
     # PyInstaller 多进程支持
     multiprocessing.freeze_support()
     args = parse_args()
-    if args.ai_attempt_worker:
-        run_ai_attempt_worker(args)
-        return
     if args.verify_v2_contract_bundle:
         verify_v2_contract_bundle()
         return
@@ -174,9 +111,6 @@ def main():
 
         verify_v2_try_on_workers()
         print("V2 try-on worker probe passed")
-        return
-    if args.verify_ai_worker_boundary:
-        verify_ai_worker_boundary()
         return
     configure_workdir()
     # 抑制 TensorFlow/MediaPipe 的冗余日志输出

@@ -1,4 +1,4 @@
-"""Create and populate the two clean, offline release build environments."""
+"""Create and populate the clean, offline release build environment."""
 
 from __future__ import annotations
 
@@ -54,97 +54,66 @@ def _offline_install_command(python: Path, wheelhouse: Path, requirements: Path)
     ]
 
 
-def _reap_install_process(name: str, process: subprocess.Popen[str]) -> str | None:
-    """Terminate and reap an unfinished sibling without masking its failure."""
-    diagnostics: list[str] = []
-    try:
-        if process.poll() is not None:
-            return None
-    except OSError as exc:
-        diagnostics.append(f"poll_{exc.__class__.__name__}")
+def _terminate_and_reap(process: subprocess.Popen[str]) -> str | None:
+    """Bound cleanup and return a stable diagnostic instead of leaking a child."""
+    diagnostics = []
     try:
         process.terminate()
-        process.wait(timeout=INSTALL_REAP_TIMEOUT_SECONDS)
-        return ";".join(f"{name}_install_{item}" for item in diagnostics) or None
     except OSError as exc:
         diagnostics.append(f"terminate_{exc.__class__.__name__}")
-    except subprocess.TimeoutExpired:
-        pass
-
     try:
-        if process.poll() is not None:
-            return ";".join(f"{name}_install_{item}" for item in diagnostics) or None
-    except OSError as exc:
-        diagnostics.append(f"poll_{exc.__class__.__name__}")
-
+        process.wait(timeout=INSTALL_REAP_TIMEOUT_SECONDS)
+        return ";".join(diagnostics) or None
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     try:
         process.kill()
     except OSError as exc:
         diagnostics.append(f"kill_{exc.__class__.__name__}")
-
     try:
         process.wait(timeout=INSTALL_REAP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         diagnostics.append("kill_reap_timeout")
     except OSError as exc:
         diagnostics.append(f"kill_reap_{exc.__class__.__name__}")
-    return ";".join(f"{name}_install_{item}" for item in diagnostics) or None
+    return ";".join(diagnostics) or None
 
 
-def _cleanup_install_processes(
-    processes: list[tuple[str, subprocess.Popen[str]]], *, exclude: str | None = None
-) -> list[str]:
-    return [
-        diagnostic
-        for name, process in processes
-        if name != exclude
-        and (diagnostic := _reap_install_process(name, process)) is not None
-    ]
-
-
-def _install_isolated_closures(
-    *installs: tuple[str, Path, Path, Path],
+def _install_core_closure(
+    python: Path, wheelhouse: Path, requirements: Path
 ) -> None:
-    """Run the independently locked offline closures concurrently and fail closed."""
-    processes: list[tuple[str, subprocess.Popen[str]]] = []
-    deadline = time.monotonic() + INSTALL_TIMEOUT_SECONDS
+    command = _offline_install_command(python, wheelhouse, requirements)
     try:
-        for name, python, wheelhouse, requirements in installs:
-            processes.append(
-                (name, subprocess.Popen(_offline_install_command(python, wheelhouse, requirements)))
-            )
+        process = subprocess.Popen(command)
     except OSError as exc:
-        cleanup = _cleanup_install_processes(processes)
-        suffix = f";{';'.join(cleanup)}" if cleanup else ""
         raise BuildBootstrapError(
-            f"build_env_install_launch_failed:{exc.__class__.__name__}{suffix}"
+            f"core_install_launch_failed:{exc.__class__.__name__}"
         ) from exc
-
-    pending = dict(processes)
-    while pending:
-        for name, process in tuple(pending.items()):
+    deadline = time.monotonic() + INSTALL_TIMEOUT_SECONDS
+    while True:
+        try:
+            returncode = process.poll()
+        except OSError as exc:
+            cleanup = _terminate_and_reap(process)
+            suffix = f";core_install_{cleanup}" if cleanup else ""
+            raise BuildBootstrapError(
+                f"core_install_poll_failed:{exc.__class__.__name__}{suffix}"
+            ) from exc
+        if returncode is not None:
             try:
-                returncode = process.poll()
-            except OSError as exc:
-                cleanup = _cleanup_install_processes(processes)
-                suffix = f";{';'.join(cleanup)}" if cleanup else ""
+                process.wait(timeout=INSTALL_REAP_TIMEOUT_SECONDS)
+            except (OSError, subprocess.TimeoutExpired) as exc:
                 raise BuildBootstrapError(
-                    f"{name}_install_poll_failed:{exc.__class__.__name__}{suffix}"
+                    f"core_install_reap_failed:{exc.__class__.__name__}"
                 ) from exc
-            if returncode is None:
-                continue
-            del pending[name]
-            if returncode == 0:
-                continue
-            cleanup = _cleanup_install_processes(processes, exclude=name)
-            suffix = f";{';'.join(cleanup)}" if cleanup else ""
-            raise BuildBootstrapError(f"{name}_install_failed:exit_{returncode}{suffix}")
-        if pending:
-            if time.monotonic() >= deadline:
-                cleanup = _cleanup_install_processes(processes)
-                suffix = f";{';'.join(cleanup)}" if cleanup else ""
-                raise BuildBootstrapError(f"build_env_install_deadline_exceeded{suffix}")
-            time.sleep(INSTALL_POLL_SECONDS)
+            if returncode != 0:
+                raise BuildBootstrapError(f"core_install_failed:exit_{returncode}")
+            return
+        if time.monotonic() >= deadline:
+            cleanup = _terminate_and_reap(process)
+            suffix = f";core_install_{cleanup}" if cleanup else ""
+            raise BuildBootstrapError(f"core_install_deadline_exceeded{suffix}")
+        time.sleep(INSTALL_POLL_SECONDS)
 
 
 def bootstrap_build_envs(
@@ -153,33 +122,26 @@ def bootstrap_build_envs(
     core_env: Path,
     core_wheelhouse: Path,
     core_requirements: Path,
-    ai_env: Path,
-    ai_wheelhouse: Path,
-    ai_requirements: Path,
 ) -> dict[str, str]:
     base_python = _required_file(base_python, "base_python_missing")
     core_wheelhouse = _required_directory(core_wheelhouse, "core_wheelhouse_missing")
-    ai_wheelhouse = _required_directory(ai_wheelhouse, "ai_wheelhouse_missing")
     core_requirements = _required_file(core_requirements, "core_requirements_missing")
-    ai_requirements = _required_file(ai_requirements, "ai_requirements_missing")
     core_env = core_env.resolve()
-    ai_env = ai_env.resolve()
-    if core_env == ai_env:
-        raise BuildBootstrapError("build_envs_must_be_distinct")
-    if core_env.exists() or ai_env.exists():
+    if core_env.exists():
         raise BuildBootstrapError("build_env_must_not_exist")
 
-    for environment in (core_env, ai_env):
-        subprocess.run([str(base_python), "-m", "venv", str(environment)], check=True)
+    try:
+        subprocess.run(
+            [str(base_python), "-m", "venv", str(core_env)], check=True
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise BuildBootstrapError(
+            f"core_env_create_failed:{exc.__class__.__name__}"
+        ) from exc
 
     core_python = _venv_python(core_env)
-    ai_python = _venv_python(ai_env)
-    installs = (
-        ("core", core_python, core_wheelhouse, core_requirements),
-        ("ai", ai_python, ai_wheelhouse, ai_requirements),
-    )
-    _install_isolated_closures(*installs)
-    return {"corePython": str(core_python.resolve()), "aiPython": str(ai_python.resolve())}
+    _install_core_closure(core_python, core_wheelhouse, core_requirements)
+    return {"corePython": str(core_python.absolute())}
 
 
 def main() -> int:
@@ -188,9 +150,6 @@ def main() -> int:
     parser.add_argument("--core-env", required=True, type=Path)
     parser.add_argument("--core-wheelhouse", required=True, type=Path)
     parser.add_argument("--core-requirements", required=True, type=Path)
-    parser.add_argument("--ai-env", required=True, type=Path)
-    parser.add_argument("--ai-wheelhouse", required=True, type=Path)
-    parser.add_argument("--ai-requirements", required=True, type=Path)
     args = parser.parse_args()
     result = bootstrap_build_envs(**vars(args))
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

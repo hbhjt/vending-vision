@@ -1,4 +1,4 @@
-"""Spawn-safe broker children for v2 fast-attempt tests.
+"""Spawn-safe broker children for v2 try-on attempt tests.
 
 Keep this module free of application imports: Windows ``spawn`` imports the
 target module afresh before it can enter a test-controlled synchronization

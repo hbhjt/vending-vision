@@ -11,7 +11,7 @@ import pytest
 import app as vision_app
 from vision import camera_manager
 from vision.config import settings
-from vision.fast_attempt_registry import FastAttemptRegistry
+from vision.try_on_attempt_registry import TryOnAttemptRegistry
 from vision.frame_source import RecordedVideoFrameSource
 from vision.presence_runtime import PresenceRuntime
 from vision.profile_state import get_occupancy_gate, reset_active_track
@@ -32,7 +32,7 @@ def configure_recorded_sources(monkeypatch, manifest):
             settings,
             setting_name,
             {
-                "role": "presence" if role == "top" else "profile_fast_try_on",
+                "role": "presence" if role == "top" else "profile_try_on",
                 "source": "recorded_video",
                 "video_path": str(FIXTURE_ROOT / recording["file"]),
                 "loop": recording["loop"],
@@ -47,7 +47,7 @@ def write_managed_recorded_video_config(path, manifest, *, front_loop=None):
     for role in ("top", "front"):
         recording = manifest["recordings"][role]
         cameras[role] = {
-            "role": "presence" if role == "top" else "profile_fast_try_on",
+            "role": "presence" if role == "top" else "profile_try_on",
             "source": "recorded_video",
             "video_path": str(FIXTURE_ROOT / recording["file"]),
             "loop": recording["loop"] if role == "top" or front_loop is None else front_loop,
@@ -309,9 +309,9 @@ def test_recorded_top_departure_cancels_active_public_attempt_once(monkeypatch, 
         configure_recorded_sources(monkeypatch, manifest)
         reset_presence_state()
         runtime = PresenceRuntime()
-        registry = FastAttemptRegistry(terminal_ttl_seconds=60)
+        registry = TryOnAttemptRegistry(terminal_ttl_seconds=60)
         monkeypatch.setattr(vision_app, "get_presence_runtime", lambda: runtime)
-        monkeypatch.setattr(vision_app, "_fast_attempt_registry", registry)
+        monkeypatch.setattr(vision_app, "_try_on_attempt_registry", registry)
         attempt_id = "550e8400-e29b-41d4-a716-446655440124"
 
         async def active_owner():
@@ -326,7 +326,7 @@ def test_recorded_top_departure_cancels_active_public_attempt_once(monkeypatch, 
             accepted={
                 "type": "vision.try_on.attempt.accepted",
                 "messageId": "accepted",
-                "payload": {"attemptId": attempt_id, "mode": "fast"},
+                "payload": {"attemptId": attempt_id},
             },
             generating={
                 "type": "vision.try_on.attempt.generating",

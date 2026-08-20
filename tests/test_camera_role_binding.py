@@ -268,7 +268,7 @@ def test_active_directshow_broker_is_dead_before_parent_maintenance_open_and_res
     active = context.Value("i", 0)
     starts = context.Value("i", 0)
     config = {
-        "role": "profile_fast_try_on",
+        "role": "profile_try_on",
         "index": 7,
         "backend": "dshow",
         "stableId": "usb#front-002",

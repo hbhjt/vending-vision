@@ -17,8 +17,6 @@ def test_canonical_text_is_forced_to_lf_in_windows_checkouts():
             "eol",
             "--",
             "contracts/vem_vision_v2/manifest.json",
-            "ai-runtime-descriptor.json",
-            "regional-evaluator-descriptor.json",
             "requirements.txt",
         ],
         cwd=ROOT,

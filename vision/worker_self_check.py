@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 from vision.acquisition_observer import AcquisitionObservationWorker
-from vision.attempt_worker import FastRenderBroker
+from vision.attempt_worker import TryOnRenderBroker
 from vision.garment_composer import PoseUnavailableError
 
 
@@ -33,7 +33,7 @@ async def _verify_production_workers() -> None:
     context = multiprocessing.get_context("spawn")
     baseline = {child.pid for child in multiprocessing.active_children()}
     observer = AcquisitionObservationWorker(context=context)
-    renderer = FastRenderBroker(context=context)
+    renderer = TryOnRenderBroker(context=context)
     observation_status = None
     render_status = None
     try:

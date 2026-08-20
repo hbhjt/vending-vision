@@ -157,7 +157,7 @@ def collect_front_profile_update(
     owner_result = wait_for_front_camera_owner(event_id)
 
     if not owner_result.get("ok"):
-        # 获取失败：可能被 Fast attempt 占用或超时
+        # 获取失败：可能被 Try-On attempt 占用或超时
         reason = owner_result.get("error") or "front_camera_busy"
         mark_vision_session_waiting_front_camera(
             reason=reason, owner_status=owner_result,

@@ -418,7 +418,7 @@ def collect_best_profile_samples(
     index = 1
 
     # One physical-camera sequence owns the lane across every frame and every
-    # inter-frame gap.  Fast may preempt only after this sequence releases it.
+    # inter-frame gap. Try-On may preempt only after this sequence releases it.
     sequence_lock = nullcontext() if _io_lock_held else front_camera_io_lock()
     with sequence_lock:
         while time.monotonic() < deadline:

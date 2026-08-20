@@ -1,8 +1,6 @@
 import json
 import shutil
 import asyncio
-import hashlib
-import time
 from pathlib import Path
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -11,12 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as vision_app
-import vision.ai_model_pack as ai_model_pack_module
 from vision import v2_contract_bundle
-from vision.ai_model_pack import (
-    canonical_ai_model_manifest_json,
-    reset_official_ai_readiness_cache_for_tests,
-)
 from vision.v2_contract_bundle import V2ContractBundleUnavailable
 
 
@@ -40,7 +33,7 @@ def _hello_payload(manifest: dict) -> dict:
         "schemaVersion": manifest["schemaVersion"],
         "bundleVersion": manifest["bundleVersion"],
         "contractDigest": manifest["bundleDigest"],
-        "capabilities": ["try_on_fast"],
+        "capabilities": ["try_on"],
     }
 
 
@@ -111,7 +104,7 @@ def test_v2_identity_rejects_noncanonical_duplicate_and_digest_tampering(
         v2_contract_bundle.load_v2_contract_identity()
 
 
-def test_v2_digest_mismatch_withholds_fast_readiness_without_rejecting_core_connection(
+def test_v2_digest_mismatch_withholds_try_on_readiness_without_rejecting_core_connection(
     monkeypatch,
 ):
     """A contract mismatch is an enhancement diagnostic, not a core Vision outage."""
@@ -137,7 +130,7 @@ def test_v2_digest_mismatch_withholds_fast_readiness_without_rejecting_core_conn
     assert ready["payload"]["bundleVersion"] == manifest["bundleVersion"]
     assert ready["payload"]["schemaVersion"] == manifest["schemaVersion"]
     assert ready["payload"]["visionBusinessReady"] is False
-    assert ready["payload"]["fastReady"] is False
+    assert ready["payload"]["tryOnReady"] is False
     assert ready["payload"]["cameraReady"] is True
 
 
@@ -184,7 +177,7 @@ def test_missing_identity_returns_a_strict_degraded_ready_after_valid_hello(
 
     assert ready["type"] == "vision.ready"
     assert ready["payload"]["businessReadinessDiagnostic"] == "contract_bundle_unavailable"
-    assert ready["payload"]["fastReady"] is False
+    assert ready["payload"]["tryOnReady"] is False
     assert ready["payload"]["visionBusinessReady"] is False
 
 
@@ -209,10 +202,10 @@ def test_missing_generated_parser_never_falls_back_to_hello_capabilities(monkeyp
     assert error["payload"]["code"] == "invalid_message"
 
 
-def test_generated_hello_reports_fast_unavailable_when_acquisition_observer_is_not_ready(
+def test_generated_hello_reports_try_on_unavailable_when_acquisition_observer_is_not_ready(
     monkeypatch,
 ):
-    """Observer prewarm is a Fast capability gate, not a core camera outage."""
+    """Observer prewarm is a Try-On capability gate, not a core camera outage."""
     manifest = json.loads((BUNDLE_ROOT / "manifest.json").read_text("utf-8"))
     monkeypatch.setattr(
         vision_app,
@@ -220,8 +213,8 @@ def test_generated_hello_reports_fast_unavailable_when_acquisition_observer_is_n
         lambda: {
             "cameraReady": True,
             "modelReady": True,
-            "fastRenderReady": True,
-            "fastPoseReady": True,
+            "tryOnRenderReady": True,
+            "tryOnPoseReady": True,
             "acquisitionObserverReady": False,
         },
     )
@@ -232,172 +225,9 @@ def test_generated_hello_reports_fast_unavailable_when_acquisition_observer_is_n
 
     assert ready["type"] == "vision.ready"
     assert ready["payload"]["cameraReady"] is True
-    assert ready["payload"]["fastReady"] is False
+    assert ready["payload"]["tryOnReady"] is False
     assert ready["payload"]["visionBusinessReady"] is False
     assert ready["payload"]["businessReadinessDiagnostic"] == "camera_unavailable"
-
-
-@pytest.mark.parametrize(
-    ("pack_case", "expected_diagnostic"),
-    [
-        ("missing", "model_pack_missing"),
-        ("corrupt", "model_pack_invalid"),
-    ],
-)
-def test_ai_pack_failure_reports_stable_reason_without_degrading_public_core(
-    tmp_path,
-    monkeypatch,
-    pack_case,
-    expected_diagnostic,
-):
-    """AI-only degradation remains diagnosable across the public Vision boundary."""
-    manifest = json.loads((BUNDLE_ROOT / "manifest.json").read_text("utf-8"))
-    if pack_case == "missing":
-        monkeypatch.delenv("VEM_AI_MODEL_PACK", raising=False)
-    else:
-        pack = tmp_path / "corrupt-pack"
-        descriptor = json.loads(
-            (Path(__file__).parents[1] / "official-ai-model-pack-descriptor.json").read_text(
-                "utf-8"
-            )
-        )
-        for entry in descriptor["files"]:
-            model = pack / entry["path"]
-            model.parent.mkdir(parents=True, exist_ok=True)
-            with model.open("wb") as stream:
-                stream.truncate(entry["byteSize"])
-        (pack / "ai-model-manifest.json").write_text("{corrupt", "utf-8")
-        monkeypatch.setenv("VEM_AI_MODEL_PACK", str(pack))
-    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
-    monkeypatch.setattr(
-        vision_app,
-        "get_runtime_status",
-        lambda: {
-            "cameraReady": True,
-            "modelReady": True,
-            "ageGenderReady": True,
-            "ageGenderMode": "production",
-            "fastRenderReady": True,
-            "fastPoseReady": True,
-            "acquisitionObserverReady": True,
-            "check": {"checks": {}},
-        },
-    )
-
-    with TestClient(vision_app.app) as client:
-        health = client.get("/health")
-        with client.websocket_connect("/ws") as socket:
-            socket.send_json(_envelope("vision.hello", _hello_payload(manifest)))
-            ready = socket.receive_json()
-            socket.send_json(_envelope("vision.ping", {}))
-            pong = socket.receive_json()
-
-    assert health.status_code == 200
-    assert health.json()["status"] == "ok"
-    assert ready["type"] == "vision.ready"
-    assert ready["payload"]["aiReady"] is False
-    assert ready["payload"]["fastReady"] is True
-    assert ready["payload"]["visionBusinessReady"] is True
-    assert "try_on_fast" in ready["payload"]["capabilities"]
-    assert "try_on_ai" not in ready["payload"]["capabilities"]
-    assert "profile_push" in ready["payload"]["capabilities"]
-    assert "presence_status" in ready["payload"]["capabilities"]
-    assert pong["type"] == "vision.pong"
-    assert ready["payload"]["aiReadinessDiagnostic"] == expected_diagnostic
-    assert health.json()["aiReadinessDiagnostic"] == expected_diagnostic
-    assert str(tmp_path) not in json.dumps(ready)
-    assert str(tmp_path) not in json.dumps(health.json())
-
-
-def test_public_readiness_atomically_tracks_model_pack_root_becoming_unset(
-    tmp_path, monkeypatch
-):
-    manifest = json.loads((BUNDLE_ROOT / "manifest.json").read_text("utf-8"))
-    pack = tmp_path / "valid-pack"
-    model = pack / "mini" / "a.bin"
-    model.parent.mkdir(parents=True)
-    model.write_bytes(b"mini-model")
-    descriptor = {
-        "schemaVersion": "vem-official-ai-model-pack-descriptor/v2",
-        "catvtonSourceRevision": "test-source",
-        "totalByteSize": model.stat().st_size,
-        "upstreams": [
-            {"id": "mini", "repository": "example/mini", "revision": "abc"}
-        ],
-        "files": [
-            {
-                "path": "mini/a.bin",
-                "upstreamPath": "a.bin",
-                "upstream": "mini",
-                "role": "mini_weight",
-                "format": "bin",
-                "byteSize": model.stat().st_size,
-                "sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
-            }
-        ],
-    }
-    (pack / "ai-model-manifest.json").write_text(
-        canonical_ai_model_manifest_json(descriptor), "utf-8"
-    )
-    monkeypatch.setattr(
-        ai_model_pack_module,
-        "load_official_ai_model_pack_descriptor",
-        lambda: descriptor,
-    )
-    monkeypatch.setattr(
-        "vision.ai_attempt_process.probe_ai_attempt_worker", lambda _pack: None
-    )
-    monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
-    monkeypatch.setattr(
-        vision_app,
-        "get_runtime_status",
-        lambda: {
-            "cameraReady": True,
-            "modelReady": True,
-            "ageGenderReady": True,
-            "ageGenderMode": "production",
-            "fastRenderReady": True,
-            "fastPoseReady": True,
-            "acquisitionObserverReady": True,
-            "check": {"checks": {}},
-        },
-    )
-    monkeypatch.setenv("VEM_AI_MODEL_PACK", str(pack))
-    reset_official_ai_readiness_cache_for_tests()
-
-    with TestClient(vision_app.app) as client:
-        assert client.get("/health").json()["aiReadinessDiagnostic"] == "ready"
-        monkeypatch.delenv("VEM_AI_MODEL_PACK")
-        health = client.get("/health").json()
-        with client.websocket_connect("/ws") as socket:
-            socket.send_json(_envelope("vision.hello", _hello_payload(manifest)))
-            ready = socket.receive_json()["payload"]
-
-        monkeypatch.setenv("VEM_AI_MODEL_PACK", str(pack))
-        for _ in range(50):
-            restored = client.get("/health").json()
-            if restored["aiReady"]:
-                break
-            time.sleep(0.01)
-        (pack / "ai-model-manifest.json").write_text("{corrupt", "utf-8")
-        corrupt = client.get("/health").json()
-
-    assert (health["aiReady"], health["aiReadinessDiagnostic"]) == (
-        False,
-        "model_pack_missing",
-    )
-    assert (ready["aiReady"], ready["aiReadinessDiagnostic"]) == (
-        False,
-        "model_pack_missing",
-    )
-    assert (restored["aiReady"], restored["aiReadinessDiagnostic"]) == (
-        True,
-        "ready",
-    )
-    assert (corrupt["aiReady"], corrupt["aiReadinessDiagnostic"]) == (
-        False,
-        "model_pack_invalid",
-    )
 
 
 def test_websocket_session_repeated_cancel_still_runs_cleanup_barrier(monkeypatch):
@@ -426,7 +256,7 @@ def test_websocket_session_repeated_cancel_still_runs_cleanup_barrier(monkeypatc
         async def unregister(_websocket):
             cleanup.append("unregister")
 
-        monkeypatch.setattr(vision_app._fast_attempt_registry, "detach_subscriber", detach)
+        monkeypatch.setattr(vision_app._try_on_attempt_registry, "detach_subscriber", detach)
         monkeypatch.setattr(vision_app, "unregister_profile_client", unregister)
 
         with pytest.raises(asyncio.CancelledError):

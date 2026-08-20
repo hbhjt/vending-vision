@@ -1,4 +1,4 @@
-"""Spawn-safe target for the lifecycle-owned Fast render process.
+"""Spawn-safe target for the lifecycle-owned Try-On render process.
 
 The target deliberately has no dependency on the FastAPI application or model
 runtime.  PyInstaller and Windows ``spawn`` can import it as a plain module.
@@ -25,25 +25,25 @@ _RENDER_SHARED_NAME = re.compile(r"^vem_render_[0-9a-f]{32}$")
 # per spawn worker, rather than once per attempt.  Dynamic import keeps the
 # spawn target free of an app/parent import cycle and remains PyInstaller
 # discoverable through the hidden import in the spec.
-_FAST_RUNTIME = None
+_TRY_ON_RUNTIME = None
 _POSE_READY = False
 
 
 def _initialize_runtime():
-    global _FAST_RUNTIME, _POSE_READY
+    global _TRY_ON_RUNTIME, _POSE_READY
     from vision.garment_composer import GarmentComposer
 
     try:
         pose_module = __import__("vision." + "pose_estimator", fromlist=["PoseEstimator"])
         estimator = pose_module.PoseEstimator()
-        _FAST_RUNTIME = GarmentComposer(pose_estimator=estimator)
+        _TRY_ON_RUNTIME = GarmentComposer(pose_estimator=estimator)
         _POSE_READY = True
     except Exception:
-        # The worker stays alive so the parent can report Fast degradation;
+        # The worker stays alive so the parent can report Try-On degradation;
         # camera/presence/health remain owned by the main Vision process.
-        _FAST_RUNTIME = GarmentComposer(pose_estimator=None)
+        _TRY_ON_RUNTIME = GarmentComposer(pose_estimator=None)
         _POSE_READY = False
-    return _FAST_RUNTIME
+    return _TRY_ON_RUNTIME
 
 
 def _render(
@@ -136,14 +136,14 @@ def _render(
         digest=digest,
         template=payload["template"],
     )
-    runtime = _FAST_RUNTIME or _initialize_runtime()
+    runtime = _TRY_ON_RUNTIME or _initialize_runtime()
     if not _POSE_READY:
         from vision.garment_composer import PoseUnavailableError
 
         raise PoseUnavailableError("pose_unavailable")
     result = runtime.compose(frame, source, garment_scale).png
     if len(result) > MAX_RESULT_BYTES:
-        raise RuntimeError("fast result exceeds render cap")
+        raise RuntimeError("try_on result exceeds render cap")
     return result
 
 

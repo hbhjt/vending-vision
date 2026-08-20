@@ -77,11 +77,6 @@ jobs:
         with:
           python-version-file: ".python-version"
           cache: pip
-      - name: 恢复 AI wheelhouse 缓存
-        uses: actions/cache@v4
-        with:
-          path: ai-wheelhouse
-          key: ${{ runner.os }}-vending-vision-ai-wheelhouse-${{ hashFiles('requirements-ai.lock.json') }}-${{ hashFiles('ai-runtime-descriptor.json') }}-${{ hashFiles('.python-version') }}
       - name: 下载完整锁定 wheel 闭包
         run: >-
           python -m pip download --only-binary=:all: --require-hashes
@@ -90,56 +85,18 @@ jobs:
         run: |
           python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
           python scripts/dependency_lock.py --wheelhouse wheelhouse --python python --target-sys-platform win32
-      - name: 物化或校验精确 AI wheel 闭包
-        shell: pwsh
-        run: |
-          if (Test-Path -LiteralPath ai-wheelhouse) {
-            New-Item -ItemType Directory -Force -Path build | Out-Null
-            python scripts/materialize_ai_wheelhouse.py `
-              --descriptor requirements-ai.lock.json `
-              --runtime-descriptor ai-runtime-descriptor.json `
-              --wheelhouse ai-wheelhouse `
-              --requirements-output build/requirements-ai-release.txt
-            if ($LASTEXITCODE -ne 0) {
-              Remove-Item -LiteralPath ai-wheelhouse -Recurse -Force
-            }
-          }
-          if (-not (Test-Path -LiteralPath ai-wheelhouse)) {
-            python scripts/materialize_ai_wheelhouse.py `
-              --descriptor requirements-ai.lock.json `
-              --runtime-descriptor ai-runtime-descriptor.json `
-              --destination ai-wheelhouse
-          }
       - name: 构建并验证 Windows runtime 与录播交付包
         shell: pwsh
         run: |
-          ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse") -AiWheelhouse (Join-Path $PWD "ai-wheelhouse") -AiWheelhouseDescriptor (Join-Path $PWD "requirements-ai.lock.json")
+          ./scripts/build_exe.ps1 -Wheelhouse (Join-Path $PWD "wheelhouse")
           & (Join-Path $PWD ".venv-packaging-core\Scripts\python.exe") scripts/verify_packaged_exe.py
           ./scripts/package_main_artifacts.ps1 -Commit "${{ github.sha }}" -OutputDirectory (Join-Path $PWD "main-artifacts")
-          $worker = Join-Path $PWD "build/dist-ai/vending-vision-ai-worker"
-          $patch = Join-Path $PWD "build/ai-worker-vm-patch"
-          New-Item -ItemType Directory -Force (Join-Path $patch "_internal/vision") | Out-Null
-          Copy-Item -LiteralPath (Join-Path $worker "vending-vision-ai-worker.exe") -Destination $patch
-          foreach ($name in @("official-ai-source-descriptor.json", "regional-evaluator-descriptor.json")) {
-            Copy-Item -LiteralPath (Join-Path $worker "_internal/$name") -Destination (Join-Path $patch "_internal/$name")
-          }
-          foreach ($name in @("ai_attempt_worker.py", "catvton_pose_masks.py", "regional_evaluator.py", "regional_evaluator_provenance.py")) {
-            Copy-Item -LiteralPath (Join-Path $worker "_internal/vision/$name") -Destination (Join-Path $patch "_internal/vision/$name")
-          }
       - name: 暂存同提交 Vision artifacts
         uses: actions/upload-artifact@v4
         with:
           name: vending-vision-main-staging-${{ github.sha }}
           path: main-artifacts/*
           if-no-files-found: error
-      - name: 暂存 VM AI worker 热补丁
-        uses: actions/upload-artifact@v4
-        with:
-          name: vending-vision-ai-worker-patch-${{ github.sha }}
-          path: build/ai-worker-vm-patch/**
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 3
       - name: 生成同提交候选交付包（供 VM 验收）
         shell: pwsh
         run: |
@@ -158,46 +115,6 @@ jobs:
           path: candidate-artifacts/*
           if-no-files-found: error
 
-  regional-evidence-contract:
-    name: VEM 区域证据合同
-    timeout-minutes: 15
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          lfs: true
-      - name: Checkout pinned VEM regional evidence contract
-        uses: actions/checkout@v4
-        with:
-          repository: YKDZ/vem
-          ref: e5230a8a206343bb6f80f2e30e3d2f8b8807f2e4
-          path: vem-contract
-          sparse-checkout: |
-            scripts/testbed/ai-regional-evidence.mjs
-            scripts/testbed/ai-regional-evidence-policy.json
-          sparse-checkout-cone-mode: false
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version-file: ".python-version"
-          cache: pip
-      - name: 下载完整锁定 wheel 闭包
-        run: >-
-          python -m pip download --only-binary=:all: --require-hashes
-          --dest wheelhouse -r requirements.txt
-      - name: 离线安装并校验锁定闭包
-        run: |
-          python -m pip install --no-index --find-links wheelhouse --require-hashes -r requirements.txt
-          python scripts/dependency_lock.py --wheelhouse wheelhouse --python python
-      - name: 验证 Vision 区域证据与固定 VEM 合同
-        env:
-          VEM_REGIONAL_EVIDENCE_MODULE: ${{ github.workspace }}/vem-contract/scripts/testbed/ai-regional-evidence.mjs
-        run: >-
-          python -m pytest -q
-          tests/test_ai_attempt_worker_boundary.py::test_worker_customer_attempt_runs_catvton_pipeline_and_writes_private_png
-
   publish-main-artifacts:
     name: 发布同提交 Vision artifacts
     if: github.ref == 'refs/heads/main'
@@ -205,7 +122,6 @@ jobs:
     needs:
       - test
       - windows-test
-      - regional-evidence-contract
       - windows-package
     runs-on: ubuntu-latest
     steps:

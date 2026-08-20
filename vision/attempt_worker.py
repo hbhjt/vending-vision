@@ -1,6 +1,6 @@
-"""Lifecycle-owned, bounded Fast render broker.
+"""Lifecycle-owned, bounded Try-On render broker.
 
-The Vision application starts one spawn-compatible child before accepting Fast
+The Vision application starts one spawn-compatible child before accepting TryOn
 attempt work.  Attempt requests submit at most one bounded raw-frame job and
 never synchronously create a process on the event-loop thread.
 """
@@ -173,8 +173,8 @@ def _should_call_kill(process: Any) -> bool:
     )
 
 
-class FastRenderBroker:
-    """Parent-side owner of the single Fast render process and job slot."""
+class TryOnRenderBroker:
+    """Parent-side owner of the single Try-On render process and job slot."""
 
     def __init__(
         self, *, context=None, target=render_worker_entry, target_args: tuple = ()
@@ -426,7 +426,7 @@ class FastRenderBroker:
                 task = self._start_task
                 if task is None or task.done():
                     task = asyncio.create_task(
-                        self._start_once(), name="fast-render-shared-start"
+                        self._start_once(), name="try_on-render-shared-start"
                     )
                     self._start_task = task
         await asyncio.shield(task)
@@ -467,7 +467,7 @@ class FastRenderBroker:
             )
         start_task = asyncio.create_task(
             asyncio.to_thread(process.start),
-            name="fast-render-process-start",
+            name="try_on-render-process-start",
         )
         while not start_task.done():
             try:
@@ -742,7 +742,7 @@ class FastRenderBroker:
             return dead and requests_done
 
         dead = await _run_broker_control(
-            "fast-render-shutdown", stop_and_join_requests
+            "try_on-render-shutdown", stop_and_join_requests
         )
         if not dead:
             with self._state_lock:
@@ -875,7 +875,7 @@ class FastRenderBroker:
                         self._fatal_error = reason
                     return
 
-        await _run_broker_control("fast-render-recover", recover)
+        await _run_broker_control("try_on-render-recover", recover)
         with self._state_lock:
             should_restart = bool(restart and not self._quiesced)
         if should_restart:
@@ -890,7 +890,7 @@ class FastRenderBroker:
                     return
             return
 
-        await _run_broker_control("fast-render-restart", restart)
+        await _run_broker_control("try_on-render-restart", restart)
         with self._state_lock:
             if self._quiesced:
                 return
@@ -925,7 +925,7 @@ class FastRenderBroker:
                     return
             return
 
-        await _run_broker_control("fast-render-delayed-cancel-restart", restart)
+        await _run_broker_control("try_on-render-delayed-cancel-restart", restart)
         with self._state_lock:
             if self._quiesced or self._fatal_error == reason:
                 return
@@ -951,7 +951,7 @@ class FastRenderBroker:
 
         thread = threading.Thread(
             target=request,
-            name="fast-render-request",
+            name="try_on-render-request",
             daemon=False,
         )
         with self._state_lock:
@@ -1020,7 +1020,7 @@ class FastRenderBroker:
 
 def _validate_render_inputs(frame: np.ndarray, garment_png: bytes, template: str) -> int:
     if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
-        raise ValueError("fast frame must be a BGR image")
+        raise ValueError("try_on frame must be a BGR image")
     height, width = frame.shape[:2]
     if (
         height <= 0
@@ -1028,13 +1028,13 @@ def _validate_render_inputs(frame: np.ndarray, garment_png: bytes, template: str
         or height > _MAX_FRAME_HEIGHT
         or width > _MAX_FRAME_WIDTH
     ):
-        raise ValueError("fast frame dimensions exceed render cap")
+        raise ValueError("try_on frame dimensions exceed render cap")
     if frame.nbytes > _MAX_FRAME_RAW_BYTES:
-        raise ValueError("fast frame bytes exceed render cap")
+        raise ValueError("try_on frame bytes exceed render cap")
     if frame.dtype != np.uint8:
-        raise ValueError("fast frame dtype must be uint8")
+        raise ValueError("try_on frame dtype must be uint8")
     if not frame.flags.c_contiguous:
-        raise ValueError("fast frame must be C-contiguous")
+        raise ValueError("try_on frame must be C-contiguous")
     if not isinstance(garment_png, bytes) or not garment_png:
         raise ValueError("garment PNG bytes are required")
     if len(garment_png) > _MAX_GARMENT_BYTES:
@@ -1051,7 +1051,7 @@ async def render_attempt_frame(
     digest: str,
     template: str,
     timeout: float,
-    broker: FastRenderBroker,
+    broker: TryOnRenderBroker,
     garment_scale: float = 1.0,
 ) -> bytes:
     """Apply one absolute deadline before any bounded frame copy or IPC."""

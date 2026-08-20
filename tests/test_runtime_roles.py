@@ -31,7 +31,7 @@ def test_runtime_roles_reports_declared_process_roles(monkeypatch):
     observer = ObserverStub()
     broker = BrokerStub()
     monkeypatch.setattr(vision_app, "_get_acquisition_observer", lambda: observer)
-    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", broker)
 
     response = TestClient(vision_app.app).get("/v2/runtime/roles")
 
@@ -48,7 +48,7 @@ def test_runtime_roles_reports_declared_process_roles(monkeypatch):
 def test_stop_observer_uses_the_declared_role_boundary(monkeypatch):
     observer = ObserverStub()
     monkeypatch.setattr(vision_app, "_get_acquisition_observer", lambda: observer)
-    monkeypatch.setattr(vision_app, "_fast_render_broker", BrokerStub())
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", BrokerStub())
 
     response = TestClient(vision_app.app).post("/v2/runtime/roles/observer/stop")
 
@@ -60,7 +60,7 @@ def test_stop_observer_uses_the_declared_role_boundary(monkeypatch):
 def test_stop_broker_shuts_down_the_render_worker(monkeypatch):
     broker = BrokerStub()
     monkeypatch.setattr(vision_app, "_get_acquisition_observer", lambda: ObserverStub())
-    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", broker)
 
     response = TestClient(vision_app.app).post("/v2/runtime/roles/broker/stop")
 
@@ -70,7 +70,7 @@ def test_stop_broker_shuts_down_the_render_worker(monkeypatch):
 
 def test_stop_unknown_role_is_rejected(monkeypatch):
     monkeypatch.setattr(vision_app, "_get_acquisition_observer", lambda: ObserverStub())
-    monkeypatch.setattr(vision_app, "_fast_render_broker", BrokerStub())
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", BrokerStub())
 
     response = TestClient(vision_app.app).post("/v2/runtime/roles/mystery/stop")
 

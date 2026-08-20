@@ -33,7 +33,7 @@ _WINDOWS_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:")
 
 
 class V2ContractBundleUnavailable(RuntimeError):
-    """The optional Fast bundle is unavailable; core Vision keeps running."""
+    """The optional Try-On bundle is unavailable; core Vision keeps running."""
 
 
 class _DuplicateManifestKey(ValueError):

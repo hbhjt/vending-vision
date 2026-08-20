@@ -17,19 +17,56 @@ EMBEDDED_MANIFEST = "candidate-manifest.json"
 LAYOUT = {
     "mainOnedir": "vending-vision",
     "mainExecutable": "vending-vision/vending-vision.exe",
-    "workerOnedir": "vending-vision-ai-worker",
-    "workerExecutable": "vending-vision-ai-worker/vending-vision-ai-worker.exe",
-    "workerInternal": "vending-vision-ai-worker/_internal",
 }
 BINDING_PATHS = {
     "mainExecutable": LAYOUT["mainExecutable"],
-    "workerExecutable": LAYOUT["workerExecutable"],
-    "runtimeDescriptor": f'{LAYOUT["workerInternal"]}/ai-runtime-descriptor.json',
-    "aiLock": f'{LAYOUT["workerInternal"]}/requirements-ai.lock.json',
-    "sourceDescriptor": f'{LAYOUT["workerInternal"]}/official-ai-source-descriptor.json',
-    "modelPackDescriptor": f'{LAYOUT["workerInternal"]}/official-ai-model-pack-descriptor.json',
 }
 _MAX_ARCHIVE_FILES = 100_000
+
+
+def retired_packaged_entries(entries, *, include_historical_generic_modules=True):
+    """Return normalized archive/resource entries owned by the retired paths."""
+    generative_prefix = "".join(("a", "i"))
+    quick_prefix = "".join(("fa", "st"))
+    vendor_name = "".join(("cat", "vton"))
+    regional_name = "".join(("regional", r"[_-]?", "evaluator"))
+    retired = re.compile(
+        rf"(?:^|[./\\])try[_-]?on[_-]?(?:session|frontend|{generative_prefix}|{quick_prefix})(?:[./\\]|$)"
+        rf"|(?:^|[./\\])profile[_-]?{quick_prefix}[_-]?try[_-]?on(?:[./\\]|$)"
+        r"|(?:^|[./\\])vem[_-]?vision[_-]?v1(?:[./\\]|$)"
+        rf"|(?:^|[./\\])(?:{generative_prefix}[_-]?(?:acceptance[_-]?evidence|attempt(?:[_-]?(?:worker|process|runtime))?|model(?:[_-]?(?:pack|manifest)(?:[_-]?release)?)?|process[_-]?tree[_-]?worker|runtime(?:[_-]?descriptor)?|wheelhouse|worker)|{vendor_name}|{regional_name}(?:[_-]?descriptor)?)(?:[./\\]|$)"
+        rf"|(?:^|[./\\])(?:official|requirements)[_-]?{generative_prefix}(?:[_-][^./\\]+)*(?:[./\\]|$)"
+        rf"|(?:^|[./\\])[.]venv[_-]?packaging[_-]?{generative_prefix}(?:[./\\]|$)"
+        rf"|(?:^|[./\\])(?:materialize|verify)[_-]?{generative_prefix}[_-]?wheelhouse(?:[./\\]|$)"
+        rf"|(?:^|[./\\])render[_-]?{generative_prefix}[_-]?build[_-]?requirements(?:[./\\]|$)"
+        rf"|(?:^|[./\\])(?:{quick_prefix}[_-]?(?:attempt|result|adjustment))(?:[./\\]|$)"
+        rf"|(?:^|[./\\])vending[_-]?vision[_-]?{generative_prefix}[_-]?worker(?:[./\\]|$)",
+        re.I,
+    )
+    historical_generic = re.compile(
+        r"(?:^|[./\\])vision[./\\]"
+        r"(?:process[_-]?supervisor|source[_-]?provenance)(?:[.]py)?(?:[./\\]|$)",
+        re.I,
+    )
+    return sorted(
+        entry
+        for entry in entries
+        if retired.search(entry)
+        or (
+            include_historical_generic_modules
+            and historical_generic.search(entry)
+        )
+        or (
+            ":" in entry
+            and (
+                retired.search(entry.split(":", 1)[1])
+                or (
+                    include_historical_generic_modules
+                    and historical_generic.search(entry.split(":", 1)[1])
+                )
+            )
+        )
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -69,7 +106,11 @@ def _payload_files(dist_root: Path) -> list[tuple[str, Path]]:
         if not path.is_file():
             raise RuntimeError("candidate_payload_special")
         relative = path.relative_to(dist_root).as_posix()
-        _safe_relative(relative)
+        safe_relative = _safe_relative(relative)
+        if not safe_relative.parts or safe_relative.parts[0] != LAYOUT["mainOnedir"]:
+            raise RuntimeError("candidate_payload_layout")
+        if retired_packaged_entries([relative]):
+            raise RuntimeError("candidate_payload_retired")
         result.append((relative, path))
     if not result or len(result) > _MAX_ARCHIVE_FILES:
         raise RuntimeError("candidate_payload_count")

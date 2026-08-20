@@ -20,19 +20,19 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from tests import fast_worker_fixture
+from tests import try_on_worker_fixture
 
 import app as vision_app
 from vision import camera_manager
 from vision.config import settings
 from vision.directshow_broker import DirectShowCameraBroker
-from vision.attempt_worker import FastRenderBroker
+from vision.attempt_worker import TryOnRenderBroker
 from vision.acquisition_observer import AcquisitionObservation
 
 
-def test_fast_worker_fixture_is_spawn_safe():
+def test_try_on_worker_fixture_is_spawn_safe():
     """Broker child targets must not import the application test module on spawn."""
-    module = importlib.import_module("tests.fast_worker_fixture")
+    module = importlib.import_module("tests.try_on_worker_fixture")
     tree = ast.parse(Path(module.__file__).read_text("utf-8"))
     top_level_imports = {
         alias.name.split(".")[0]
@@ -91,7 +91,7 @@ def test_raw_value_wait_timeout_returns_from_asyncio_run_without_executor(monkey
     assert time.monotonic() - started < 0.5
 
 
-def _fast_pose_error_then_success_target(connection, counter):
+def _try_on_pose_error_then_success_target(connection, counter):
     """A test-only worker fixture for public typed-attempt outcome coverage."""
     connection.send(("ready", {"pid": os.getpid(), "poseReady": True}))
     try:
@@ -160,7 +160,7 @@ def _configure_recorded_front(monkeypatch):
         settings,
         "FRONT_CAMERA_CONFIG",
         {
-            "role": "profile_fast_try_on",
+            "role": "profile_try_on",
             "source": "recorded_video",
             "video_path": str(fixture_root / "man-front.mp4"),
             "loop": True,
@@ -179,7 +179,7 @@ def _hello(manifest):
             "schemaVersion": manifest["schemaVersion"],
             "bundleVersion": manifest["bundleVersion"],
             "contractDigest": manifest["bundleDigest"],
-            "capabilities": ["try_on_fast"],
+            "capabilities": ["try_on"],
         },
     )
 
@@ -196,7 +196,6 @@ def _start(attempt_id, reference):
         "vision.try_on.attempt.start",
         {
             "attemptId": attempt_id,
-            "mode": "fast",
             "variantId": str(uuid4()),
             "garment": {
                 "assetId": str(uuid4()),
@@ -210,7 +209,7 @@ def _start(attempt_id, reference):
     )
 
 
-class _ReadyFastBroker:
+class _ReadyTryOnBroker:
     ready = True
     pose_ready = True
 
@@ -325,7 +324,7 @@ def _envelope(message_type, payload):
 
 
 def _await_generating(socket):
-    """Preserve Fast terminal assertions while crossing the V2 acquisition stage."""
+    """Preserve Try-On terminal assertions while crossing the V2 acquisition stage."""
     while True:
         message = socket.receive_json()
         if message["type"] == "vision.try_on.attempt.generating":
@@ -333,16 +332,16 @@ def _await_generating(socket):
         assert message["type"] == "vision.try_on.attempt.acquiring"
 
 
-def await_no_active_fast_attempt():
+def await_no_active_try_on_attempt():
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
-        if asyncio.run(vision_app._fast_attempt_registry.active_attempt_id()) is None:
+        if asyncio.run(vision_app._try_on_attempt_registry.active_attempt_id()) is None:
             return True
         time.sleep(0.002)
     return False
 
 
-def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
+def test_v2_try_on_attempt_accepts_generated_start_and_returns_tokenized_png(
     monkeypatch, garment_reference
 ):
     """Public V2 completes a max garment against a recorded 720p frame."""
@@ -386,8 +385,8 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
     start = _start(attempt_id, garment_reference)
 
     with TestClient(vision_app.app) as client:
-        assert vision_app._fast_render_broker.ready
-        render_pid = vision_app._fast_render_broker.pid
+        assert vision_app._try_on_render_broker.ready
+        render_pid = vision_app._try_on_render_broker.pid
         assert render_pid is not None
         with client.websocket_connect("/ws") as socket:
             socket.send_json(hello)
@@ -396,7 +395,7 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
             _await_generating(socket)
             completed = socket.receive_json()
-        assert vision_app._fast_render_broker.pid == render_pid
+        assert vision_app._try_on_render_broker.pid == render_pid
 
         assert completed["type"] == "vision.try_on.attempt.completed"
         result = completed["payload"]["result"]
@@ -410,7 +409,7 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
         duplicate_grant = client.get(f"{grant_path}&token=second")
         wrong_method = client.post(grant_path)
 
-    assert vision_app._fast_render_broker.pid is None
+    assert vision_app._try_on_render_broker.pid is None
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/png"
@@ -431,10 +430,10 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
     assert camera_manager.get_frame_source("front").status()["source"] == "recorded_video"
 
 
-def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result_grant(
+def test_v2_try_on_completed_envelope_failure_has_only_failed_replay_and_no_result_grant(
     monkeypatch, garment_reference
 ):
-    """A post-render contract failure cannot retain a staged Fast capability."""
+    """A post-render contract failure cannot retain a staged Try-On capability."""
     manifest = json.loads(
         (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
             "utf-8"
@@ -450,10 +449,10 @@ def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result
     # This covers post-render completed-envelope cleanup, not the production
     # broker's startup readiness.  Keep TestClient admission deterministic so
     # the real recorded acquisition and staged-result path are reached.
-    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", broker)
     _configure_recorded_front(monkeypatch)
     sentinel_token = "sentinel-result-token"
-    original_prepare = vision_app._prepare_fast_result
+    original_prepare = vision_app._prepare_try_on_result
     original_envelope = vision_app._generated_v2_envelope
     prepared_attempts = []
     rejected_completed = []
@@ -461,7 +460,7 @@ def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result
     def prepare_with_sentinel(attempt_id, image):
         prepared_attempts.append((attempt_id, image))
         stored, public = original_prepare(attempt_id, image)
-        reference = vision_app._fast_result_reference(attempt_id, sentinel_token)
+        reference = vision_app._try_on_result_reference(attempt_id, sentinel_token)
         stored.update(token=sentinel_token, reference=reference)
         public.update(reference=reference)
         return stored, public
@@ -472,7 +471,7 @@ def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result
             raise ValueError("forced_completed_contract_failure")
         return original_envelope(message_type, payload)
 
-    monkeypatch.setattr(vision_app, "_prepare_fast_result", prepare_with_sentinel)
+    monkeypatch.setattr(vision_app, "_prepare_try_on_result", prepare_with_sentinel)
     monkeypatch.setattr(vision_app, "_generated_v2_envelope", reject_completed)
     attempt_id = str(uuid4())
 
@@ -486,7 +485,7 @@ def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result
             failed = socket.receive_json()
 
         assert failed["type"] == "vision.try_on.attempt.failed"
-        assert failed["payload"] == {"attemptId": attempt_id, "reason": "fast_failed"}
+        assert failed["payload"] == {"attemptId": attempt_id, "reason": "try_on_failed"}
         assert len(broker.render_calls) == 1
         render_call = broker.render_calls[0]
         assert render_call["deadline"] > render_call["called_at"]
@@ -513,10 +512,10 @@ def test_v2_fast_completed_envelope_failure_has_only_failed_replay_and_no_result
             replay_failed = replay_socket.receive_json()
             assert replay_failed == failed
 
-    assert await_no_active_fast_attempt()
+    assert await_no_active_try_on_attempt()
 
 
-def test_v2_fast_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(
+def test_v2_try_on_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(
     monkeypatch, garment_reference
 ):
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
@@ -583,7 +582,7 @@ def test_v2_top_departure_does_not_cancel_active_generated_attempt_without_late_
         with client.websocket_connect("/ws") as socket:
             socket.send_json(
                 _hello_with_capabilities(
-                    manifest, ["try_on_fast", "person_departed"]
+                    manifest, ["try_on", "person_departed"]
                 )
             )
             assert socket.receive_json()["type"] == "vision.ready"
@@ -608,7 +607,7 @@ def test_v2_top_departure_does_not_cancel_active_generated_attempt_without_late_
                 } and message["payload"].get("attemptId") == attempt_id:
                     break
 
-        assert await_no_active_fast_attempt()
+        assert await_no_active_try_on_attempt()
         assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
     completed = [
@@ -657,7 +656,7 @@ def test_v2_route_leave_cancel_during_generation_fences_late_result_and_releases
             canceled = socket.receive_json()
             _GarmentHandler.release.set()
 
-        assert await_no_active_fast_attempt()
+        assert await_no_active_try_on_attempt()
         assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
         with client.websocket_connect("/ws") as replay:
@@ -671,7 +670,7 @@ def test_v2_route_leave_cancel_during_generation_fences_late_result_and_releases
     assert replayed == canceled
 
 
-def test_v2_fast_pose_failures_are_stable_terminals_without_worker_recovery(
+def test_v2_try_on_pose_failures_are_stable_terminals_without_worker_recovery(
     monkeypatch, garment_reference
 ):
     """Public failed attempts expose no result and retain the warmed worker."""
@@ -682,12 +681,12 @@ def test_v2_fast_pose_failures_are_stable_terminals_without_worker_recovery(
     monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
-    broker = FastRenderBroker(
+    broker = TryOnRenderBroker(
         context=context,
-        target=_fast_pose_error_then_success_target,
+        target=_try_on_pose_error_then_success_target,
         target_args=(counter,),
     )
-    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", broker)
 
     with TestClient(vision_app.app) as client:
         pid = broker.pid
@@ -701,7 +700,7 @@ def test_v2_fast_pose_failures_are_stable_terminals_without_worker_recovery(
                 _await_generating(socket)
                 failed = socket.receive_json()
                 assert failed["type"] == "vision.try_on.attempt.failed"
-                assert failed["payload"]["reason"] == "fast_failed"
+                assert failed["payload"]["reason"] == "try_on_failed"
                 assert "result" not in failed["payload"]
                 assert broker.pid == pid
             attempt_id = str(uuid4())
@@ -717,7 +716,7 @@ def test_v2_fast_pose_failures_are_stable_terminals_without_worker_recovery(
     assert broker.pid is None
 
 
-def test_v2_fast_attempt_replays_same_owner_active_attempt_without_new_terminal(
+def test_v2_try_on_attempt_replays_same_owner_active_attempt_without_new_terminal(
     monkeypatch, garment_reference
 ):
     """A transport retry of the same attempt joins the owner attempt instead of failing."""
@@ -754,7 +753,7 @@ def test_v2_fast_attempt_replays_same_owner_active_attempt_without_new_terminal(
     assert completed["payload"]["attemptId"] == attempt_id
 
 
-def test_v2_fast_attempt_second_socket_joins_and_both_receive_one_terminal(
+def test_v2_try_on_attempt_second_socket_joins_and_both_receive_one_terminal(
     monkeypatch, garment_reference
 ):
     """A reconnecting transport is a subscriber, never a competing owner."""
@@ -793,7 +792,7 @@ def test_v2_fast_attempt_second_socket_joins_and_both_receive_one_terminal(
     assert owner_terminal == subscriber_terminal
 
 
-def test_v2_fast_attempt_second_socket_joins_without_cancelling_owner(
+def test_v2_try_on_attempt_second_socket_joins_without_cancelling_owner(
     monkeypatch, garment_reference
 ):
     """A retry on another WS is a subscriber, never a second owner or terminal."""
@@ -830,7 +829,7 @@ def test_v2_fast_attempt_second_socket_joins_without_cancelling_owner(
     assert completed["payload"]["attemptId"] == attempt_id
 
 
-def test_v2_fast_attempt_terminal_reconnect_replays_the_identical_grant(
+def test_v2_try_on_attempt_terminal_reconnect_replays_the_identical_grant(
     monkeypatch, garment_reference
 ):
     """Terminal records are canonical across a fresh WebSocket connection."""
@@ -860,7 +859,7 @@ def test_v2_fast_attempt_terminal_reconnect_replays_the_identical_grant(
     assert replay == terminal
 
 
-def test_v2_fast_unavailable_is_one_canonical_terminal_across_sockets_and_readiness_recovery(
+def test_v2_try_on_unavailable_is_one_canonical_terminal_across_sockets_and_readiness_recovery(
     monkeypatch, garment_reference
 ):
     """A valid unavailable start is registered once, never rerun after recovery."""
@@ -890,10 +889,10 @@ def test_v2_fast_unavailable_is_one_canonical_terminal_across_sockets_and_readin
             assert recovered.receive_json() == terminal
 
     assert terminal["type"] == "vision.try_on.attempt.failed"
-    assert terminal["payload"] == {"attemptId": attempt_id, "reason": "fast_unavailable"}
+    assert terminal["payload"] == {"attemptId": attempt_id, "reason": "try_on_unavailable"}
 
 
-def test_v2_fast_attempt_replacement_joins_old_worker_before_new_admission(
+def test_v2_try_on_attempt_replacement_joins_old_worker_before_new_admission(
     monkeypatch, garment_reference
 ):
     """A different attempt cannot overtake its canceled worker's cleanup."""
@@ -945,12 +944,12 @@ def test_v2_replacement_restarts_render_then_next_attempts_complete(
     monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
-    broker = FastRenderBroker(
+    broker = TryOnRenderBroker(
         context=context,
-        target=fast_worker_fixture.block_first_render,
+        target=try_on_worker_fixture.block_first_render,
         target_args=(counter,),
     )
-    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", broker)
     first_id, second_id, third_id = str(uuid4()), str(uuid4()), str(uuid4())
 
     with TestClient(vision_app.app) as client:
@@ -1017,19 +1016,21 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
     context = multiprocessing.get_context("spawn")
     starts = context.Value("i", 0)
     requests = context.Value("i", 0)
-    broker = FastRenderBroker(
+    broker = TryOnRenderBroker(
         context=context,
-        target=fast_worker_fixture.block_then_fail_restart_render,
+        target=try_on_worker_fixture.block_then_fail_restart_render,
         target_args=(starts, requests),
     )
-    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", broker)
     monkeypatch.setattr(
         vision_app,
         "get_runtime_status",
         lambda: {
             "cameraReady": True,
             "modelReady": True,
-            "fastRenderReady": broker.ready,
+            "tryOnRenderReady": broker.ready,
+            "tryOnPoseReady": broker.pose_ready,
+            "acquisitionObserverReady": True,
         },
     )
     first_id, second_id, third_id, fourth_id = (
@@ -1044,7 +1045,7 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
         assert first_pid is not None
         with client.websocket_connect("/ws") as socket:
             socket.send_json(_hello(manifest))
-            assert socket.receive_json()["payload"]["fastReady"] is True
+            assert socket.receive_json()["payload"]["tryOnReady"] is True
             socket.send_json(_start(first_id, garment_reference))
             assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
             _await_generating(socket)
@@ -1065,7 +1066,7 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
             assert unavailable["type"] == "vision.try_on.attempt.failed"
             assert unavailable["payload"] == {
                 "attemptId": second_id,
-                "reason": "fast_unavailable",
+                "reason": "try_on_unavailable",
             }
 
             assert not broker.ready
@@ -1078,14 +1079,14 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
             unavailable = socket.receive_json()
             assert unavailable["payload"] == {
                 "attemptId": third_id,
-                "reason": "fast_unavailable",
+                "reason": "try_on_unavailable",
             }
             assert starts.value == 2
 
         with client.websocket_connect("/ws") as fresh:
             fresh.send_json(_hello(manifest))
             ready = fresh.receive_json()
-            assert ready["payload"]["fastReady"] is False
+            assert ready["payload"]["tryOnReady"] is False
             assert ready["payload"]["businessReadinessDiagnostic"] == (
                 "camera_unavailable"
             )
@@ -1093,7 +1094,7 @@ def test_v2_restart_failure_is_live_stable_unavailable_without_second_worker(
             unavailable = fresh.receive_json()
             assert unavailable["payload"] == {
                 "attemptId": fourth_id,
-                "reason": "fast_unavailable",
+                "reason": "try_on_unavailable",
             }
 
         assert starts.value == 2
@@ -1117,9 +1118,9 @@ def test_v2_duplicate_waits_for_atomic_failed_replacement_admission(
     requests = context.Value("i", 0)
     restart_entered = context.Event()
     restart_release = context.Event()
-    broker = FastRenderBroker(
+    broker = TryOnRenderBroker(
         context=context,
-        target=fast_worker_fixture.block_then_barrier_restart_render,
+        target=try_on_worker_fixture.block_then_barrier_restart_render,
         target_args=(
             starts,
             requests,
@@ -1128,14 +1129,14 @@ def test_v2_duplicate_waits_for_atomic_failed_replacement_admission(
             True,
         ),
     )
-    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", broker)
     monkeypatch.setattr(
         vision_app,
         "get_runtime_status",
         lambda: {
             "cameraReady": True,
             "modelReady": True,
-            "fastRenderReady": broker.ready,
+            "tryOnReady": broker.ready,
         },
     )
     first_id, replacement_id = str(uuid4()), str(uuid4())
@@ -1152,8 +1153,8 @@ def test_v2_duplicate_waits_for_atomic_failed_replacement_admission(
         ):
             owner.send_json(_hello(manifest))
             duplicate.send_json(_hello(manifest))
-            assert owner.receive_json()["payload"]["fastReady"] is True
-            assert duplicate.receive_json()["payload"]["fastReady"] is True
+            assert owner.receive_json()["payload"]["tryOnReady"] is True
+            assert duplicate.receive_json()["payload"]["tryOnReady"] is True
             owner.send_json(_start(first_id, garment_reference))
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
             _await_generating(owner)
@@ -1206,7 +1207,7 @@ def test_v2_duplicate_waits_for_atomic_failed_replacement_admission(
         assert expected_unavailable["type"] == "vision.try_on.attempt.failed"
         assert expected_unavailable["payload"] == {
             "attemptId": replacement_id,
-            "reason": "fast_unavailable",
+            "reason": "try_on_unavailable",
         }
         assert duplicate_messages == [expected_unavailable]
         assert replayed_terminal == expected_unavailable
@@ -1232,9 +1233,9 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
     requests = context.Value("i", 0)
     restart_entered = context.Event()
     restart_release = context.Event()
-    broker = FastRenderBroker(
+    broker = TryOnRenderBroker(
         context=context,
-        target=fast_worker_fixture.block_then_barrier_restart_render,
+        target=try_on_worker_fixture.block_then_barrier_restart_render,
         target_args=(
             starts,
             requests,
@@ -1243,14 +1244,14 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
             False,
         ),
     )
-    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", broker)
     monkeypatch.setattr(
         vision_app,
         "get_runtime_status",
         lambda: {
             "cameraReady": True,
             "modelReady": True,
-            "fastRenderReady": broker.ready,
+            "tryOnReady": broker.ready,
         },
     )
     first_id, replacement_id = str(uuid4()), str(uuid4())
@@ -1269,8 +1270,8 @@ def test_v2_duplicate_replays_only_after_atomic_ready_replacement_admission(
         ):
             owner.send_json(_hello(manifest))
             duplicate.send_json(_hello(manifest))
-            assert owner.receive_json()["payload"]["fastReady"] is True
-            assert duplicate.receive_json()["payload"]["fastReady"] is True
+            assert owner.receive_json()["payload"]["tryOnReady"] is True
+            assert duplicate.receive_json()["payload"]["tryOnReady"] is True
             owner.send_json(_start(first_id, garment_reference))
             assert owner.receive_json()["type"] == "vision.try_on.attempt.accepted"
             _await_generating(owner)
@@ -1361,12 +1362,12 @@ def test_v2_disconnect_restarts_render_and_new_connection_completes(
     _configure_recorded_front(monkeypatch)
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
-    broker = FastRenderBroker(
+    broker = TryOnRenderBroker(
         context=context,
-        target=fast_worker_fixture.block_first_render,
+        target=try_on_worker_fixture.block_first_render,
         target_args=(counter,),
     )
-    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", broker)
     retry_id = str(uuid4())
 
     with TestClient(vision_app.app) as client:
@@ -1400,7 +1401,7 @@ def test_v2_disconnect_restarts_render_and_new_connection_completes(
             retry.send_json(_hello(manifest))
             ready = retry.receive_json()
             assert ready["type"] == "vision.ready"
-            assert ready["payload"]["fastReady"] is True
+            assert ready["payload"]["tryOnReady"] is True
             retry.send_json(_start(retry_id, garment_reference))
             assert retry.receive_json()["type"] == "vision.try_on.attempt.accepted"
             _await_generating(retry)
@@ -1424,15 +1425,15 @@ def test_v2_start_rechecks_acquisition_observer_after_ready_before_accepting_att
         )
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
-    monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
     monkeypatch.setattr(
         vision_app,
         "get_runtime_status",
         lambda: {
             "cameraReady": True,
             "modelReady": True,
-            "fastRenderReady": True,
-            "fastPoseReady": True,
+            "tryOnReady": True,
+            "tryOnPoseReady": True,
             "acquisitionObserverReady": True,
         },
     )
@@ -1442,13 +1443,13 @@ def test_v2_start_rechecks_acquisition_observer_after_ready_before_accepting_att
             with client.websocket_connect("/ws") as socket:
                 socket.send_json(_hello(manifest))
                 ready = socket.receive_json()
-                assert ready["payload"]["fastReady"] is True
+                assert ready["payload"]["tryOnReady"] is True
 
                 socket.send_json(_start(str(uuid4()), garment_reference))
                 rejected = socket.receive_json()
 
         assert rejected["type"] == "vision.try_on.attempt.failed"
-        assert rejected["payload"]["reason"] == "fast_unavailable"
+        assert rejected["payload"]["reason"] == "try_on_unavailable"
     finally:
         vision_app._acquisition_observer = None
 
@@ -1461,7 +1462,7 @@ def test_v2_acquisition_observer_uses_remaining_attempt_deadline(monkeypatch, ga
         )
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
-    monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
     monkeypatch.setattr(vision_app, "_ACQUISITION_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(vision_app, "_ACQUISITION_POLL_SECONDS", 0.005)
     observer = _DeadlineRecordingObserver()
@@ -1478,8 +1479,8 @@ def test_v2_acquisition_observer_uses_remaining_attempt_deadline(monkeypatch, ga
         lambda: {
             "cameraReady": True,
             "modelReady": True,
-            "fastRenderReady": True,
-            "fastPoseReady": True,
+            "tryOnReady": True,
+            "tryOnPoseReady": True,
             "acquisitionObserverReady": True,
         },
     )
@@ -1527,23 +1528,23 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
         lambda: {
             "cameraReady": True,
             "modelReady": True,
-            "fastRenderReady": vision_app._fast_render_broker.ready,
+            "tryOnReady": vision_app._try_on_render_broker.ready,
         },
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     # Keep real acquisition on its normal deadline.  The render phase itself
     # gets a deliberately short first-worker deadline, so this test never
     # mistakes hosted spawn/load time for an attempt timeout.
-    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 15.0)
+    monkeypatch.setattr(vision_app, "_TRY_ON_ATTEMPT_TIMEOUT_SECONDS", 15.0)
     _configure_recorded_front(monkeypatch)
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
-    broker = FastRenderBroker(
+    broker = TryOnRenderBroker(
         context=context,
-        target=fast_worker_fixture.block_first_render,
+        target=try_on_worker_fixture.block_first_render,
         target_args=(counter,),
     )
-    monkeypatch.setattr(vision_app, "_fast_render_broker", broker)
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", broker)
     real_render = vision_app.render_attempt_frame
 
     async def render_with_first_worker_deadline(*args, **kwargs):
@@ -1559,7 +1560,7 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
         assert first_pid is not None
         with client.websocket_connect("/ws") as first:
             first.send_json(_hello(manifest))
-            assert first.receive_json()["payload"]["fastReady"] is True
+            assert first.receive_json()["payload"]["tryOnReady"] is True
             first.send_json(_start(timed_out_id, garment_reference))
             assert first.receive_json()["type"] == "vision.try_on.attempt.accepted"
             _await_generating(first)
@@ -1581,7 +1582,7 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
         with client.websocket_connect("/ws") as retry:
             retry.send_json(_hello(manifest))
             ready = retry.receive_json()
-            assert ready["payload"]["fastReady"] is True
+            assert ready["payload"]["tryOnReady"] is True
             retry.send_json(_start(retry_id, garment_reference))
             assert retry.receive_json()["type"] == "vision.try_on.attempt.accepted"
             _await_generating(retry)
@@ -1595,13 +1596,13 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
     assert broker.pid is None
 
 
-def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garment_reference):
+def test_v2_try_on_attempt_reads_front_frame_in_parent_process(monkeypatch, garment_reference):
     """Acquisition must not spawn a child that opens the front camera device."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
-    test_broker = _ReadyFastBroker()
-    monkeypatch.setattr(vision_app, "_fast_render_broker", test_broker)
+    test_broker = _ReadyTryOnBroker()
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", test_broker)
     parent_pid = os.getpid()
     read_pids = []
 
@@ -1641,7 +1642,7 @@ def test_v2_fast_attempt_reads_front_frame_in_parent_process(monkeypatch, garmen
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
-def test_v2_fast_attempt_respects_attempt_owner_lease(monkeypatch):
+def test_v2_try_on_attempt_respects_attempt_owner_lease(monkeypatch):
     """Acquisition cannot replace an existing attempt camera lease."""
     owner = vision_app.acquire_front_camera(
         "try_on_attempt",
@@ -1653,7 +1654,7 @@ def test_v2_fast_attempt_respects_attempt_owner_lease(monkeypatch):
     async def is_current(_receipt):
         return True
 
-    monkeypatch.setattr(vision_app._fast_attempt_registry, "is_current", is_current)
+    monkeypatch.setattr(vision_app._try_on_attempt_registry, "is_current", is_current)
     receipt = vision_app.AttemptReceipt(
         attempt_id=str(uuid4()),
         owner_token="owner-token",
@@ -1684,7 +1685,7 @@ def test_v2_capture_preview_close_failure_releases_lease_and_commits_one_failed_
         )
     )
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
-    monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
     monkeypatch.setattr(vision_app, "_acquisition_observer", _SingleAlignedObserver())
     monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
     monkeypatch.setattr(
@@ -1693,8 +1694,8 @@ def test_v2_capture_preview_close_failure_releases_lease_and_commits_one_failed_
         lambda: {
             "cameraReady": True,
             "modelReady": True,
-            "fastRenderReady": True,
-            "fastPoseReady": True,
+            "tryOnReady": True,
+            "tryOnPoseReady": True,
         },
     )
     monkeypatch.setattr(
@@ -1759,14 +1760,14 @@ def test_v2_capture_preview_close_failure_releases_lease_and_commits_one_failed_
         {
             **terminals[0],
             "type": "vision.try_on.attempt.failed",
-            "payload": {"attemptId": attempt_id, "reason": "fast_failed"},
+            "payload": {"attemptId": attempt_id, "reason": "try_on_failed"},
         }
     ]
     assert len(close_calls) >= 1
     assert vision_app.get_front_camera_owner()["owner"] == "idle"
 
 
-def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeypatch):
+def test_v2_try_on_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeypatch):
     """The production dshow branch enters camera_manager and opens one broker boundary."""
     parent_pid = os.getpid()
     events = []
@@ -1814,12 +1815,12 @@ def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeyp
     async def cancel_event_for(_receipt):
         return asyncio.Event()
 
-    monkeypatch.setattr(vision_app._fast_attempt_registry, "is_current", is_current)
+    monkeypatch.setattr(vision_app._try_on_attempt_registry, "is_current", is_current)
     monkeypatch.setattr(
-        vision_app._fast_attempt_registry, "cancel_event_for", cancel_event_for
+        vision_app._try_on_attempt_registry, "cancel_event_for", cancel_event_for
     )
     monkeypatch.setattr(vision_app.settings, "FRONT_CAMERA_CONFIG", {
-        "role": "profile_fast_try_on",
+        "role": "profile_try_on",
         "source": "dshow",
         "keep_open": True,
     })
@@ -1851,7 +1852,7 @@ def test_v2_fast_attempt_uses_camera_manager_dshow_broker_not_app_worker(monkeyp
 
 
 @pytest.mark.parametrize("stability_round", [1, 2])
-def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restarts(
+def test_try_on_blocked_production_broker_cancel_keeps_loop_live_joins_and_restarts(
     monkeypatch, stability_round
 ):
     context = multiprocessing.get_context("spawn")
@@ -1860,7 +1861,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
     broker = DirectShowCameraBroker(
         "front",
         {
-            "role": "profile_fast_try_on",
+            "role": "profile_try_on",
             "source": "dshow",
             "index": 9,
             "backend": "dshow",
@@ -1871,7 +1872,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
             "blockedReadEntered": blocked_read_entered,
         },
         context=context,
-        target=fast_worker_fixture.block_first_directshow,
+        target=try_on_worker_fixture.block_first_directshow,
     )
 
     class Candidate:
@@ -1898,9 +1899,9 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
             return self.cancel_event
 
     registry = Registry()
-    monkeypatch.setattr(vision_app, "_fast_attempt_registry", registry)
+    monkeypatch.setattr(vision_app, "_try_on_attempt_registry", registry)
     monkeypatch.setattr(vision_app.settings, "FRONT_CAMERA_CONFIG", {
-        "role": "profile_fast_try_on", "source": "dshow", "keep_open": True,
+        "role": "profile_try_on", "source": "dshow", "keep_open": True,
     })
     monkeypatch.setattr(vision_app.settings, "CAMERA_READ_RETRY_COUNT", 0)
     monkeypatch.setattr(camera_manager, "get_camera_maintenance", lambda: Maintenance())
@@ -1953,7 +1954,7 @@ def test_fast_blocked_production_broker_cancel_keeps_loop_live_joins_and_restart
 
 
 @pytest.mark.parametrize("prestart", [False, True])
-def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monkeypatch, prestart):
+def test_try_on_cancel_joins_replacement_ready_before_next_generation_budget(monkeypatch, prestart):
     """A new generation receives a warmed command loop, not a spawn deadline."""
     context = multiprocessing.get_context("spawn")
     starts = context.Value("i", 0)
@@ -1963,7 +1964,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
     broker = DirectShowCameraBroker(
         "front",
         {
-            "role": "profile_fast_try_on",
+            "role": "profile_try_on",
             "source": "dshow",
             "index": 9,
             "backend": "dshow",
@@ -1976,7 +1977,7 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
             "restartReadyRelease": restart_ready_release,
         },
         context=context,
-        target=fast_worker_fixture.block_then_ready_barrier_directshow,
+        target=try_on_worker_fixture.block_then_ready_barrier_directshow,
     )
 
     class Candidate:
@@ -2003,9 +2004,9 @@ def test_fast_cancel_joins_replacement_ready_before_next_generation_budget(monke
             return self.cancel_event
 
     registry = Registry()
-    monkeypatch.setattr(vision_app, "_fast_attempt_registry", registry)
+    monkeypatch.setattr(vision_app, "_try_on_attempt_registry", registry)
     monkeypatch.setattr(vision_app.settings, "FRONT_CAMERA_CONFIG", {
-        "role": "profile_fast_try_on", "source": "dshow", "keep_open": True,
+        "role": "profile_try_on", "source": "dshow", "keep_open": True,
     })
     monkeypatch.setattr(vision_app.settings, "CAMERA_READ_RETRY_COUNT", 0)
     monkeypatch.setattr(camera_manager, "get_camera_maintenance", lambda: Maintenance())
@@ -2086,7 +2087,7 @@ def test_front_read_cancellation_wins_when_waiter_scheduling_lags(monkeypatch):
     async def restart(_role):
         return True
 
-    monkeypatch.setattr(vision_app, "_fast_attempt_registry", Registry())
+    monkeypatch.setattr(vision_app, "_try_on_attempt_registry", Registry())
     monkeypatch.setattr(vision_app, "read_camera_with_source_async", blocked_read)
     monkeypatch.setattr(vision_app, "abort_camera_request", aborted)
     monkeypatch.setattr(vision_app, "restart_camera_request", restart)
@@ -2126,7 +2127,7 @@ def test_front_read_current_receipt_fence_wins_after_completed_frame(monkeypatch
     async def restart(_role):
         return True
 
-    monkeypatch.setattr(vision_app, "_fast_attempt_registry", Registry())
+    monkeypatch.setattr(vision_app, "_try_on_attempt_registry", Registry())
     monkeypatch.setattr(vision_app, "read_camera_with_source_async", completed_read)
     monkeypatch.setattr(vision_app, "abort_camera_request", abort)
     monkeypatch.setattr(vision_app, "restart_camera_request", restart)
@@ -2162,7 +2163,7 @@ def test_render_cancellation_wins_when_waiter_scheduling_lags(monkeypatch):
     async def completed_render():
         return b"rendered"
 
-    monkeypatch.setattr(vision_app, "_fast_attempt_registry", Registry())
+    monkeypatch.setattr(vision_app, "_try_on_attempt_registry", Registry())
     receipt = vision_app.AttemptReceipt(str(uuid4()), "owner", 1)
 
     with pytest.raises(vision_app.GarmentFetchError, match="attempt_canceled"):
@@ -2173,8 +2174,8 @@ def test_render_cancellation_wins_when_waiter_scheduling_lags(monkeypatch):
         )
 
 
-def test_v2_fast_result_store_rejects_self_too_large_without_publishing(monkeypatch):
-    monkeypatch.setattr(vision_app, "_FAST_RESULT_MAX_BYTES", 8)
+def test_v2_try_on_result_store_rejects_self_too_large_without_publishing(monkeypatch):
+    monkeypatch.setattr(vision_app, "_TRY_ON_RESULT_MAX_BYTES", 8)
     image = _png_bytes()
-    with pytest.raises(RuntimeError, match="fast_result_too_large"):
-        vision_app._prepare_fast_result(str(uuid4()), image)
+    with pytest.raises(RuntimeError, match="try_on_result_too_large"):
+        vision_app._prepare_try_on_result(str(uuid4()), image)

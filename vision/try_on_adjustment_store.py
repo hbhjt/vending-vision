@@ -1,12 +1,12 @@
-"""Bounded attempt-scoped retention of the Fast source for locked-center re-scaling.
+"""Bounded attempt-scoped retention of the Try-On source for locked-center re-scaling.
 
-Re-rendering a completed Fast result at another garment scale needs the
+Re-rendering a completed Try-On result at another garment scale needs the
 original source frame and garment bytes, which the stored result PNG cannot
 provide. This store keeps exactly that snapshot, bounded in count and time,
 and never exposes it to the Machine: reads happen only inside the Vision
 process and produce a replacement result.
 
-The snapshot is deliberately bound to the Fast result TTL and is additionally
+The snapshot is deliberately bound to the Try-On result TTL and is additionally
 dropped on route-leave cancellation or a top-camera departure so a departed
 customer's source cannot outlive their interaction.
 """
@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 
 @dataclass(frozen=True)
-class FastAdjustmentSnapshot:
+class TryOnAdjustmentSnapshot:
     attempt_id: str
     frame: Any
     garment_png: bytes
@@ -30,7 +30,7 @@ class FastAdjustmentSnapshot:
     expires_at: float
 
 
-class FastAdjustmentStore:
+class TryOnAdjustmentStore:
     def __init__(
         self,
         *,
@@ -39,11 +39,11 @@ class FastAdjustmentStore:
         clock: Callable[[], float] = time.monotonic,
     ):
         if max_count < 1 or ttl_seconds <= 0:
-            raise ValueError("invalid Fast adjustment store limits")
+            raise ValueError("invalid Try-On adjustment store limits")
         self.max_count = int(max_count)
         self.ttl_seconds = float(ttl_seconds)
         self._clock = clock
-        self._snapshots: OrderedDict[str, FastAdjustmentSnapshot] = OrderedDict()
+        self._snapshots: OrderedDict[str, TryOnAdjustmentSnapshot] = OrderedDict()
 
     def _prune_expired(self) -> None:
         now = self._clock()
@@ -61,7 +61,7 @@ class FastAdjustmentStore:
     ) -> None:
         self._prune_expired()
         now = self._clock()
-        self._snapshots[attempt_id] = FastAdjustmentSnapshot(
+        self._snapshots[attempt_id] = TryOnAdjustmentSnapshot(
             attempt_id=attempt_id,
             frame=frame,
             garment_png=bytes(garment_png),
@@ -74,7 +74,7 @@ class FastAdjustmentStore:
         while len(self._snapshots) > self.max_count:
             self._snapshots.popitem(last=False)
 
-    def get(self, attempt_id: str) -> FastAdjustmentSnapshot | None:
+    def get(self, attempt_id: str) -> TryOnAdjustmentSnapshot | None:
         self._prune_expired()
         return self._snapshots.get(attempt_id)
 

@@ -1,4 +1,4 @@
-"""Process-wide ownership and replay state for Fast try-on attempts.
+"""Process-wide ownership and replay state for Try-On attempts.
 
 Replacement uses a pending admission reservation while the old owner joins.
 No accepted/generating state becomes visible until readiness and active ownership
@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
 
-from vision.fast_result_store import FastResultStore, ResultAdmissionError
+from vision.try_on_result_store import TryOnResultStore, ResultAdmissionError
 
 _PENDING_READINESS_WAIT_SECONDS = 0.25
 _PENDING_READINESS_POLL_SECONDS = 0.01
@@ -110,7 +110,7 @@ class AdmissionPreparation:
         return self.token is not None
 
 
-class FastAttemptRegistry:
+class TryOnAttemptRegistry:
     """One active attempt plus bounded canonical terminal replay records.
 
     Replays retain the newest ``terminal_max_count`` terminal records for the
@@ -127,7 +127,7 @@ class FastAttemptRegistry:
         terminal_ttl_seconds: float,
         terminal_max_count: int = 32,
         subscriber_max_count: int = 32,
-        result_store: FastResultStore | None = None,
+        result_store: TryOnResultStore | None = None,
         result_max_count: int = 1000,
         result_max_bytes: int = 256 * 1024 * 1024,
         result_single_max_bytes: int | None = None,
@@ -141,7 +141,7 @@ class FastAttemptRegistry:
         self._terminal_ttl_seconds = terminal_ttl_seconds
         self._terminal_max_count = terminal_max_count
         self._subscriber_max_count = subscriber_max_count
-        self._results = result_store or FastResultStore(
+        self._results = result_store or TryOnResultStore(
             max_count=result_max_count,
             max_bytes=result_max_bytes,
             single_max_bytes=result_single_max_bytes,
@@ -345,7 +345,7 @@ class FastAttemptRegistry:
                         None,
                         self._replay_active(active),
                     )
-                raise RuntimeError("pending Fast admission resolved without state")
+                raise RuntimeError("pending Try-On admission resolved without state")
 
         if (
             preparation.join_task is not None
@@ -445,7 +445,7 @@ class FastAttemptRegistry:
                         None,
                         self._replay_active(active),
                     )
-                raise RuntimeError("Fast admission reservation was lost")
+                raise RuntimeError("Try-On admission reservation was lost")
 
             is_ready, committed_accepted = resolve_accepted()
             if not is_ready:
@@ -707,13 +707,12 @@ class FastAttemptRegistry:
 
     @staticmethod
     def _result_failure_message(message: dict, active: ActiveAttempt) -> dict:
-        """Map an unpublishable completion without crossing Fast/AI semantics."""
+        """Map an unpublishable completion to the sole Try-On failure contract."""
         failure = dict(message)
-        mode = active.accepted.get("payload", {}).get("mode") if active.accepted else None
         failure["type"] = "vision.try_on.attempt.failed"
         failure["payload"] = {
             "attemptId": message.get("payload", {}).get("attemptId"),
-            "reason": "ai_failed" if mode == "ai" else "fast_failed",
+            "reason": "try_on_failed",
         }
         return failure
 

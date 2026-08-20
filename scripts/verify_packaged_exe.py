@@ -21,15 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.candidate_artifact_manifest import LAYOUT
-from vision.regional_evaluator_provenance import (
-    load_regional_evaluator_descriptor,
-    verify_regional_evaluator_provenance_at_root,
-)
-from vision.source_provenance import (
-    load_official_source_descriptor,
-    verify_official_source_provenance_at_root,
-)
+from scripts.candidate_artifact_manifest import LAYOUT, retired_packaged_entries
 
 
 CONTRACT_ROOT = Path(__file__).resolve().parents[1] / "contracts" / "vem_vision_v2"
@@ -63,7 +55,7 @@ def create_managed_maintenance_fixture(temp_dir, *, port):
         "allowed_origins": [f"http://127.0.0.1:{port}", "http://tauri.localhost"],
         "cameras": {
             "top": {"backend": "dshow", "role": "presence", "keep_open": True, "rotate": 0},
-            "front": {"backend": "dshow", "role": "profile_fast_try_on", "keep_open": True, "rotate": 0},
+            "front": {"backend": "dshow", "role": "profile_try_on", "keep_open": True, "rotate": 0},
         },
     }), encoding="utf-8")
     return config_path
@@ -207,15 +199,6 @@ def packaged_archive_entries(exe_path):
     return entries
 
 
-def retired_packaged_entries(entries):
-    retired = re.compile(
-        r"(?:^|[./\\])try[_-]?on[_-]?(?:session|frontend)(?:[./\\]|$)"
-        r"|(?:^|[./\\])vem[_-]?vision[_-]?v1(?:[./\\]|$)",
-        re.I,
-    )
-    return sorted(entry for entry in entries if retired.search(entry))
-
-
 def assert_hard_cutover_archive_absence(exe_path):
     internal = exe_path.parent / "_internal"
     entries = set(packaged_archive_entries(exe_path))
@@ -227,6 +210,15 @@ def assert_hard_cutover_archive_absence(exe_path):
     violations = retired_packaged_entries(entries)
     if violations:
         raise AssertionError(f"retired modules remain in packaged archive: {violations}")
+
+
+def assert_release_version_runtime_marker(exe_path):
+    marker = exe_path.parent / "_internal" / "vision" / "_build_version.py"
+    if not marker.is_file():
+        raise AssertionError("missing release version runtime marker")
+    source = marker.read_text("utf-8")
+    if BUILD_VERSION_MARKER_RE.fullmatch(source) is None:
+        raise AssertionError("invalid release version runtime marker")
 
 
 def assert_bundled_resources(exe_path):
@@ -266,6 +258,7 @@ def assert_bundled_resources(exe_path):
     camera_adapter = internal / "cv2_enumerate_cameras"
     if sys.platform == "win32" and not any(camera_adapter.glob("_windows_backend*.pyd")):
         raise AssertionError("missing packaged cv2-enumerate-cameras Windows DirectShow adapter")
+    assert_release_version_runtime_marker(exe_path)
     assert_hard_cutover_archive_absence(exe_path)
 
 
@@ -291,7 +284,7 @@ async def verify_websocket(port):
                             "presence_status",
                             "person_departed",
                             "ambient_light",
-                            "try_on_fast",
+                            "try_on",
                         ],
                         "clientRole": "machine",
                         "machineCode": "PACKAGED-TEST",
@@ -303,7 +296,7 @@ async def verify_websocket(port):
         if ready.get("type") != "vision.ready":
             raise AssertionError(f"expected vision.ready, got: {ready}")
         capabilities = set(ready.get("payload", {}).get("capabilities") or [])
-        if "try_on_fast" not in capabilities or "profile_push" not in capabilities:
+        if "try_on" not in capabilities or "profile_push" not in capabilities:
             raise AssertionError(f"server capabilities are incomplete: {capabilities}")
 
         await websocket.send(json.dumps(message("vision.ping", "ping-packaged")))
@@ -430,107 +423,6 @@ def run_packaged_probe(exe_path, argument, expected_stdout):
         )
 
 
-def _candidate_ai_worker_paths(exe_path):
-    suffix = ".exe" if sys.platform == "win32" else ""
-    return [
-        exe_path.with_name(f"vending-vision-ai-worker{suffix}"),
-        exe_path.parent / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}",
-        exe_path.parent.parent / "vending-vision-ai-worker" / f"vending-vision-ai-worker{suffix}",
-    ]
-
-
-def assert_release_version_runtime_marker(internal):
-    """Require the sole release-materialized runtime datum outside evaluator provenance."""
-    marker = internal / "vision" / "_build_version.py"
-    try:
-        raw = marker.read_text("utf-8")
-    except OSError as exc:
-        raise AssertionError("missing release version runtime marker") from exc
-    if BUILD_VERSION_MARKER_RE.fullmatch(raw) is None:
-        raise AssertionError("invalid release version runtime marker")
-
-
-def assert_regional_evaluator_resource_closure(internal):
-    """Bind physical Vision resources to both source descriptors and the marker."""
-    if not (
-        verify_official_source_provenance_at_root(internal)
-        and verify_regional_evaluator_provenance_at_root(internal)
-    ):
-        raise AssertionError("packaged regional evaluator resources are invalid")
-    declared = {
-        source["path"]
-        for descriptor in (
-            load_official_source_descriptor(internal),
-            load_regional_evaluator_descriptor(internal),
-        )
-        for source in descriptor["sources"]
-        if source["path"].startswith("vision/")
-    }
-    declared.add("vision/_build_version.py")
-    vision_root = internal / "vision"
-    actual = {
-        path.relative_to(internal).as_posix()
-        for path in vision_root.rglob("*")
-        if path.is_file()
-    }
-    if actual != declared or len({path.casefold() for path in actual}) != len(actual):
-        raise AssertionError("packaged regional evaluator resources are invalid")
-
-
-def assert_ai_worker_layout(exe_path, *, required):
-    candidates = _candidate_ai_worker_paths(exe_path)
-    worker = next((path for path in candidates if path.is_file()), None)
-    if worker is None:
-        if required:
-            raise AssertionError(f"missing packaged AI worker: {[str(path) for path in candidates]}")
-        return None
-    internal = worker.parent / "_internal"
-    required_resources = [
-        internal / "official-ai-model-pack-descriptor.json",
-        internal / "ai-runtime-descriptor.json",
-        internal / "requirements-ai.lock.json",
-        internal / "official-ai-source-descriptor.json",
-        internal / "regional-evaluator-descriptor.json",
-    ]
-    missing = [str(path) for path in required_resources if not path.is_file()]
-    if missing:
-        raise AssertionError(f"missing packaged AI worker resources: {missing}")
-    assert_release_version_runtime_marker(internal)
-    assert_regional_evaluator_resource_closure(internal)
-    digest = __import__("hashlib").sha256(worker.read_bytes()).hexdigest()
-    return {"path": worker, "sha256": digest}
-
-
-def verify_ai_worker_runtime_probe(ai_worker):
-    probe = subprocess.run(
-        [str(ai_worker["path"]), "--probe-runtime"],
-        cwd=str(ai_worker["path"].parent),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-        timeout=30,
-    )
-    combined = f"{probe.stdout}{probe.stderr}"
-    assert_no_worker_resource_leak_output(combined)
-    try:
-        payload = json.loads(probe.stdout.strip().splitlines()[-1])
-    except (IndexError, ValueError) as exc:
-        raise AssertionError(f"AI worker runtime probe failed: {combined}") from exc
-    if (
-        probe.returncode != 0
-        or payload.get("probe") != "official-catvton-worker-runtime"
-        or payload.get("catvtonSourceRevision") != "3b795364a4d2f3b5adb365f39cdea376d20bc53c"
-        or payload.get("torch") != "2.8.0+cpu"
-        or payload.get("torchvision") != "0.23.0+cpu"
-        or payload.get("diffusers") != "0.29.2"
-        or payload.get("transformers") != "4.53.3"
-    ):
-        raise AssertionError(f"AI worker runtime probe failed: {combined}")
-    return payload
-
-
 def verify_plain_camera_maintenance_contract(base_url):
     """Exercise the real packaged adapter through plain loopback v2 routes."""
     read_status, contract = http_status_json(f"{base_url}/maintenance/cameras")
@@ -612,7 +504,6 @@ def verify_managed_production_surface(exe_path, *, port, startup_timeout, temp_d
 def main():
     args = parse_args()
     root = Path(__file__).resolve().parents[1]
-    ai_worker = None
     exe_path = Path(args.exe)
     if not exe_path.is_absolute():
         exe_path = root / exe_path
@@ -631,13 +522,6 @@ def main():
         "--verify-v2-try-on-workers",
         "V2 try-on worker probe passed",
     )
-    if ai_worker is not None:
-        verify_ai_worker_runtime_probe(ai_worker)
-        run_packaged_probe(
-            exe_path,
-            "--verify-ai-worker-boundary",
-            "AI runtime worker contract probe passed",
-        )
     ensure_port_available(args.port)
     managed_port = args.port + 1
     ensure_port_available(managed_port)
@@ -719,13 +603,8 @@ def main():
         )
         print(
             "PACKAGED_EXE_VERIFICATION=PASS"
-            if ai_worker is not None
-            else "PACKAGED_EXE_VERIFICATION=CORE_ONLY"
         )
         print(f"EXE={exe_path}")
-        if ai_worker is not None:
-            print(f"AI_WORKER={ai_worker['path']}")
-            print(f"AI_WORKER_SHA256={ai_worker['sha256']}")
         print(f"SERVER_VERSION={version.get('version')}")
         print(f"AGE_GENDER_MODE={health.get('ageGenderMode')}")
 

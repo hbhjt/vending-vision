@@ -52,7 +52,10 @@ def _permanently_blocking_acquisition_observer(connection):
 
 
 def _png_bytes():
-    image = np.full((48, 36, 4), (20, 120, 220, 255), dtype=np.uint8)
+    image = np.zeros((48, 36, 4), dtype=np.uint8)
+    image[3:45, 10:25] = (20, 120, 220, 255)
+    image[8:28, 3:10] = (20, 120, 220, 255)
+    image[8:28, 25:33] = (20, 120, 220, 255)
     ok, encoded = cv2.imencode(".png", image)
     assert ok
     return encoded.tobytes()
@@ -85,7 +88,7 @@ def _envelope(message_type, payload):
 def _configure_recorded_front(monkeypatch, filename="front.mp4"):
     fixture_root = Path(__file__).parents[1] / "fixtures" / "recorded-video"
     monkeypatch.setattr(settings, "FRONT_CAMERA_CONFIG", {
-        "role": "profile_fast_try_on", "source": "recorded_video",
+        "role": "profile_try_on", "source": "recorded_video",
         "video_path": str(fixture_root / filename), "loop": True, "rotate": 0,
     })
     camera_manager.release_all_cameras()
@@ -101,7 +104,7 @@ def _configure_recorded_top(monkeypatch):
     camera_manager.release_all_cameras()
 
 
-class _ReadyFastBroker:
+class _ReadyTryOnBroker:
     ready = True
     pose_ready = True
 
@@ -232,7 +235,7 @@ def test_recorded_departure_fixture_watchdog_unblocks_asyncio_run():
 
 def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkeypatch):
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
-    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "tryOnRenderReady": True, "tryOnPoseReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     frame = cv2.imread(str(Path(__file__).parents[1] / "fixtures/recorded-video/sources/person-man-front.png"))
     assert frame is not None
@@ -245,10 +248,10 @@ def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkey
     try:
         with TestClient(vision_app.app) as client:
             with client.websocket_connect("/ws") as socket:
-                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on_fast"]}))
+                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on"]}))
                 assert socket.receive_json()["type"] == "vision.ready"
                 garment = _GarmentHandler.payload
-                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
+                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
                 assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
                 deadline = time.monotonic() + 1
                 while vision_app._acquisition_observer.active_request_count == 0 and time.monotonic() < deadline:
@@ -282,10 +285,10 @@ def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile
     # The deterministic top boundary reaches the fixture's departure edge in
     # 23 polls while leaving the real front sampler time to publish its result.
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_INTERVAL_MS", 250)
-    monkeypatch.setattr(vision_app, "_FAST_ATTEMPT_TIMEOUT_SECONDS", 10)
+    monkeypatch.setattr(vision_app, "_TRY_ON_ATTEMPT_TIMEOUT_SECONDS", 10)
     monkeypatch.setattr(vision_app, "_ACQUISITION_POLL_SECONDS", 0.01)
     monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 0.0)
-    monkeypatch.setattr(vision_app, "_fast_render_broker", _ReadyFastBroker())
+    monkeypatch.setattr(vision_app, "_try_on_render_broker", _ReadyTryOnBroker())
     monkeypatch.setattr(
         vision_app,
         "_acquisition_observer",
@@ -297,8 +300,8 @@ def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile
         lambda: {
             "cameraReady": True,
             "modelReady": True,
-            "fastRenderReady": True,
-            "fastPoseReady": True,
+            "tryOnRenderReady": True,
+            "tryOnPoseReady": True,
             "acquisitionObserverReady": vision_app._acquisition_observer_ready(),
         },
     )
@@ -391,14 +394,14 @@ def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile
                     "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"],
                     "contractDigest": manifest["bundleDigest"],
                     "capabilities": [
-                        "try_on_fast", "profile_push", "presence_status",
+                        "try_on", "profile_push", "presence_status",
                         "person_departed", "ambient_light",
                     ],
                 }))
                 assert socket.receive_json()["type"] == "vision.ready"
                 garment = _GarmentHandler.payload
                 socket.send_json(_envelope("vision.try_on.attempt.start", {
-                    "attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()),
+                    "attemptId": attempt_id, "variantId": str(uuid4()),
                     "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"},
                 }))
 
@@ -486,7 +489,7 @@ def test_public_recorded_top_departure_does_not_cancel_attempt_and_keeps_profile
 def test_v2_start_exposes_attempt_scoped_tokenized_acquisition_preview(monkeypatch):
     """A Machine can display, but never supply, the acquiring camera input."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
-    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "tryOnRenderReady": True, "tryOnPoseReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     _configure_recorded_front(monkeypatch)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _GarmentHandler)
@@ -499,12 +502,12 @@ def test_v2_start_exposes_attempt_scoped_tokenized_acquisition_preview(monkeypat
                 socket.send_json(_envelope("vision.hello", {
                     "clientRole": "machine", "machineCode": "M001",
                     "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"],
-                    "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on_fast"],
+                    "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on"],
                 }))
                 assert socket.receive_json()["type"] == "vision.ready"
                 garment = _GarmentHandler.payload
                 socket.send_json(_envelope("vision.try_on.attempt.start", {
-                    "attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()),
+                    "attemptId": attempt_id, "variantId": str(uuid4()),
                     "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"},
                 }))
                 assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
@@ -542,7 +545,7 @@ def test_v2_start_exposes_attempt_scoped_tokenized_acquisition_preview(monkeypat
 def test_v2_manual_capture_bypasses_stability_but_not_single_person_alignment(monkeypatch):
     """Manual intent converts an unstable eligible recorded observation to generating."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
-    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "tryOnRenderReady": True, "tryOnPoseReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 1000.0)
     _configure_recorded_front(monkeypatch, "man-front.mp4")
@@ -553,10 +556,10 @@ def test_v2_manual_capture_bypasses_stability_but_not_single_person_alignment(mo
     try:
         with TestClient(vision_app.app) as client:
             with client.websocket_connect("/ws") as socket:
-                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on_fast"]}))
+                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on"]}))
                 assert socket.receive_json()["type"] == "vision.ready"
                 garment = _GarmentHandler.payload
-                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
+                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
                 assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
                 acquiring = socket.receive_json()
                 assert acquiring["payload"]["guidance"] == "counting_down"
@@ -582,7 +585,7 @@ def test_v2_recorded_production_observation_truthfully_blocks_capture(
 ):
     """No detector, box, or pose stub may turn an unsafe source into capture."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
-    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "tryOnRenderReady": True, "tryOnPoseReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     _configure_recorded_front(monkeypatch, filename)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _GarmentHandler)
@@ -592,10 +595,10 @@ def test_v2_recorded_production_observation_truthfully_blocks_capture(
     try:
         with TestClient(vision_app.app) as client:
             with client.websocket_connect("/ws") as socket:
-                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on_fast"]}))
+                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on"]}))
                 assert socket.receive_json()["type"] == "vision.ready"
                 garment = _GarmentHandler.payload
-                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
+                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
                 assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
                 acquiring = socket.receive_json()
                 assert acquiring["type"] == "vision.try_on.attempt.acquiring"
@@ -618,7 +621,7 @@ def test_v2_recorded_close_up_single_person_manual_capture_proceeds_when_aligned
 ):
     """A close-up single person (lower body cropped) is aligned and manual intent captures immediately."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
-    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "tryOnRenderReady": True, "tryOnPoseReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     monkeypatch.setattr(vision_app, "_ACQUISITION_HOLD_SECONDS", 1000.0)
     _configure_recorded_front(monkeypatch, "man-unaligned-front.mp4")
@@ -629,10 +632,10 @@ def test_v2_recorded_close_up_single_person_manual_capture_proceeds_when_aligned
     try:
         with TestClient(vision_app.app) as client:
             with client.websocket_connect("/ws") as socket:
-                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on_fast"]}))
+                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on"]}))
                 assert socket.receive_json()["type"] == "vision.ready"
                 garment = _GarmentHandler.payload
-                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
+                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
                 assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
                 acquiring = socket.receive_json()
                 assert acquiring["type"] == "vision.try_on.attempt.acquiring"
@@ -652,7 +655,7 @@ def test_v2_recorded_close_up_single_person_manual_capture_proceeds_when_aligned
 def test_v2_recorded_single_person_auto_capture_uses_production_yolo_and_pose(monkeypatch):
     """A traceable recorded input automatically reaches generation without detector stubs."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
-    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "tryOnRenderReady": True, "tryOnPoseReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     _configure_recorded_front(monkeypatch, "man-front.mp4")
     server = ThreadingHTTPServer(("127.0.0.1", 0), _GarmentHandler)
@@ -665,12 +668,12 @@ def test_v2_recorded_single_person_auto_capture_uses_production_yolo_and_pose(mo
                 socket.send_json(_envelope("vision.hello", {
                     "clientRole": "machine", "machineCode": "M001",
                     "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"],
-                    "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on_fast"],
+                    "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on"],
                 }))
                 assert socket.receive_json()["type"] == "vision.ready"
                 garment = _GarmentHandler.payload
                 socket.send_json(_envelope("vision.try_on.attempt.start", {
-                    "attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()),
+                    "attemptId": attempt_id, "variantId": str(uuid4()),
                     "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"},
                 }))
                 assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
@@ -685,7 +688,7 @@ def test_v2_recorded_single_person_auto_capture_uses_production_yolo_and_pose(mo
                     assert message["type"] == "vision.try_on.attempt.acquiring"
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
                 terminal = socket.receive_json()
-                assert terminal["type"] == "vision.try_on.attempt.completed"
+                assert terminal["type"] == "vision.try_on.attempt.completed", terminal
                 assert terminal["payload"]["attemptId"] == attempt_id
     finally:
         server.shutdown()
@@ -698,7 +701,7 @@ def test_v2_unstable_alignment_resets_countdown_and_manual_capture_still_complet
 ):
     """An intermittent misalignment never completes the hold; manual intent still captures."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
-    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "fastRenderReady": True, "fastPoseReady": True})
+    monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True, "tryOnRenderReady": True, "tryOnPoseReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", False)
     _configure_recorded_front(monkeypatch, "front-vertical-unstable.mp4")
     server = ThreadingHTTPServer(("127.0.0.1", 0), _GarmentHandler)
@@ -708,10 +711,10 @@ def test_v2_unstable_alignment_resets_countdown_and_manual_capture_still_complet
     try:
         with TestClient(vision_app.app) as client:
             with client.websocket_connect("/ws") as socket:
-                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on_fast"]}))
+                socket.send_json(_envelope("vision.hello", {"clientRole": "machine", "machineCode": "M001", "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"], "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on"]}))
                 assert socket.receive_json()["type"] == "vision.ready"
                 garment = _GarmentHandler.payload
-                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "mode": "fast", "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
+                socket.send_json(_envelope("vision.try_on.attempt.start", {"attemptId": attempt_id, "variantId": str(uuid4()), "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(garment).hexdigest()}", "contentType": "image/png", "byteSize": len(garment), "template": "tshirt_short_sleeve"}}))
                 assert socket.receive_json()["type"] == "vision.try_on.attempt.accepted"
                 observed_guidances = []
                 deadline = time.monotonic() + 3.5

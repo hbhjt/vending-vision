@@ -1,7 +1,7 @@
 """
 前置摄像头所有权管理模块
 
-中部（前置）摄像头是共享资源，可能被 profile 采集和 Fast Virtual Try-On attempt 竞争。
+中部（前置）摄像头是共享资源，可能被 profile 采集和 Try-On attempt 竞争。
 本模块实现基于优先级的准入控制：
 
 优先级（从低到高）：

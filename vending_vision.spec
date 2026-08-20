@@ -1,6 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-import json
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (
@@ -13,8 +12,6 @@ from PyInstaller.utils.hooks import (
 
 ROOT = Path(SPECPATH)
 CONTRACT_ROOT = ROOT / "contracts" / "vem_vision_v2"
-OFFICIAL_AI_SOURCE_DESCRIPTOR_PATH = ROOT / "official-ai-source-descriptor.json"
-REGIONAL_EVALUATOR_DESCRIPTOR_PATH = ROOT / "regional-evaluator-descriptor.json"
 CONTRACT_DATA_FILES = [
     (CONTRACT_ROOT / "manifest.json", "contracts/vem_vision_v2"),
     (CONTRACT_ROOT / "__init__.py", "contracts/vem_vision_v2"),
@@ -27,20 +24,6 @@ CONTRACT_DATA_FILES = [
     (CONTRACT_ROOT / "fixtures" / "server-valid.json", "contracts/vem_vision_v2/fixtures"),
     (CONTRACT_ROOT / "fixtures" / "server-invalid.json", "contracts/vem_vision_v2/fixtures"),
 ]
-OFFICIAL_AI_SOURCE_DATA_FILES = []
-for source in json.loads(OFFICIAL_AI_SOURCE_DESCRIPTOR_PATH.read_text("utf-8"))["sources"]:
-    relative = source["path"]
-    if relative.endswith(".py"):
-        OFFICIAL_AI_SOURCE_DATA_FILES.append((str(ROOT / relative), str(Path(relative).parent)))
-REGIONAL_EVALUATOR_SOURCE_DATA_FILES = []
-official_source_paths = {
-    source["path"]
-    for source in json.loads(OFFICIAL_AI_SOURCE_DESCRIPTOR_PATH.read_text("utf-8"))["sources"]
-}
-for source in json.loads(REGIONAL_EVALUATOR_DESCRIPTOR_PATH.read_text("utf-8"))["sources"]:
-    relative = source["path"]
-    if relative.endswith(".py") and relative not in official_source_paths:
-        REGIONAL_EVALUATOR_SOURCE_DATA_FILES.append((str(ROOT / relative), str(Path(relative).parent)))
 
 datas = [
     (str(ROOT / "config.json"), "."),
@@ -48,15 +31,7 @@ datas = [
     (str(ROOT / "dashboard"), "dashboard"),
     (str(ROOT / "models"), "models"),
     (str(ROOT / "vision" / "_build_version.py"), "vision"),
-    (str(ROOT / "official-ai-model-pack-descriptor.json"), "."),
-    (str(ROOT / "ai-runtime-descriptor.json"), "."),
-    (str(ROOT / "requirements-ai.txt"), "."),
-    (str(ROOT / "requirements-ai.lock.json"), "."),
-    (str(ROOT / "official-ai-source-descriptor.json"), "."),
-    (str(ROOT / "regional-evaluator-descriptor.json"), "."),
     *[(str(source), destination) for source, destination in CONTRACT_DATA_FILES],
-    *OFFICIAL_AI_SOURCE_DATA_FILES,
-    *REGIONAL_EVALUATOR_SOURCE_DATA_FILES,
 ]
 datas += collect_data_files("mediapipe")
 datas += collect_data_files("cv2_enumerate_cameras")
@@ -70,16 +45,6 @@ hiddenimports = [
     "vision.render_worker_target",
     "vision.acquisition_observer",
     "vision.worker_self_check",
-    "vision.ai_model_pack",
-    "vision.ai_runtime_descriptor",
-    "vision.ai_attempt_worker",
-    "vision.regional_evaluator",
-    "vision.regional_evaluator_provenance",
-    "vision.ai_attempt_process",
-    "vision.ai_acceptance_evidence",
-    "vision.process_supervisor",
-    "vision.catvton_pose_masks",
-    "vision.catvton_preprocess",
     "contracts.vem_vision_v2.python.vision_v2_models",
     "uvicorn.lifespan.on",
     "uvicorn.loops.auto",
@@ -126,10 +91,6 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-# Delivery layout contract: build `vending_vision_ai_worker.spec` alongside
-# this main runtime and place the resulting `vending-vision-ai-worker` onedir
-# next to `vending-vision`.  The main runtime supervises that artifact-relative
-# worker executable per probe/attempt; model weights stay outside both archives.
 pyz = PYZ(a.pure)
 
 exe = EXE(

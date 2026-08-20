@@ -13,27 +13,10 @@ Windows 候选版本使用 PyInstaller `onedir`。本地构建只属于开发产
 `vending-vision-main-artifacts.json` 列出两个 archive 的 SHA-256。消费方按该
 commit 下载并原样安装或解压，不重新打包 Vision 内容。
 
-AI 模型是独立的 `vending-vision-ai-models.zip`，绝不嵌入 runtime ZIP。
-解压后目录必须只含 `ai-model-manifest.json` 和其精确 allowlist 文件；manifest
-逐项绑定 `zhengchong/CatVTON` 的不可变 revision、相对路径、大小和 SHA-256。
-部署先验证 pack，再以 `VEM_AI_MODEL_PACK` 指向该目录。启动仅校验 manifest、
-代码和轻量 worker import，不加载完整模型或推理；顾客启动禁止下载。缺 pack
-只使 AI readiness 为 false，Fast 与核心 Vision 仍可用。
-
-官方 CatVTON worker 作为独立 `vending-vision-ai-worker.exe` onedir 与主
-runtime 同 ZIP 交付，但不是服务、不是相机 owner、也不常驻。主 Vision 只按
-attempt/probe 通过 supervisor 启动该 artifact-relative worker；source/dev 才使用
-当前 Python 的 `vision.ai_attempt_worker` module。AI 依赖使用独立
-`requirements-ai.txt` 的 exact direct versions，并由 `requirements-ai.lock.json`
-描述 Windows x64 release wheelhouse；`scripts/verify_ai_wheelhouse.py` 在缺少
-release-provided wheel manifest 时 fail closed，现场不得临时 pip install。不要把
-torch/diffusers/SCHP 运行依赖或 4.5GB 权重折进核心 Vision hash lock，也不要把
-权重打入任一 PyInstaller archive。正式 attempt child 使用 `VEM_AI_MODEL_PACK`
-指向的 verified pack、vendored CatVTON source、`HF_HUB_OFFLINE=1`、
-`TRANSFORMERS_OFFLINE=1` 和 CatVTON `local_files_only=True`；startup probe 只
-import torch/torchvision/diffusers/accelerate/safetensors/PIL/numpy/cv2 与 vendored
-CatVTON/SCHP，解析 3 个 JSON，不 `torch.load`、不 `from_pretrained`、不推理。
-失败时只让 AI readiness/attempt failclosed。
+Windows onedir 只包含一个 `vending-vision` 主运行时。录播 fixture 单独交付；
+生产人物、姿态、年龄与性别检测模型继续由 `models/model-manifest.json` 固定摘要并
+随主运行时打包。候选归档清单只绑定主可执行文件，不存在第二个试衣运行时或额外
+模型安装步骤。
 
 CI 会验证 runtime ZIP 根目录包含 `vending-vision.exe` 和 manifest，fixture ZIP
 包含 `recorded-video/top.mp4`、`front.mp4`、expected manifest 与
@@ -51,12 +34,12 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1 -Wheelhouse .\whe
 每次构建后运行打包契约测试：
 
 ```powershell
-.\.venv-packaging\Scripts\python.exe scripts\verify_packaged_exe.py
+.\.venv-packaging-core\Scripts\python.exe scripts\verify_packaged_exe.py
 ```
 
 该测试检查 bundle 资源（包括 Windows DirectShow 枚举 adapter）、`/health`、`/version`、显式开发 Dashboard、metrics、严格
 machine 角色 WebSocket 握手、ping/pong 和画像消息契约。真实摄像头、旋转、
-V2 试衣尝试与结果读取必须通过现场硬件验收。生产启动不开放 Dashboard
+V2 试衣尝试、采集与结果读取必须通过现场硬件验收。生产启动不开放 Dashboard
 或旧的开发 camera snapshot；冒烟测试仅通过显式 development flag 验证供应方
 调试资源已经被正确打包。
 

@@ -18,11 +18,8 @@ import hashlib
 import json
 import ipaddress
 import math
-import os
 import re
 import secrets
-import shutil
-import tempfile
 import threading
 from datetime import datetime
 from json import JSONDecodeError
@@ -68,9 +65,9 @@ from vision.protocol import APP_VERSION, PROTOCOL, envelope, error_envelope
 from vision.self_check import check_camera, run_self_check
 from vision.session_state import get_vision_session_status
 from vision.garment_composer import GarmentComposer, GarmentFetchError, PoseUnavailableError
-from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
-from vision.fast_adjustment_store import FastAdjustmentStore
-from vision.attempt_worker import AttemptWorkerError, FastRenderBroker, render_attempt_frame
+from vision.try_on_attempt_registry import AttemptReceipt, TryOnAttemptRegistry, TerminalTransition
+from vision.try_on_adjustment_store import TryOnAdjustmentStore
+from vision.attempt_worker import AttemptWorkerError, TryOnRenderBroker, render_attempt_frame
 from vision.acquisition_preview import AcquisitionPreviewStore
 from vision.acquisition_observer import AcquisitionObservationWorker
 from vision.v2_contract_bundle import (
@@ -79,45 +76,31 @@ from vision.v2_contract_bundle import (
     parse_v2_client_message,
     parse_v2_server_message,
 )
-from vision.ai_model_pack import (
-    official_ai_readiness_snapshot,
-    refresh_official_ai_readiness,
-    shutdown_official_ai_readiness_refresh,
-)
-from vision.ai_attempt_process import AiAttemptProcess
-from vision.ai_acceptance_evidence import publish_completed_ai_regional_evidence
-
-
 app = FastAPI(
     title=settings.APP_NAME,
     description="Smart vending machine vision API",
     version=APP_VERSION,
 )
 
-_FAST_RESULT_TTL_SECONDS = 5 * 60
-_FAST_RESULT_MAX_BYTES = 16 * 1024 * 1024
-_FAST_RESULT_MAX_COUNT = 1000
-_FAST_RESULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
-_FAST_ATTEMPT_TIMEOUT_SECONDS = 15
-# AI 推理是分钟级产品能力，与服务端/机器端 10 分钟终端窗口保持一致；
-# 60 秒会在真实 CatVTON 推理尚未完成时误判为 timeout。
-_AI_ATTEMPT_TIMEOUT_SECONDS = 600
-_FAST_ATTEMPT_MAX_TASKS = 2
-_FAST_TERMINAL_SEND_TIMEOUT_SECONDS = 0.25
-_fast_runtime = GarmentComposer()
-_fast_attempt_registry = FastAttemptRegistry(
-    terminal_ttl_seconds=_FAST_RESULT_TTL_SECONDS,
-    result_max_count=_FAST_RESULT_MAX_COUNT,
-    result_max_bytes=_FAST_RESULT_MAX_TOTAL_BYTES,
-    result_single_max_bytes=_FAST_RESULT_MAX_BYTES,
+_TRY_ON_RESULT_TTL_SECONDS = 5 * 60
+_TRY_ON_RESULT_MAX_BYTES = 16 * 1024 * 1024
+_TRY_ON_RESULT_MAX_COUNT = 1000
+_TRY_ON_RESULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+_TRY_ON_ATTEMPT_TIMEOUT_SECONDS = 15
+_TRY_ON_ATTEMPT_MAX_TASKS = 2
+_TRY_ON_TERMINAL_SEND_TIMEOUT_SECONDS = 0.25
+_try_on_runtime = GarmentComposer()
+_try_on_attempt_registry = TryOnAttemptRegistry(
+    terminal_ttl_seconds=_TRY_ON_RESULT_TTL_SECONDS,
+    result_max_count=_TRY_ON_RESULT_MAX_COUNT,
+    result_max_bytes=_TRY_ON_RESULT_MAX_TOTAL_BYTES,
+    result_single_max_bytes=_TRY_ON_RESULT_MAX_BYTES,
 )
-_fast_adjustment_store = FastAdjustmentStore(ttl_seconds=_FAST_RESULT_TTL_SECONDS)
-_fast_attempt_task_slots = asyncio.Semaphore(_FAST_ATTEMPT_MAX_TASKS)
-_fast_render_broker = FastRenderBroker()
+_try_on_adjustment_store = TryOnAdjustmentStore(ttl_seconds=_TRY_ON_RESULT_TTL_SECONDS)
+_try_on_attempt_task_slots = asyncio.Semaphore(_TRY_ON_ATTEMPT_MAX_TASKS)
+_try_on_render_broker = TryOnRenderBroker()
 _acquisition_previews = AcquisitionPreviewStore()
 _acquisition_observer: AcquisitionObservationWorker | None = None
-_ai_attempt_process_factory = AiAttemptProcess
-_ai_attempt_execution_lock = asyncio.Lock()
 _ACQUISITION_TIMEOUT_SECONDS = 20.0
 # 首次识别到稳定后展示 3 秒倒计时，倒计时期间若再次失稳则重新计时；
 # 手动拍照仍可在对齐窗口内立即触发，不受该倒计时限制。
@@ -148,47 +131,40 @@ async def on_startup():
     else:
         logger.warning(f"Vision module self check failed: {startup_check}")
     try:
-        await _fast_render_broker.start()
+        await _try_on_render_broker.start()
     except Exception:
-        # Fast is an enhancement capability.  A failed broker readiness probe
+        # Try-On is an enhancement capability.  A failed broker readiness probe
         # keeps the service alive but is reflected truthfully in V2 readiness.
-        logger.exception("Fast render broker failed startup readiness")
+        logger.exception("Try-On render broker failed startup readiness")
     try:
         await _get_acquisition_observer().start()
     except Exception:
         # Acquisition stays fail-closed until the production observation
         # boundary can be prewarmed; ordinary Vision capability remains alive.
         logger.exception("Acquisition observer failed startup readiness")
-    try:
-        await refresh_official_ai_readiness(os.environ.get("VEM_AI_MODEL_PACK"))
-    except Exception:
-        # AI is optional for core/Fast readiness.  Refresh is owned by startup
-        # and the public hello/admission path only performs bounded stat checks.
-        logger.exception("Official AI readiness refresh failed")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     """服务关闭事件：停止后台工作线程并释放所有摄像头资源。"""
-    await shutdown_official_ai_readiness_refresh()
     for task in (_presence_worker_task, _profile_worker_task):
         if task is not None and not task.done():
             task.cancel()
 
-    _fast_render_broker.quiesce()
+    _try_on_render_broker.quiesce()
     preview_shutdown_error = None
     try:
         await _acquisition_previews.close()
     except Exception as exc:
         preview_shutdown_error = exc
         logger.warning("Acquisition preview shutdown close failed: %s", exc)
-    await _fast_attempt_registry.shutdown()
+    await _try_on_attempt_registry.shutdown()
     observer = _acquisition_observer
     if observer is not None:
         await observer.shutdown()
     render_shutdown_error = None
     try:
-        await _fast_render_broker.shutdown()
+        await _try_on_render_broker.shutdown()
     except Exception as exc:
         render_shutdown_error = exc
     aborted = await abort_all_camera_requests(reason="vision_shutdown")
@@ -207,13 +183,13 @@ async def on_shutdown():
     logger.info("Camera streams released")
 
 
-def _discard_completed_fast_attempt(task: asyncio.Task) -> None:
+def _discard_completed_try_on_attempt(task: asyncio.Task) -> None:
     try:
         task.result()
     except asyncio.CancelledError:
         pass
     except Exception:
-        logger.exception("Fast attempt task ended with an unhandled error")
+        logger.exception("Try-On attempt task ended with an unhandled error")
 
 
 async def _await_cleanup_uncancelled(awaitable):
@@ -228,22 +204,22 @@ async def _await_cleanup_uncancelled(awaitable):
 
 
 async def _cancel_disconnect_owner_and_publish(receipt: AttemptReceipt) -> None:
-    transition = await _fast_attempt_registry.cancel_owner_and_join(
+    transition = await _try_on_attempt_registry.cancel_owner_and_join(
         receipt,
         _generated_v2_envelope(
             "vision.try_on.attempt.canceled",
             {"attemptId": receipt.attempt_id, "reason": "disconnect"},
         ),
     )
-    await _publish_fast_transition(transition)
+    await _publish_try_on_transition(transition)
 
 
 async def _run_owned_attempt_step(receipt: AttemptReceipt, operation, *, timeout: float):
     """Race an owned process operation with cancellation and join it in all cases."""
-    if not await _fast_attempt_registry.is_current(receipt):
+    if not await _try_on_attempt_registry.is_current(receipt):
         raise GarmentFetchError("attempt_canceled")
     worker = asyncio.create_task(operation)
-    cancel_event = await _fast_attempt_registry.cancel_event_for(receipt)
+    cancel_event = await _try_on_attempt_registry.cancel_event_for(receipt)
     cancel_waiter = asyncio.create_task(cancel_event.wait())
     try:
         done, _ = await asyncio.wait(
@@ -263,7 +239,7 @@ async def _run_owned_attempt_step(receipt: AttemptReceipt, operation, *, timeout
     finally:
         cancel_waiter.cancel()
         await asyncio.gather(cancel_waiter, return_exceptions=True)
-        if not await _fast_attempt_registry.is_current(receipt):
+        if not await _try_on_attempt_registry.is_current(receipt):
             raise GarmentFetchError("attempt_canceled")
 
 
@@ -289,7 +265,7 @@ async def _read_attempt_front_frame(
     try:
         await _acquire_front_io_until(deadline)
         io_acquired = True
-        if not await _fast_attempt_registry.is_current(receipt):
+        if not await _try_on_attempt_registry.is_current(receipt):
             raise GarmentFetchError("attempt_canceled")
         if managed_lease:
             owner = acquire_front_camera(
@@ -312,7 +288,7 @@ async def _read_attempt_front_frame(
                 "front", 1, timeout=max(0.001, deadline - loop.time())
             )
         )
-        cancel_event = await _fast_attempt_registry.cancel_event_for(receipt)
+        cancel_event = await _try_on_attempt_registry.cancel_event_for(receipt)
         cancel_waiter = asyncio.create_task(cancel_event.wait())
         try:
             done, _ = await asyncio.wait(
@@ -330,7 +306,7 @@ async def _read_attempt_front_frame(
                 # immediately before handing a physical frame to the caller:
                 # a replacement may have fenced this receipt after the event
                 # snapshot but before the read task delivered its result.
-                if await _fast_attempt_registry.is_current(receipt):
+                if await _try_on_attempt_registry.is_current(receipt):
                     return frame
                 cancelled = True
 
@@ -390,7 +366,7 @@ async def _read_attempt_front_frame(
             )
 
 
-async def _publish_fast_transition(transition: TerminalTransition | None) -> None:
+async def _publish_try_on_transition(transition: TerminalTransition | None) -> None:
     """Deliver a registry-won terminal to every still-live subscriber."""
     if transition is None:
         return
@@ -400,10 +376,10 @@ async def _publish_fast_transition(transition: TerminalTransition | None) -> Non
                 subscriber.websocket,
                 subscriber.send_lock,
                 transition.message,
-                timeout=_FAST_TERMINAL_SEND_TIMEOUT_SECONDS,
+                timeout=_TRY_ON_TERMINAL_SEND_TIMEOUT_SECONDS,
             )
         except Exception:
-            await _fast_attempt_registry.detach_subscriber(subscriber.websocket)
+            await _try_on_attempt_registry.detach_subscriber(subscriber.websocket)
 
     await asyncio.gather(
         *(send_one(subscriber) for subscriber in transition.subscribers),
@@ -442,7 +418,7 @@ def get_startup_check():
     return startup_check
 
 
-def _fast_result_reference(attempt_id: str, token: str) -> str:
+def _try_on_result_reference(attempt_id: str, token: str) -> str:
     host = str(settings.HOST)
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
@@ -508,28 +484,28 @@ def _acquiring_message(
     return _generated_v2_envelope("vision.try_on.attempt.acquiring", payload)
 
 
-def _prepare_fast_result(attempt_id: str, image: bytes) -> tuple[dict, dict]:
-    if len(image) > _FAST_RESULT_MAX_BYTES:
-        raise RuntimeError("fast_result_too_large")
+def _prepare_try_on_result(attempt_id: str, image: bytes) -> tuple[dict, dict]:
+    if len(image) > _TRY_ON_RESULT_MAX_BYTES:
+        raise RuntimeError("try_on_result_too_large")
     png_signature = b"\x89PNG\r\n\x1a\n"
     if len(image) < 33 or image[:8] != png_signature or image[12:16] != b"IHDR":
-        raise RuntimeError("fast_result_invalid_png")
+        raise RuntimeError("try_on_result_invalid_png")
     width = int.from_bytes(image[16:20], "big")
     height = int.from_bytes(image[20:24], "big")
     if not 1 <= width <= 8192 or not 1 <= height <= 8192:
-        raise RuntimeError("fast_result_dimensions_too_large")
+        raise RuntimeError("try_on_result_dimensions_too_large")
     if width * height > 8192 * 8192:
-        raise RuntimeError("fast_result_dimensions_too_large")
+        raise RuntimeError("try_on_result_dimensions_too_large")
     decoded = cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if decoded is None or decoded.ndim != 3:
-        raise RuntimeError("fast_result_invalid_png")
+        raise RuntimeError("try_on_result_invalid_png")
     if decoded.shape[1] != width or decoded.shape[0] != height:
-        raise RuntimeError("fast_result_invalid_png")
+        raise RuntimeError("try_on_result_invalid_png")
     token = secrets.token_urlsafe(32)
     stored = {
         "token": token,
         "bytes": image,
-        "reference": _fast_result_reference(attempt_id, token),
+        "reference": _try_on_result_reference(attempt_id, token),
         "digest": f"sha256:{hashlib.sha256(image).hexdigest()}",
         "contentType": "image/png",
         "byteSize": len(image),
@@ -538,113 +514,6 @@ def _prepare_fast_result(attempt_id: str, image: bytes) -> tuple[dict, dict]:
     }
     public = {key: value for key, value in stored.items() if key not in {"token", "bytes"}}
     return stored, public
-
-
-def _prepare_ai_result(
-    attempt_id: str, image: bytes, *, person_png: bytes, garment_png: bytes
-) -> tuple[dict, dict]:
-    if image == person_png or image == garment_png:
-        raise RuntimeError("ai_result_reused_input")
-    return _prepare_fast_result(attempt_id, image)
-
-
-async def _read_ai_output_bytes(output_png: Path) -> bytes:
-    try:
-        size = output_png.stat().st_size
-    except OSError as exc:
-        raise RuntimeError("ai_result_missing") from exc
-    if size > _FAST_RESULT_MAX_BYTES:
-        raise RuntimeError("ai_result_too_large")
-    return await asyncio.to_thread(output_png.read_bytes)
-
-
-def _validate_ai_private_staging(
-    staging_dir: Path,
-    output_png: Path,
-    *,
-    regional_evidence_output: Path | None = None,
-) -> None:
-    root = staging_dir.resolve()
-    output = output_png.resolve(strict=False)
-    if output.parent != root or output_png.is_symlink():
-        raise RuntimeError("ai_staging_output_path_invalid")
-    expected = {"person.png", "garment.png", "output.png"}
-    if regional_evidence_output is not None:
-        regional = regional_evidence_output.resolve(strict=False)
-        if regional.parent != root or regional_evidence_output.is_symlink():
-            raise RuntimeError("ai_staging_regional_evidence_path_invalid")
-        expected.add("regional-evidence.json")
-    actual = {path.name for path in staging_dir.iterdir()}
-    if actual != expected:
-        raise RuntimeError("ai_staging_unexpected_files")
-    for name in expected:
-        path = staging_dir / name
-        if path.is_symlink() or not path.is_file():
-            raise RuntimeError("ai_staging_file_invalid")
-
-
-def _validate_captured_ai_source(source: object) -> dict:
-    expected = {
-        "adapter",
-        "configSha256",
-        "decodedFrameCount",
-        "fixtureSha256",
-        "frameIndex",
-        "relabeled",
-        "role",
-        "synthetic",
-    }
-    if (
-        not isinstance(source, dict)
-        or set(source) != expected
-        or source.get("adapter") != "recorded_video"
-        or source.get("role") != "front"
-        or source.get("synthetic") is not False
-        or source.get("relabeled") is not False
-        or not isinstance(source.get("decodedFrameCount"), int)
-        or not isinstance(source.get("frameIndex"), int)
-        or not 0 <= source["frameIndex"] < source["decodedFrameCount"]
-        or not re.fullmatch(r"[a-f0-9]{64}", source.get("fixtureSha256", ""))
-        or not re.fullmatch(r"[a-f0-9]{64}", source.get("configSha256", ""))
-    ):
-        raise RuntimeError("ai_captured_source_invalid")
-    return source
-
-
-def _validate_ai_regional_evidence(
-    content: bytes,
-    *,
-    captured_source: dict,
-    person_png: bytes,
-    garment_png: bytes,
-    result_png: bytes,
-    result: dict,
-) -> None:
-    try:
-        value = json.loads(content.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise RuntimeError("ai_regional_evidence_invalid") from exc
-    if (
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        + "\n"
-    ).encode("utf-8") != content:
-        raise RuntimeError("ai_regional_evidence_noncanonical")
-    attempt = value.get("attempt") if isinstance(value, dict) else None
-    if (
-        value.get("schemaVersion") != "vem-ai-regional-evidence/v1"
-        or value.get("kind") != "regional-evidence"
-        or not isinstance(attempt, dict)
-        or attempt.get("acquisitionSource") != "direct_recorded_frame"
-        or attempt.get("sourceCamera") != "front"
-        or attempt.get("recordedFixtureSha256")
-        != captured_source["fixtureSha256"]
-        or attempt.get("inputSha256") != hashlib.sha256(person_png).hexdigest()
-        or attempt.get("garmentSha256") != hashlib.sha256(garment_png).hexdigest()
-        or attempt.get("resultSha256") != hashlib.sha256(result_png).hexdigest()
-        or attempt.get("decodedWidth") != result["width"]
-        or attempt.get("decodedHeight") != result["height"]
-    ):
-        raise RuntimeError("ai_regional_evidence_identity_invalid")
 
 
 def _generated_v2_envelope(message_type: str, payload: dict) -> dict:
@@ -657,7 +526,7 @@ def _generated_v2_envelope(message_type: str, payload: dict) -> dict:
 
 
 @app.api_route("/v2/try-on/results/{attempt_id}", methods=["GET", "HEAD"])
-async def read_fast_result(request: Request, attempt_id: str, token: Optional[str] = None):
+async def read_try_on_result(request: Request, attempt_id: str, token: Optional[str] = None):
     """Serve only an unguessable, disposable local PNG result read grant."""
     raw_query = request.scope.get("query_string", b"")
     if not isinstance(raw_query, bytes) or not re.fullmatch(
@@ -668,7 +537,7 @@ async def read_fast_result(request: Request, attempt_id: str, token: Optional[st
         canonical_token = raw_query[6:].decode("ascii")
     except UnicodeDecodeError:
         raise HTTPException(status_code=404, detail="result not found")
-    result = await _fast_attempt_registry.get_result(attempt_id, canonical_token)
+    result = await _try_on_attempt_registry.get_result(attempt_id, canonical_token)
     if result is None:
         raise HTTPException(status_code=404, detail="result not found")
     image = result["bytes"]
@@ -751,8 +620,8 @@ def get_runtime_status():
         "modelReady": model_ready,
         "ageGenderReady": age_gender_ready,
         "ageGenderMode": age_gender_mode,
-        "fastRenderReady": _fast_render_broker.ready,
-        "fastPoseReady": _fast_render_broker.pose_ready,
+        "tryOnRenderReady": _try_on_render_broker.ready,
+        "tryOnPoseReady": _try_on_render_broker.pose_ready,
         "acquisitionObserverReady": _acquisition_observer_ready(),
     }
 
@@ -800,15 +669,15 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
         bundle_version = identity.bundle_version
         contract_digest = identity.contract_digest
     elif (
-        not status.get("fastRenderReady", True)
-        or not status.get("fastPoseReady", True)
+        not status.get("tryOnRenderReady", True)
+        or not status.get("tryOnPoseReady", True)
         or not status.get("acquisitionObserverReady", True)
     ):
         logger.warning(
-            f"V2 ready degraded: fastRenderReady={status.get('fastRenderReady')}, "
-            f"fastPoseReady={status.get('fastPoseReady')}, "
+            f"V2 ready degraded: tryOnRenderReady={status.get('tryOnRenderReady')}, "
+            f"tryOnPoseReady={status.get('tryOnPoseReady')}, "
             f"acquisitionObserverReady={status.get('acquisitionObserverReady')}, "
-            f"brokerFatal={getattr(_fast_render_broker, 'fatal_error', None)}, "
+            f"brokerFatal={getattr(_try_on_render_broker, 'fatal_error', None)}, "
             f"observerFatal={getattr(_acquisition_observer, 'fatal_error', None)}"
         )
         diagnostic = "camera_unavailable"
@@ -821,8 +690,6 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
         bundle_version = identity.bundle_version
         contract_digest = identity.contract_digest
 
-    model_pack = os.environ.get("VEM_AI_MODEL_PACK")
-    ai_snapshot = official_ai_readiness_snapshot(model_pack)
     ready = envelope(
         message_type="vision.ready",
         message_id=str(uuid4()),
@@ -833,11 +700,7 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
             "bundleVersion": bundle_version,
             "contractDigest": contract_digest,
             "cameraReady": status["cameraReady"],
-            "fastReady": diagnostic == "ready",
-            # The separate pack is optional for core/Fast.  This lightweight
-            # verifier never loads model weights or performs inference.
-            "aiReady": ai_snapshot.ready,
-            "aiReadinessDiagnostic": ai_snapshot.diagnostic,
+            "tryOnReady": diagnostic == "ready",
             "visionBusinessReady": diagnostic == "ready",
             "businessReadinessDiagnostic": diagnostic,
             "capabilities": [
@@ -845,8 +708,7 @@ def build_v2_ready_message(hello: dict, status: dict) -> tuple[dict, set[str]]:
                 "presence_status",
                 "person_departed",
                 "ambient_light",
-                "try_on_fast",
-                *(["try_on_ai"] if diagnostic == "ready" and ai_snapshot.ready else []),
+                "try_on",
             ],
         },
     )
@@ -962,7 +824,6 @@ def debug_contract_bundle():
 @app.get("/health")
 def health():
     status = get_runtime_status()
-    ai_snapshot = official_ai_readiness_snapshot(os.environ.get("VEM_AI_MODEL_PACK"))
 
     service_status = (
         "ok"
@@ -978,8 +839,6 @@ def health():
         "mockScenario": settings.MOCK_SCENARIO,
         "cameraReady": status["cameraReady"],
         "modelReady": status["modelReady"],
-        "aiReady": ai_snapshot.ready,
-        "aiReadinessDiagnostic": ai_snapshot.diagnostic,
         "ageGenderReady": status["ageGenderReady"],
         "ageGenderMode": status["ageGenderMode"],
         "checks": status["check"]["checks"],
@@ -988,8 +847,8 @@ def health():
 
 @app.get("/v2/runtime/roles")
 def read_runtime_roles():
-    """返回 Fast 渲染与采集观察子进程的角色声明，供受控验收故障注入使用。"""
-    broker = _fast_render_broker
+    """返回 Try-On 渲染与采集观察子进程的角色声明，供受控验收故障注入使用。"""
+    broker = _try_on_render_broker
     observer = _get_acquisition_observer()
     return {
         "schemaVersion": "vem-vision-runtime-roles/v1",
@@ -1016,8 +875,8 @@ async def stop_runtime_role(role: str):
     if role == "observer":
         stopped = await _get_acquisition_observer().kill_child()
     elif role == "broker":
-        await _fast_render_broker.shutdown()
-        stopped = _fast_render_broker.pid is None
+        await _try_on_render_broker.shutdown()
+        stopped = _try_on_render_broker.pid is None
     else:
         raise HTTPException(status_code=404, detail="unknown runtime role")
     if not stopped:
@@ -1481,10 +1340,10 @@ async def broadcast_profile_update(update: dict):
 
 async def _cancel_active_attempt(reason: str) -> None:
     """Top-camera departure fences the current try-on without stopping top work."""
-    attempt_id = await _fast_attempt_registry.active_attempt_id()
+    attempt_id = await _try_on_attempt_registry.active_attempt_id()
     if attempt_id is None:
         return
-    await _publish_fast_transition(await _cancel_v2_attempt(
+    await _publish_try_on_transition(await _cancel_v2_attempt(
         attempt_id=attempt_id,
         terminal=_generated_v2_envelope(
             "vision.try_on.attempt.canceled",
@@ -1495,7 +1354,7 @@ async def _cancel_active_attempt(reason: str) -> None:
 
 async def _cancel_v2_attempt(*, attempt_id: str, terminal: dict) -> TerminalTransition | None:
     """Make cancellation immediately relinquish acquisition-only capabilities."""
-    transition = await _fast_attempt_registry.cancel_current(
+    transition = await _try_on_attempt_registry.cancel_current(
         attempt_id=attempt_id, terminal=terminal
     )
     if transition is None:
@@ -1642,7 +1501,7 @@ async def presence_broadcast_loop():
                 if result.update["message_type"] == "vision.person_departed":
                     # The departed customer's retained re-render source must
                     # never survive into another customer's interaction.
-                    _fast_adjustment_store.discard_all()
+                    _try_on_adjustment_store.discard_all()
                 await broadcast_profile_update(result.update)
 
             if (
@@ -1736,320 +1595,15 @@ async def _release_acquisition_resources(
     return errors
 
 
-async def run_v2_ai_attempt(
-    websocket: WebSocket,
-    send_lock: asyncio.Lock,
-    payload: dict,
-    owned_fast_attempt_receipts: set[AttemptReceipt],
-    connection_closed: asyncio.Event,
-) -> None:
-    """Run one attempt-scoped official AI child after the shared acquisition path."""
-    attempt_id = payload["attemptId"]
-    unavailable_terminal = _generated_v2_envelope(
-        "vision.try_on.attempt.failed",
-        {"attemptId": attempt_id, "reason": "ai_unavailable"},
-    )
-    canceled_terminal = _generated_v2_envelope(
-        "vision.try_on.attempt.canceled",
-        {"attemptId": attempt_id, "reason": "replaced"},
-    )
-    admitted_model_pack: Path | None = None
-    acceptance_evidence_enabled = bool(
-        os.environ.get("VEM_AI_ACCEPTANCE_EVIDENCE_ROOT", "").strip()
-    )
-
-    def resolve_current_ai_accepted() -> dict | None:
-        nonlocal admitted_model_pack
-        current_root = os.environ.get("VEM_AI_MODEL_PACK")
-        snapshot = official_ai_readiness_snapshot(current_root)
-        observer_ready = _acquisition_observer_ready()
-        if (
-            not snapshot.ready
-            or not observer_ready
-            or not current_root
-        ):
-            logger.warning(
-                "AI attempt admission not ready: root=%s ready=%s diag=%s observer=%s",
-                current_root,
-                snapshot.ready,
-                snapshot.diagnostic,
-                observer_ready,
-            )
-            admitted_model_pack = None
-            return None
-        admitted_model_pack = Path(current_root)
-        return _generated_v2_envelope(
-            "vision.try_on.attempt.accepted",
-            {"attemptId": attempt_id, "mode": "ai"},
-        )
-
-    preparation = await _fast_attempt_registry.prepare_admission(
-        attempt_id=attempt_id,
-        websocket=websocket,
-        send_lock=send_lock,
-        task=asyncio.current_task(),
-        canceled_terminal=canceled_terminal,
-        owner_receipts=owned_fast_attempt_receipts,
-    )
-    for transition in preparation.transitions:
-        await _publish_fast_transition(transition)
-    await _ai_attempt_execution_lock.acquire()
-    try:
-        admission = await _fast_attempt_registry.commit_prepared_admission(
-            preparation,
-            accepted=None,
-            generating=None,
-            unavailable_terminal=unavailable_terminal,
-            accepted_resolver=resolve_current_ai_accepted,
-        )
-        if not admission.is_owner:
-            for replay_message in admission.replay:
-                await _send_json_bounded(websocket, send_lock, replay_message)
-            return
-        logger.info(
-            "AI attempt admitted attemptId=%s", admission.receipt.attempt_id
-        )
-
-        receipt = admission.receipt
-        assert receipt is not None
-        assert admitted_model_pack is not None
-        if connection_closed.is_set():
-            await _publish_fast_transition(
-                await _fast_attempt_registry.cancel_owner_and_join(receipt)
-            )
-            return
-
-        lease_token = f"try-on:{receipt.attempt_id}:{receipt.generation}:{receipt.owner_token}"
-        lease_acquired = False
-        staging_dir: Path | None = None
-        ai_child = None
-        stored_result = None
-        regional_evidence_bytes = None
-        try:
-            for replay_message in admission.replay:
-                await _send_json_bounded(websocket, send_lock, replay_message)
-            await _acquire_front_io_until(
-                asyncio.get_running_loop().time() + _ACQUISITION_TIMEOUT_SECONDS
-            )
-            try:
-                owner = acquire_front_camera(
-                    "try_on_attempt", reason=f"try_on_acquisition:{attempt_id}", lease_token=lease_token
-                )
-            finally:
-                release_front_camera_io_lock()
-            if not owner.get("ok"):
-                raise GarmentFetchError(owner.get("error") or "front_camera_busy")
-            lease_acquired = True
-
-            hold_started_at = None
-            last_guidance = None
-            captured_frame = None
-            captured_source = None
-            deadline = asyncio.get_running_loop().time() + _ACQUISITION_TIMEOUT_SECONDS
-            preview_token = None
-            while asyncio.get_running_loop().time() < deadline:
-                remaining = max(0.001, deadline - asyncio.get_running_loop().time())
-                frame, source = await _read_attempt_front_frame(
-                    receipt, timeout=remaining, lease_token=lease_token
-                )
-                observation = await _get_acquisition_observer().observe(frame, timeout=remaining)
-                jpeg = observation.jpeg
-                if preview_token is None:
-                    preview_token = await _acquisition_previews.open(attempt_id, jpeg)
-                else:
-                    await _acquisition_previews.update(attempt_id, preview_token, jpeg)
-                occupancy, aligned = observation.occupancy, observation.aligned
-                now = asyncio.get_running_loop().time()
-                if occupancy == "single" and aligned:
-                    if hold_started_at is None:
-                        hold_started_at = now
-                else:
-                    hold_started_at = None
-                hold_remaining_ms = _acquisition_hold_remaining_ms(hold_started_at, now)
-                stable = hold_remaining_ms == 0
-                acquiring = _acquiring_message(
-                    attempt_id,
-                    preview_token,
-                    occupancy,
-                    aligned,
-                    hold_remaining_ms,
-                )
-                if acquiring["payload"]["guidance"] != last_guidance:
-                    await _publish_fast_transition(
-                        await _fast_attempt_registry.publish_nonterminal(receipt, acquiring)
-                    )
-                    last_guidance = acquiring["payload"]["guidance"]
-                manual = await _fast_attempt_registry.manual_capture_requested(receipt)
-                if stable or (manual and occupancy == "single" and aligned):
-                    if not stable:
-                        await _fast_attempt_registry.consume_manual_capture_request(receipt)
-                    captured_frame, captured_source = frame.copy(), source
-                    break
-                await asyncio.sleep(_ACQUISITION_POLL_SECONDS)
-            if captured_frame is None:
-                raise asyncio.TimeoutError()
-            if acceptance_evidence_enabled:
-                captured_source = _validate_captured_ai_source(captured_source)
-
-            cleanup_errors = await _release_acquisition_resources(receipt, lease_token)
-            lease_acquired = False
-            if cleanup_errors:
-                raise RuntimeError("acquisition_cleanup_failed")
-            await _publish_fast_transition(
-                await _fast_attempt_registry.publish_nonterminal(
-                    receipt,
-                    _generated_v2_envelope(
-                        "vision.try_on.attempt.generating",
-                        {"attemptId": attempt_id, "stage": "preparing"},
-                    ),
-                )
-            )
-
-            garment_source = await asyncio.wait_for(
-                _fast_runtime.fetch_garment(
-                    payload["garment"], await _fast_attempt_registry.cancel_event_for(receipt)
-                ),
-                timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
-            )
-            staging_dir = Path(tempfile.mkdtemp(prefix=f"vem-ai-attempt-{attempt_id}-"))
-            person_png = staging_dir / "person.png"
-            garment_png = staging_dir / "garment.png"
-            output_png = staging_dir / "output.png"
-            regional_evidence = (
-                staging_dir / "regional-evidence.json"
-                if acceptance_evidence_enabled
-                else None
-            )
-            ok, encoded_person = cv2.imencode(".png", captured_frame)
-            if not ok:
-                raise RuntimeError("ai_person_encode_failed")
-            person_bytes = encoded_person.tobytes()
-            person_png.write_bytes(person_bytes)
-            garment_png.write_bytes(garment_source.png_bytes)
-
-            await _publish_fast_transition(
-                await _fast_attempt_registry.publish_nonterminal(
-                    receipt,
-                    _generated_v2_envelope(
-                        "vision.try_on.attempt.generating",
-                        {"attemptId": attempt_id, "stage": "generating"},
-                    ),
-                )
-            )
-            ai_child = _ai_attempt_process_factory(admitted_model_pack)
-            await _run_owned_attempt_step(
-                receipt,
-                ai_child.run(
-                    person_png=person_png,
-                    garment_png=garment_png,
-                    output_png=output_png,
-                    regional_evidence_output=regional_evidence,
-                    captured_source=(captured_source if acceptance_evidence_enabled else None),
-                    timeout=_AI_ATTEMPT_TIMEOUT_SECONDS,
-                    template=garment_source.template,
-                ),
-                timeout=_AI_ATTEMPT_TIMEOUT_SECONDS,
-            )
-            _validate_ai_private_staging(
-                staging_dir,
-                output_png,
-                regional_evidence_output=regional_evidence,
-            )
-            output = await _read_ai_output_bytes(output_png)
-            if regional_evidence is not None:
-                regional_evidence_bytes = await asyncio.to_thread(
-                    regional_evidence.read_bytes
-                )
-            stored_result, result = _prepare_ai_result(
-                attempt_id,
-                output,
-                person_png=person_bytes,
-                garment_png=garment_source.png_bytes,
-            )
-            if regional_evidence_bytes is not None:
-                _validate_ai_regional_evidence(
-                    regional_evidence_bytes,
-                    captured_source=captured_source,
-                    person_png=person_bytes,
-                    garment_png=garment_source.png_bytes,
-                    result_png=output,
-                    result=result,
-                )
-            terminal = _generated_v2_envelope(
-                "vision.try_on.attempt.completed", {"attemptId": attempt_id, "result": result}
-            )
-        except GarmentFetchError as error:
-            terminal = _generated_v2_envelope(
-                "vision.try_on.attempt.canceled"
-                if str(error) == "attempt_canceled"
-                else "vision.try_on.attempt.failed",
-                {"attemptId": attempt_id, "reason": "replaced"}
-                if str(error) == "attempt_canceled"
-                else {"attemptId": attempt_id, "reason": "garment_rejected"},
-            )
-        except asyncio.TimeoutError:
-            terminal = _generated_v2_envelope(
-                "vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "timeout"}
-            )
-        except asyncio.CancelledError:
-            terminal = _generated_v2_envelope(
-                "vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "replaced"}
-            )
-        except Exception:
-            logger.exception("AI attempt failed attemptId=%s", attempt_id)
-            terminal = _generated_v2_envelope(
-                "vision.try_on.attempt.failed",
-                {"attemptId": attempt_id, "reason": "ai_failed"},
-            )
-        finally:
-            if ai_child is not None:
-                try:
-                    await ai_child.close()
-                except Exception:
-                    logger.exception("AI child cleanup failed attemptId=%s", attempt_id)
-            if lease_acquired:
-                await _release_acquisition_resources(receipt, lease_token)
-            if staging_dir is not None:
-                await asyncio.to_thread(shutil.rmtree, staging_dir, ignore_errors=True)
-            await _get_acquisition_observer().wait_idle()
-
-        if terminal.get("type") != "vision.try_on.attempt.completed":
-            stored_result = None
-            regional_evidence_bytes = None
-        transition = await _fast_attempt_registry.commit_terminal_transition(
-            receipt, terminal, stored_result
-        )
-        if transition is not None:
-            if (
-                transition.message.get("type") == "vision.try_on.attempt.completed"
-                and transition.message.get("payload", {}).get("attemptId")
-                == receipt.attempt_id
-                and regional_evidence_bytes is not None
-            ):
-                try:
-                    await asyncio.to_thread(
-                        publish_completed_ai_regional_evidence,
-                        attempt_id,
-                        regional_evidence_bytes,
-                    )
-                except Exception:
-                    logger.exception(
-                        "AI acceptance evidence export failed attemptId=%s",
-                        attempt_id,
-                    )
-            await _publish_fast_transition(transition)
-    finally:
-        _ai_attempt_execution_lock.release()
-
-async def run_v2_fast_attempt(
+async def run_v2_try_on_attempt(
     websocket: WebSocket,
     send_lock: asyncio.Lock,
     message: dict,
-    fast_ready: bool,
-    owned_fast_attempt_receipts: set[AttemptReceipt],
+    try_on_ready: bool,
+    owned_try_on_attempt_receipts: set[AttemptReceipt],
     connection_closed: asyncio.Event,
 ) -> None:
-    """Run one bounded Fast attempt without holding a WS or store lock on I/O."""
+    """Run one bounded Try-On attempt without holding a WS or store lock on I/O."""
     try:
         parsed = parse_v2_client_message(message)
         if parsed.type != "vision.try_on.attempt.start":
@@ -2069,56 +1623,45 @@ async def run_v2_fast_attempt(
     # Handshake readiness is a negotiation fact, not a lifetime lease on the
     # render process.  Every attempt must also observe the live broker before
     # constructing admission replay.
-    fast_ready = bool(
-        fast_ready
-        and _fast_render_broker.ready
-        and _fast_render_broker.pose_ready
+    try_on_ready = bool(
+        try_on_ready
+        and _try_on_render_broker.ready
+        and _try_on_render_broker.pose_ready
         and _acquisition_observer_ready()
     )
     attempt_id = payload["attemptId"]
-    if payload["mode"] != "fast":
-        await run_v2_ai_attempt(
-            websocket,
-            send_lock,
-            payload,
-            owned_fast_attempt_receipts,
-            connection_closed,
-        )
-        return
     unavailable_terminal = _generated_v2_envelope(
         "vision.try_on.attempt.failed",
-        {"attemptId": attempt_id, "reason": "fast_unavailable"},
+        {"attemptId": attempt_id, "reason": "try_on_unavailable"},
     )
     canceled_terminal = _generated_v2_envelope(
         "vision.try_on.attempt.canceled",
         {"attemptId": attempt_id, "reason": "replaced"},
     )
     accepted = (
-        _generated_v2_envelope(
-            "vision.try_on.attempt.accepted", {"attemptId": attempt_id, "mode": "fast"}
-        )
-        if fast_ready
+        _generated_v2_envelope("vision.try_on.attempt.accepted", {"attemptId": attempt_id})
+        if try_on_ready
         else None
     )
-    preparation = await _fast_attempt_registry.prepare_admission(
+    preparation = await _try_on_attempt_registry.prepare_admission(
         attempt_id=attempt_id,
         websocket=websocket,
         send_lock=send_lock,
         task=asyncio.current_task(),
         canceled_terminal=canceled_terminal,
-        owner_receipts=owned_fast_attempt_receipts,
+        owner_receipts=owned_try_on_attempt_receipts,
     )
     for transition in preparation.transitions:
-        await _publish_fast_transition(transition)
-    admission = await _fast_attempt_registry.commit_prepared_admission(
+        await _publish_try_on_transition(transition)
+    admission = await _try_on_attempt_registry.commit_prepared_admission(
         preparation,
         accepted=accepted,
         generating=None,
         unavailable_terminal=unavailable_terminal,
         readiness=lambda: bool(
-            fast_ready
-            and _fast_render_broker.ready
-            and _fast_render_broker.pose_ready
+            try_on_ready
+            and _try_on_render_broker.ready
+            and _try_on_render_broker.pose_ready
             and _acquisition_observer_ready()
         ),
     )
@@ -2129,8 +1672,8 @@ async def run_v2_fast_attempt(
     receipt = admission.receipt
     assert receipt is not None
     if connection_closed.is_set():
-        await _publish_fast_transition(
-            await _fast_attempt_registry.cancel_owner_and_join(receipt)
+        await _publish_try_on_transition(
+            await _try_on_attempt_registry.cancel_owner_and_join(receipt)
         )
         return
     stored_result = None
@@ -2186,14 +1729,14 @@ async def run_v2_fast_attempt(
                 hold_remaining_ms,
             )
             if acquiring["payload"]["guidance"] != last_guidance:
-                await _publish_fast_transition(
-                    await _fast_attempt_registry.publish_nonterminal(receipt, acquiring)
+                await _publish_try_on_transition(
+                    await _try_on_attempt_registry.publish_nonterminal(receipt, acquiring)
                 )
                 last_guidance = acquiring["payload"]["guidance"]
-            manual = await _fast_attempt_registry.manual_capture_requested(receipt)
+            manual = await _try_on_attempt_registry.manual_capture_requested(receipt)
             if stable or (manual and occupancy == "single" and aligned):
                 if not stable:
-                    await _fast_attempt_registry.consume_manual_capture_request(receipt)
+                    await _try_on_attempt_registry.consume_manual_capture_request(receipt)
                 # The source frame remains Vision memory, never the MJPEG representation.
                 captured_frame, source_frame = frame.copy(), source
                 break
@@ -2210,13 +1753,13 @@ async def run_v2_fast_attempt(
         generating = _generated_v2_envelope(
             "vision.try_on.attempt.generating", {"attemptId": attempt_id, "stage": "preparing"}
         )
-        await _publish_fast_transition(
-            await _fast_attempt_registry.publish_nonterminal(receipt, generating)
+        await _publish_try_on_transition(
+            await _try_on_attempt_registry.publish_nonterminal(receipt, generating)
         )
         garment_source = await asyncio.wait_for(
-            _fast_runtime.fetch_garment(
-                payload["garment"], await _fast_attempt_registry.cancel_event_for(receipt)
-            ), timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
+            _try_on_runtime.fetch_garment(
+                payload["garment"], await _try_on_attempt_registry.cancel_event_for(receipt)
+            ), timeout=_TRY_ON_ATTEMPT_TIMEOUT_SECONDS,
         )
         result_image = await _run_owned_attempt_step(
             receipt,
@@ -2225,16 +1768,16 @@ async def run_v2_fast_attempt(
                 garment_source.png_bytes,
                 digest=garment_source.digest,
                 template=garment_source.template,
-                timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
-                broker=_fast_render_broker,
+                timeout=_TRY_ON_ATTEMPT_TIMEOUT_SECONDS,
+                broker=_try_on_render_broker,
             ),
-            timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
+            timeout=_TRY_ON_ATTEMPT_TIMEOUT_SECONDS,
         )
-        stored_result, result = _prepare_fast_result(attempt_id, result_image)
-        # A completed Fast result may be re-scaled around its locked center.
+        stored_result, result = _prepare_try_on_result(attempt_id, result_image)
+        # A completed Try-On result may be re-scaled around its locked center.
         # Retain exactly the re-render inputs while the result itself lives;
         # the snapshot is Vision-owned, bounded, and never sent to Machine.
-        _fast_adjustment_store.admit(
+        _try_on_adjustment_store.admit(
             attempt_id,
             captured_frame,
             garment_source.png_bytes,
@@ -2242,7 +1785,7 @@ async def run_v2_fast_attempt(
             garment_source.template,
         )
         logger.info(
-            "Fast attempt completed attemptId=%s frameSource=%s",
+            "Try-On attempt completed attemptId=%s frameSource=%s",
             attempt_id,
             source_frame.get("source") if isinstance(source_frame, dict) else "unknown",
         )
@@ -2250,13 +1793,13 @@ async def run_v2_fast_attempt(
             "vision.try_on.attempt.completed", {"attemptId": attempt_id, "result": result}
         )
     except PoseUnavailableError as error:
-        # The contract's existing fast_failed terminal is the stable local
+        # The contract's existing try_on_failed terminal is the stable local
         # equivalent of pose_unavailable; never publish a result without
         # valid official shoulder/hip geometry.
-        logger.warning("Fast pose unavailable attemptId=%s reason=%s", attempt_id, error)
+        logger.warning("Try-On pose unavailable attemptId=%s reason=%s", attempt_id, error)
         terminal = _generated_v2_envelope(
             "vision.try_on.attempt.failed",
-            {"attemptId": attempt_id, "reason": "fast_failed"},
+            {"attemptId": attempt_id, "reason": "try_on_failed"},
         )
     except GarmentFetchError as error:
         terminal = _generated_v2_envelope(
@@ -2272,10 +1815,10 @@ async def run_v2_fast_attempt(
             "vision.try_on.attempt.canceled", {"attemptId": attempt_id, "reason": "timeout"}
         )
     except Exception:
-        logger.exception("Fast attempt failed attemptId=%s", attempt_id)
+        logger.exception("Try-On attempt failed attemptId=%s", attempt_id)
         terminal = _generated_v2_envelope(
             "vision.try_on.attempt.failed",
-            {"attemptId": attempt_id, "reason": "fast_failed"},
+            {"attemptId": attempt_id, "reason": "try_on_failed"},
         )
     except asyncio.CancelledError:
         terminal = _generated_v2_envelope(
@@ -2293,29 +1836,29 @@ async def run_v2_fast_attempt(
     # registry's atomic boundary.
     if terminal.get("type") != "vision.try_on.attempt.completed":
         stored_result = None
-    transition = await _fast_attempt_registry.commit_terminal_transition(
+    transition = await _try_on_attempt_registry.commit_terminal_transition(
         receipt, terminal, stored_result
     )
     if transition is not None:
-        await _publish_fast_transition(transition)
+        await _publish_try_on_transition(transition)
 
 
-async def run_v2_fast_adjustment(
+async def run_v2_try_on_adjustment(
     websocket: WebSocket,
     send_lock: asyncio.Lock,
     message: dict,
 ) -> None:
-    """Re-render one completed Fast result at a customer-chosen garment scale."""
+    """Re-render one completed Try-On result at a customer-chosen garment scale."""
     payload = message["payload"]
     attempt_id = payload["attemptId"]
     scale = payload["garmentScale"]
-    snapshot = _fast_adjustment_store.get(attempt_id)
+    snapshot = _try_on_adjustment_store.get(attempt_id)
     if snapshot is None:
         async with send_lock:
             await send_error(
                 websocket,
                 code="adjustment_unavailable",
-                message="the Fast adjustment source is no longer retained",
+                message="the Try-On adjustment source is no longer retained",
                 retryable=False,
                 message_id=message.get("messageId"),
             )
@@ -2326,16 +1869,16 @@ async def run_v2_fast_adjustment(
             snapshot.garment_png,
             digest=snapshot.garment_digest,
             template=snapshot.template,
-            timeout=_FAST_ATTEMPT_TIMEOUT_SECONDS,
-            broker=_fast_render_broker,
+            timeout=_TRY_ON_ATTEMPT_TIMEOUT_SECONDS,
+            broker=_try_on_render_broker,
             garment_scale=scale,
         )
-        stored_result, _public_result = _prepare_fast_result(attempt_id, result_image)
-        replaced = await _fast_attempt_registry.replace_completed_result(
+        stored_result, _public_result = _prepare_try_on_result(attempt_id, result_image)
+        replaced = await _try_on_attempt_registry.replace_completed_result(
             attempt_id, stored_result
         )
         if replaced is None:
-            raise RuntimeError("fast_adjustment_target_unavailable")
+            raise RuntimeError("try_on_adjustment_target_unavailable")
         adjusted = _generated_v2_envelope(
             "vision.try_on.result.adjusted",
             {"attemptId": attempt_id, "result": replaced},
@@ -2344,7 +1887,7 @@ async def run_v2_fast_adjustment(
             await websocket.send_json(adjusted)
     except (PoseUnavailableError, AttemptWorkerError, RuntimeError, TimeoutError):
         logger.exception(
-            "Fast adjustment failed attemptId=%s scale=%s",
+            "Try-On adjustment failed attemptId=%s scale=%s",
             attempt_id,
             scale,
         )
@@ -2352,13 +1895,13 @@ async def run_v2_fast_adjustment(
             await send_error(
                 websocket,
                 code="internal_error",
-                message="the Fast result could not be adjusted",
+                message="the Try-On result could not be adjusted",
                 retryable=False,
                 message_id=message.get("messageId"),
             )
 
 
-async def reject_v2_fast_attempt_for_backpressure(
+async def reject_v2_try_on_attempt_for_backpressure(
     websocket: WebSocket, send_lock: asyncio.Lock, message: dict
 ) -> None:
     """Reject only an overflowed *new* attempt while preserving same-ID joins."""
@@ -2367,7 +1910,6 @@ async def reject_v2_fast_attempt_for_backpressure(
         if parsed.type != "vision.try_on.attempt.start":
             raise ValueError("invalid_v2_boundary_message")
         attempt_id = parsed.payload.attemptId
-        mode = parsed.payload.mode
     except (V2ContractBundleUnavailable, ValueError):
         async with send_lock:
             await send_error(
@@ -2382,10 +1924,10 @@ async def reject_v2_fast_attempt_for_backpressure(
         "vision.try_on.attempt.failed",
         {
             "attemptId": attempt_id,
-            "reason": "ai_unavailable" if mode == "ai" else "fast_unavailable",
+            "reason": "try_on_unavailable",
         },
     )
-    admission = await _fast_attempt_registry.join_pending_or_reject(
+    admission = await _try_on_attempt_registry.join_pending_or_reject(
         attempt_id=attempt_id,
         websocket=websocket,
         send_lock=send_lock,
@@ -2422,11 +1964,11 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
     断开连接时自动清理广播注册。
     """
     send_lock = asyncio.Lock()
-    owned_fast_attempt_receipts: set[AttemptReceipt] = set()
-    fast_attempt_tasks: set[asyncio.Task] = set()
+    owned_try_on_attempt_receipts: set[AttemptReceipt] = set()
+    try_on_attempt_tasks: set[asyncio.Task] = set()
     connection_closed = asyncio.Event()
     handshake_complete = False
-    fast_attempt_ready = False
+    try_on_attempt_ready = False
 
     await websocket.accept()
     if not websocket_origin_allowed(websocket):
@@ -2532,7 +2074,7 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 async with send_lock:
                     await websocket.send_json(ready)
 
-                fast_attempt_ready = bool(ready["payload"]["fastReady"])
+                try_on_attempt_ready = bool(ready["payload"]["tryOnReady"])
 
                 # Contract incompatibility is an enhancement-only readiness
                 # fact. Presence/profile registration remains independent.
@@ -2575,7 +2117,7 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                 "vision.try_on.attempt.cancel",
                 "vision.try_on.attempt.adjust",
             }
-            is_v2_fast_attempt = (
+            is_v2_try_on_attempt = (
                 message_type == "vision.try_on.attempt.start"
                 and isinstance(payload, dict)
                 and "attemptId" in payload
@@ -2608,44 +2150,44 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
                     )
                 continue
 
-            if is_v2_fast_attempt:
-                if _fast_attempt_task_slots.locked():
-                    await reject_v2_fast_attempt_for_backpressure(websocket, send_lock, message)
+            if is_v2_try_on_attempt:
+                if _try_on_attempt_task_slots.locked():
+                    await reject_v2_try_on_attempt_for_backpressure(websocket, send_lock, message)
                     continue
-                await _fast_attempt_task_slots.acquire()
+                await _try_on_attempt_task_slots.acquire()
                 task = asyncio.create_task(
-                    run_v2_fast_attempt(
+                    run_v2_try_on_attempt(
                         websocket,
                         send_lock,
                         message,
-                        fast_attempt_ready,
-                        owned_fast_attempt_receipts,
+                        try_on_attempt_ready,
+                        owned_try_on_attempt_receipts,
                         connection_closed,
                     )
                 )
-                task.add_done_callback(lambda _: _fast_attempt_task_slots.release())
-                fast_attempt_tasks.add(task)
-                task.add_done_callback(fast_attempt_tasks.discard)
-                task.add_done_callback(_discard_completed_fast_attempt)
+                task.add_done_callback(lambda _: _try_on_attempt_task_slots.release())
+                try_on_attempt_tasks.add(task)
+                task.add_done_callback(try_on_attempt_tasks.discard)
+                task.add_done_callback(_discard_completed_try_on_attempt)
                 continue
 
             if message_type == "vision.try_on.attempt.capture":
                 # Intent is deliberately non-terminal and accepts no frame bytes.
-                await _fast_attempt_registry.request_manual_capture(payload["attemptId"])
+                await _try_on_attempt_registry.request_manual_capture(payload["attemptId"])
                 continue
 
             if message_type == "vision.try_on.attempt.adjust":
-                await run_v2_fast_adjustment(websocket, send_lock, message)
+                await run_v2_try_on_adjustment(websocket, send_lock, message)
                 continue
 
             if message_type == "vision.try_on.attempt.cancel":
                 if payload.get("reason") == "route_leave":
-                    _fast_adjustment_store.discard(payload["attemptId"])
+                    _try_on_adjustment_store.discard(payload["attemptId"])
                 terminal = _generated_v2_envelope(
                     "vision.try_on.attempt.canceled",
                     {"attemptId": payload["attemptId"], "reason": payload["reason"]},
                 )
-                await _publish_fast_transition(await _cancel_v2_attempt(
+                await _publish_try_on_transition(await _cancel_v2_attempt(
                     attempt_id=payload["attemptId"], terminal=terminal
                 ))
                 continue
@@ -2690,14 +2232,14 @@ async def websocket_session(websocket: WebSocket, allowed_client_roles: set[str]
         logger.info("WebSocket client disconnected")
     finally:
         connection_closed.set()
-        await _await_cleanup_uncancelled(_fast_attempt_registry.detach_subscriber(websocket))
-        for receipt in list(owned_fast_attempt_receipts):
+        await _await_cleanup_uncancelled(_try_on_attempt_registry.detach_subscriber(websocket))
+        for receipt in list(owned_try_on_attempt_receipts):
             await _await_cleanup_uncancelled(
                 _cancel_disconnect_owner_and_publish(receipt)
             )
-        if fast_attempt_tasks:
+        if try_on_attempt_tasks:
             await _await_cleanup_uncancelled(
-                asyncio.gather(*list(fast_attempt_tasks), return_exceptions=True)
+                asyncio.gather(*list(try_on_attempt_tasks), return_exceptions=True)
             )
         await _await_cleanup_uncancelled(unregister_profile_client(websocket))
 

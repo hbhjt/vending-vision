@@ -4,7 +4,7 @@
 
 默认 WebSocket 地址：`ws://127.0.0.1:7892/ws`
 
-本文只描述 V2 的连接、合同身份和就绪边界。画像、presence 和 Fast 试衣尝试必须在 V2
+本文只描述 V2 的连接、合同身份和就绪边界。画像、presence 和虚拟试衣尝试必须在 V2
 就绪之后按生成的合同消费；本文不定义旧式会话流程。
 
 ## 唯一合同来源
@@ -90,10 +90,10 @@ V1 hello、`protocolVersion`、`modelReady` 与所有 V1 成功条件均不受�
     "bundleVersion": "<manifest bundleVersion>",
     "contractDigest": "<manifest contractDigest>",
     "cameraReady": true,
-    "fastReady": true,
+    "tryOnReady": true,
     "visionBusinessReady": true,
     "capabilities": ["profile_push", "presence_status"],
-    "diagnostics": []
+    "businessReadinessDiagnostic": "ready"
   }
 }
 ```
@@ -110,9 +110,9 @@ V1 hello、`protocolVersion`、`modelReady` 与所有 V1 成功条件均不受�
   "schemaVersion": "unavailable",
   "bundleVersion": "unavailable",
   "contractDigest": "0000000000000000000000000000000000000000000000000000000000000000",
-  "fastReady": false,
+  "tryOnReady": false,
   "visionBusinessReady": false,
-  "diagnostics": ["contract_bundle_unavailable"]
+  "businessReadinessDiagnostic": "contract_bundle_unavailable"
 }
 ```
 
@@ -128,16 +128,20 @@ V1 hello、`protocolVersion`、`modelReady` 与所有 V1 成功条件均不受�
 
 运行时健康检查与 WebSocket 合同是不同边界；健康成功不能证明 V2 identity 已可用。
 
-## Fast 尝试与结果
+## 虚拟试衣尝试与结果
 
-Machine 仅可在 ready 后发起一个 `vision.try_on.attempt.start`。Fast 尝试会依次发布
-accepted 只是启动确认，不是生命周期 phase。客户试衣的公开 phase 是
-`acquiring -> generating -> completed`，并以 `failed` 或 `canceled` 作为 terminal。采集阶段返回当前
+Machine 仅可在 ready 后发起一个 `vision.try_on.attempt.start`。accepted 只是启动确认，
+不是生命周期 phase。当前 bundle 允许客户试衣的公开 phase 为
+`acquiring -> captured -> generating -> completed`，并以 `failed` 或 `canceled` 作为 terminal。采集阶段返回当前
 active attempt 的 rotating-token loopback HTTP MJPEG preview（固定路径
 `/v2/try-on/acquisition/preview.mjpeg?token=...`）、`streamType`、真实 occupancy、guidance
 和 `manualCaptureAllowed`。Machine 发送 capture 或仅带 `user`/`route_leave` 的 cancel；
-manual 只在 single/`hold_still` 时可用，只绕过 stability waiting，不能绕过 no-person、multiple-person
-或 alignment 保护；`ready` 会立即自动采集，不公开 manual 动作。
+manual 只在 single/`counting_down` 时可用，只绕过 stability waiting，不能绕过 no-person、multiple-person
+或 alignment 保护。
+
+bundle 已定义 captured phase，但当前 Vision runtime 尚未发布该事件或固定资源，
+仍可观测为 `acquiring -> generating -> completed`。对应 runtime rollout 将单独完成；
+消费者在此之前不得从 preview 末帧推断 captured 事实。
 
 Vision 直接拥有源帧，Machine 不从渲染后的 preview bytes 提取生成输入。capture 后 preview
 关闭且 front-camera lease 在 generating 前释放；generating 只发布 `preparing`/`rendering`
@@ -145,7 +149,7 @@ Vision 直接拥有源帧，Machine 不从渲染后的 preview bytes 提取生�
 `disconnect`、`departure`、`replaced`、`timeout`。一个 machine-wide 非 terminal attempt
 以及 attempt identity fencing 保证 replacement、departure、disconnect、timeout 和 late
 worker output 不会污染新交互。top-camera presence/departure/ambient 贯穿全流程，try-on
-route 内 profile 不触发导航，也不存在 automaticFast/AI fallback。
+route 内 profile 不触发导航，也不存在模式选择或自动回退。
 
 ## 验证与兼容性
 
