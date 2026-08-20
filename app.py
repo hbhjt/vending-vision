@@ -67,7 +67,7 @@ from vision.profile_push import collect_front_profile_update, collect_profile_up
 from vision.protocol import APP_VERSION, PROTOCOL, envelope, error_envelope
 from vision.self_check import check_camera, run_self_check
 from vision.session_state import get_vision_session_status
-from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError, PoseUnavailableError
+from vision.garment_composer import GarmentComposer, GarmentFetchError, PoseUnavailableError
 from vision.fast_attempt_registry import AttemptReceipt, FastAttemptRegistry, TerminalTransition
 from vision.fast_adjustment_store import FastAdjustmentStore
 from vision.attempt_worker import AttemptWorkerError, FastRenderBroker, render_attempt_frame
@@ -104,7 +104,7 @@ _FAST_ATTEMPT_TIMEOUT_SECONDS = 15
 _AI_ATTEMPT_TIMEOUT_SECONDS = 600
 _FAST_ATTEMPT_MAX_TASKS = 2
 _FAST_TERMINAL_SEND_TIMEOUT_SECONDS = 0.25
-_fast_runtime = FastTryOnRuntime()
+_fast_runtime = GarmentComposer()
 _fast_attempt_registry = FastAttemptRegistry(
     terminal_ttl_seconds=_FAST_RESULT_TTL_SECONDS,
     result_max_count=_FAST_RESULT_MAX_COUNT,

@@ -28,15 +28,26 @@ _TEST_POSE_FIXTURE = {
 }
 
 
+def _short_sleeve_garment(height: int, width: int, alpha: int = 220) -> np.ndarray:
+    """A connected, padded short-sleeve fixture accepted by source validation."""
+    garment = np.zeros((height, width, 4), dtype=np.uint8)
+    colour = (20, 120, 220, alpha)
+    torso_left, torso_right = width * 32 // 100, width * 68 // 100
+    garment[height * 3 // 100 : height * 97 // 100, torso_left:torso_right] = colour
+    garment[height * 15 // 100 : height * 48 // 100, width * 6 // 100 : torso_left] = colour
+    garment[height * 15 // 100 : height * 48 // 100, torso_right : width * 94 // 100] = colour
+    return garment
+
+
 def _test_fixture_render_worker_target(connection, test_pose_fixture):
     """Spawn-safe test worker; it is intentionally outside packaged Vision code."""
     from multiprocessing import shared_memory
 
-    from vision.fast_tryon import (
-        FastTryOnRuntime,
+    from vision.garment_composer import (
+        GarmentComposer,
         GarmentFetchError,
         PoseUnavailableError,
-        ValidatedGarmentSource,
+        TransparentGarmentSource,
     )
 
     class TestFixturePoseEstimator:
@@ -47,7 +58,7 @@ def _test_fixture_render_worker_target(connection, test_pose_fixture):
                 points[index] = SimpleNamespace(x=x, y=y, visibility=visibility)
             return SimpleNamespace(pose_landmarks=SimpleNamespace(landmark=points))
 
-    runtime = FastTryOnRuntime(pose_estimator=TestFixturePoseEstimator())
+    runtime = GarmentComposer(pose_estimator=TestFixturePoseEstimator())
     connection.send(("ready", {"pid": os.getpid(), "poseReady": True}))
     try:
         while True:
@@ -68,12 +79,12 @@ def _test_fixture_render_worker_target(connection, test_pose_fixture):
                     shm.close()
                 garment = payload["garmentPng"]
                 digest = "sha256:" + hashlib.sha256(garment).hexdigest()
-                source = ValidatedGarmentSource(
+                source = TransparentGarmentSource(
                     png_bytes=garment,
                     digest=digest,
                     template=payload["template"],
                 )
-                connection.send(("ok", runtime.render(frame, source)))
+                connection.send(("ok", runtime.compose(frame, source, 1.0).png))
             except BaseException as exc:
                 kind = (
                     "garment_error"
@@ -231,28 +242,28 @@ def _pose_error_then_success_target(connection, counter):
 
 
 def _blocked_worker_encode_target(connection, entered, test_pose_fixture):
-    import vision.fast_tryon as fast_tryon
+    import vision.garment_composer as garment_composer
 
     def blocked_encode(*_args, **_kwargs):
         entered.set()
         while True:
             time.sleep(1)
 
-    fast_tryon.cv2.imencode = blocked_encode
+    garment_composer.cv2.imencode = blocked_encode
     _test_fixture_render_worker_target(connection, test_pose_fixture)
 
 
 def _slow_worker_encode_target(connection, entered, delay_seconds, test_pose_fixture):
-    import vision.fast_tryon as fast_tryon
+    import vision.garment_composer as garment_composer
 
-    real_encode = fast_tryon.cv2.imencode
+    real_encode = garment_composer.cv2.imencode
 
     def slow_encode(*args, **kwargs):
         entered.set()
         time.sleep(delay_seconds)
         return real_encode(*args, **kwargs)
 
-    fast_tryon.cv2.imencode = slow_encode
+    garment_composer.cv2.imencode = slow_encode
     _test_fixture_render_worker_target(connection, test_pose_fixture)
 
 
@@ -546,8 +557,7 @@ def test_prestarted_render_broker_rejects_real_max_images_without_blocking_or_le
 
 
 def test_prestarted_render_broker_completes_one_real_encoded_job():
-    garment = np.zeros((256, 192, 4), dtype=np.uint8)
-    garment[8:248, 12:180] = (20, 120, 220, 220)
+    garment = _short_sleeve_garment(256, 192)
     ok, encoded_garment = cv2.imencode(".png", garment)
     assert ok
     garment_png = encoded_garment.tobytes()
@@ -586,8 +596,7 @@ def test_production_render_request_does_not_call_parent_connection_send(monkeypa
     """Fast render request metadata must not depend on parent-side Pipe send."""
     from multiprocessing.connection import Connection
 
-    garment = np.zeros((256, 192, 4), dtype=np.uint8)
-    garment[8:248, 12:180] = (20, 120, 220, 220)
+    garment = _short_sleeve_garment(256, 192)
     ok, encoded_garment = cv2.imencode(".png", garment)
     assert ok
     garment_png = encoded_garment.tobytes()
@@ -771,8 +780,7 @@ def test_render_worker_rejects_wrong_request_generation_before_shm_attach(monkey
 
 
 def test_parent_cv2_encode_block_cannot_enter_the_prestarted_render_path(monkeypatch):
-    garment = np.zeros((256, 192, 4), dtype=np.uint8)
-    garment[8:248, 12:180] = (20, 120, 220, 220)
+    garment = _short_sleeve_garment(256, 192)
     ok, encoded_garment = cv2.imencode(".png", garment)
     assert ok
     garment_png = encoded_garment.tobytes()
@@ -827,7 +835,10 @@ def test_parent_cv2_encode_block_cannot_enter_the_prestarted_render_path(monkeyp
 def test_cancel_joins_blocked_native_encode_then_readies_one_replacement():
     context = multiprocessing.get_context("spawn")
     entered = context.Event()
-    garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
+    garment = np.zeros((64, 48, 4), dtype=np.uint8)
+    garment[3:61, 14:34] = (20, 120, 220, 255)
+    garment[10:36, 3:14] = (20, 120, 220, 255)
+    garment[10:36, 34:45] = (20, 120, 220, 255)
     ok, encoded = cv2.imencode(".png", garment)
     assert ok
     garment_png = encoded.tobytes()
@@ -885,7 +896,10 @@ def test_cancel_joins_blocked_native_encode_then_readies_one_replacement():
 def test_worker_slow_encode_times_out_then_readies_one_replacement():
     context = multiprocessing.get_context("spawn")
     entered = context.Event()
-    garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
+    garment = np.zeros((64, 48, 4), dtype=np.uint8)
+    garment[3:61, 14:34] = (20, 120, 220, 255)
+    garment[10:36, 3:14] = (20, 120, 220, 255)
+    garment[10:36, 34:45] = (20, 120, 220, 255)
     ok, encoded = cv2.imencode(".png", garment)
     assert ok
     garment_png = encoded.tobytes()
@@ -988,7 +1002,10 @@ def test_cancelled_blocked_render_is_joined_before_controlled_recovery():
 def test_crashed_render_is_joined_and_one_replacement_is_prestarted():
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
-    garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
+    garment = np.zeros((64, 48, 4), dtype=np.uint8)
+    garment[3:61, 14:34] = (20, 120, 220, 255)
+    garment[10:36, 3:14] = (20, 120, 220, 255)
+    garment[10:36, 34:45] = (20, 120, 220, 255)
     ok, encoded = cv2.imencode(".png", garment)
     assert ok
     garment_png = encoded.tobytes()
@@ -1034,11 +1051,14 @@ def test_crashed_render_is_joined_and_one_replacement_is_prestarted():
 
 def test_pose_failures_are_typed_attempt_outcomes_and_keep_the_worker_pid():
     """Blank/no-person/degenerate pose failures do not kill a healthy worker."""
-    from vision.fast_tryon import PoseUnavailableError
+    from vision.garment_composer import PoseUnavailableError
 
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
-    garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
+    garment = np.zeros((64, 48, 4), dtype=np.uint8)
+    garment[3:61, 14:34] = (20, 120, 220, 255)
+    garment[10:36, 3:14] = (20, 120, 220, 255)
+    garment[10:36, 34:45] = (20, 120, 220, 255)
     ok, encoded = cv2.imencode(".png", garment)
     assert ok
     garment_png = encoded.tobytes()
@@ -1077,7 +1097,10 @@ def test_pose_failures_are_typed_attempt_outcomes_and_keep_the_worker_pid():
 
 def test_stale_render_ipc_response_aborts_slot_and_fails_closed_without_restart():
     context = multiprocessing.get_context("spawn")
-    garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
+    garment = np.zeros((64, 48, 4), dtype=np.uint8)
+    garment[3:61, 14:34] = (20, 120, 220, 255)
+    garment[10:36, 3:14] = (20, 120, 220, 255)
+    garment[10:36, 34:45] = (20, 120, 220, 255)
     ok, encoded = cv2.imencode(".png", garment)
     assert ok
     garment_png = encoded.tobytes()
@@ -1308,7 +1331,10 @@ def test_cancelled_render_start_caller_does_not_cancel_shared_worker_start():
 def test_concurrent_render_start_is_rejected_without_worker_or_queue_growth():
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
-    garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
+    garment = np.zeros((64, 48, 4), dtype=np.uint8)
+    garment[3:61, 14:34] = (20, 120, 220, 255)
+    garment[10:36, 3:14] = (20, 120, 220, 255)
+    garment[10:36, 34:45] = (20, 120, 220, 255)
     ok, encoded = cv2.imencode(".png", garment)
     assert ok
     garment_png = encoded.tobytes()
@@ -1518,7 +1544,10 @@ def test_render_broker_can_start_a_new_generation_after_completed_shutdown():
 def test_shutdown_joins_a_blocked_render_without_starting_a_replacement():
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
-    garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
+    garment = np.zeros((64, 48, 4), dtype=np.uint8)
+    garment[3:61, 14:34] = (20, 120, 220, 255)
+    garment[10:36, 3:14] = (20, 120, 220, 255)
+    garment[10:36, 34:45] = (20, 120, 220, 255)
     ok, encoded = cv2.imencode(".png", garment)
     assert ok
     garment_png = encoded.tobytes()
@@ -1564,7 +1593,10 @@ def test_shutdown_joins_a_blocked_render_without_starting_a_replacement():
 def test_blocked_render_timeout_joins_before_controlled_recovery():
     context = multiprocessing.get_context("spawn")
     counter = context.Value("i", 0)
-    garment = np.full((64, 48, 4), (20, 120, 220, 255), dtype=np.uint8)
+    garment = np.zeros((64, 48, 4), dtype=np.uint8)
+    garment[3:61, 14:34] = (20, 120, 220, 255)
+    garment[10:36, 3:14] = (20, 120, 220, 255)
+    garment[10:36, 34:45] = (20, 120, 220, 255)
     ok, encoded = cv2.imencode(".png", garment)
     assert ok
     garment_png = encoded.tobytes()

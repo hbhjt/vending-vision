@@ -31,17 +31,17 @@ _POSE_READY = False
 
 def _initialize_runtime():
     global _FAST_RUNTIME, _POSE_READY
-    from vision.fast_tryon import FastTryOnRuntime
+    from vision.garment_composer import GarmentComposer
 
     try:
         pose_module = __import__("vision." + "pose_estimator", fromlist=["PoseEstimator"])
         estimator = pose_module.PoseEstimator()
-        _FAST_RUNTIME = FastTryOnRuntime(pose_estimator=estimator)
+        _FAST_RUNTIME = GarmentComposer(pose_estimator=estimator)
         _POSE_READY = True
     except Exception:
         # The worker stays alive so the parent can report Fast degradation;
         # camera/presence/health remain owned by the main Vision process.
-        _FAST_RUNTIME = FastTryOnRuntime(pose_estimator=None)
+        _FAST_RUNTIME = GarmentComposer(pose_estimator=None)
         _POSE_READY = False
     return _FAST_RUNTIME
 
@@ -55,7 +55,7 @@ def _render(
     """Decode, prepare and render entirely inside the bounded child."""
     import numpy as np
 
-    from vision.fast_tryon import GarmentFetchError, ValidatedGarmentSource
+    from vision.garment_composer import GarmentFetchError, TransparentGarmentSource
 
     if not isinstance(payload, dict) or set(payload) != {
         "frameShared",
@@ -131,17 +131,17 @@ def _render(
         frame = np.ndarray((height, width, channels), dtype=np.uint8, buffer=shm.buf).copy()
     finally:
         shm.close()
-    source = ValidatedGarmentSource(
+    source = TransparentGarmentSource(
         png_bytes=garment_png,
         digest=digest,
         template=payload["template"],
     )
     runtime = _FAST_RUNTIME or _initialize_runtime()
     if not _POSE_READY:
-        from vision.fast_tryon import PoseUnavailableError
+        from vision.garment_composer import PoseUnavailableError
 
         raise PoseUnavailableError("pose_unavailable")
-    result = runtime.render(frame, source, garment_scale=garment_scale)
+    result = runtime.compose(frame, source, garment_scale).png
     if len(result) > MAX_RESULT_BYTES:
         raise RuntimeError("fast result exceeds render cap")
     return result
@@ -172,7 +172,7 @@ def render_worker_entry(connection: Connection) -> None:
                     )
                 )
             except BaseException as exc:
-                from vision.fast_tryon import GarmentFetchError, PoseUnavailableError
+                from vision.garment_composer import GarmentFetchError, PoseUnavailableError
 
                 kind = (
                     "garment_error"

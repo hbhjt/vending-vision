@@ -12,7 +12,7 @@ import numpy as np
 
 from vision.acquisition_observer import AcquisitionObservationWorker
 from vision.attempt_worker import FastRenderBroker
-from vision.fast_tryon import PoseUnavailableError
+from vision.garment_composer import PoseUnavailableError
 
 
 def _probe_garment_png() -> bytes:

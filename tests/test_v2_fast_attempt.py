@@ -112,7 +112,12 @@ def _fast_pose_error_then_success_target(connection, counter):
 
 
 def _png_bytes():
-    image = np.full((48, 36, 4), (20, 120, 220, 255), dtype=np.uint8)
+    # Production rejects clipped sources.  Keep a four-sided transparent
+    # margin and a real bilateral short-sleeve silhouette for V2 attempts.
+    image = np.zeros((112, 100, 4), dtype=np.uint8)
+    image[18:94, 25:75] = (20, 120, 220, 255)
+    image[32:58, 8:27] = (20, 120, 220, 255)
+    image[32:58, 73:92] = (20, 120, 220, 255)
     ok, encoded = cv2.imencode(".png", image)
     assert ok
     return encoded.tobytes()
@@ -355,6 +360,8 @@ def test_v2_fast_attempt_accepts_generated_start_and_returns_tokenized_png(
     _configure_recorded_front(monkeypatch)
     garment_image = np.zeros((4096, 4096, 4), dtype=np.uint8)
     garment_image[384:3712, 640:3456] = (20, 120, 220, 220)
+    garment_image[960:1920, 256:704] = (20, 120, 220, 220)
+    garment_image[960:1920, 3392:3840] = (20, 120, 220, 220)
     ok, encoded_garment = cv2.imencode(".png", garment_image)
     assert ok
     garment = encoded_garment.tobytes()

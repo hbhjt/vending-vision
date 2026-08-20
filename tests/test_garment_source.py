@@ -9,7 +9,10 @@ import pytest
 
 
 def png_bytes(color=(20, 120, 220, 255)):
-    image = np.full((48, 36, 4), color, dtype=np.uint8)
+    image = np.zeros((48, 36, 4), dtype=np.uint8)
+    image[3:45, 10:25] = color  # torso
+    image[8:28, 3:10] = color  # short left sleeve
+    image[8:28, 25:33] = color  # short right sleeve
     ok, encoded = cv2.imencode(".png", image)
     assert ok
     return encoded.tobytes()
@@ -74,10 +77,10 @@ def garment_server():
     thread.join()
 
 
-def test_fast_runtime_downloads_only_declared_loopback_png_and_composites_a_decodable_result(
+def test_garment_source_downloads_only_declared_loopback_png_and_composes_a_decodable_result(
     garment_server,
 ):
-    from vision.fast_tryon import FastTryOnRuntime
+    from vision.garment_composer import GarmentComposer
 
     garment = GarmentHandler.payload
     class DeterministicPoseEstimator:
@@ -89,7 +92,7 @@ def test_fast_runtime_downloads_only_declared_loopback_png_and_composites_a_deco
                 points[index] = type("Point", (), {"x": x, "y": y, "visibility": 0.95})()
             return type("Pose", (), {"pose_landmarks": type("Landmarks", (), {"landmark": points})()})()
 
-    runtime = FastTryOnRuntime(
+    runtime = GarmentComposer(
         max_garment_bytes=1024 * 1024, pose_estimator=DeterministicPoseEstimator()
     )
     prepared = asyncio.run(runtime.fetch_garment(
@@ -102,7 +105,7 @@ def test_fast_runtime_downloads_only_declared_loopback_png_and_composites_a_deco
         }
     ))
     frame = np.full((160, 120, 3), (235, 220, 205), dtype=np.uint8)
-    result = runtime.render(frame, prepared)
+    result = runtime.compose(frame, prepared, 1.0).png
 
     decoded = cv2.imdecode(np.frombuffer(result, dtype=np.uint8), cv2.IMREAD_COLOR)
     assert decoded is not None
@@ -113,10 +116,10 @@ def test_fast_runtime_downloads_only_declared_loopback_png_and_composites_a_deco
     assert np.count_nonzero(torso[:, :, 0] != frame[int(frame.shape[0] * 0.34) : int(frame.shape[0] * 0.68), :, 0]) > 100
 
 
-def test_fast_runtime_rejects_redirect_and_digest_mismatch(garment_server):
-    from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
+def test_garment_source_rejects_redirect_and_digest_mismatch(garment_server):
+    from vision.garment_composer import GarmentComposer, GarmentFetchError
 
-    runtime = FastTryOnRuntime(max_garment_bytes=1024 * 1024)
+    runtime = GarmentComposer(max_garment_bytes=1024 * 1024)
     descriptor = {
         "reference": garment_server,
         "digest": "sha256:" + "0" * 64,
@@ -135,8 +138,8 @@ def test_fast_runtime_rejects_redirect_and_digest_mismatch(garment_server):
         GarmentHandler.redirect = False
 
 
-def test_fast_runtime_rejects_png_bomb_dimensions_before_decode(garment_server):
-    from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
+def test_garment_source_rejects_png_bomb_dimensions_before_decode(garment_server):
+    from vision.garment_composer import GarmentComposer, GarmentFetchError
 
     oversized_ihdr = (
         b"\x89PNG\r\n\x1a\n"
@@ -152,7 +155,7 @@ def test_fast_runtime_rejects_png_bomb_dimensions_before_decode(garment_server):
     )
     GarmentHandler.payload = oversized_ihdr
     try:
-        runtime = FastTryOnRuntime(max_garment_bytes=1024 * 1024)
+        runtime = GarmentComposer(max_garment_bytes=1024 * 1024)
         with pytest.raises(GarmentFetchError, match="png_dimensions"):
             asyncio.run(runtime.fetch_garment(
                 {
@@ -167,7 +170,7 @@ def test_fast_runtime_rejects_png_bomb_dimensions_before_decode(garment_server):
         GarmentHandler.payload = png_bytes()
 
 
-def test_fast_runtime_cancels_a_slow_drip_and_closes_its_stream():
+def test_garment_source_cancels_a_slow_drip_and_closes_its_stream():
     """A replacement never leaves a blocking response reader behind."""
     SlowDripHandler.streaming.clear()
     SlowDripHandler.closed.clear()
@@ -176,7 +179,7 @@ def test_fast_runtime_cancels_a_slow_drip_and_closes_its_stream():
     thread.start()
 
     async def exercise():
-        runtime = FastTryOnRuntime(max_garment_bytes=1024 * 1024)
+        runtime = GarmentComposer(max_garment_bytes=1024 * 1024)
         canceled = asyncio.Event()
         task = asyncio.create_task(
             runtime.fetch_garment(
@@ -199,7 +202,7 @@ def test_fast_runtime_cancels_a_slow_drip_and_closes_its_stream():
         assert task.done()
         assert await asyncio.to_thread(SlowDripHandler.closed.wait, 5.0)
 
-    from vision.fast_tryon import FastTryOnRuntime, GarmentFetchError
+    from vision.garment_composer import GarmentComposer, GarmentFetchError
 
     try:
         asyncio.run(exercise())

@@ -1,4 +1,4 @@
-"""Bounded, local-only Fast virtual try-on primitive.
+"""Bounded, local-only garment composition primitive.
 
 The runtime receives only a daemon-issued loopback PNG descriptor.  It never
 contacts platform services or follows redirects, and derives placement from the
@@ -34,13 +34,49 @@ class PreparedGarment:
     template: str
     alpha_mask: np.ndarray
     opaque_bounds: tuple[int, int, int, int]
+    sleeve_semantics: str
+    quality: "GarmentQualityFacts"
 
 
 @dataclass(frozen=True)
-class ValidatedGarmentSource:
+class TransparentGarmentSource:
     png_bytes: bytes
     digest: str
     template: str
+
+
+@dataclass(frozen=True)
+class GarmentQualityFacts:
+    digest: str
+    opaque_pixel_count: int
+    opaque_ratio: float
+    source_aspect_ratio: float
+    sleeve_semantics: str
+
+
+@dataclass(frozen=True)
+class _SleeveContourFacts:
+    """Source-only evidence used to validate a declared sleeve template."""
+
+    has_bilateral_short_sleeves: bool
+    has_wrist_length_sleeves: bool
+
+
+@dataclass(frozen=True)
+class CompositionGeometryFacts:
+    garment_digest: str
+    source_aspect_ratio: float
+    placed_aspect_ratio: float
+    center: tuple[float, float]
+    width: float
+    height: float
+    rotation_degrees: float
+
+
+@dataclass(frozen=True)
+class CompositionResult:
+    png: bytes
+    geometry: CompositionGeometryFacts
 
 
 @dataclass(frozen=True)
@@ -72,7 +108,71 @@ _POSE_LANDMARKS = {
 }
 
 
-class FastTryOnRuntime:
+def _source_row_edges(rows: np.ndarray, width: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return source-mask left/right opaque edges for each supplied row."""
+    left = np.argmax(rows, axis=1)
+    right = width - 1 - np.argmax(rows[:, ::-1], axis=1)
+    return left, right
+
+
+def _classify_source_sleeve_contour(source_bbox: np.ndarray) -> _SleeveContourFacts:
+    """Classify source-only short and wrist-length sleeve silhouette evidence."""
+    height, width = source_bbox.shape
+    row_widths = np.count_nonzero(source_bbox, axis=1)
+
+    # A short-sleeve declaration needs sustained, roughly symmetric expansion
+    # on both sides of a lower-torso reference; a wide rectangle alone is not
+    # sufficient evidence.
+    torso_rows = source_bbox[height * 3 // 4 : height * 19 // 20]
+    torso_lefts, torso_rights = _source_row_edges(torso_rows, width)
+    torso_left = float(np.median(torso_lefts))
+    torso_right = float(np.median(torso_rights))
+    torso_width = torso_right - torso_left + 1.0
+    shoulder_rows = source_bbox[height * 3 // 20 : height * 3 // 5]
+    shoulder_lefts, shoulder_rights = _source_row_edges(shoulder_rows, width)
+    left_expansion = torso_left - shoulder_lefts
+    right_expansion = shoulder_rights - torso_right
+    minimum_expansion = max(3.0, torso_width * 0.08)
+    bilateral_sleeve_rows = (
+        (left_expansion >= minimum_expansion)
+        & (right_expansion >= minimum_expansion)
+        & (
+            np.minimum(left_expansion, right_expansion)
+            / np.maximum(1.0, np.maximum(left_expansion, right_expansion))
+            >= 0.55
+        )
+    )
+    has_bilateral_short_sleeves = np.count_nonzero(bilateral_sleeve_rows) >= max(
+        5, len(shoulder_rows) // 5
+    )
+
+    # Wrist-length sleeves are a distinct lower-body expansion relative to
+    # the terminal torso width.
+    terminal_width = float(np.quantile(row_widths[height * 3 // 4 :], 0.15))
+    terminal_rows = source_bbox[row_widths <= terminal_width * 1.05]
+    terminal_lefts, terminal_rights = _source_row_edges(terminal_rows, width)
+    terminal_left = float(np.median(terminal_lefts))
+    terminal_right = float(np.median(terminal_rights))
+    lower_start, lower_stop = height * 3 // 5, height * 19 // 20
+    lower_rows = source_bbox[lower_start:lower_stop]
+    lower_widths = row_widths[lower_start:lower_stop]
+    lower_left, lower_right = _source_row_edges(lower_rows, width)
+    outward = max(2.0, width * 0.05)
+    expanded_bilateral_rows = (
+        (lower_widths >= terminal_width * 1.25)
+        & (lower_left <= terminal_left - outward)
+        & (lower_right >= terminal_right + outward)
+    )
+    has_wrist_length_sleeves = np.count_nonzero(expanded_bilateral_rows) >= max(
+        3, len(lower_rows) // 4
+    )
+    return _SleeveContourFacts(
+        has_bilateral_short_sleeves=has_bilateral_short_sleeves,
+        has_wrist_length_sleeves=has_wrist_length_sleeves,
+    )
+
+
+class GarmentComposer:
     def __init__(
         self,
         max_garment_bytes: int = 8 * 1024 * 1024,
@@ -86,7 +186,7 @@ class FastTryOnRuntime:
 
     async def fetch_garment(
         self, descriptor: dict, cancel_event=None
-    ) -> ValidatedGarmentSource:
+    ) -> TransparentGarmentSource:
         reference = descriptor.get("reference")
         if not isinstance(reference, str):
             raise GarmentFetchError("reference")
@@ -158,13 +258,13 @@ class FastTryOnRuntime:
             "template"
         ) not in {"tshirt_short_sleeve", "tshirt_long_sleeve"}:
             raise GarmentFetchError("descriptor")
-        return ValidatedGarmentSource(
+        return TransparentGarmentSource(
             png_bytes=payload,
             digest=digest,
             template=descriptor["template"],
         )
 
-    def prepare_garment(self, source: ValidatedGarmentSource) -> PreparedGarment:
+    def prepare_garment(self, source: TransparentGarmentSource) -> PreparedGarment:
         if len(source.png_bytes) > self.max_garment_bytes:
             raise GarmentFetchError("byte_size")
         digest = "sha256:" + hashlib.sha256(source.png_bytes).hexdigest()
@@ -179,6 +279,16 @@ class FastTryOnRuntime:
         if source.template not in {"tshirt_short_sleeve", "tshirt_long_sleeve"}:
             raise GarmentFetchError("descriptor")
         alpha_mask = np.where(rgba[:, :, 3] >= 12, 255, 0).astype(np.uint8)
+        if not np.any(rgba[:, :, 3] < 12):
+            raise GarmentFetchError("transparent_boundary")
+        if not np.any(alpha_mask):
+            raise GarmentFetchError("transparent_png")
+        # Component validity is a source-quality fact. It must precede the
+        # boundary-noise close, which can otherwise fuse distinct silhouettes.
+        raw_component_count, _labels = cv2.connectedComponents(alpha_mask)
+        if raw_component_count != 2:
+            raise GarmentFetchError("garment_quality")
+        source_alpha_mask = alpha_mask
         # Keep source cut-outs (neckline and transparent hem) while closing
         # only single-pixel encode noise at the garment boundary.
         alpha_mask = cv2.morphologyEx(
@@ -193,6 +303,24 @@ class FastTryOnRuntime:
         if points is None:
             raise GarmentFetchError("transparent_png")
         x, y, width, height = cv2.boundingRect(points)
+        opaque_pixel_count = int(np.count_nonzero(alpha_mask))
+        opaque_ratio = opaque_pixel_count / float(alpha_mask.size)
+        if opaque_ratio < 0.04 or width < 8 or height < 8:
+            raise GarmentFetchError("garment_quality")
+        component_count, _labels = cv2.connectedComponents(alpha_mask)
+        if component_count != 2:
+            raise GarmentFetchError("garment_quality")
+        if x == 0 or y == 0 or x + width == rgba.shape[1] or y + height == rgba.shape[0]:
+            raise GarmentFetchError("garment_cropped")
+        sleeve_semantics = "long" if source.template == "tshirt_long_sleeve" else "short"
+        source_bbox = source_alpha_mask[y : y + height, x : x + width] > 0
+        sleeve_contour = _classify_source_sleeve_contour(source_bbox)
+        if sleeve_semantics == "long" and not sleeve_contour.has_wrist_length_sleeves:
+            raise GarmentFetchError("template_mismatch")
+        if sleeve_semantics == "short" and sleeve_contour.has_wrist_length_sleeves:
+            raise GarmentFetchError("template_mismatch")
+        if sleeve_semantics == "short" and not sleeve_contour.has_bilateral_short_sleeves:
+            raise GarmentFetchError("garment_quality")
         # This preparation is attempt-local: it is deterministically derived
         # from source PNG + template + verified digest and is discarded after
         # rendering. No garment anchors or product tuning cross the boundary.
@@ -202,6 +330,14 @@ class FastTryOnRuntime:
             template=source.template,
             alpha_mask=alpha_mask,
             opaque_bounds=(x, y, width, height),
+            sleeve_semantics=sleeve_semantics,
+            quality=GarmentQualityFacts(
+                digest=digest,
+                opaque_pixel_count=opaque_pixel_count,
+                opaque_ratio=opaque_ratio,
+                source_aspect_ratio=width / float(height),
+                sleeve_semantics=sleeve_semantics,
+            ),
         )
 
     @staticmethod
@@ -357,8 +493,8 @@ class FastTryOnRuntime:
         )
 
     @staticmethod
-    def _protected_regions(geometry: PoseGeometry, width: int, height: int) -> np.ndarray:
-        """Return head/face and visible-arm regions that must remain original."""
+    def _foreground_occlusion(geometry: PoseGeometry, width: int, height: int, sleeve_semantics: str) -> np.ndarray:
+        """Return only the person pixels that correctly belong in front."""
         protected = np.zeros((height, width), dtype=np.uint8)
         points = geometry.landmarks
         span = geometry.shoulder_span
@@ -386,15 +522,18 @@ class FastTryOnRuntime:
             wrist = points.get(f"{side}_wrist")
             if shoulder is None or elbow is None:
                 continue
-            arm = [shoulder, elbow]
+            if sleeve_semantics == "short" and wrist is not None:
+                # A short sleeve owns shoulder-to-elbow. Only the exposed
+                # forearm and hand return to the camera foreground.
+                start = shoulder + (elbow - shoulder) * 0.72
+                cv2.line(protected, tuple(np.rint(start).astype(int)), tuple(np.rint(wrist).astype(int)), 255, max(8, round(span * 0.12)), cv2.LINE_AA)
+            elif sleeve_semantics == "long" and wrist is not None:
+                across_distance = abs(float(np.dot(wrist - geometry.shoulder_center, geometry.across_unit)))
+                if across_distance <= span * 0.65:
+                    cv2.line(protected, tuple(np.rint(elbow).astype(int)), tuple(np.rint(wrist).astype(int)), 255, max(9, round(span * 0.14)), cv2.LINE_AA)
             if wrist is not None:
-                arm.append(wrist)
-            arm_axis = arm[-1] - arm[0]
-            normal = np.array([-arm_axis[1], arm_axis[0]], dtype=np.float32)
-            normal /= max(float(np.linalg.norm(normal)), 1e-6)
-            radius = span * 0.17
-            polygon = np.asarray([arm[0] + normal * radius, arm[0] - normal * radius, arm[-1] - normal * radius * 0.65, arm[-1] + normal * radius * 0.65], dtype=np.float32).astype(np.int32)
-            cv2.fillConvexPoly(protected, polygon, 255)
+                palm = wrist + (wrist - elbow) * 0.08
+                cv2.circle(protected, tuple(np.rint(palm).astype(int)), max(8, round(span * 0.09)), 255, -1, cv2.LINE_AA)
         return protected
 
     def _resolve_pose(self, frame: np.ndarray, pose_results=None) -> PoseGeometry:
@@ -407,58 +546,71 @@ class FastTryOnRuntime:
                 raise PoseUnavailableError("pose_unavailable") from exc
         return self.pose_geometry(pose_results, frame.shape[1], frame.shape[0])
 
-    def render(
+    def compose(
         self,
-        frame: np.ndarray,
-        garment: PreparedGarment | ValidatedGarmentSource,
-        *,
-        pose_results=None,
-        garment_scale: float = 1.0,
-    ) -> bytes:
-        if isinstance(garment, ValidatedGarmentSource):
+        captured_frame: np.ndarray,
+        transparent_garment_source: PreparedGarment | TransparentGarmentSource,
+        scale: float,
+    ) -> CompositionResult:
+        """Compose one captured frame and source into PNG plus stable facts."""
+        garment = transparent_garment_source
+        if isinstance(garment, TransparentGarmentSource):
             garment = self.prepare_garment(garment)
-        garment_scale = float(garment_scale)
-        if not math.isfinite(garment_scale):
+        garment_scale = float(scale)
+        if not math.isfinite(garment_scale) or garment_scale < 0.8 or garment_scale > 1.6:
             raise PoseUnavailableError("pose_unavailable")
-        garment_scale = min(1.6, max(0.8, garment_scale))
-        height, width = frame.shape[:2]
+        frame = captured_frame
         if frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8:
             raise PoseUnavailableError("pose_unavailable")
-        geometry = self._resolve_pose(frame, pose_results)
+        height, width = frame.shape[:2]
+        geometry = self._resolve_pose(frame)
+        rotation_degrees = float(math.degrees(math.atan2(geometry.across_unit[1], geometry.across_unit[0])))
+        if abs(rotation_degrees) > 30.0:
+            raise PoseUnavailableError("pose_unavailable")
         x0, y0, source_width, source_height = garment.opaque_bounds
         source = garment.rgba[y0 : y0 + source_height, x0 : x0 + source_width]
-        # Map the prepared shirt rectangle onto the shoulder/hip frame-space
-        # quadrilateral in source screen-left -> screen-right order. Every
-        # placement value follows the current customer's center, shoulder
-        # width and torso axis; no screen bands or fixed percentage placement
-        # remain.
-        long_sleeve = garment.template == "tshirt_long_sleeve"
-        target_width = geometry.shoulder_span * (1.34 if long_sleeve else 1.26)
-        target_height = geometry.torso_length * (1.38 if long_sleeve else 1.08)
-        top_center = geometry.shoulder_center + geometry.torso_down_unit * geometry.torso_length * 0.025
-        bottom_center = top_center + geometry.torso_down_unit * target_height
-        half_width = geometry.across_unit * (target_width * 0.5)
-        destination = np.asarray(
-            [top_center - half_width, top_center + half_width, bottom_center + half_width, bottom_center - half_width],
-            dtype=np.float32,
+        desired_width = geometry.shoulder_span * (1.90 if garment.sleeve_semantics == "long" else 1.26)
+        desired_height = geometry.torso_length * (1.38 if garment.sleeve_semantics == "long" else 1.08)
+        base_uniform_scale = min(desired_width / source_width, desired_height / source_height)
+        # The placement centre belongs to the captured person, not to a
+        # particular adjustment. Customer scaling expands from this locked
+        # point and therefore cannot make the garment drift down the torso.
+        center = geometry.shoulder_center + geometry.torso_down_unit * (
+            source_height * base_uniform_scale * 0.5 + geometry.torso_length * 0.025
         )
-        if garment_scale != 1.0:
-            # A customer adjustment scales the whole placed shirt uniformly
-            # around its fixed geometric center; pose and center never move.
-            destination_center = destination.mean(axis=0)
-            destination = (
-                destination_center + (destination - destination_center) * garment_scale
-            )
-        source_corners = np.asarray([[0, 0], [source_width - 1, 0], [source_width - 1, source_height - 1], [0, source_height - 1]], dtype=np.float32)
-        transform = cv2.getPerspectiveTransform(source_corners, destination)
-        overlay = cv2.warpPerspective(source, transform, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        uniform_scale = base_uniform_scale * garment_scale
+        placed_width, placed_height = source_width * uniform_scale, source_height * uniform_scale
+        source_center = np.array([source_width * 0.5, source_height * 0.5], dtype=np.float32)
+        # The shoulder axis decides rotation.  Hips determine only torso
+        # placement and scale; using the raw shoulder-to-hip vector here would
+        # shear the PNG whenever those two observed axes are not perpendicular.
+        rotation_down = np.array(
+            [-geometry.across_unit[1], geometry.across_unit[0]], dtype=np.float32
+        )
+        if float(np.dot(rotation_down, geometry.torso_down_unit)) < 0:
+            rotation_down = -rotation_down
+        basis = np.column_stack((geometry.across_unit, rotation_down)) * uniform_scale
+        offset = center - basis @ source_center
+        transform = np.column_stack((basis, offset)).astype(np.float32)
+        overlay = cv2.warpAffine(source, transform, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
         result = frame.copy()
-        protected = self._protected_regions(geometry, width, height)
+        protected = self._foreground_occlusion(geometry, width, height, garment.sleeve_semantics)
         alpha = overlay[:, :, 3].astype(np.float32) / 255.0
         alpha[protected > 0] = 0.0
         alpha = alpha[:, :, None]
         result = (overlay[:, :, :3].astype(np.float32) * alpha + result.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
         ok, encoded = cv2.imencode(".png", result)
         if not ok:
-            raise RuntimeError("fast_result_encode")
-        return encoded.tobytes()
+            raise RuntimeError("garment_result_encode")
+        return CompositionResult(
+            png=encoded.tobytes(),
+            geometry=CompositionGeometryFacts(
+                garment_digest=garment.digest,
+                source_aspect_ratio=source_width / float(source_height),
+                placed_aspect_ratio=placed_width / placed_height,
+                center=(float(center[0]), float(center[1])),
+                width=float(placed_width),
+                height=float(placed_height),
+                rotation_degrees=rotation_degrees,
+            ),
+        )

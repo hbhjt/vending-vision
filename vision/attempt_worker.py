@@ -822,11 +822,11 @@ class FastRenderBroker:
                             )
                         return response
                     if kind == "garment_error":
-                        from vision.fast_tryon import GarmentFetchError
+                        from vision.garment_composer import GarmentFetchError
 
                         raise GarmentFetchError(response)
                     if kind == "pose_error":
-                        from vision.fast_tryon import PoseUnavailableError
+                        from vision.garment_composer import PoseUnavailableError
 
                         # Child diagnostics may contain model paths or native
                         # exception detail.  Pose absence is a normal attempt
@@ -1006,7 +1006,7 @@ class FastRenderBroker:
             # keep its warmed model and PID for the next captured person.
             # Transport/protocol/corrupt-response failures still fall through
             # to bounded recovery below.
-            from vision.fast_tryon import GarmentFetchError, PoseUnavailableError
+            from vision.garment_composer import GarmentFetchError, PoseUnavailableError
 
             if isinstance(error, (GarmentFetchError, PoseUnavailableError)):
                 raise error
@@ -1068,7 +1068,7 @@ async def render_attempt_frame(
     if not broker.ready:
         raise AttemptWorkerError("render broker is not ready")
     if not broker.pose_ready:
-        from vision.fast_tryon import PoseUnavailableError
+        from vision.garment_composer import PoseUnavailableError
 
         raise PoseUnavailableError("pose_unavailable")
     if timeout <= 0 or loop.time() + conservative_seconds >= deadline:
