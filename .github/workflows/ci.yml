@@ -33,8 +33,8 @@ jobs:
       - name: 运行聚焦 Python lint/type
         run: |
           python -m pip install --no-index --find-links quality-wheelhouse --require-hashes -r requirements-quality.txt
-          python -m ruff check --select E4,E7,E9,F vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/candidate_artifact_manifest.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
-          python -m mypy --follow-imports=skip --ignore-missing-imports --check-untyped-defs vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/candidate_artifact_manifest.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
+          python -m ruff check --select E4,E7,E9,F vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
+          python -m mypy --follow-imports=skip --ignore-missing-imports --check-untyped-defs vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
       - run: python -m pytest -q
       - run: python -m py_compile app.py run_vision_server.py vision/*.py scripts/*.py
       - run: python -c "from vision.model_manifest import verify_model_manifest; result=verify_model_manifest(); assert result['ok'], result"
@@ -70,8 +70,8 @@ jobs:
       - name: 运行聚焦 Python lint/type
         run: |
           python -m pip install --no-index --find-links quality-wheelhouse --require-hashes -r requirements-quality.txt
-          python -m ruff check --select E4,E7,E9,F vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/candidate_artifact_manifest.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
-          python -m mypy --follow-imports=skip --ignore-missing-imports --check-untyped-defs vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/candidate_artifact_manifest.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
+          python -m ruff check --select E4,E7,E9,F vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
+          python -m mypy --follow-imports=skip --ignore-missing-imports --check-untyped-defs vision/build_identity.py vision/config.py vision/v2_contract_bundle.py scripts/hard_cutover_policy.py scripts/verify_packaged_exe.py scripts/write_packaged_build_identity.py
       - name: 运行完整测试
         run: python -m pytest -q
       - name: 校验 Python 源码
@@ -115,24 +115,6 @@ jobs:
           name: vending-vision-main-staging-${{ github.sha }}
           path: main-artifacts/*
           if-no-files-found: error
-      - name: 生成同提交候选交付包（供 VM 验收）
-        shell: pwsh
-        run: |
-          $candidateDir = Join-Path $PWD "candidate-artifacts"
-          New-Item -ItemType Directory -Force -Path $candidateDir | Out-Null
-          & (Join-Path $PWD ".venv-packaging-core\Scripts\python.exe") scripts/candidate_artifact_manifest.py `
-            --dist-root (Join-Path $PWD "dist") `
-            --artifact (Join-Path $candidateDir "vending-vision-${{ github.sha }}.zip") `
-            --manifest-output (Join-Path $candidateDir "candidate-manifest.json") `
-            --source-commit "${{ github.sha }}"
-          if ($LASTEXITCODE -ne 0) { throw "candidate delivery generation failed" }
-      - name: 暂存同提交候选交付包
-        uses: actions/upload-artifact@v4
-        with:
-          name: vending-vision-candidate-${{ github.sha }}
-          path: candidate-artifacts/*
-          if-no-files-found: error
-
   publish-main-artifacts:
     name: 发布同提交 Vision artifacts
     if: github.ref == 'refs/heads/main'

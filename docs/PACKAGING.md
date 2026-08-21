@@ -1,10 +1,10 @@
-# Windows 候选发布物打包
+# Windows 交付物打包
 
-Windows 候选版本使用 PyInstaller `onedir`。本地构建只属于开发产物；每次
-`main` CI 构建并上传同 commit 的候选交付包，供 VEM 验收使用。
+Windows runtime 使用 PyInstaller `onedir`。本地构建只属于开发产物；每次
+`main` CI 构建并上传同 commit 的 runtime 与 fixture 交付对，供 VEM 验收使用。
 
 每个 Windows CI（含 PR）都会构建、验证并检查以下交付布局；只有成功的
-`main` Windows CI 会上传两个同提交的 Actions artifacts：
+`main` Windows CI 会上传一个同提交的 Actions artifact，其中包含两个 archive：
 
 - `vending-vision-windows-x86_64.zip`：自包含 runtime；不含录播 fixture。
 - `vending-vision-test-fixtures.zip`：`recorded-video` 的 top/front MP4 和 expected manifest。
@@ -15,8 +15,7 @@ commit 下载并原样安装或解压，不重新打包 Vision 内容。
 
 Windows onedir 只包含一个 `vending-vision` 主运行时。录播 fixture 单独交付；
 生产人物、姿态、年龄与性别检测模型继续由 `models/model-manifest.json` 固定摘要并
-随主运行时打包。候选归档清单只绑定主可执行文件，不存在第二个试衣运行时或额外
-模型安装步骤。
+随主运行时打包，不存在第二个试衣运行时或额外模型安装步骤。
 
 CI 会验证 runtime ZIP 根目录包含 `vending-vision.exe` 和 manifest，fixture ZIP
 包含 `recorded-video/top.mp4`、`front.mp4`、expected manifest 与

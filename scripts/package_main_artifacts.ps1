@@ -233,10 +233,12 @@ $delivery = @{
     runtime = @{
         file = [IO.Path]::GetFileName($RuntimeArchive)
         sha256 = (Get-FileHash -Algorithm SHA256 $RuntimeArchive).Hash.ToLowerInvariant()
+        bytes = [int64](Get-Item -LiteralPath $RuntimeArchive).Length
     }
     fixtures = @{
         file = [IO.Path]::GetFileName($FixtureArchive)
         sha256 = (Get-FileHash -Algorithm SHA256 $FixtureArchive).Hash.ToLowerInvariant()
+        bytes = [int64](Get-Item -LiteralPath $FixtureArchive).Length
     }
 } | ConvertTo-Json -Depth 5
 $DeliveryPath = Join-Path $OutputDirectory "vending-vision-main-artifacts.json"
@@ -248,7 +250,9 @@ if ($deliveryCheck.schemaVersion -ne "vending-vision-main-artifacts/v1" -or
     $deliveryCheck.runtime.file -ne [IO.Path]::GetFileName($RuntimeArchive) -or
     $deliveryCheck.fixtures.file -ne [IO.Path]::GetFileName($FixtureArchive) -or
     $deliveryCheck.runtime.sha256 -ne (Get-FileHash -Algorithm SHA256 $RuntimeArchive).Hash.ToLowerInvariant() -or
-    $deliveryCheck.fixtures.sha256 -ne (Get-FileHash -Algorithm SHA256 $FixtureArchive).Hash.ToLowerInvariant()) {
+    $deliveryCheck.fixtures.sha256 -ne (Get-FileHash -Algorithm SHA256 $FixtureArchive).Hash.ToLowerInvariant() -or
+    $deliveryCheck.runtime.bytes -ne [int64](Get-Item -LiteralPath $RuntimeArchive).Length -or
+    $deliveryCheck.fixtures.bytes -ne [int64](Get-Item -LiteralPath $FixtureArchive).Length) {
     throw "Delivery manifest does not match packaged archives"
 }
 

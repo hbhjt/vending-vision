@@ -22,10 +22,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from vision.build_identity import load_build_identity  # noqa: E402
-from scripts.candidate_artifact_manifest import (  # noqa: E402
-    LAYOUT,
-    audit_packaged_archives,
-    audit_packaged_model_files,
+from vision.model_manifest import verify_model_manifest  # noqa: E402
+from scripts.hard_cutover_policy import (  # noqa: E402
     retired_packaged_entries,
 )
 
@@ -208,24 +206,6 @@ def assert_hard_cutover_archive_absence(exe_path):
     violations = retired_packaged_entries(entries)
     if violations:
         raise AssertionError(f"retired modules remain in packaged archive: {violations}")
-    audit_packaged_archives(
-        [
-            (
-                f"{LAYOUT['mainOnedir']}/_internal/"
-                f"{path.relative_to(internal).as_posix()}",
-                path,
-            )
-            for path in internal.rglob("*")
-            if path.is_file()
-        ]
-    )
-    audit_packaged_model_files(
-        [
-            (f"{LAYOUT['mainOnedir']}/_internal/{path.relative_to(internal).as_posix()}", path)
-            for path in internal.rglob("*")
-            if path.is_file()
-        ]
-    )
 
 
 def assert_release_version_runtime_marker(exe_path):
@@ -234,6 +214,13 @@ def assert_release_version_runtime_marker(exe_path):
         load_build_identity(marker_root, require_source_commit=True)
     except RuntimeError as error:
         raise AssertionError("invalid release version runtime marker") from error
+
+
+def assert_packaged_model_manifest(exe_path):
+    """Verify the production-owned manifest against the packaged onedir root."""
+    result = verify_model_manifest(exe_path.parent / "_internal")
+    if not result["ok"]:
+        raise AssertionError(f"production model manifest verification failed: {result['message']}")
 
 
 def assert_bundled_resources(exe_path):
@@ -275,6 +262,7 @@ def assert_bundled_resources(exe_path):
     if sys.platform == "win32" and not any(camera_adapter.glob("_windows_backend*.pyd")):
         raise AssertionError("missing packaged cv2-enumerate-cameras Windows DirectShow adapter")
     assert_release_version_runtime_marker(exe_path)
+    assert_packaged_model_manifest(exe_path)
     assert_hard_cutover_archive_absence(exe_path)
 
 

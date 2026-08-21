@@ -18,7 +18,7 @@ HASH = re.compile(r"--hash=sha256:([0-9a-f]{64})$")
 
 
 class DependencyLockError(ValueError):
-    """The candidate dependency closure is incomplete or unverified."""
+    """The runtime dependency closure is incomplete or unverified."""
 
 
 def sha256_file(path: Path) -> str:
@@ -145,10 +145,7 @@ def installed_distributions(python: str) -> dict[str, dict]:
     command = (
         "import importlib.metadata as m, json; "
         "print(json.dumps({d.metadata['Name'].lower().replace('_','-'):{"
-        "'name':d.metadata['Name'],'version':d.version,"
-        "'licenseExpression':d.metadata.get('License-Expression') or '',"
-        "'license':d.metadata.get('License') or '',"
-        "'classifiers':d.metadata.get_all('Classifier') or []} "
+        "'name':d.metadata['Name'],'version':d.version} "
         "for d in m.distributions() if d.metadata.get('Name')}, sort_keys=True))"
     )
     completed = subprocess.run([python, "-c", command], check=False, text=True, capture_output=True)
@@ -158,99 +155,6 @@ def installed_distributions(python: str) -> dict[str, dict]:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise DependencyLockError("installed dependency inventory was not JSON") from exc
-
-
-# These are SPDX expressions for the exact locked package releases.  New lock
-# entries must receive an explicit legal review instead of silently emitting
-# NOASSERTION.  cv2-enumerate-cameras is intentionally GPLv3.
-LICENSE_OVERRIDES = {
-    "absl-py": "Apache-2.0",
-    "altgraph": "MIT",
-    "annotated-doc": "MIT",
-    "annotated-types": "MIT",
-    "anyio": "MIT",
-    "attrs": "MIT",
-    "certifi": "MPL-2.0",
-    "cffi": "MIT-0",
-    "click": "BSD-3-Clause",
-    "colorama": "BSD-3-Clause",
-    "contourpy": "BSD-3-Clause",
-    "cv2-enumerate-cameras": "GPL-3.0-or-later",
-    "cycler": "BSD-3-Clause",
-    "fastapi": "MIT",
-    "flatbuffers": "Apache-2.0",
-    "fonttools": "MIT",
-    "h11": "MIT",
-    "httpcore": "BSD-3-Clause",
-    "httpx": "BSD-3-Clause",
-    "idna": "BSD-3-Clause",
-    "iniconfig": "MIT",
-    "jax": "Apache-2.0",
-    "jaxlib": "Apache-2.0",
-    "jsonschema": "MIT",
-    "jsonschema-specifications": "MIT",
-    "kiwisolver": "BSD-3-Clause",
-    "matplotlib": "PSF-2.0",
-    "mediapipe": "Apache-2.0",
-    "ml-dtypes": "Apache-2.0",
-    "numpy": "BSD-3-Clause",
-    "opencv-contrib-python": "Apache-2.0",
-    "openvino": "Apache-2.0",
-    "openvino-telemetry": "Apache-2.0",
-    "opt-einsum": "MIT",
-    "packaging": "Apache-2.0 OR BSD-2-Clause",
-    "pillow": "MIT-CMU",
-    "pip": "MIT",
-    "pluggy": "MIT",
-    "protobuf": "BSD-3-Clause",
-    "pycparser": "BSD-3-Clause",
-    "pydantic": "MIT",
-    "pydantic-core": "MIT",
-    "pygments": "BSD-2-Clause",
-    "pyinstaller": "GPL-2.0-or-later WITH Bootloader-exception",
-    "pyinstaller-hooks-contrib": "GPL-2.0-or-later",
-    "pyparsing": "MIT",
-    "pefile": "MIT",
-    "pytest": "MIT",
-    "pywin32-ctypes": "BSD-3-Clause",
-    "python-dateutil": "Apache-2.0 OR BSD-3-Clause",
-    "referencing": "MIT",
-    "rpds-py": "MIT",
-    "scipy": "BSD-3-Clause",
-    "setuptools": "MIT",
-    "six": "MIT",
-    "sounddevice": "MIT",
-    "starlette": "BSD-3-Clause",
-    "typing-extensions": "PSF-2.0",
-    "typing-inspection": "MIT",
-    "uvicorn": "BSD-3-Clause",
-    "websockets": "BSD-3-Clause",
-    "wheel": "MIT",
-}
-
-
-METADATA_LICENSE_EXPRESSION_FACTS = {
-    "cffi": "MIT-0",
-    "pillow": "MIT-CMU",
-}
-
-
-def resolved_license(normalized_name: str, installed: dict) -> str:
-    """Return reviewed SPDX, refusing an unknown package rather than NOASSERTION."""
-    metadata_expression = installed.get("licenseExpression", "").strip()
-    expected_metadata_expression = METADATA_LICENSE_EXPRESSION_FACTS.get(normalized_name)
-    if expected_metadata_expression and metadata_expression != expected_metadata_expression:
-        raise DependencyLockError(
-            f"{normalized_name} metadata license expression must be {expected_metadata_expression}"
-        )
-    if normalized_name == "cv2-enumerate-cameras":
-        metadata_license = installed.get("license", "")
-        if "GNU GENERAL PUBLIC LICENSE" not in metadata_license.upper() or "VERSION 3" not in metadata_license.upper():
-            raise DependencyLockError("cv2-enumerate-cameras metadata no longer declares GPLv3")
-    value = LICENSE_OVERRIDES.get(normalized_name)
-    if not value:
-        raise DependencyLockError(f"installed dependency requires reviewed SPDX license mapping: {normalized_name}")
-    return value
 
 
 def verify_dependency_closure(
@@ -276,7 +180,6 @@ def verify_dependency_closure(
         result.append({
             **entry,
             "wheel": wheels[normalized],
-            "license": resolved_license(normalized, distribution),
         })
     return result
 

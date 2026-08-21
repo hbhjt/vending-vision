@@ -32,8 +32,8 @@ ws://127.0.0.1:7892/ws
 `/dashboard` 和旧 snapshot 诊断默认关闭。仅供应方开发时可在启动前显式设置
 `VISION_DEVELOPMENT_DASHBOARD=true`；带 `--config` 的 VEM 托管生产启动固定关闭。
 
-VEM 托管运行不使用上述源码启动方式。候选发布物必须由受保护的 RC tag
-构建为自包含 Windows bundle，VEM 以
+VEM 托管运行不使用上述源码启动方式。正式交付物由 `main` CI 从同一提交
+构建为自包含 Windows runtime 与录播 fixture，VEM 以
 `vending-vision.exe --config C:\ProgramData\VEM\vision\config\site.json`
 启动。`--config` 会启用严格、失败即停的外部配置模式；示例和 schema 位于
 `config/`。
@@ -182,18 +182,18 @@ http://127.0.0.1:7892/proximity/debug
 
 ## 上线注意
 
-- 开发、CI 和 Candidate 打包统一使用 `.python-version` 固定的 Python 3.11.9，且只消费同一份完整、传递闭包、SHA-256 锁定的 `requirements.txt`；先下载 wheelhouse，再以 `--no-index --require-hashes` 离线安装。
+- 开发、CI 和 Windows runtime 打包统一使用 `.python-version` 固定的 Python 3.11.9，且只消费同一份完整、传递闭包、SHA-256 锁定的 `requirements.txt`；先下载 wheelhouse，再以 `--no-index --require-hashes` 离线安装。
 - Windows 正式枚举使用严格 pin 的 `cv2-enumerate-cameras` DirectShow moniker/index 边界；同一稳定 moniker 在 replug 后可解析为新 index。
-- 生产模型由 `models/model-manifest.json` 声明并通过 Git LFS 进入候选 bundle；现场不得补模型。
+- 生产模型由 `models/model-manifest.json` 声明并通过 Git LFS 进入 runtime；现场不得补模型。
 - 正式运行保持 `mock_scenario=off`。
 - 先完成双摄编号确认，再做顶部多人阈值和中部画像质量联调。
 - 长期运行可查看 `/metrics` 和 `logs/vision.log`，日志默认按 5MB 滚动保留 5 份。
 
-## 候选发布边界
+## Windows 交付边界
 
-- PR 和普通 `main` 只运行验证，不发布可部署 bundle；仓库不再维护另一套 Development 构建。
-- `main` CI 每次构建同一 commit 的 Windows runtime、录播 fixture 与候选交付包，并上传 `vending-vision-main-<commit>` 和 `vending-vision-candidate-<commit>` 两个 Actions artifacts；`vending-vision-main-artifacts.json` 以 SHA-256 锁定 runtime 与 fixture。
-- VEM 按 commit 下载成对 artifacts，校验候选 manifest 的 source commit、交付清单 SHA-256 与 fixture 摘要后原样使用；供应仓不安装、不批准、也不重打包候选。
+- PR 只运行验证；成功的 `main` CI 发布可部署的 runtime 与 fixture 交付对，仓库不维护另一套 Development 构建。
+- `main` CI 每次构建同一 commit 的 Windows runtime 与录播 fixture，并上传 `vending-vision-main-<commit>`；`vending-vision-main-artifacts.json` 以 SHA-256 锁定 runtime 与 fixture。
+- VEM 按 commit 下载交付对，校验 delivery manifest 的 source commit、SHA-256、字节数与 fixture 摘要后原样使用；供应仓不安装、不批准、也不重打包交付物。
 - `scripts/verify_real_camera_capability.py` 用于现场真实双摄核心能力验收，强制 `mockScenario=off` 并验证 presence、单人可用画像和离开。
 - `/dashboard` 与旧 `/camera/{role}/snapshot.jpg` 仅在供应方开发启动显式设置 `VISION_DEVELOPMENT_DASHBOARD=true` 时开放；托管生产模式固定关闭。
 

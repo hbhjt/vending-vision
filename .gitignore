@@ -10,7 +10,6 @@ __pycache__/
 /.venv-packaging-core/
 /wheelhouse/
 /main-artifacts/
-/candidate-artifacts/
 venv/
 env/
 ENV/

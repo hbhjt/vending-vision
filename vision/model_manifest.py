@@ -26,8 +26,13 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def verify_model_manifest() -> dict:
-    manifest_path = Path(runtime_path("models/model-manifest.json"))
+def verify_model_manifest(runtime_root: Path | None = None) -> dict:
+    """Verify declared production models under the configured or explicit runtime root."""
+    manifest_path = (
+        Path(runtime_path("models/model-manifest.json"))
+        if runtime_root is None
+        else Path(runtime_root) / "models" / "model-manifest.json"
+    )
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -46,7 +51,11 @@ def verify_model_manifest() -> dict:
         expected = item.get("sha256")
         if not isinstance(relative, str) or not isinstance(expected, str):
             return {"ok": False, "message": "model manifest entry is invalid", "models": results}
-        model_path = Path(runtime_path(relative))
+        model_path = (
+            Path(runtime_path(relative))
+            if runtime_root is None
+            else Path(runtime_root) / relative
+        )
         actual = sha256_file(model_path) if model_path.is_file() else None
         ok = actual == expected
         results.append({"role": item["role"], "path": relative, "ok": ok})

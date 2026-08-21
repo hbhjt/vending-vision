@@ -64,6 +64,61 @@ def is_retired_runtime_dependency(value: str) -> bool:
     )
 
 
+def _contains_packaged_tokens(tokens: list[str], expected: tuple[str, ...]) -> bool:
+    width = len(expected)
+    return any(
+        tuple(tokens[index : index + width]) == expected
+        for index in range(len(tokens) - width + 1)
+    )
+
+
+def retired_packaged_entries(entries: set[str] | list[str]) -> list[str]:
+    """Return packaged names owned by the retired AI try-on path."""
+    retired_sequences = (
+        ("try", "on", "session"),
+        ("try", "on", "frontend"),
+        ("try", "on", "ai"),
+        ("try", "on", "fast"),
+        ("profile", "fast", "try", "on"),
+        ("vem", "vision", "v1"),
+        ("ai", "acceptance", "evidence"),
+        ("ai", "attempt"),
+        ("ai", "model"),
+        ("ai", "process", "tree", "worker"),
+        ("ai", "runtime"),
+        ("ai", "source", "provenance"),
+        ("ai", "wheelhouse"),
+        ("ai", "worker"),
+        ("".join(("cat", "vton")),),
+        ("regional", "evaluator"),
+        ("official", "ai"),
+        ("requirements", "ai"),
+        ("venv", "packaging", "ai"),
+        ("materialize", "ai", "wheelhouse"),
+        ("verify", "ai", "wheelhouse"),
+        ("render", "ai", "build", "requirements"),
+        ("fast", "attempt"),
+        ("fast", "result"),
+        ("fast", "adjustment"),
+        ("vending", "vision", "ai", "worker"),
+        ("safetensors",),
+        ("vision", "process", "supervisor"),
+        ("vision", "source", "provenance"),
+    )
+    violations = []
+    for entry in entries:
+        if any(
+            is_retired_runtime_dependency(token)
+            for token in re.findall(r"[A-Za-z0-9_.-]+", entry)
+        ):
+            violations.append(entry)
+            continue
+        tokens = [token for token in re.split(r"[\\/._:\-]+", entry.casefold()) if token]
+        if any(_contains_packaged_tokens(tokens, sequence) for sequence in retired_sequences):
+            violations.append(entry)
+    return sorted(violations)
+
+
 def _production_python_path(relative_path: str) -> bool:
     path = PurePosixPath(relative_path)
     return (

@@ -2,25 +2,23 @@
 
 ## 职责边界
 
-本仓库负责生成不可变的 Windows 视觉候选发布物，包括运行时、模型、依赖、
+本仓库负责生成不可变的 Windows 视觉交付物，包括运行时、模型、依赖、
 现场配置 schema、bundle 和同 commit 的 SHA-256 交付清单。本仓库不在售货机
-上复制源码、联网下载依赖、注册 Windows 任务、批准候选版本或重新打包
+上复制源码、联网下载依赖、注册 Windows 任务或重新打包
 已经发布的 bundle。
 
-VEM 负责候选版本 conformance、approval、Factory Manifest、解压到
-`C:\VEM\vision\releases\<version>-<digest-prefix>`、当前版本选择、
+VEM 负责按同一 commit 的交付清单校验 archive SHA-256 与字节数、解压到
+`C:\VEM\vision\app`、
 `C:\ProgramData\VEM\vision`、`VEM\StartVisionServer` 任务、安装验收和回滚。
 
-## 候选版本发布
+## 同提交产物对发布
 
-1. 将候选修改合并到 `main`。
+1. 将修改合并到 `main`。
 2. `.github/workflows/ci.yml` 在测试、Windows 测试与区域证据合同通过后，
    构建 onedir EXE、执行机器协议打包冒烟测试，并上传同 commit 的
-   `vending-vision-main-<commit>` 与 `vending-vision-candidate-<commit>`
-   Actions artifacts。
+   `vending-vision-main-<commit>` Actions artifact。
 3. `vending-vision-main-artifacts.json` 以 SHA-256 锁定 runtime 与录播
-   fixture；candidate 包内嵌 `candidate-manifest.json` 并声明 source commit
-   与逐文件 SHA-256。
+   fixture、同一 commit 与 archive 文件名。
 4. VEM 按 commit 下载成对 artifacts，校验清单与摘要后原样安装；本仓库
    永远不生成 VEM approval，也不依赖任何签名 secret。
 
@@ -44,11 +42,11 @@ camera identity；VEM 只消费合同中的不透明 candidate ID 和 role readi
 
 安装验收必须证明：
 
-- 精确的 bundle digest 和按版本寻址的安装目录；
+- delivery manifest 的同提交、archive SHA-256、字节数与内部 digest；
 - `models/model-manifest.json` 中每个模型都存在且 hash 正确；
 - 即使现场摄像头暂时离线，完整模型仍使 `modelReady=true`；
 - HTTP `/health` 和严格机器端 `ws://127.0.0.1:7892/ws` 握手成功；
-- 运行时版本与候选发布版本一致。
+- 运行时 build identity 与交付 commit 一致。
 
 摄像头不可用属于 degraded，不回滚其他部分有效的软件。模型、配置、进程、
 HTTP 或 WebSocket 契约失败属于安装失败，必须回滚。

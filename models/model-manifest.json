@@ -1,10 +1,5 @@
 {
   "schemaVersion": "vending-vision-model-manifest/v1",
-  "sourceArtifact": {
-    "name": "vending-vision.zip",
-    "digest": "sha256:9dc9dda0fb60a69cfac142bbbfd09f769b8ef965c0f4d3bbc8ccf3a8e33d4b1b",
-    "status": "experimental-provenance"
-  },
   "models": [
     {
       "role": "person_detection",
