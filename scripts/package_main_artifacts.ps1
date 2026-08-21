@@ -6,10 +6,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $RuntimeDirectory = Join-Path $Root "dist\vending-vision"
 $FixtureDirectory = Join-Path $Root "fixtures\recorded-video"
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
+
+function Write-Utf8NoBom([string]$Path, [string]$Content) {
+    [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
+}
 
 if (-not (Test-Path -LiteralPath $RuntimeDirectory -PathType Container)) {
     throw "Windows runtime build is missing: $RuntimeDirectory"
@@ -32,12 +37,12 @@ $manifest = @{
 
 $RuntimeStage = Join-Path $StageDirectory "runtime"
 Copy-Item -LiteralPath $RuntimeDirectory -Destination $RuntimeStage -Recurse
-Set-Content -LiteralPath (Join-Path $RuntimeStage "vision-artifact.json") -Value $manifest -Encoding utf8NoBOM
+Write-Utf8NoBom (Join-Path $RuntimeStage "vision-artifact.json") $manifest
 
 $FixtureStage = Join-Path $StageDirectory "fixtures"
 New-Item -ItemType Directory -Force $FixtureStage | Out-Null
 Copy-Item -LiteralPath $FixtureDirectory -Destination (Join-Path $FixtureStage "recorded-video") -Recurse
-Set-Content -LiteralPath (Join-Path $FixtureStage "vision-artifact.json") -Value $manifest -Encoding utf8NoBOM
+Write-Utf8NoBom (Join-Path $FixtureStage "vision-artifact.json") $manifest
 
 $RuntimeArchive = Join-Path $OutputDirectory "vending-vision-windows-x86_64.zip"
 $FixtureArchive = Join-Path $OutputDirectory "vending-vision-test-fixtures.zip"

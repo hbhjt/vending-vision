@@ -1572,12 +1572,20 @@ def test_main_artifact_runtime_allows_only_the_exact_v2_contract_fixtures(tmp_pa
     assert completed.returncode == 0, combined
     with zipfile.ZipFile(output / "vending-vision-windows-x86_64.zip") as archive:
         entries = {entry.replace("\\", "/") for entry in archive.namelist()}
+        artifact_manifest = archive.read("vision-artifact.json")
     assert {
         "_internal/contracts/vem_vision_v2/fixtures/client-invalid.json",
         "_internal/contracts/vem_vision_v2/fixtures/client-valid.json",
         "_internal/contracts/vem_vision_v2/fixtures/server-invalid.json",
         "_internal/contracts/vem_vision_v2/fixtures/server-valid.json",
     } <= entries
+    assert not artifact_manifest.startswith(b"\xef\xbb\xbf")
+    assert json.loads(artifact_manifest.decode("utf-8")) == {
+        "schemaVersion": "vending-vision-main-artifacts/v1",
+        "commit": "a" * 40,
+        "runtimeArchive": "vending-vision-windows-x86_64.zip",
+        "fixtureArchive": "vending-vision-test-fixtures.zip",
+    }
 
 
 def test_main_artifact_runtime_rejects_noncontract_fixture_paths(tmp_path):
