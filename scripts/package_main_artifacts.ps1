@@ -54,7 +54,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 function Read-ZipEntries([string]$Archive) {
     $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
     try {
-        return @($zip.Entries | ForEach-Object { $_.FullName })
+        return @($zip.Entries | ForEach-Object { $_.FullName.Replace("\", "/") })
     } finally {
         $zip.Dispose()
     }
