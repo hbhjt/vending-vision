@@ -51,10 +51,25 @@ Compress-Archive -Path (Join-Path $RuntimeStage "*") -DestinationPath $RuntimeAr
 Compress-Archive -Path (Join-Path $FixtureStage "*") -DestinationPath $FixtureArchive -CompressionLevel Optimal
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+function ConvertTo-CanonicalZipEntryName([string]$EntryName) {
+    return $EntryName.Replace("\", "/")
+}
+
+function Find-ZipEntry([IO.Compression.ZipArchive]$Zip, [string]$EntryName) {
+    $canonicalEntryName = ConvertTo-CanonicalZipEntryName $EntryName
+    $matches = @($Zip.Entries | Where-Object {
+        (ConvertTo-CanonicalZipEntryName $_.FullName) -ceq $canonicalEntryName
+    })
+    if ($matches.Count -gt 1) {
+        throw "Archive has duplicate canonical entry: $canonicalEntryName"
+    }
+    return $matches | Select-Object -First 1
+}
+
 function Read-ZipEntries([string]$Archive) {
     $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
     try {
-        return @($zip.Entries | ForEach-Object { $_.FullName.Replace("\", "/") })
+        return @($zip.Entries | ForEach-Object { ConvertTo-CanonicalZipEntryName $_.FullName })
     } finally {
         $zip.Dispose()
     }
@@ -63,7 +78,7 @@ function Read-ZipEntries([string]$Archive) {
 function Read-ZipJson([string]$Archive, [string]$EntryName) {
     $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
     try {
-        $entry = $zip.GetEntry($EntryName)
+        $entry = Find-ZipEntry $zip $EntryName
         if ($null -eq $entry) {
             throw "Archive $Archive is missing $EntryName"
         }
@@ -81,7 +96,7 @@ function Read-ZipJson([string]$Archive, [string]$EntryName) {
 function Get-ZipEntrySha256([string]$Archive, [string]$EntryName) {
     $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
     try {
-        $entry = $zip.GetEntry($EntryName)
+        $entry = Find-ZipEntry $zip $EntryName
         if ($null -eq $entry) {
             throw "Archive $Archive is missing $EntryName"
         }
@@ -101,7 +116,7 @@ function Get-ZipEntrySha256([string]$Archive, [string]$EntryName) {
 function Test-ZipEntry([string]$Archive, [string]$EntryName) {
     $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
     try {
-        return $null -ne $zip.GetEntry($EntryName)
+        return $null -ne (Find-ZipEntry $zip $EntryName)
     } finally {
         $zip.Dispose()
     }
@@ -225,7 +240,7 @@ $delivery = @{
     }
 } | ConvertTo-Json -Depth 5
 $DeliveryPath = Join-Path $OutputDirectory "vending-vision-main-artifacts.json"
-Set-Content -LiteralPath $DeliveryPath -Value $delivery -Encoding utf8NoBOM
+Write-Utf8NoBom $DeliveryPath $delivery
 
 $deliveryCheck = Get-Content -LiteralPath $DeliveryPath -Raw | ConvertFrom-Json
 if ($deliveryCheck.schemaVersion -ne "vending-vision-main-artifacts/v1" -or

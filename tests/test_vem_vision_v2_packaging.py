@@ -1573,6 +1573,7 @@ def test_main_artifact_runtime_allows_only_the_exact_v2_contract_fixtures(tmp_pa
     with zipfile.ZipFile(output / "vending-vision-windows-x86_64.zip") as archive:
         entries = {entry.replace("\\", "/") for entry in archive.namelist()}
         artifact_manifest = archive.read("vision-artifact.json")
+    delivery_manifest = (output / "vending-vision-main-artifacts.json").read_bytes()
     assert {
         "_internal/contracts/vem_vision_v2/fixtures/client-invalid.json",
         "_internal/contracts/vem_vision_v2/fixtures/client-valid.json",
@@ -1580,6 +1581,7 @@ def test_main_artifact_runtime_allows_only_the_exact_v2_contract_fixtures(tmp_pa
         "_internal/contracts/vem_vision_v2/fixtures/server-valid.json",
     } <= entries
     assert not artifact_manifest.startswith(b"\xef\xbb\xbf")
+    assert not delivery_manifest.startswith(b"\xef\xbb\xbf")
     assert json.loads(artifact_manifest.decode("utf-8")) == {
         "schemaVersion": "vending-vision-main-artifacts/v1",
         "commit": "a" * 40,
@@ -1775,6 +1777,65 @@ def test_main_artifact_runtime_normalizes_legacy_backslash_contract_entries(tmp_
     completed = _run_main_artifact_archive_guard(
         root, _runtime_contract_archive_entries("\\")
     )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_main_artifact_fixture_manifest_uses_canonical_zip_lookup_names(tmp_path):
+    """A Windows-created backslash ZIP passes both layout and bound-byte checks."""
+    root = _main_artifact_harness_root(tmp_path)
+    script_path = root / "scripts" / "package_main_artifacts.ps1"
+    script = script_path.read_text("utf-8")
+    script = script.replace(
+        "Remove-Item -LiteralPath $RuntimeArchive, $FixtureArchive -Force -ErrorAction SilentlyContinue",
+        "$null = 1",
+    ).replace(
+        "Compress-Archive -Path (Join-Path $RuntimeStage \"*\") -DestinationPath $RuntimeArchive -CompressionLevel Optimal",
+        "$null = 1",
+    ).replace(
+        "Compress-Archive -Path (Join-Path $FixtureStage \"*\") -DestinationPath $FixtureArchive -CompressionLevel Optimal",
+        "$null = 1",
+    )
+    script_path.write_text(script, "utf-8")
+    output = root / "output"
+    output.mkdir()
+    artifact_manifest = json.dumps(
+        {
+            "schemaVersion": "vending-vision-main-artifacts/v1",
+            "commit": "a" * 40,
+            "runtimeArchive": "vending-vision-windows-x86_64.zip",
+            "fixtureArchive": "vending-vision-test-fixtures.zip",
+        }
+    ).encode()
+    with zipfile.ZipFile(output / "vending-vision-windows-x86_64.zip", "w") as archive:
+        for entry in _runtime_contract_archive_entries("\\"):
+            archive.writestr(
+                entry,
+                artifact_manifest if entry.replace("\\", "/") == "vision-artifact.json" else b"x",
+            )
+    recordings = {}
+    source_bytes = (ROOT / "fixtures" / "recorded-video" / "sources" / "person-man-front.png").read_bytes()
+    fixture_entries = {"sources/person-man-front.png": source_bytes, "generate-geometry-front.py": b"generator"}
+    for key, filename in (("geometryFar", "geometry-far.mp4"), ("geometryMid", "geometry-mid.mp4"), ("geometryNear", "geometry-near.mp4")):
+        payload = filename.encode()
+        fixture_entries[filename] = payload
+        recordings[key] = {
+            "file": filename,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "loop": True,
+            "source": "sources/person-man-front.png",
+            "sourceSha256": hashlib.sha256(source_bytes).hexdigest(),
+            "generator": "generate-geometry-front.py",
+        }
+    fixture_entries["expected-results.json"] = json.dumps(
+        {"schemaVersion": "vending-vision-recorded-video-fixture/v1", "recordings": recordings}
+    ).encode()
+    fixture_entries.update({"top.mp4": b"top", "front.mp4": b"front", "vision-artifact.json": artifact_manifest})
+    with zipfile.ZipFile(output / "vending-vision-test-fixtures.zip", "w") as archive:
+        for entry, payload in fixture_entries.items():
+            archive.writestr(f"recorded-video\\{entry}" if entry != "vision-artifact.json" else entry, payload)
+
+    completed = _run_main_artifact_package(root)
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
