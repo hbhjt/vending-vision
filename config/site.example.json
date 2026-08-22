@@ -10,8 +10,8 @@
   "cameras": {
     "top": {
       "backend": "dshow",
-      "width": 1280,
-      "height": 720,
+      "width": 1920,
+      "height": 1080,
       "fps": 30,
       "fourcc": "MJPG",
       "role": "presence",
@@ -20,8 +20,8 @@
     },
     "front": {
       "backend": "dshow",
-      "width": 1280,
-      "height": 720,
+      "width": 1920,
+      "height": 1080,
       "fps": 30,
       "fourcc": "MJPG",
       "role": "profile_try_on",

@@ -14,13 +14,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from common import FPS, FRONT_FRAME_SIZE, PERSON_SOURCE
 
 ROOT = Path(__file__).parent
-SOURCE = ROOT / "sources" / "person-man-front.png"
-FRAME_SIZE = (720, 1280)
-FPS = 6
+SOURCE = PERSON_SOURCE
+FRAME_SIZE = FRONT_FRAME_SIZE
 FRAME_COUNT = 36
-SCALES = {"geometry-far.mp4": 0.70, "geometry-mid.mp4": 0.88, "geometry-near.mp4": 1.05}
+SCALES = {"geometry-far.mp4": 0.62, "geometry-mid.mp4": 0.86, "geometry-near.mp4": 1.05}
 
 
 def _center_crop_or_pad(image: np.ndarray) -> np.ndarray:

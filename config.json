@@ -1,7 +1,7 @@
 {
   "camera_backend": "dshow",
-  "camera_width": 1280,
-  "camera_height": 720,
+  "camera_width": 1920,
+  "camera_height": 1080,
   "camera_fps": 30,
   "camera_fourcc": "MJPG",
   "camera_warmup_frames": 1,

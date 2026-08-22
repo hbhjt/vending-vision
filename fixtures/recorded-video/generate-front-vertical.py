@@ -16,16 +16,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from common import FPS, FRONT_FRAME_SIZE, PERSON_SOURCE
 
-SOURCE = Path(__file__).with_name("sources") / "person-man-front.png"
-FRAME_SIZE = (720, 1280)
+SOURCE = PERSON_SOURCE
+FRAME_SIZE = FRONT_FRAME_SIZE
 FRAME_COUNT = 6
 SCALE = 1.55
 
 
 def write_recording(output: Path, frame) -> None:
     writer = cv2.VideoWriter(
-        str(output), cv2.VideoWriter_fourcc(*"mp4v"), 6, FRAME_SIZE
+        str(output), cv2.VideoWriter_fourcc(*"mp4v"), FPS, FRAME_SIZE
     )
     if not writer.isOpened():
         raise SystemExit("could not open recorded-video writer")
@@ -55,9 +56,11 @@ def main() -> None:
         interpolation=cv2.INTER_AREA,
     )
     scaled_height, scaled_width = scaled.shape[:2]
-    canvas = np.zeros((1280, 720, 3), dtype=np.uint8)
-    horizontal_offset = (scaled_width - 720) // 2
-    visible = scaled[:1280, horizontal_offset : horizontal_offset + 720]
+    canvas = np.zeros((FRAME_SIZE[1], FRAME_SIZE[0], 3), dtype=np.uint8)
+    horizontal_offset = (scaled_width - FRAME_SIZE[0]) // 2
+    visible = scaled[
+        : FRAME_SIZE[1], horizontal_offset : horizontal_offset + FRAME_SIZE[0]
+    ]
     canvas[: visible.shape[0]] = visible
     output = Path(__file__).with_name("front-vertical.mp4")
     write_recording(output, canvas)

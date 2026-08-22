@@ -85,6 +85,19 @@ def open_camera(
         )
 
     apply_camera_settings(cap, width=width, height=height, fps=fps, fourcc=fourcc)
+
+    # DirectShow 会静默协商成别的分辨率；显式请求分辨率时必须 fail closed，
+    # 否则 1080p 部署会在不支持时无声降级。
+    if width and width > 0 and height and height > 0:
+        negotiated_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        negotiated_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if negotiated_width != width or negotiated_height != height:
+            cap.release()
+            raise RuntimeError(
+                f"camera resolution negotiation failed: requested {width}x{height}, "
+                f"actual {negotiated_width}x{negotiated_height}"
+            )
+
     return cap
 
 

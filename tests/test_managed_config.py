@@ -78,6 +78,29 @@ def test_frozen_site_schema_and_example_are_real_json_sources():
     jsonschema.Draft202012Validator(schema).validate(example)
 
 
+def test_camera_defaults_are_single_sourced_and_consistent():
+    defaults = json.loads(
+        (ROOT / "config" / "camera-defaults.json").read_text(encoding="utf-8")
+    )
+    flat = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    example = json.loads(
+        (ROOT / "config" / "site.example.json").read_text(encoding="utf-8")
+    )
+
+    assert flat["camera_backend"] == defaults["backend"]
+    assert flat["camera_width"] == defaults["width"]
+    assert flat["camera_height"] == defaults["height"]
+    assert flat["camera_fps"] == defaults["fps"]
+    assert flat["camera_fourcc"] == defaults["fourcc"]
+    for role, entry in example["cameras"].items():
+        assert entry["backend"] == defaults["backend"]
+        assert entry["width"] == defaults["width"]
+        assert entry["height"] == defaults["height"]
+        assert entry["fps"] == defaults["fps"]
+        assert entry["fourcc"] == defaults["fourcc"]
+        assert entry["rotate"] == defaults[role]["rotate"]
+
+
 def test_managed_config_values_come_from_the_frozen_site_source(tmp_path):
     config = tmp_path / "site.json"
     value = valid_config()

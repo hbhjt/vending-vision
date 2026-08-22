@@ -23,7 +23,7 @@ repository `https://github.com/hbhjt/virtual-tryon` at commit
 it is a known fictional test input, not a customer or field photograph. The
 reference repository is source history and is never fetched or invoked by a
 Vision build, test, package, runtime, or deployment step. Its generator is
-`generate-man-front.py`; it resizes the source to 512x768 and uses OpenCV's
+`generate-man-front.py`; it resizes the source to 1080x1920 and uses OpenCV's
 `mp4v` encoder.  It exists solely for production YOLO and MediaPipe Pose
 acquisition acceptance and has no runtime-bundle dependency.  The same
 generator emits `man-unaligned-front.mp4`, a deterministic left crop which
@@ -40,7 +40,7 @@ live frame identity without relabeling a clip or altering the person.  Each
 clip's source, source digest, generator and video digest are bound by
 `expected-results.json` for the installed Windows fixture artifact.
 
-`front-vertical.mp4` is a six-frame 720x1280 portrait close-up derived from the
+`front-vertical.mp4` is a six-frame 1080x1920 portrait close-up derived from the
 same `sources/person-man-front.png` by `generate-front-vertical.py`.  It
 reproduces the physical front-camera field condition: the single person is
 centered and aligned by the shoulder rule while the lower body (hips) falls
@@ -60,3 +60,10 @@ open until the finite top recording reaches its departure edge.
 frame sequence.  It keeps the V2 acquisition in the single-person aligned but
 not-stable state so the installed Machine UI manual-capture control remains
 available; the manual-capture VM regression uses it as the front source.
+
+All acquisition fixtures are generated at 1080p portrait (1080x1920) from the
+1024x1536 fictional source. `top.mp4` is a 1920x1080 presence clip regenerated
+by `generate-top.py` from the committed legacy `sources/top-legacy-320.mp4`:
+resampling keeps the approach/departure behavior and production presence
+detection semantics while matching the field 1080p top camera. Frame sizes,
+fps, and source paths live in `common.py` as the single fixture spec.

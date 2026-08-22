@@ -1,0 +1,9 @@
+{
+  "backend": "dshow",
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "fourcc": "MJPG",
+  "top": { "rotate": 0 },
+  "front": { "rotate": 270 }
+}

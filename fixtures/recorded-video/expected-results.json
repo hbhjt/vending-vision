@@ -3,8 +3,11 @@
   "recordings": {
     "top": {
       "file": "top.mp4",
-      "sha256": "7e35b8e7a680e64189c48ee4f0ea1d10d087a041bec7f05687e1b09b5a506d9b",
-      "loop": false
+      "sha256": "863a530c65e85794f620143f9b9775a1f752365aa0dc51a3f3a2e97bb273e227",
+      "loop": false,
+      "source": "sources/top-legacy-320.mp4",
+      "sourceSha256": "7e35b8e7a680e64189c48ee4f0ea1d10d087a041bec7f05687e1b09b5a506d9b",
+      "generator": "generate-top.py"
     },
     "front": {
       "file": "front.mp4",
@@ -13,7 +16,7 @@
     },
     "manFront": {
       "file": "man-front.mp4",
-      "sha256": "f096c0c22049087bd771ef5483cbbdb63adc7a6bcb3a6ceb837486fb98634ff5",
+      "sha256": "4a86a6b7b0aae11e00cd808c64c4cfa47295df3bdb04ec93da34ae21956abbc2",
       "loop": true,
       "source": "sources/person-man-front.png",
       "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
@@ -21,7 +24,7 @@
     },
     "geometryFar": {
       "file": "geometry-far.mp4",
-      "sha256": "9dec68bf2e82907d4567ebdf619c5b08a6a1b6f600b17b417612b1625ea08415",
+      "sha256": "7938f5483213b437b6490b62915e491390e280be9af78b57a80e7cc9e2d3bdc1",
       "loop": true,
       "source": "sources/person-man-front.png",
       "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
@@ -29,7 +32,7 @@
     },
     "geometryMid": {
       "file": "geometry-mid.mp4",
-      "sha256": "b27b5b62a947506d6874f4b947d65d9b4f28deb4216315c805eb1e021755a4ee",
+      "sha256": "0ebc8808fc308a128b4e8b8324338d044fa4afe2b5e8efc510dea0a4e6d4f455",
       "loop": true,
       "source": "sources/person-man-front.png",
       "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
@@ -37,7 +40,7 @@
     },
     "geometryNear": {
       "file": "geometry-near.mp4",
-      "sha256": "846fd0f36b7f8258fb63cf102f962b91bc72de2c862837213106f2bd7e6a5a6f",
+      "sha256": "42c7e4e894671b944e307a2d0f588cf5810da988779383c2329c1ccd80d44309",
       "loop": true,
       "source": "sources/person-man-front.png",
       "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
@@ -45,7 +48,7 @@
     },
     "frontVertical": {
       "file": "front-vertical.mp4",
-      "sha256": "80f29c1cf42f16a3bc5aa8bc6df45db581d56e741cc5eac0edf3377d1768d7ff",
+      "sha256": "5c722e27c99745be6193977864f875d6ebb3983c70ec3fd1bdb13c5f0c4f6e48",
       "loop": true,
       "source": "sources/person-man-front.png",
       "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
@@ -53,7 +56,7 @@
     },
     "frontVerticalUnstable": {
       "file": "front-vertical-unstable.mp4",
-      "sha256": "c2a1961dc040eb7c1b238e62a64d789471cedd9f5fde7af3adf22f528537aba3",
+      "sha256": "6bb98a3d9be8aeb10a04a0aa6a829256ec4b59050b1fa4e184de5225a20fa1e6",
       "loop": true,
       "source": "sources/person-man-front.png",
       "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
@@ -61,7 +64,7 @@
     },
     "manUnalignedFront": {
       "file": "man-unaligned-front.mp4",
-      "sha256": "aa0be84735b96bee0a80436e01fe1ed62390c04a81e7c2920823b8414f9b1db6",
+      "sha256": "757ff41ce2caecf4e747a2c0d07155c78939384f9fb7ef3afb3629306bbed591",
       "loop": true,
       "source": "sources/person-man-front.png",
       "sourceSha256": "659f08c709c8d526552713741f5e2cfe3fa819a34a63a34a8372a3404890952c",
@@ -69,7 +72,7 @@
     },
     "emptyFront": {
       "file": "empty-front.mp4",
-      "sha256": "7efebb8ca8049af095c2544f81c60e3fa17bb675e9b2a281a45c16bd355c04a5",
+      "sha256": "2de948bb12095e165879655caecc799d2be176fa0268f52f5ffc00af3256b235",
       "loop": true,
       "generator": "generate-man-front.py"
     }

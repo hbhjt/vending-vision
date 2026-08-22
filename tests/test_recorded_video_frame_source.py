@@ -335,7 +335,7 @@ def test_recorded_geometry_assertion_rejects_insignificant_adjacent_steps(mutate
 
 
 def test_recorded_video_front_vertical_fixture_is_traceable_and_vertical():
-    """The vertical close-up fixture is reproducible and 720x1280 with a single aligned person."""
+    """The vertical close-up fixture is reproducible and 1080x1920 with a single aligned person."""
     recording = fixture_manifest()["recordings"]["frontVertical"]
     video = FIXTURE_ROOT / recording["file"]
     generator = FIXTURE_ROOT / recording["generator"]
@@ -348,7 +348,7 @@ def test_recorded_video_front_vertical_fixture_is_traceable_and_vertical():
     capture = cv2.VideoCapture(str(video))
     ok, frame = capture.read()
     capture.release()
-    assert ok and frame.shape == (1280, 720, 3)
+    assert ok and frame.shape == (1920, 1080, 3)
     assert fixture_manifest()["expected"]["frontVertical"]["profile"]["minimumFields"]
 
 
@@ -366,7 +366,7 @@ def test_recorded_video_front_vertical_unstable_fixture_is_traceable():
     capture = cv2.VideoCapture(str(video))
     ok, frame = capture.read()
     capture.release()
-    assert ok and frame.shape == (1280, 720, 3)
+    assert ok and frame.shape == (1920, 1080, 3)
 
 
 def test_recorded_video_man_front_fixture_is_traceable_and_decodes():
@@ -383,7 +383,7 @@ def test_recorded_video_man_front_fixture_is_traceable_and_decodes():
     capture = cv2.VideoCapture(str(video))
     ok, frame = capture.read()
     capture.release()
-    assert ok and frame.shape == (768, 512, 3)
+    assert ok and frame.shape == (1920, 1080, 3)
 
 
 def test_recorded_video_source_decodes_fixture_frames_in_order():

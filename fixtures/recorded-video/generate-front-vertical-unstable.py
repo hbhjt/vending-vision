@@ -16,9 +16,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from common import FPS, FRONT_FRAME_SIZE, PERSON_SOURCE
 
-SOURCE = Path(__file__).with_name("sources") / "person-man-front.png"
-FRAME_SIZE = (720, 1280)
+SOURCE = PERSON_SOURCE
+FRAME_SIZE = FRONT_FRAME_SIZE
 FRAME_COUNT = 6
 SCALE = 1.55
 
@@ -37,9 +38,11 @@ def build_close_up_canvas() -> np.ndarray:
         interpolation=cv2.INTER_AREA,
     )
     scaled_height, scaled_width = scaled.shape[:2]
-    canvas = np.zeros((1280, 720, 3), dtype=np.uint8)
-    horizontal_offset = (scaled_width - 720) // 2
-    visible = scaled[:1280, horizontal_offset : horizontal_offset + 720]
+    canvas = np.zeros((FRAME_SIZE[1], FRAME_SIZE[0], 3), dtype=np.uint8)
+    horizontal_offset = (scaled_width - FRAME_SIZE[0]) // 2
+    visible = scaled[
+        : FRAME_SIZE[1], horizontal_offset : horizontal_offset + FRAME_SIZE[0]
+    ]
     canvas[: visible.shape[0]] = visible
     return canvas
 
@@ -47,13 +50,14 @@ def build_close_up_canvas() -> np.ndarray:
 def build_unaligned_canvas(close_up: np.ndarray) -> np.ndarray:
     """Shift the close-up so the shoulders leave the centered alignment band."""
     shifted = np.zeros_like(close_up)
-    shifted[:, : 720 - 300] = close_up[:, 300:]
+    shift = FRAME_SIZE[0] * 300 // 720
+    shifted[:, : FRAME_SIZE[0] - shift] = close_up[:, shift:]
     return shifted
 
 
 def write_recording(output: Path, frames: list[np.ndarray]) -> None:
     writer = cv2.VideoWriter(
-        str(output), cv2.VideoWriter_fourcc(*"mp4v"), 6, FRAME_SIZE
+        str(output), cv2.VideoWriter_fourcc(*"mp4v"), FPS, FRAME_SIZE
     )
     if not writer.isOpened():
         raise SystemExit("could not open recorded-video writer")
