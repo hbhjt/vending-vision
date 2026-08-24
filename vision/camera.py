@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import math
+
 import cv2
 
 from vision.config import settings
@@ -36,26 +38,38 @@ def apply_camera_settings(
     fps: int | None = None,
     fourcc: str | None = None,
 ):
-    """将分辨率、帧率、编码格式等参数应用到已打开的摄像头。
-
-    只设置大于0的有效值，避免无效参数导致摄像头异常。
-    """
+    """Request one exact capture MediaType and return its normalized facts."""
     width = settings.CAMERA_WIDTH if width is None else width
     height = settings.CAMERA_HEIGHT if height is None else height
     fps = settings.CAMERA_FPS if fps is None else fps
     fourcc = settings.CAMERA_FOURCC if fourcc is None else fourcc
+    try:
+        width = int(width)
+        height = int(height)
+        fps = float(fps)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("camera media type request is invalid") from exc
+    fourcc = str(fourcc or "").upper()
+    if width <= 0 or height <= 0 or fps <= 0 or len(fourcc) != 4:
+        raise RuntimeError("camera media type request is invalid")
 
-    if fourcc:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc[:4]))
-
-    if width and width > 0:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-
-    if height and height > 0:
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-
-    if fps and fps > 0:
-        cap.set(cv2.CAP_PROP_FPS, fps)
+    # OpenCV's DirectShow backend commits width+height through IAMStreamConfig,
+    # then may rebuild the graph again for FPS. Apply FOURCC last so the final
+    # graph selects the requested subtype at the already-selected size/FPS.
+    properties = (
+        ("width", cv2.CAP_PROP_FRAME_WIDTH, width),
+        ("height", cv2.CAP_PROP_FRAME_HEIGHT, height),
+        ("fps", cv2.CAP_PROP_FPS, fps),
+        ("fourcc", cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc)),
+    )
+    requested = {"width": width, "height": height, "fps": fps, "fourcc": fourcc}
+    for name, prop, value in properties:
+        if not cap.set(prop, value):
+            raise RuntimeError(
+                "camera media type selection failed: "
+                f"requested={_media_type_label(requested)}, property={name}"
+            )
+    return requested
 
 
 def open_camera(
@@ -84,19 +98,28 @@ def open_camera(
             f"backend={backend_name or settings.CAMERA_BACKEND}"
         )
 
-    apply_camera_settings(cap, width=width, height=height, fps=fps, fourcc=fourcc)
-
-    # DirectShow 会静默协商成别的分辨率；显式请求分辨率时必须 fail closed，
-    # 否则 1080p 部署会在不支持时无声降级。
-    if width and width > 0 and height and height > 0:
-        negotiated_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        negotiated_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        if negotiated_width != width or negotiated_height != height:
-            cap.release()
+    try:
+        requested = apply_camera_settings(
+            cap, width=width, height=height, fps=fps, fourcc=fourcc
+        )
+        actual = describe_capture(cap)
+        fps_tolerance = max(0.5, requested["fps"] * 0.02)
+        matches = (
+            actual["width"] == requested["width"]
+            and actual["height"] == requested["height"]
+            and actual["fps"] is not None
+            and abs(actual["fps"] - requested["fps"]) <= fps_tolerance
+            and actual["fourcc"] == requested["fourcc"]
+        )
+        if not matches:
             raise RuntimeError(
-                f"camera resolution negotiation failed: requested {width}x{height}, "
-                f"actual {negotiated_width}x{negotiated_height}"
+                "camera media type negotiation failed: "
+                f"requested={_media_type_label(requested)}, "
+                f"actual={_media_type_label(actual)}"
             )
+    except Exception:
+        cap.release()
+        raise
 
     return cap
 
@@ -122,15 +145,26 @@ def read_warmup_frame(cap, warmup_frames: int):
 
 def describe_capture(cap):
     """获取摄像头的实际输出参数（分辨率、帧率、编码格式）。"""
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    fourcc_value = int(cap.get(cv2.CAP_PROP_FOURCC))
-    fourcc = "".join(chr((fourcc_value >> 8 * i) & 0xFF) for i in range(4)).strip()
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    raw_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    fps = round(raw_fps, 2) if math.isfinite(raw_fps) and raw_fps > 0 else None
+    fourcc_value = int(cap.get(cv2.CAP_PROP_FOURCC) or 0)
+    raw_fourcc = "".join(chr((fourcc_value >> 8 * i) & 0xFF) for i in range(4))
+    fourcc = raw_fourcc if all(32 <= ord(value) <= 126 for value in raw_fourcc) else None
 
     return {
         "width": width,
         "height": height,
-        "fps": round(float(fps), 2),
+        "fps": fps,
         "fourcc": fourcc,
     }
+
+
+def _media_type_label(value: dict) -> str:
+    width = value.get("width") or "unreported"
+    height = value.get("height") or "unreported"
+    fps = value.get("fps")
+    fps_label = "unreported" if fps is None or fps <= 0 else f"{fps:g}"
+    fourcc = value.get("fourcc") or "unreported"
+    return f"{width}x{height}@{fps_label} {fourcc}"
