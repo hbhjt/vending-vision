@@ -257,16 +257,27 @@ def test_recorded_video_geometry_fixtures_pass_the_production_observer_with_mono
     assert min(shoulder_spans[1] - shoulder_spans[0], shoulder_spans[2] - shoulder_spans[1]) > 0.05
 
 
-def test_recorded_video_geometry_generator_is_byte_reproducible():
-    """Regenerating the fixture twice preserves the manifest-bound bytes and digests."""
+def test_recorded_video_geometry_generator_is_byte_reproducible(tmp_path):
+    """The generator is deterministic without overwriting the committed fixture."""
     root = FIXTURE_ROOT
     generator = root / "generate-geometry-front.py"
     before = {path.name: path.read_bytes() for path in root.glob("geometry-*.mp4")}
-    subprocess.run([sys.executable, str(generator)], cwd=root.parents[1], check=True)
-    after_first = {path.name: path.read_bytes() for path in root.glob("geometry-*.mp4")}
-    subprocess.run([sys.executable, str(generator)], cwd=root.parents[1], check=True)
-    after_second = {path.name: path.read_bytes() for path in root.glob("geometry-*.mp4")}
-    assert before == after_first == after_second
+    command = [
+        sys.executable,
+        str(generator),
+        "--output-directory",
+        str(tmp_path),
+    ]
+    subprocess.run(command, cwd=root.parents[1], check=True)
+    after_first = {path.name: path.read_bytes() for path in tmp_path.glob("geometry-*.mp4")}
+    subprocess.run(command, cwd=root.parents[1], check=True)
+    after_second = {path.name: path.read_bytes() for path in tmp_path.glob("geometry-*.mp4")}
+
+    assert set(after_first) == set(before)
+    assert after_first == after_second
+    assert before == {
+        path.name: path.read_bytes() for path in root.glob("geometry-*.mp4")
+    }
 
 
 class _RecordedAcquisitionCamera:

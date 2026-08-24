@@ -8,6 +8,7 @@ included in the Windows runtime archive.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 from pathlib import Path
 
@@ -72,16 +73,19 @@ def _write(output: Path, base: np.ndarray) -> None:
         raise SystemExit(f"generated recording cannot be fully decoded: {output}")
 
 
-def main() -> None:
+def main(output_directory: Path = ROOT) -> None:
+    output_directory.mkdir(parents=True, exist_ok=True)
     image = cv2.imread(str(SOURCE))
     if image is None:
         raise SystemExit(f"missing source image: {SOURCE}")
     for filename, scale in SCALES.items():
         scaled = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        output = ROOT / filename
+        output = output_directory / filename
         _write(output, _center_crop_or_pad(scaled))
         print(f"{output.name} sha256={hashlib.sha256(output.read_bytes()).hexdigest()}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-directory", type=Path, default=ROOT)
+    main(parser.parse_args().output_directory)
