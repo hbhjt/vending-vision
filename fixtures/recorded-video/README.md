@@ -77,3 +77,10 @@ camera aspect, and resizes into the shared 1080p fixture contract. These four
 source JPEGs are deliberately identifiable field-test photographs and were
 explicitly approved for permanent shared test-fixture use on 2026-08-24. They
 must not be reused outside VEM Vision product testing.
+
+`sources/try-on-silhouette.png` is the same approved short-sleeve fixture used
+by installed-Windows try-on acceptance. Its SHA-256 is bound in the manifest.
+Together with the unmodified near/far front JPEGs it preserves the confirmed
+field comparison: the old customer scale 140% is the visual target for the
+corrected product default 100%. Geometry tests use semantic output facts rather
+than a whole-image hash.

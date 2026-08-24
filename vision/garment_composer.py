@@ -129,6 +129,11 @@ _CROPPED_EDGE_MINIMUM_SOLID_MATERIAL_RATIO = 0.80
 # 128，聚合结果也不会实质变化。正常不透明主体及现场纹理成衣则远高于 60%。
 _MINIMUM_SUBJECT_ALPHA_MASS_RATIO = 0.60
 
+# 真人近/远现场构图确认：短袖模板的旧外部 140% 是可感知且接近实衣的默认
+# 覆盖，旧 100% 则系统性偏小。这个倍率属于模板族的产品基准；顾客 80%–160%
+# 调节仍围绕该基准展开，不能演变成人物、商品或现场专用校准。
+_SHORT_SLEEVE_BASELINE_SCALE = 1.40
+
 
 def _source_row_edges(rows: np.ndarray, width: int) -> tuple[np.ndarray, np.ndarray]:
     """Return source-mask left/right opaque edges for each supplied row."""
@@ -598,7 +603,7 @@ class GarmentComposer:
                 # A short sleeve owns shoulder-to-elbow. Only the exposed
                 # forearm and hand return to the camera foreground.
                 start = shoulder + (elbow - shoulder) * 0.72
-                cv2.line(protected, tuple(np.rint(start).astype(int)), tuple(np.rint(wrist).astype(int)), 255, max(8, round(span * 0.12)), cv2.LINE_AA)
+                cv2.line(protected, tuple(np.rint(start).astype(int)), tuple(np.rint(wrist).astype(int)), 255, max(9, round(span * 0.14)), cv2.LINE_AA)
             elif sleeve_semantics == "long" and wrist is not None:
                 across_distance = abs(float(np.dot(wrist - geometry.shoulder_center, geometry.across_unit)))
                 if across_distance <= span * 0.65:
@@ -650,7 +655,14 @@ class GarmentComposer:
         center = geometry.shoulder_center + geometry.torso_down_unit * (
             source_height * base_uniform_scale * 0.5 + geometry.torso_length * 0.025
         )
-        uniform_scale = base_uniform_scale * garment_scale
+        template_baseline_scale = (
+            1.0
+            if garment.sleeve_semantics == "long"
+            else _SHORT_SLEEVE_BASELINE_SCALE
+        )
+        uniform_scale = (
+            base_uniform_scale * template_baseline_scale * garment_scale
+        )
         placed_width, placed_height = source_width * uniform_scale, source_height * uniform_scale
         source_center = np.array([source_width * 0.5, source_height * 0.5], dtype=np.float32)
         # The shoulder axis decides rotation.  Hips determine only torso

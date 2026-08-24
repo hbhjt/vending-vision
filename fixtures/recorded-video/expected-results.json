@@ -1,5 +1,12 @@
 {
   "schemaVersion": "vending-vision-recorded-video-fixture/v1",
+  "assets": {
+    "tryOnSilhouette": {
+      "file": "sources/try-on-silhouette.png",
+      "sha256": "57b5872801b884b6125078eb7cdb54f0be40e34677046214d1c4d8b155740222",
+      "template": "tshirt_short_sleeve"
+    }
+  },
   "recordings": {
     "top": {
       "file": "top.mp4",
@@ -142,6 +149,10 @@
     "fieldRecommendation": {
       "near": {"presence": "single", "bodyType": "strong"},
       "far": {"presence": "single", "bodyType": "strong"}
+    },
+    "fieldGarmentGeometry": {
+      "near": {"width": 633.91, "height": 686.0},
+      "far": {"width": 307.13, "height": 332.36}
     }
   }
 }

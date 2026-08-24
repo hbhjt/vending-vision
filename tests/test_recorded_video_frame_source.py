@@ -164,6 +164,106 @@ def test_field_recommendation_fixtures_are_traceable_and_drive_stable_production
     assert body_types[0] == body_types[1]
 
 
+class _DetectedPoseEstimator:
+    """Reuse one production detection while exercising every compose call."""
+
+    def __init__(self, pose):
+        self._pose = pose
+
+    def detect(self, _frame):
+        return self._pose
+
+
+def _decoded_garment_change(frame, result):
+    rendered = cv2.imdecode(
+        np.frombuffer(result.png, dtype=np.uint8), cv2.IMREAD_COLOR
+    )
+    assert rendered is not None and rendered.shape == frame.shape
+    changed = (np.max(cv2.absdiff(rendered, frame), axis=2) >= 30).astype(np.uint8)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(changed, 8)
+    assert count > 1
+    garment_component = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return labels == garment_component
+
+
+def _field_front_source(manifest, distance):
+    recording = manifest["recordings"][f"fieldRecommendation{distance.title()}Front"]
+    source = FIXTURE_ROOT / recording["source"]
+    assert recording["sourceSha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    raw = cv2.imread(str(source), cv2.IMREAD_COLOR)
+    assert raw is not None and raw.shape == (480, 640, 3)
+    return cv2.rotate(raw, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+
+def _field_garment_source(manifest):
+    asset = manifest["assets"]["tryOnSilhouette"]
+    path = FIXTURE_ROOT / asset["file"]
+    payload = path.read_bytes()
+    assert asset["sha256"] == hashlib.sha256(payload).hexdigest()
+    return TransparentGarmentSource(
+        payload,
+        "sha256:" + asset["sha256"],
+        asset["template"],
+    )
+
+
+def test_field_near_far_default_garment_matches_confirmed_visible_geometry():
+    """The public 100% result, not a hidden product branch, owns field geometry."""
+    manifest = fixture_manifest()
+    garment = _field_garment_source(manifest)
+    observations = {}
+
+    for distance in ("near", "far"):
+        frame = _field_front_source(manifest, distance)
+        production_pose = PoseEstimator().detect(frame)
+        assert production_pose.pose_landmarks is not None
+        composer = GarmentComposer(
+            pose_estimator=_DetectedPoseEstimator(production_pose)
+        )
+        result = composer.compose(frame, garment, 1.0)
+        expected = manifest["expected"]["fieldGarmentGeometry"][distance]
+
+        assert result.geometry.width == pytest.approx(expected["width"], rel=0.03)
+        assert result.geometry.height == pytest.approx(expected["height"], rel=0.03)
+        assert result.geometry.placed_aspect_ratio == pytest.approx(
+            result.geometry.source_aspect_ratio, rel=1e-6
+        )
+
+        changed = _decoded_garment_change(frame, result)
+        ys, xs = np.nonzero(changed)
+        top = int(ys.min())
+        center_x = round(result.geometry.center[0])
+        center_strip = changed[:, max(0, center_x - 8) : center_x + 9]
+        neckline_y = int(np.nonzero(center_strip)[0].min())
+        neckline_offset = (neckline_y - top) / result.geometry.height
+
+        sleeve_band_end = min(
+            changed.shape[0], round(neckline_y + result.geometry.height * 0.18)
+        )
+        sleeve_band = changed[top:sleeve_band_end]
+        left_pixels = int(np.count_nonzero(sleeve_band[:, :center_x]))
+        right_pixels = int(np.count_nonzero(sleeve_band[:, center_x:]))
+        assert min(left_pixels, right_pixels) >= 4_000
+        assert min(left_pixels, right_pixels) / max(left_pixels, right_pixels) >= 0.70
+        assert 0.06 <= neckline_offset <= 0.16
+
+        scaled = [composer.compose(frame, garment, scale) for scale in (1.0, 1.05, 1.10)]
+        assert all(
+            np.linalg.norm(np.subtract(item.geometry.center, scaled[0].geometry.center))
+            <= 2
+            for item in scaled[1:]
+        )
+        assert [item.geometry.width for item in scaled] == sorted(
+            item.geometry.width for item in scaled
+        )
+        assert [item.geometry.height for item in scaled] == sorted(
+            item.geometry.height for item in scaled
+        )
+        observations[distance] = neckline_offset
+
+    assert abs(observations["near"] - observations["far"]) <= 0.05
+
+
 def test_recorded_video_geometry_fixtures_are_distinct_dynamic_and_traceable():
     """The public fixture manifest exposes three reproducible live front clips."""
     manifest = fixture_manifest()
