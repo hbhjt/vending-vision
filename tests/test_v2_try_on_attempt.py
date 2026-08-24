@@ -827,16 +827,16 @@ def test_v2_disconnect_retires_only_its_completed_attempt_media_and_replays_term
     departed_id = str(uuid4())
     survivor_id = str(uuid4())
     with TestClient(vision_app.app) as client:
-        with client.websocket_connect("/ws") as departed:
-            departed.send_json(_hello(manifest))
-            assert departed.receive_json()["type"] == "vision.ready"
-            departed_terminal, departed_captured, departed_result = complete(
-                departed, departed_id
-            )
+        with client.websocket_connect("/ws") as survivor:
+            survivor.send_json(_hello(manifest))
+            assert survivor.receive_json()["type"] == "vision.ready"
 
-            with client.websocket_connect("/ws") as survivor:
-                survivor.send_json(_hello(manifest))
-                assert survivor.receive_json()["type"] == "vision.ready"
+            with client.websocket_connect("/ws") as departed:
+                departed.send_json(_hello(manifest))
+                assert departed.receive_json()["type"] == "vision.ready"
+                departed_terminal, departed_captured, departed_result = complete(
+                    departed, departed_id
+                )
                 survivor_terminal, survivor_captured, survivor_result = complete(
                     survivor, survivor_id
                 )
@@ -845,14 +845,15 @@ def test_v2_disconnect_retires_only_its_completed_attempt_media_and_replays_term
                 assert client.get(survivor_captured).status_code == 200
                 assert client.get(survivor_result).status_code == 200
 
-                departed.close()
-
-                assert client.get(departed_captured).status_code == 404
-                assert client.get(departed_result).status_code == 404
-                assert client.get(survivor_captured).status_code == 200
-                assert client.get(survivor_result).status_code == 200
-                survivor.send_json(_envelope("vision.ping", {}))
-                assert survivor.receive_json()["type"] == "vision.pong"
+            # Leaving the TestClient WebSocket scope joins the server-side
+            # disconnect finalizer; a raw close frame does not provide that
+            # scheduling barrier under a loaded full-suite run.
+            assert client.get(departed_captured).status_code == 404
+            assert client.get(departed_result).status_code == 404
+            assert client.get(survivor_captured).status_code == 200
+            assert client.get(survivor_result).status_code == 200
+            survivor.send_json(_envelope("vision.ping", {}))
+            assert survivor.receive_json()["type"] == "vision.pong"
 
         with client.websocket_connect("/ws") as replay:
             replay.send_json(_hello(manifest))
@@ -963,7 +964,7 @@ def await_no_active_try_on_attempt():
 def test_v2_try_on_attempt_accepts_generated_start_and_returns_tokenized_png(
     monkeypatch, garment_reference
 ):
-    """Public V2 completes a max garment against a recorded 720p frame."""
+    """Public V2 renders 720p output from the canonical recorded 1080p source."""
     manifest = json.loads(
         (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
             "utf-8"
@@ -989,7 +990,7 @@ def test_v2_try_on_attempt_accepts_generated_start_and_returns_tokenized_png(
     recorded_dimensions = []
     original_recorded_read = camera_manager.RecordedVideoFrameSource.read
 
-    def read_recorded_720p(source, warmup_frames=None):
+    def read_recorded_and_resize_720p(source, warmup_frames=None):
         recorded = original_recorded_read(source, warmup_frames=warmup_frames)
         recorded_dimensions.append(recorded.shape)
         return cv2.resize(recorded, (1280, 720), interpolation=cv2.INTER_LINEAR)
@@ -997,7 +998,7 @@ def test_v2_try_on_attempt_accepts_generated_start_and_returns_tokenized_png(
     monkeypatch.setattr(
         camera_manager.RecordedVideoFrameSource,
         "read",
-        read_recorded_720p,
+        read_recorded_and_resize_720p,
     )
     attempt_id = str(uuid4())
     hello = _hello(manifest)
@@ -1048,7 +1049,7 @@ def test_v2_try_on_attempt_accepts_generated_start_and_returns_tokenized_png(
     # Acquisition consumes three stable production source frames before the
     # fixed captured frame enters rendering; the preview never supplies it.
     assert len(recorded_dimensions) >= 3
-    assert set(recorded_dimensions) == {(768, 512, 3)}
+    assert set(recorded_dimensions) == {(1920, 1080, 3)}
     assert camera_manager.get_frame_source("front").status()["source"] == "recorded_video"
 
 
@@ -2275,7 +2276,10 @@ def test_v2_timeout_restarts_render_and_new_connection_completes(
 
     async def render_with_first_worker_deadline(*args, **kwargs):
         if counter.value == 0:
-            kwargs["timeout"] = 0.1
+            # A 1080p frame's conservative copy budget is intentionally above
+            # the historical 100 ms. Keep enough time to enter the worker,
+            # then prove that a blocked worker is killed and replaced.
+            kwargs["timeout"] = 1.0
         return await real_render(*args, **kwargs)
 
     monkeypatch.setattr(vision_app, "render_attempt_frame", render_with_first_worker_deadline)
