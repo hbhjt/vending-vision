@@ -19,11 +19,14 @@ from vision.acquisition_observer import _observe_frame
 from vision.garment_composer import GarmentComposer, TransparentGarmentSource
 from vision.person_detector import PersonDetector
 from vision.pose_estimator import PoseEstimator
+from vision.profile_state import protocol_occupancy_snapshot
+from vision.proximity import ProximityMonitor
 from vision.try_on_attempt_registry import TryOnAttemptRegistry
 from vision.frame_source import RecordedVideoFrameSource
 from vision.presence_runtime import PresenceRuntime
 from vision.profile_state import get_occupancy_gate, reset_active_track
 from vision.self_check import check_camera
+from vision.vision_pipeline import VisionPipeline
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "recorded-video"
@@ -98,7 +101,9 @@ def test_recorded_video_fixture_manifest_binds_top_and_front_recordings():
     assert manifest["schemaVersion"] == "vending-vision-recorded-video-fixture/v1"
     assert set(manifest["recordings"]) == {
         "top", "front", "manFront", "geometryFar", "geometryMid", "geometryNear",
-        "frontVertical", "frontVerticalUnstable", "manUnalignedFront", "emptyFront"
+        "frontVertical", "frontVerticalUnstable", "manUnalignedFront", "emptyFront",
+        "fieldRecommendationNearTop", "fieldRecommendationNearFront",
+        "fieldRecommendationFarTop", "fieldRecommendationFarFront",
     }
     for role, recording in manifest["recordings"].items():
         video = FIXTURE_ROOT / recording["file"]
@@ -110,6 +115,53 @@ def test_recorded_video_fixture_manifest_binds_top_and_front_recordings():
         "vision.person_departed",
     ]
     assert manifest["expected"]["front"]["profile"]["minimumFields"]
+
+
+def test_field_recommendation_fixtures_are_traceable_and_drive_stable_production_facts():
+    """The authorized near/far field captures exercise real presence and profile models."""
+    manifest = fixture_manifest()
+    pipeline = VisionPipeline()
+    body_types = []
+
+    for distance in ("Near", "Far"):
+        monitor = ProximityMonitor()
+        top_recording = manifest["recordings"][f"fieldRecommendation{distance}Top"]
+        front_recording = manifest["recordings"][f"fieldRecommendation{distance}Front"]
+        for recording, expected_shape in (
+            (top_recording, (1080, 1920, 3)),
+            (front_recording, (1920, 1080, 3)),
+        ):
+            source = FIXTURE_ROOT / recording["source"]
+            video = FIXTURE_ROOT / recording["file"]
+            assert source.is_file()
+            assert (FIXTURE_ROOT / recording["generator"]).is_file()
+            assert recording["sourceSha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+            assert recording["sha256"] == hashlib.sha256(video.read_bytes()).hexdigest()
+            assert recording["loop"] is True
+            capture = cv2.VideoCapture(str(video))
+            ok, frame = capture.read()
+            capture.release()
+            assert ok and frame.shape == expected_shape
+
+        top_capture = cv2.VideoCapture(str(FIXTURE_ROOT / top_recording["file"]))
+        top_observations = []
+        for _ in range(4):
+            ok, frame = top_capture.read()
+            assert ok
+            top_observations.append(monitor.check_image(frame))
+        top_capture.release()
+        assert protocol_occupancy_snapshot(top_observations[-1])["state"] == "single"
+
+        front_capture = cv2.VideoCapture(str(FIXTURE_ROOT / front_recording["file"]))
+        ok, frame = front_capture.read()
+        front_capture.release()
+        assert ok
+        profile = pipeline.infer(frame)
+        assert profile.presence is True
+        assert profile.body_type != "unknown"
+        body_types.append(profile.body_type)
+
+    assert body_types[0] == body_types[1]
 
 
 def test_recorded_video_geometry_fixtures_are_distinct_dynamic_and_traceable():

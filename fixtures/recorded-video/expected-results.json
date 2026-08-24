@@ -75,6 +75,38 @@
       "sha256": "2de948bb12095e165879655caecc799d2be176fa0268f52f5ffc00af3256b235",
       "loop": true,
       "generator": "generate-man-front.py"
+    },
+    "fieldRecommendationNearTop": {
+      "file": "field-recommendation-near-top.mp4",
+      "sha256": "c001dc84d137fcb50edeeaefd6997dd4070ffa25f9f4c540ef9aea4065018c83",
+      "loop": true,
+      "source": "sources/field-recommendation-near-top.jpg",
+      "sourceSha256": "57eabbbce01cbf7c1aaff1519a88ab649b7fd9d72a831509c5751e5da6ddcc9f",
+      "generator": "generate-field-recommendation.py"
+    },
+    "fieldRecommendationNearFront": {
+      "file": "field-recommendation-near-front.mp4",
+      "sha256": "2487ecacf844d8dc3afd10508ae4d4235b4ae2cb6acbefd791d084405f473765",
+      "loop": true,
+      "source": "sources/field-recommendation-near-front.jpg",
+      "sourceSha256": "b31fd348971aa3b3e6d50f992305ad6a7fabf84b62d62bff7e8064424fbf81f6",
+      "generator": "generate-field-recommendation.py"
+    },
+    "fieldRecommendationFarTop": {
+      "file": "field-recommendation-far-top.mp4",
+      "sha256": "7a6efa41785a2447c1e138f1a1e8a1bf81b5d8603443ffb01cb34c78d02c220b",
+      "loop": true,
+      "source": "sources/field-recommendation-far-top.jpg",
+      "sourceSha256": "c18847094df98fafc76fdaa2b6e3ab131eb55526a044fca6360633a040467ed7",
+      "generator": "generate-field-recommendation.py"
+    },
+    "fieldRecommendationFarFront": {
+      "file": "field-recommendation-far-front.mp4",
+      "sha256": "67e144e92d581a2761ffc5fbfa373298b717217eefff04a2840f9610b99c3cbb",
+      "loop": true,
+      "source": "sources/field-recommendation-far-front.jpg",
+      "sourceSha256": "251e0d44a00d0357dc7ba24224848da599f99244ec5425abd69b36cb5f235fef",
+      "generator": "generate-field-recommendation.py"
     }
   },
   "expected": {
@@ -106,6 +138,10 @@
         "minimumConfidence": 0.25
       },
       "tryOn": {"jpeg": true}
+    },
+    "fieldRecommendation": {
+      "near": {"presence": "single", "bodyType": "strong"},
+      "far": {"presence": "single", "bodyType": "strong"}
     }
   }
 }

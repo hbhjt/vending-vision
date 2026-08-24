@@ -67,3 +67,13 @@ by `generate-top.py` from the committed legacy `sources/top-legacy-320.mp4`:
 resampling keeps the approach/departure behavior and production presence
 detection semantics while matching the field 1080p top camera. Frame sizes,
 fps, and source paths live in `common.py` as the single fixture spec.
+
+`field-recommendation-near-{top,front}.mp4` and
+`field-recommendation-far-{top,front}.mp4` are generated from the paired,
+authorized physical-machine captures in `sources/`. They retain the real
+person, clothing, background, and near/far composition. The generator only
+corrects the physically rotated front camera, center-crops to the managed
+camera aspect, and resizes into the shared 1080p fixture contract. These four
+source JPEGs are deliberately identifiable field-test photographs and were
+explicitly approved for permanent shared test-fixture use on 2026-08-24. They
+must not be reused outside VEM Vision product testing.
