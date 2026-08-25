@@ -63,7 +63,6 @@ def test_try_on_attempt_runtime_uses_explicit_ports_and_owns_attempt_lifecycle()
     assert {
         "adjust",
         "cancel",
-        "cancel_active",
         "disconnect",
         "read_captured",
     } <= set(vars(attempt_runtime.TryOnAttemptRuntime))
@@ -657,10 +656,10 @@ def test_v2_route_leave_retires_completed_attempt_media_capabilities(
     assert adjustment_error["payload"]["code"] == "adjustment_unavailable"
 
 
-def test_v2_departure_retires_completed_attempt_media_but_replays_its_terminal(
+def test_v2_stable_owner_disconnect_retires_completed_media_after_raw_departure(
     monkeypatch, garment_reference
 ):
-    """A completed customer's departure revokes media without reopening identity."""
+    """Raw departure stays observable; owner disconnect performs customer cleanup."""
     manifest = json.loads(
         (Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text(
             "utf-8"
@@ -745,8 +744,11 @@ def test_v2_departure_retires_completed_attempt_media_but_replays_its_terminal(
             while socket.receive_json()["type"] != "vision.person_departed":
                 pass
 
-            assert client.get(captured_reference).status_code == 404
-            assert client.get(result_reference).status_code == 404
+            assert client.get(captured_reference).status_code == 200
+            assert client.get(result_reference).status_code == 200
+
+        assert client.get(captured_reference).status_code == 404
+        assert client.get(result_reference).status_code == 404
 
         with client.websocket_connect("/ws") as replay:
             replay.send_json(_hello_with_capabilities(manifest, ["try_on"]))
@@ -1161,10 +1163,10 @@ def test_v2_try_on_attempt_keeps_ping_responsive_while_daemon_fetch_is_blocked(
             assert socket.receive_json()["type"] == "vision.try_on.attempt.completed"
 
 
-def test_v2_top_departure_cancels_active_generated_attempt_and_fences_late_completion(
+def test_v2_raw_top_departure_waits_for_stable_owner_disconnect_to_cancel_attempt(
     monkeypatch, garment_reference
 ):
-    """The public departure event cancels its active attempt before render can finish."""
+    """Raw departure remains a fact; the Machine's stable owner ends the attempt."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     monkeypatch.setattr(vision_app, "get_runtime_status", lambda: {"cameraReady": True, "modelReady": True})
     monkeypatch.setattr(vision_app.settings, "PROFILE_PUSH_ENABLED", True)
@@ -1173,8 +1175,7 @@ def test_v2_top_departure_cancels_active_generated_attempt_and_fences_late_compl
     _configure_recorded_front(monkeypatch)
     depart = threading.Event()
     departed_once = threading.Event()
-    render_release = threading.Event()
-    render_finished = threading.Event()
+    render_entered = threading.Event()
 
     def collect_departure(_status, _ambient, include_departure):
         if depart.is_set() and include_departure and not departed_once.is_set():
@@ -1191,18 +1192,16 @@ def test_v2_top_departure_cancels_active_generated_attempt_and_fences_late_compl
         return None
 
     monkeypatch.setattr(vision_app, "collect_profile_update", collect_departure)
-    async def render_until_departure(*_args, **_kwargs):
-        # Keep the render uncooperative after the departure edge.  The public
-        # canceled terminal must be visible before this old worker can return.
-        assert await asyncio.to_thread(depart.wait, 5)
-        try:
-            await asyncio.to_thread(render_release.wait, 5)
-        except asyncio.CancelledError:
-            await asyncio.to_thread(render_release.wait, 5)
-        render_finished.set()
-        return _png_bytes()
+    async def render_until_owner_disconnect(*_args, **_kwargs):
+        # The attempt remains active across the raw departure edge. Closing the
+        # owner socket models the Machine's later stable-departure action.
+        render_entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("owner disconnect did not cancel the render")
 
-    monkeypatch.setattr(vision_app, "render_attempt_frame", render_until_departure)
+    monkeypatch.setattr(
+        vision_app, "render_attempt_frame", render_until_owner_disconnect
+    )
     attempt_id = str(uuid4())
     messages = []
 
@@ -1227,28 +1226,35 @@ def test_v2_top_departure_cancels_active_generated_attempt_and_fences_late_compl
                     "vision.try_on.attempt.acquiring",
                     "vision.try_on.attempt.captured",
                 }
+            assert render_entered.wait(timeout=1)
             assert captured_reference is not None
             assert client.get(captured_reference).status_code == 200
 
             depart.set()
-            terminal = None
             departed = False
-            while terminal is None or not departed:
+            while not departed:
                 messages.append(socket.receive_json())
                 message = messages[-1]
                 if message["type"] == "vision.person_departed":
                     departed = True
-                if message["type"] in {
+            assert not any(
+                message["type"]
+                in {
                     "vision.try_on.attempt.completed",
                     "vision.try_on.attempt.failed",
                     "vision.try_on.attempt.canceled",
-                } and message["payload"].get("attemptId") == attempt_id:
-                    terminal = message
-                    render_release.set()
+                }
+                for message in messages
+            )
+            assert (
+                asyncio.run(
+                    vision_app._try_on_attempt_registry.active_attempt_id()
+                )
+                == attempt_id
+            )
 
         assert await_no_active_try_on_attempt()
         assert vision_app.get_front_camera_owner()["owner"] == "idle"
-        assert render_finished.wait(timeout=1)
 
         with client.websocket_connect("/ws") as replay:
             replay.send_json(_hello_with_capabilities(manifest, ["try_on"]))
@@ -1260,14 +1266,12 @@ def test_v2_top_departure_cancels_active_generated_attempt_and_fences_late_compl
         message for message in messages
         if message["type"] == "vision.try_on.attempt.completed"
     ]
-    canceled = [
-        message for message in messages
-        if message["type"] == "vision.try_on.attempt.canceled"
-    ]
     assert completed == []
-    assert len(canceled) == 1
-    assert canceled[0]["payload"] == {"attemptId": attempt_id, "reason": "departure"}
-    assert replayed_terminal == canceled[0]
+    assert replayed_terminal["type"] == "vision.try_on.attempt.canceled"
+    assert replayed_terminal["payload"] == {
+        "attemptId": attempt_id,
+        "reason": "disconnect",
+    }
     assert client.get(captured_reference).status_code == 404
     assert any(
         message["type"] == "vision.person_departed"

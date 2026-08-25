@@ -905,29 +905,6 @@ class TryOnAttemptRegistry:
                 and self._revoke_completed_result_unlocked(attempt_id, terminal)
             )
 
-    async def revoke_current_owner_results(self) -> tuple[str, ...]:
-        """Revoke completed grants belonging to the latest customer owner."""
-        async with self._gate:
-            self._prune_unlocked()
-            owner_key = next(
-                (
-                    terminal.owner_subscriber_key
-                    for terminal in reversed(self._terminals.values())
-                    if terminal.owner_subscriber_key is not None
-                ),
-                None,
-            )
-            if owner_key is None:
-                return ()
-            revoked = []
-            for attempt_id, terminal in self._terminals.items():
-                if (
-                    terminal.owner_subscriber_key == owner_key
-                    and self._revoke_completed_result_unlocked(attempt_id, terminal)
-                ):
-                    revoked.append(attempt_id)
-            return tuple(revoked)
-
     async def revoke_completed_owner_results(self, websocket: Any) -> tuple[str, ...]:
         """Revoke only completed grants whose admission owner disconnected."""
         owner_key = id(websocket)

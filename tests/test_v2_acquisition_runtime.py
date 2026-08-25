@@ -284,8 +284,8 @@ def test_v2_ws_ping_and_cancel_stay_live_while_production_observer_blocks(monkey
         vision_app._acquisition_observer = None
 
 
-def test_public_recorded_top_departure_cancels_attempt_and_keeps_profile_events(monkeypatch):
-    """Production departure cancels its public attempt while profile facts continue."""
+def test_public_recorded_top_departure_stays_raw_until_owner_disconnect(monkeypatch):
+    """Recorded departure remains observable while the stable Machine owns cancellation."""
     manifest = json.loads((Path(__file__).parents[1] / "contracts/vem_vision_v2/manifest.json").read_text("utf-8"))
     recorded_manifest = json.loads(
         (Path(__file__).parents[1] / "fixtures/recorded-video/expected-results.json").read_text(
@@ -363,8 +363,6 @@ def test_public_recorded_top_departure_cancels_attempt_and_keeps_profile_events(
             missing.append("person departure")
         if not generating_seen:
             missing.append("generating")
-        if not canceled:
-            missing.append("cancellation after departure")
         if not post_departure_presence:
             missing.append("post-departure presence")
         if not front_idle_after_generating:
@@ -389,12 +387,13 @@ def test_public_recorded_top_departure_cancels_attempt_and_keeps_profile_events(
 
     async def render_until_departure(*_args, **_kwargs):
         generating_started.set()
-        # Hold generation until the recorded departure edge has been observed
-        # so the departure fence wins over an uncooperative late render.
+        # Raw departure is not a business terminal.  Keep generation alive until
+        # the stable Machine owner closes its socket and the disconnect fence wins.
         assert await asyncio.to_thread(
             _wait_for_recorded_fixture_event, departure_seen, timeout=8
         ), "recorded departure edge did not arrive while the attempt was generating"
-        return _png_bytes()
+        await asyncio.Event().wait()
+        raise AssertionError("owner disconnect did not cancel the render")
 
     monkeypatch.setattr(vision_app, "render_attempt_frame", render_until_departure)
     monkeypatch.setattr(vision_app, "broadcast_profile_update", broadcast_after_generating)
@@ -435,7 +434,7 @@ def test_public_recorded_top_departure_cancels_attempt_and_keeps_profile_events(
                     if message["type"] == "vision.person_departed":
                         departures.append(message)
                         departure_seen.set()
-                    if canceled and message["type"] == "vision.presence_status":
+                    if departures and message["type"] == "vision.presence_status":
                         post_departure_presence = True
                     if message["type"] in {
                         "vision.presence_status",
@@ -450,12 +449,8 @@ def test_public_recorded_top_departure_cancels_attempt_and_keeps_profile_events(
                     f"seen types: {seen_types}"
                 )
                 assert completed == []
-                assert len(canceled) == 1
-                assert canceled[0]["payload"] == {
-                    "attemptId": attempt_id,
-                    "reason": "departure",
-                }
-                assert "vision.try_on.attempt.canceled" in seen_types
+                assert canceled == []
+                assert "vision.try_on.attempt.canceled" not in seen_types
                 assert "vision.try_on.attempt.failed" not in seen_types
                 assert generating_seen
                 assert front_idle_after_generating
@@ -481,6 +476,23 @@ def test_public_recorded_top_departure_cancels_attempt_and_keeps_profile_events(
                 assert monitor.poll_count >= expected_polls + 1
                 assert monitor.source.frame_count == monitor.poll_count
                 assert vision_app.get_front_camera_owner()["owner"] == "idle"
+            with client.websocket_connect("/ws") as replay:
+                replay.send_json(_envelope("vision.hello", {
+                    "clientRole": "machine", "machineCode": "M001",
+                    "schemaVersion": manifest["schemaVersion"], "bundleVersion": manifest["bundleVersion"],
+                    "contractDigest": manifest["bundleDigest"], "capabilities": ["try_on"],
+                }))
+                assert replay.receive_json()["type"] == "vision.ready"
+                replay.send_json(_envelope("vision.try_on.attempt.start", {
+                    "attemptId": attempt_id, "variantId": str(uuid4()),
+                    "garment": {"assetId": str(uuid4()), "reference": f"http://127.0.0.1:{server.server_port}/garment?token=source-token", "digest": f"sha256:{hashlib.sha256(_GarmentHandler.payload).hexdigest()}", "contentType": "image/png", "byteSize": len(_GarmentHandler.payload), "template": "tshirt_short_sleeve"},
+                }))
+                replayed_terminal = replay.receive_json()
+            assert replayed_terminal["type"] == "vision.try_on.attempt.canceled"
+            assert replayed_terminal["payload"] == {
+                "attemptId": attempt_id,
+                "reason": "disconnect",
+            }
     finally:
         # Release every fixture barrier before shutting down TestClient.  A
         # failing assertion must never leave an asyncio default-executor

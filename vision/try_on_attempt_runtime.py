@@ -444,15 +444,6 @@ class TryOnAttemptRuntime:
         await p.transport.publish(transition)
         return transition
 
-    async def cancel_active(self, reason: str) -> None:
-        registry = self._ports.registry.current
-        attempt_id = await registry.active_attempt_id()
-        if attempt_id is not None:
-            await self.cancel(attempt_id, reason)
-        if reason == "departure":
-            for completed_attempt_id in await registry.revoke_current_owner_results():
-                await self._ports.media.revoke(completed_attempt_id)
-
     async def adjust(
         self, websocket: object, send_lock: asyncio.Lock, message: dict
     ) -> None:

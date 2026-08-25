@@ -692,8 +692,10 @@ def test_recorded_video_drives_real_presence_profile_and_departure(monkeypatch, 
     pytest.fail("recorded top source did not produce a departure edge")
 
 
-def test_recorded_top_departure_cancels_active_public_attempt_once(monkeypatch, tmp_path):
-    """Production recorded top departure fences the active V2 attempt as departure."""
+def test_recorded_top_departure_leaves_cancellation_to_the_stable_machine_owner(
+    monkeypatch, tmp_path
+):
+    """Recorded top departure is one raw fact, not a second business debounce."""
     async def scenario():
         manifest = fixture_manifest()
         expected = manifest["expected"]
@@ -739,12 +741,10 @@ def test_recorded_top_departure_cancels_active_public_attempt_once(monkeypatch, 
             )
             if result.update and result.update["message_type"] == "vision.person_departed":
                 departure = result.update
-                await vision_app._try_on_attempt_runtime_module.cancel_active(
-                    "departure"
-                )
                 break
 
         assert departure is not None
+        assert await registry.active_attempt_id() == attempt_id
         replay = await registry.admit(
             attempt_id=attempt_id,
             websocket=object(),
@@ -753,14 +753,20 @@ def test_recorded_top_departure_cancels_active_public_attempt_once(monkeypatch, 
             accepted=None,
             generating=None,
         )
-        assert len(replay.replay) == 1
-        assert replay.replay[0]["type"] == "vision.try_on.attempt.canceled"
-        assert replay.replay[0]["payload"] == {
-            "attemptId": attempt_id,
-            "reason": "departure",
-        }
+        assert replay.is_owner is False
+        assert [message["type"] for message in replay.replay] == [
+            "vision.try_on.attempt.accepted",
+            "vision.try_on.attempt.generating",
+        ]
+        assert admission.receipt is not None
+        await registry.cancel_owner_and_join(
+            admission.receipt,
+            {
+                "type": "vision.try_on.attempt.canceled",
+                "messageId": "disconnected",
+                "payload": {"attemptId": attempt_id, "reason": "disconnect"},
+            },
+        )
         assert await registry.active_attempt_id() is None
-        owner_task.cancel()
-        await asyncio.gather(owner_task, return_exceptions=True)
 
     asyncio.run(scenario())

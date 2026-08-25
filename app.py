@@ -1437,8 +1437,6 @@ async def presence_broadcast_loop():
                     "person_departed" in capabilities,
                 )
                 if mock_update is not None:
-                    if mock_update["message_type"] == "vision.person_departed":
-                        await _try_on_attempt_runtime_module.cancel_active("departure")
                     await broadcast_profile_update(mock_update)
                 await asyncio.sleep(settings.PROFILE_PUSH_INTERVAL_MS / 1000.0)
                 continue
@@ -1464,8 +1462,6 @@ async def presence_broadcast_loop():
                     "presence_worker_update_total",
                     message_type=result.update["message_type"],
                 )
-                if result.update["message_type"] == "vision.person_departed":
-                    await _try_on_attempt_runtime_module.cancel_active("departure")
                 await broadcast_profile_update(result.update)
 
             if (

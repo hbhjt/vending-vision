@@ -147,9 +147,10 @@ Vision 直接拥有源帧，Machine 不从渲染后的 preview bytes 提取生�
 关闭且 front-camera lease 在 generating 前释放；generating 只发布 `preparing`/`rendering`
 等 coarse stage，不发布百分比。服务端 canceled reason 仅允许 `user`、`route_leave`、
 `disconnect`、`departure`、`replaced`、`timeout`。一个 machine-wide 非 terminal attempt
-以及 attempt identity fencing 保证 replacement、departure、disconnect、timeout 和 late
-worker output 不会污染新交互。top-camera presence/departure/ambient 贯穿全流程，try-on
-route 内 profile 不触发导航，也不存在模式选择或自动回退。
+以及 attempt identity fencing 保证 replacement、disconnect、timeout 和 late worker output
+不会污染新交互。top-camera presence/departure/ambient 贯穿全流程；Vision 只发布原始离场事实，
+Machine 的唯一稳定在场聚合器确认业务离场后关闭 owning socket，由 `disconnect` fence 取消活跃
+attempt 并撤销已完成资源。try-on route 内 profile 不触发导航，也不存在模式选择或自动回退。
 
 ## 验证与兼容性
 

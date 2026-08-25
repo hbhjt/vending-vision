@@ -7,8 +7,9 @@ and never exposes it to the Machine: reads happen only inside the Vision
 process and produce a replacement result.
 
 The snapshot is deliberately bound to the Try-On result TTL and is additionally
-dropped on route-leave cancellation or a top-camera departure so a departed
-customer's source cannot outlive their interaction.
+dropped when the Machine closes the owning socket after route leave or its
+stable customer-departure edge, so one customer's source cannot outlive their
+interaction.
 """
 
 from __future__ import annotations
