@@ -222,7 +222,7 @@ def _pose_is_aligned(estimator, frame: Any) -> bool:
     return (
         0.15 <= shoulder_x <= 0.85
         and 0.05 <= shoulder_y <= 0.85
-        and 0.08 <= shoulder_span <= 0.90
+        and 0.08 <= shoulder_span <= 1.0
     )
 
 
