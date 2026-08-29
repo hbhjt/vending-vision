@@ -30,6 +30,7 @@ MAX_FRAME_WIDTH = 1920
 MAX_FRAME_HEIGHT = 1920
 MAX_FRAME_RAW_BYTES = MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3
 STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
+_PREWARM_TIMEOUT_SECONDS = 120.0
 _ACQ_SHARED_NAME = re.compile(r"^vem_acq_[0-9a-f]{32}$")
 
 
@@ -405,7 +406,7 @@ class AcquisitionObservationWorker:
                         continue
                 cleanup.result()
                 raise asyncio.CancelledError
-            deadline = time.monotonic() + 30.0
+            deadline = time.monotonic() + _PREWARM_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
                 with self._state_lock:
                     process, generation, slot = self._process, self._generation, self._slot

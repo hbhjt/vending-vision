@@ -94,7 +94,7 @@ _TRY_ON_RESULT_TTL_SECONDS = 5 * 60
 _TRY_ON_RESULT_MAX_BYTES = 16 * 1024 * 1024
 _TRY_ON_RESULT_MAX_COUNT = 1000
 _TRY_ON_RESULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
-_TRY_ON_ATTEMPT_TIMEOUT_SECONDS = 90
+_TRY_ON_ATTEMPT_TIMEOUT_SECONDS = 60
 _TRY_ON_ATTEMPT_MAX_TASKS = 2
 _TRY_ON_TERMINAL_SEND_TIMEOUT_SECONDS = 0.25
 _try_on_runtime = GarmentComposer()
@@ -111,7 +111,7 @@ _acquisition_previews = AcquisitionPreviewStore()
 _captured_frames = CapturedFrameStore()
 _acquisition_observer: AcquisitionObservationWorker | None = None
 _try_on_attempt_runtime_module: TryOnAttemptRuntime
-_ACQUISITION_TIMEOUT_SECONDS = 90.0
+_ACQUISITION_TIMEOUT_SECONDS = 30.0
 # 首次识别到稳定后展示 3 秒倒计时，倒计时期间若再次失稳则重新计时；
 # 手动拍照仍可在对齐窗口内立即触发，不受该倒计时限制。
 _ACQUISITION_HOLD_SECONDS = 3.0

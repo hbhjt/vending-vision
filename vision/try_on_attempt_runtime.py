@@ -230,6 +230,11 @@ class TryOnAttemptRuntime:
             await p.transport.publish(await registry.cancel_owner_and_join(receipt))
             return
 
+        observer = p.camera.observer()
+        start_observer = getattr(observer, "start", None)
+        if start_observer is not None:
+            # 采集计时只覆盖“稳定姿态判定”，不包含模型冷启动预热的等待。
+            await start_observer()
         acquisition_deadline = (
             asyncio.get_running_loop().time()
             + p.config.acquisition_timeout_seconds
